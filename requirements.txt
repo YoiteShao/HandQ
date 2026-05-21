@@ -1,0 +1,46 @@
+# HandQ Requirements
+# Python 3.10 or higher required
+
+# ── Custom index (Qualcomm internal) ─────────────────────────────────────────
+# Uncomment the two lines below when re-enabling qgenie-sdk.
+# --extra-index-url https://devpi.qualcomm.com/qcom/dev/+simple
+# --trusted-host devpi.qualcomm.com
+
+# ── LLM clients ───────────────────────────────────────────────────────────────
+
+# QGenie SDK (Qualcomm internal) — temporarily disabled, see handq.py
+# qgenie-sdk
+
+# Anthropic Claude API client (AnthropicStreamingService in src/infrastructure/)
+anthropic>=0.40.0
+
+# Async HTTP client (used directly by AnthropicStreamingService; also a dep of anthropic)
+httpx>=0.23.0
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+
+# YAML configuration loader (used by ConfigManager)
+pyyaml>=6.0.1
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+
+# JSON repair for truncated/malformed LLM responses
+json-repair>=0.30.0
+
+# ── UI / display ──────────────────────────────────────────────────────────────
+
+# Rich text formatting and rendering (TUI status view, markdown display)
+rich>=13.7.0
+
+# ── SSH tool dependencies ──────────────────────────────────────────────────────
+
+# SSH client (used by StatelessSSHTool and ssh_setup)
+paramiko>=3.0.0
+
+# OS keyring integration for SSH password storage
+# Stores credentials in Windows Credential Manager / Linux Secret Service / macOS Keychain
+keyring>=24.0.0
+
+# Fallback file-based keyring backend for headless/Linux environments (optional)
+# Used automatically when the system keyring (D-Bus / Secret Service) is unavailable
+keyrings.alt>=4.0.0

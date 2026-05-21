@@ -1,0 +1,76 @@
+version: '3.0'
+llm:
+  API_KEY: ff6bb18f-4a84-401d-9989-f6997487abe5
+  models:
+  - anthropic::claude-4-7-opus
+  - anthropic::claude-4-6-opus:1M
+  - anthropic::claude-4-6-opus
+  - anthropic::claude-4-6-sonnet:1M
+  - anthropic::claude-4-6-sonnet
+  - anthropic::claude-4-5-sonnet
+  - anthropic::claude-4-5-haiku:thinking
+  - anthropic::claude-4-5-haiku
+  - anthropic::claude-4-sonnet
+  - anthropic::claude-3-7-sonnet
+  - anthropic::claude-3-5-sonnet
+session:
+  workspace_base: .fengxuanworkspace
+  log_level: INFO
+  step_verification_threshold: 0.8
+interaction_switches:
+  tool_write:
+    auto_approve: true
+    description: Control write tool auto-execution
+  tool_edit:
+    auto_approve: true
+    description: Control edit tool auto-execution
+  tool_bash:
+    auto_approve: true
+    description: Control bash tool auto-execution
+  high_risk:
+    auto_approve: true
+    description: Control high-risk operation auto-execution
+high_risk_commands:
+  always_dangerous_keywords:
+  - shutdown
+  - reboot
+  - halt
+  - poweroff
+  - kill
+  - pkill
+  - killall
+  - mkfs
+  - fdisk
+  - parted
+  - dd
+  - systemctl
+  always_dangerous_patterns:
+  - dd\s+.*of=/dev/
+  - DROP\s+DATABASE
+  - DROP\s+TABLE
+  - git\s+push.*--force
+  - git\s+push.*-f\b
+  - '>\s*/dev/sd[a-z]'
+  high_risk_keywords:
+  - rm
+  - delete
+  - del
+  - remove
+  - unlink
+  - truncate
+  - chmod
+  - chown
+  - uninstall
+  - pip uninstall
+  - apt remove
+  - yum remove
+  - git reset --hard
+  - git clean -fd
+  - curl -X DELETE
+  - wget --delete
+  custom_patterns:
+  - rm\s+-rf\s+/
+  whitelist:
+  - rm -rf ./temp
+  - rm *.tmp
+  - rm -rf __pycache__

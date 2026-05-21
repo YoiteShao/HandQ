@@ -1,0 +1,13 @@
+{
+  "name": "handq-electron",
+  "version": "0.1.0",
+  "description": "Electron frontend for HandQ — talks to the Python bridge over line-delimited JSON on stdio.",
+  "main": "main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron ."
+  },
+  "devDependencies": {
+    "electron": "^31.0.0"
+  }
+}

@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="Content-Security-Policy"
+          content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self';" />
+    <title>HandQ</title>
+    <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+    <div class="app">
+        <!-- ============================================================ -->
+        <!-- Sidebar                                                       -->
+        <!-- ============================================================ -->
+        <aside class="sidebar" id="sidebar">
+            <div class="sidebar-header">
+                <span class="brand">HandQ</span>
+            </div>
+            <nav class="sidebar-nav">
+                <button class="nav-btn active" id="nav-chat" type="button">
+                    <span class="nav-icon">💬</span>
+                    <span>Chat</span>
+                </button>
+                <button class="nav-btn" id="nav-settings" type="button">
+                    <span class="nav-icon">⚙️</span>
+                    <span>Settings</span>
+                </button>
+            </nav>
+            <div class="sidebar-footer">
+                <span class="status-pill" id="status-pill">idle</span>
+            </div>
+        </aside>
+
+        <!-- ============================================================ -->
+        <!-- Main pane                                                     -->
+        <!-- ============================================================ -->
+        <main class="main">
+            <!-- Chat view -->
+            <section class="view chat-view" id="view-chat">
+                <header class="view-header">
+                    <h1>Conversation</h1>
+                </header>
+
+                <div class="conversation" id="conversation">
+                    <!-- Message bubbles get appended here by renderer.js -->
+                </div>
+
+                <form class="composer" id="composer">
+                    <textarea id="composer-input"
+                              placeholder="Describe a goal, then press Enter…"
+                              rows="3"></textarea>
+                    <button type="submit" id="composer-send">Send</button>
+                </form>
+            </section>
+
+            <!-- Settings view -->
+            <section class="view settings-view hidden" id="view-settings">
+                <header class="view-header">
+                    <h1>Settings</h1>
+                </header>
+
+                <!-- Toast / status banner shown after Save. -->
+                <div class="settings-toast hidden" id="settings-toast" role="status"></div>
+
+                <form class="settings-form" id="settings-form">
+
+                    <!-- ============================== Model ============================== -->
+                    <fieldset>
+                        <legend>Model</legend>
+
+                        <label>
+                            <span>API_KEY</span>
+                            <div class="password-row">
+                                <input type="password" id="cfg-llm-api-key"
+                                       autocomplete="off" spellcheck="false"
+                                       placeholder="ff6bb18f-…  or  sk-ant-…" />
+                                <button type="button"
+                                        id="cfg-llm-api-key-toggle"
+                                        class="reveal-btn"
+                                        aria-label="Show API key">Show</button>
+                            </div>
+                            <small class="help-text">
+                                Your provider API key. Stored as
+                                <code>llm.API_KEY</code> in the local config.
+                                No environment variable required.
+                            </small>
+                        </label>
+
+                        <label>
+                            <span>Max Response Tokens</span>
+                            <input type="number" id="cfg-llm-max-tokens"
+                                   min="1" step="1" placeholder="128000" />
+                            <small class="help-text">
+                                Maximum tokens per reply. Typical range
+                                4096–200000. Leave empty to use the model
+                                default.
+                            </small>
+                        </label>
+
+                        <label>
+                            <span>Model Priority</span>
+                            <textarea id="cfg-llm-models" rows="8"
+                                      spellcheck="false"
+                                      placeholder="anthropic::claude-4-6-sonnet:1M&#10;anthropic::claude-4-6-sonnet"></textarea>
+                            <small class="help-text">
+                                One model identifier per line. The first entry
+                                is used first; later entries are fallbacks if
+                                the primary is unavailable.
+                            </small>
+                        </label>
+                    </fieldset>
+
+                    <!-- ============================== Session ============================== -->
+                    <fieldset>
+                        <legend>Session</legend>
+
+                        <label>
+                            <span>Log Level</span>
+                            <select id="cfg-session-log-level">
+                                <option value="">(default)</option>
+                                <option value="DEBUG">DEBUG</option>
+                                <option value="INFO">INFO</option>
+                                <option value="WARNING">WARNING</option>
+                                <option value="ERROR">ERROR</option>
+                                <option value="CRITICAL">CRITICAL</option>
+                            </select>
+                            <small class="help-text">
+                                Logging verbosity. DEBUG is the most verbose,
+                                CRITICAL the quietest. Default: INFO.
+                            </small>
+                        </label>
+
+                        <label>
+                            <span>Step Verification Threshold</span>
+                            <input type="number" id="cfg-session-step-threshold"
+                                   min="0" max="1" step="0.05"
+                                   placeholder="0.8" />
+                            <small class="help-text">
+                                Confidence below this value triggers a
+                                corrective step. Range 0.0–1.0. Default: 0.8.
+                            </small>
+                        </label>
+
+                        <label>
+                            <span>Workspace Directory</span>
+                            <input type="text" id="cfg-session-workspace-base"
+                                   placeholder=".workspace" />
+                            <small class="help-text">
+                                Base directory under which each session creates
+                                its own workspace. Relative paths resolve
+                                against the project root. Default:
+                                <code>.workspace</code>.
+                            </small>
+                        </label>
+
+                        <label>
+                            <span>Python venv Path</span>
+                            <input type="text" id="cfg-session-venv-path"
+                                   placeholder="(optional — leave empty for system Python)" />
+                            <small class="help-text">
+                                Absolute path to a Python virtualenv used by
+                                the bash tool. Leave empty to use the system
+                                Python.
+                            </small>
+                        </label>
+                    </fieldset>
+
+                    <!-- ============================== Auto-approve ============================== -->
+                    <fieldset>
+                        <legend>Auto-approve</legend>
+
+                        <p class="help-text fieldset-intro">
+                            For each switch: <strong>checked</strong> = run
+                            immediately without asking; <strong>unchecked</strong>
+                            = show a confirmation dialog first. Paths inside the
+                            working directory are always auto-approved for
+                            write/edit regardless of these switches.
+                        </p>
+
+                        <label class="checkbox-row">
+                            <input type="checkbox" id="cfg-sw-tool-write" />
+                            <span>Auto-approve write tool</span>
+                            <small class="help-text">
+                                When unchecked, ask before the write tool
+                                creates or overwrites a file outside the
+                                working directory.
+                            </small>
+                        </label>
+
+                        <label class="checkbox-row">
+                            <input type="checkbox" id="cfg-sw-tool-edit" />
+                            <span>Auto-approve edit tool</span>
+                            <small class="help-text">
+                                When unchecked, ask before the edit tool
+                                modifies an existing file outside the working
+                                directory.
+                            </small>
+                        </label>
+
+                        <label class="checkbox-row">
+                            <input type="checkbox" id="cfg-sw-tool-bash" />
+                            <span>Auto-approve bash tool</span>
+                            <small class="help-text">
+                                When unchecked, ask before any bash command
+                                runs. The high-risk switch below is checked
+                                first and takes priority.
+                            </small>
+                        </label>
+
+                        <label class="checkbox-row">
+                            <input type="checkbox" id="cfg-sw-high-risk" />
+                            <span>Auto-approve high-risk commands</span>
+                            <small class="help-text">
+                                When unchecked, ask before any high-risk bash
+                                command (rm, kill, shutdown, DROP TABLE,
+                                git push --force, …). Strongly recommended:
+                                leave unchecked.
+                            </small>
+                        </label>
+                    </fieldset>
+
+                    <div class="settings-actions">
+                        <button type="button" id="settings-load">Reload</button>
+                        <button type="submit" id="settings-save">Save</button>
+                        <span class="muted" id="settings-status"></span>
+                    </div>
+                </form>
+            </section>
+        </main>
+    </div>
+
+    <script src="renderer.js"></script>
+</body>
+</html>
