@@ -192,10 +192,6 @@ class FlowController:
         self._externally_cancelled: bool = False
 
         self._in_verification_step = False
-        # Maximum confidence the planner may assign after the verification step.
-        # Set when the step is injected; enforced (clamped) before confidence_failed
-        # is evaluated so the LLM cannot report confidence above its tier ceiling.
-        self._verification_confidence_ceiling: float = 1.0
 
         # Async hook called at every task-completion point, BEFORE notifying the
         # user, so side-effects (e.g. GEP template post-processing) are
@@ -1152,7 +1148,6 @@ class FlowController:
         last_seen_msg_idx: int = 0
         in_flight_batch: Optional[List[Step]] = None
         self._in_verification_step = False
-        self._verification_confidence_ceiling = 1.0
 
         # ── Wait for the first REPLAN message to become the goal ─────────────
         self.logger.info("Idle mode: waiting for first user message", component="FlowController")
@@ -1531,22 +1526,6 @@ class FlowController:
                 # because it includes already-committed history, which would cause a
                 # spurious confidence failure and an incorrect re-plan.)
                 confidence = self.current_plan.last_step_confidence
-                # Enforce tier ceiling: clamp confidence reported by the planner
-                # after a verification step so the LLM cannot claim higher
-                # confidence than the tier's structural limit allows.
-                if (
-                    self._in_verification_step
-                    and confidence is not None
-                    and confidence > self._verification_confidence_ceiling
-                ):
-                    self.logger.info(
-                        f'Verification confidence clamped: '
-                        f'{confidence:.2f} → {self._verification_confidence_ceiling:.2f} '
-                        f'(tier ceiling)',
-                        component='FlowController',
-                    )
-                    confidence = self._verification_confidence_ceiling
-                    self.current_plan.last_step_confidence = confidence
                 confidence_failed = (
                     step_result_received
                     and pending_step is not None
@@ -1792,10 +1771,9 @@ class FlowController:
                                                 step_id=vs.step_id,
                                             )
                                         self._in_verification_step = True
-                                        self._verification_confidence_ceiling = vs.tier_ceiling
                                         self.logger.info(
                                             f'Verification step injected '
-                                            f'(confidence ceiling: {vs.tier_ceiling})',
+                                            f'(tier: {getattr(vs, "tier", "unknown")})',
                                             component='FlowController',
                                         )
                                         # Pass execution artifacts as step_supplement so the

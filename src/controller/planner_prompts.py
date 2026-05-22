@@ -520,7 +520,7 @@ Output ONLY the JSON — no prose, no markdown fences."""
 
 VERIFICATION_TIER_LIGHT = """\
 [VERIFICATION TIER: LIGHT]
-Standard: existence + non-corruption check only. Confidence ceiling: 0.75.
+Standard: existence + non-corruption check only.
 You are NOT checking correctness — only that the task did not produce obviously
 wrong output (missing artifact, empty file, broken syntax on first import).
 
@@ -540,12 +540,12 @@ The goal you write MUST instruct the executing agent to end with:
   Artifact: [EXISTS | MISSING: <path>]
   Content: [PLAUSIBLE | OBVIOUSLY WRONG] — <one sentence of evidence>
   Verdict: [PASS | FAIL]
-  Confidence: <0.0–0.75> — ceiling is 0.75; LIGHT checks existence only, not correctness
+  Confidence: <0.0–1.0>
 """
 
 VERIFICATION_TIER_STANDARD = """\
 [VERIFICATION TIER: STANDARD]
-Standard: key claims verified by independent tool calls. Confidence ceiling: 0.85.
+Standard: key claims verified by independent tool calls.
 
 Input available: PRIMARY RESULT paths (verify these) + INTERMEDIATE FILES (read as
 shortcuts to skip re-running expensive operations — do NOT verify intermediates as goals).
@@ -569,12 +569,12 @@ The goal you write MUST instruct the executing agent to end with:
   Correctness: [PASS | FAIL] — <one line of evidence>
   Adversarial probe: <what was checked> → [PASS | FAIL]
   Overall verdict: [PASS | FAIL | PARTIAL]
-  Confidence: <0.0–0.85> — ceiling is 0.85; STANDARD does not verify completeness
+  Confidence: <0.0–1.0>
 """
 
 VERIFICATION_TIER_ADVERSARIAL = """\
 [VERIFICATION TIER: ADVERSARIAL]
-Standard: full independent verification. Confidence ceiling: 0.95.
+Standard: full independent verification.
 
 Input available: all artifact paths labelled PRIMARY or INTERMEDIATE (see context above).
 Your tools: read, grep, test, bash (read-only). Do NOT write, modify, or re-run any
@@ -593,7 +593,6 @@ A check without actual tool output is not a PASS — it is a skip.
 
 The goal you write MUST instruct the executing agent to produce the full
 VERIFICATION REPORT format (as specified in the system prompt).
-Confidence may reach 0.95 only when every claim is backed by independent tool output.
 """
 
 
@@ -610,7 +609,7 @@ VERIFICATION_GOAL_SUFFIX_LIGHT = """
   Artifact: [EXISTS | MISSING: <path>]
   Content: [PLAUSIBLE | OBVIOUSLY WRONG] — <one sentence of evidence>
   Verdict: [PASS | FAIL]
-  Confidence: <0.0–0.75>  ← ceiling 0.75; this tier checks existence only"""
+  Confidence: <0.0–1.0>"""
 
 VERIFICATION_GOAL_SUFFIX_STANDARD = """
 
@@ -622,7 +621,7 @@ VERIFICATION_GOAL_SUFFIX_STANDARD = """
     <claim> → [VERIFIED | REFUTED] — <one line of evidence per claim>
   Adversarial probe: <what was checked> → [PASS | FAIL]
   Overall verdict: [PASS | FAIL | PARTIAL]
-  Confidence: <0.0–0.88>  ← ceiling 0.88; this tier does not verify completeness"""
+  Confidence: <0.0–1.0>"""
 
 VERIFICATION_GOAL_SUFFIX_ADVERSARIAL = """
 
@@ -639,7 +638,7 @@ Your response MUST end with a VERIFICATION REPORT block using this exact structu
   What was NOT checked:
     - <item>
   Overall verdict: [PASS|FAIL|PARTIAL]
-  Confidence: <0.0–0.95>  ← ceiling 0.95; adversarial checks are thorough but not omniscient"""
+  Confidence: <0.0–1.0>"""
 
 
 # ── GEP execution prompt constants ───────────────────────────────────────────

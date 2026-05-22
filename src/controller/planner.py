@@ -77,9 +77,6 @@ class VerificationStep:
       description        — human-readable label (nested under verification_step).
       rationale          — failure patterns being targeted (nested under verification_step).
       skip_reason        — why verification was skipped (only when should_verify=False).
-      tier_ceiling       — maximum confidence the planner may assign to this verification
-                           step, enforced in code by FlowController regardless of what
-                           the verifier LLM reports.  Defaults to 0.95 (adversarial max).
     """
     should_verify: bool = False
     goal: str = ""
@@ -87,7 +84,6 @@ class VerificationStep:
     description: str = "Adversarial acceptance check"
     rationale: str = ""
     skip_reason: str = ""
-    tier_ceiling: float = 0.95
 
     @classmethod
     def from_dict(cls, data: dict) -> 'VerificationStep':
@@ -1310,11 +1306,6 @@ class Planner:
                 'adversarial': VERIFICATION_GOAL_SUFFIX_ADVERSARIAL,
             }
             full_goal += _tier_suffixes.get(tier, VERIFICATION_GOAL_SUFFIX_STANDARD)
-
-            # Record the tier ceiling on the VerificationStep so FlowController
-            # can enforce it in code regardless of what the verifier LLM reports.
-            _TIER_CEILINGS = {'light': 0.75, 'standard': 0.85, 'adversarial': 0.95}
-            vs.tier_ceiling = _TIER_CEILINGS.get(tier, 0.95)
 
             # Attach the assembled Step onto the VerificationStep so the caller
             # can use it directly without re-constructing it.
