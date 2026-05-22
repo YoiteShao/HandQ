@@ -794,6 +794,12 @@ class FlowController:
             try:
                 # FR-1: Receptionist receives the same context as the Planner.
                 # FR-4: uses the Receptionist's own independent LLM service.
+                chunk_cb = (
+                    self.interaction_manager.stream_receptionist_chunk
+                    if self.interaction_manager._ui is not None
+                    and hasattr(self.interaction_manager._ui, 'stream_receptionist_reply_chunk')
+                    else None
+                )
                 evaluation = await self.receptionist.evaluate_user_message(
                     message=msg,
                     goal=goal,
@@ -804,6 +810,7 @@ class FlowController:
                     agent_progress=agent_progress,
                     completed_count=completed_count,
                     remaining_count=remaining_count,
+                    on_response_chunk=chunk_cb,
                 )
             except Exception as e:
                 self.interaction_manager.display_error(f"LLM API error: {e}")
@@ -848,7 +855,15 @@ class FlowController:
         handq --list), not through the receptionist.
         """
         async def callback(msg: str):
-            evaluation = await self.receptionist.classify_initial_goal(msg)
+            chunk_cb = (
+                self.interaction_manager.stream_receptionist_chunk
+                if self.interaction_manager._ui is not None
+                and hasattr(self.interaction_manager._ui, 'stream_receptionist_reply_chunk')
+                else None
+            )
+            evaluation = await self.receptionist.classify_initial_goal(
+                msg, on_response_chunk=chunk_cb
+            )
 
             # ── GEP_CONFIRM ───────────────────────────────────────────────────
             # Store the template id for timeout-confirm and route as REPLAN so
@@ -860,12 +875,15 @@ class FlowController:
                     self._gep_confirm_deadline = (
                         time.monotonic() + self._GEP_CONFIRM_TIMEOUT
                     )
-                return UserMessageEvaluation(
+                result = UserMessageEvaluation(
                     intent=UserMessageIntent.REPLAN,
                     response_to_user=evaluation.response_to_user,
                     reasoning=evaluation.reasoning,
                     context_for_planner=evaluation.context_for_planner or msg,
                 )
+                if getattr(evaluation, '_streamed', False):
+                    result._streamed = True  # type: ignore[attr-defined]
+                return result
 
             # ── GEP_DECLINE ───────────────────────────────────────────────────
             if evaluation.intent == UserMessageIntent.GEP_DECLINE:
@@ -939,6 +957,12 @@ class FlowController:
                     template_name=_template_name,
                     template_description=_template_description,
                     guide_steps_summary=_steps_summary,
+                    on_response_chunk=(
+                        self.interaction_manager.stream_receptionist_chunk
+                        if self.interaction_manager._ui is not None
+                        and hasattr(self.interaction_manager._ui, 'stream_receptionist_reply_chunk')
+                        else None
+                    ),
                 )
             except Exception:
                 # Restore the deadline so the countdown is not frozen on error.

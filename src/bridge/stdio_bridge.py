@@ -322,14 +322,22 @@ class _StdioUI:
         _emit({"type": "status", "kind": "task_completed",
                "summary": text}, gen=self._generation)
 
-    def receptionist_thinking_on(self) -> None:
-        _ui_logger.debug("receptionist_thinking_on")
+    def show_receptionist_thinking(self) -> None:
+        _ui_logger.debug("show_receptionist_thinking")
         _emit({"type": "status", "kind": "receptionist_thinking_on"},
               gen=self._generation)
 
-    def receptionist_thinking_off(self) -> None:
-        _ui_logger.debug("receptionist_thinking_off")
+    def clear_receptionist_thinking(self) -> None:
+        _ui_logger.debug("clear_receptionist_thinking")
         _emit({"type": "status", "kind": "receptionist_thinking_off"},
+              gen=self._generation)
+
+    def stream_receptionist_reply_chunk(self, text: str) -> None:
+        _emit({"type": "status", "kind": "reply_delta", "text": str(text)},
+              gen=self._generation)
+
+    def seal_receptionist_reply(self) -> None:
+        _emit({"type": "status", "kind": "reply_done"},
               gen=self._generation)
 
 

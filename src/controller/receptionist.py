@@ -23,11 +23,13 @@ import json
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Dict, List, Optional, cast
+from typing import Callable, Dict, List, Optional, cast
 
 from ..infrastructure.gep_template import list_templates_summary
-from ..infrastructure.llm_pool import call_with_fallback
+from ..infrastructure.json_key_streamer import JsonKeyStreamer
+from ..infrastructure.llm_pool import call_with_fallback, call_with_fallback_stream
 from ..infrastructure.llm_service import LLMChatResult, LLMService
+from ..infrastructure.anthropic_streaming_service import StreamTextDeltaEvent, StreamDoneEvent
 from ..infrastructure.logger import get_logger
 from ..infrastructure.utils import try_parse_json
 from .receptionist_prompts import (
@@ -300,6 +302,47 @@ class Receptionist:
         parsed = try_parse_json(raw.content or "")
         return parsed if isinstance(parsed, dict) else None
 
+    async def _call_and_parse_streaming(
+        self,
+        messages: List[Dict[str, str]],
+        log_context: str,
+        on_response_chunk: Callable[[str], None],
+    ) -> Optional[Dict]:
+        """
+        Streaming variant of _call_and_parse(). Forwards response_to_user
+        chunks to on_response_chunk as they arrive, then returns the full
+        parsed JSON dict.
+        """
+        streamer = JsonKeyStreamer("response_to_user")
+        accumulated = []
+
+        try:
+            async for event in call_with_fallback_stream(
+                self._services,
+                dict(messages=messages),
+                on_fallback=lambda idx, e: self.logger.warning(
+                    f"Receptionist {log_context} stream fallback to index {idx}: {e}",
+                    component="Receptionist",
+                ),
+            ):
+                if isinstance(event, StreamTextDeltaEvent):
+                    accumulated.append(event.text)
+                    if not streamer.done:
+                        for fragment in streamer.feed(event.text):
+                            on_response_chunk(fragment)
+                elif isinstance(event, StreamDoneEvent):
+                    break
+
+            full_text = "".join(accumulated)
+            parsed = try_parse_json(full_text)
+            return parsed if isinstance(parsed, dict) else None
+        except Exception as e:
+            self.logger.warning(
+                f"Receptionist {log_context} streaming failed: {e} — falling back to non-streaming",
+                component="Receptionist",
+            )
+            return await self._call_and_parse(messages, log_context)
+
     def _build_evaluation_result(
         self,
         parsed: Dict,
@@ -356,7 +399,11 @@ class Receptionist:
 
     # ── Initial goal classification ───────────────────────────────────────────
 
-    async def classify_initial_goal(self, user_input: str) -> UserMessageEvaluation:
+    async def classify_initial_goal(
+        self,
+        user_input: str,
+        on_response_chunk: Optional[Callable[[str], None]] = None,
+    ) -> UserMessageEvaluation:
         """
         Classify the user's initial message.
 
@@ -376,11 +423,18 @@ class Receptionist:
         ]
 
         try:
-            parsed = await self._call_and_parse(messages, "classify_initial_goal")
+            if on_response_chunk is not None:
+                parsed = await self._call_and_parse_streaming(
+                    messages, "classify_initial_goal", on_response_chunk
+                )
+            else:
+                parsed = await self._call_and_parse(messages, "classify_initial_goal")
             if parsed is not None:
                 evaluation = self._build_evaluation_result(
                     parsed, user_input, default_intent=UserMessageIntent.REPLAN
                 )
+                if on_response_chunk is not None:
+                    evaluation._streamed = True  # type: ignore[attr-defined]
                 self.logger.info(
                     f"Initial goal classification: intent={evaluation.intent.value}, "
                     f"matched_template_id={evaluation.matched_template_id!r}, "
@@ -412,6 +466,7 @@ class Receptionist:
         template_name: str,
         template_description: str,
         guide_steps_summary: str = "",
+        on_response_chunk: Optional[Callable[[str], None]] = None,
     ) -> UserMessageEvaluation:
         """
         Classify a user message during the GEP confirmation window.
@@ -449,11 +504,18 @@ class Receptionist:
         ]
 
         try:
-            parsed = await self._call_and_parse(messages, "evaluate_gep_confirmation")
+            if on_response_chunk is not None:
+                parsed = await self._call_and_parse_streaming(
+                    messages, "evaluate_gep_confirmation", on_response_chunk
+                )
+            else:
+                parsed = await self._call_and_parse(messages, "evaluate_gep_confirmation")
             if parsed is not None:
                 evaluation = self._build_evaluation_result(
                     parsed, user_input, default_intent=UserMessageIntent.RESPOND_ONLY
                 )
+                if on_response_chunk is not None:
+                    evaluation._streamed = True  # type: ignore[attr-defined]
                 self.logger.info(
                     f"GEP confirmation evaluation: intent={evaluation.intent.value}, "
                     f"reasoning={evaluation.reasoning}",
@@ -487,6 +549,7 @@ class Receptionist:
         agent_progress: str = "",
         completed_count: int = 0,
         remaining_count: int = 0,
+        on_response_chunk: Optional[Callable[[str], None]] = None,
     ) -> UserMessageEvaluation:
         """
         Classify a user message while a task is executing (FR-1, FR-2, FR-3).
@@ -534,11 +597,18 @@ class Receptionist:
         ]
 
         try:
-            parsed = await self._call_and_parse(messages, "evaluate_user_message")
+            if on_response_chunk is not None:
+                parsed = await self._call_and_parse_streaming(
+                    messages, "evaluate_user_message", on_response_chunk
+                )
+            else:
+                parsed = await self._call_and_parse(messages, "evaluate_user_message")
             if parsed is not None:
                 evaluation = self._build_evaluation_result(
                     parsed, message, default_intent=UserMessageIntent.REPLAN
                 )
+                if on_response_chunk is not None:
+                    evaluation._streamed = True  # type: ignore[attr-defined]
                 self.logger.info(
                     f"Message evaluation: intent={evaluation.intent.value}, "
                     f"matched_template_id={evaluation.matched_template_id!r}, "

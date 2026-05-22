@@ -11,33 +11,38 @@
     <div class="app">
         <!-- ============================================================ -->
         <!-- Custom title bar (frameless window, drag region)              -->
+        <!-- Windows-style controls on the right.                          -->
         <!-- ============================================================ -->
         <header class="titlebar" id="titlebar">
             <div class="titlebar-drag">
                 <span class="titlebar-brand">HandQ</span>
             </div>
-            <div class="titlebar-controls">
+            <div class="titlebar-controls" aria-label="Window controls">
                 <button class="tb-btn tb-min" id="tb-min" type="button"
                         aria-label="Minimize" title="Minimize">
-                    <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true">
-                        <line x1="2" y1="6.5" x2="10" y2="6.5"
-                              stroke="currentColor" stroke-width="1.2"/>
+                    <svg viewBox="0 0 12 12" aria-hidden="true">
+                        <line x1="2.5" y1="6" x2="9.5" y2="6"
+                              stroke="currentColor" stroke-width="1.2"
+                              stroke-linecap="round"/>
                     </svg>
                 </button>
                 <button class="tb-btn tb-max" id="tb-max" type="button"
                         aria-label="Maximize" title="Maximize">
-                    <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true">
-                        <rect x="2.5" y="2.5" width="7" height="7" rx="0.5"
-                              fill="none" stroke="currentColor" stroke-width="1.2"/>
+                    <svg viewBox="0 0 12 12" aria-hidden="true">
+                        <rect x="2.5" y="2.5" width="7" height="7" rx="1.5"
+                              stroke="currentColor" stroke-width="1.2"
+                              fill="none"/>
                     </svg>
                 </button>
                 <button class="tb-btn tb-close" id="tb-close" type="button"
                         aria-label="Hide to tray" title="Hide to tray">
-                    <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true">
+                    <svg viewBox="0 0 12 12" aria-hidden="true">
                         <line x1="3" y1="3" x2="9" y2="9"
-                              stroke="currentColor" stroke-width="1.2"/>
+                              stroke="currentColor" stroke-width="1.2"
+                              stroke-linecap="round"/>
                         <line x1="9" y1="3" x2="3" y2="9"
-                              stroke="currentColor" stroke-width="1.2"/>
+                              stroke="currentColor" stroke-width="1.2"
+                              stroke-linecap="round"/>
                     </svg>
                 </button>
             </div>
@@ -62,6 +67,17 @@
                 <button type="submit" id="composer-send">Send</button>
             </form>
 
+            <!-- Floating expanded editor — shown when input overflows -->
+            <div class="composer-expanded hidden" id="composer-expanded">
+                <header class="composer-expanded-header">
+                    <span>Editing</span>
+                    <button type="button" class="composer-expanded-close"
+                            id="composer-expanded-close" aria-label="Close">×</button>
+                </header>
+                <textarea id="composer-expanded-input"
+                          placeholder="Type a message…"></textarea>
+            </div>
+
             <!-- Shortcut bar: single row -->
             <nav class="shortcuts" id="shortcuts">
                 <button class="shortcut-btn" id="sc-settings" type="button">
@@ -76,9 +92,44 @@
                     <span class="sc-icon" aria-hidden="true">＋</span>
                     <span class="sc-label">New</span>
                 </button>
-                <span class="shortcuts-status" id="status-pill">idle</span>
+                <button class="activity-strip"
+                        id="activity-strip"
+                        type="button"
+                        aria-haspopup="true"
+                        aria-expanded="false"
+                        title="Click to view recent activity">
+                    <span class="activity-dot" aria-hidden="true"></span>
+                    <span class="activity-current" id="activity-current">idle</span>
+                    <span class="activity-chevron" aria-hidden="true">
+                        <svg viewBox="0 0 10 10" aria-hidden="true">
+                            <path d="M2.5 6.5 L5 4 L7.5 6.5"
+                                  stroke="currentColor" stroke-width="1.2"
+                                  stroke-linecap="round" stroke-linejoin="round"
+                                  fill="none"/>
+                        </svg>
+                    </span>
+                </button>
             </nav>
         </main>
+
+        <!-- ============================================================ -->
+        <!-- Activity popover — anchored above the activity strip.         -->
+        <!-- Toggled by clicks on the strip; auto-closes on outside click. -->
+        <!-- ============================================================ -->
+        <aside class="activity-popover hidden"
+               id="activity-popover"
+               aria-label="Agent activity feed"
+               aria-hidden="true">
+            <header class="activity-popover-header">
+                <span class="activity-title">Activity</span>
+                <button type="button"
+                        class="activity-close"
+                        id="activity-close"
+                        aria-label="Close activity panel"
+                        title="Close">×</button>
+            </header>
+            <ul class="activity-feed" id="activity-feed"></ul>
+        </aside>
 
         <!-- ============================================================ -->
         <!-- Status overlay                                                -->
@@ -129,6 +180,22 @@
                 <div class="settings-toast hidden" id="settings-toast" role="status"></div>
 
                 <form class="settings-form" id="settings-form">
+
+                    <!-- ============================== Hotkey ============================== -->
+                    <fieldset>
+                        <legend>Global Shortcut</legend>
+
+                        <label>
+                            <span>Toggle Window Hotkey</span>
+                            <input type="text" id="cfg-hotkey"
+                                   placeholder="Ctrl+Alt+W" readonly />
+                            <small class="help-text">
+                                Click the field and press a key combination to
+                                set the global hotkey for showing/hiding HandQ.
+                                Default: <code>Ctrl+Alt+W</code>.
+                            </small>
+                        </label>
+                    </fieldset>
 
                     <!-- ============================== Model ============================== -->
                     <fieldset>

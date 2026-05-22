@@ -209,3 +209,15 @@ contextBridge.exposeInMainWorld('windowControls', {
         ipcRenderer.send('window:hide');
     },
 });
+
+// Global hotkey settings — renderer reads/writes the toggle shortcut.
+contextBridge.exposeInMainWorld('hotkeySettings', {
+    get: () => {
+        preloadLog('hotkey:get');
+        return ipcRenderer.invoke('hotkey:get');
+    },
+    set: (accelerator) => {
+        preloadLog('hotkey:set', { accelerator });
+        return ipcRenderer.invoke('hotkey:set', accelerator);
+    },
+});

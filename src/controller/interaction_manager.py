@@ -242,7 +242,10 @@ class InteractionManager:
             self._ui_call("show_receptionist_thinking")
             evaluation = await callback(msg)
             self._ui_call("clear_receptionist_thinking")
-            self.display_receptionist_reply(evaluation.response_to_user)
+            if getattr(evaluation, '_streamed', False):
+                self.seal_receptionist_reply()
+            else:
+                self.display_receptionist_reply(evaluation.response_to_user)
             if evaluation.intent.value == "replan":
                 # Use context_for_planner (which includes recent conversation
                 # history) so the Planner has full context when the user
@@ -463,6 +466,14 @@ class InteractionManager:
                 except Exception:
                     pass
         self.display_message(message)
+
+    def stream_receptionist_chunk(self, text: str) -> None:
+        """Stream a text chunk of the receptionist reply to the UI (Windows UI only)."""
+        self._ui_call("stream_receptionist_reply_chunk", text)
+
+    def seal_receptionist_reply(self) -> None:
+        """Signal completion of the streamed receptionist reply."""
+        self._ui_call("seal_receptionist_reply")
 
     def display_error(self, message: str) -> None:
         """

@@ -14,7 +14,7 @@
 
 'use strict';
 
-const { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage } = require('electron');
+const { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, globalShortcut } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const { spawn } = require('child_process');
@@ -152,6 +152,67 @@ let isQuitting = false;
 let pythonChild = null;
 let stdoutReader = null;
 let isShuttingDown = false;
+
+// --- global hotkey (toggle window visibility) --------------------------------
+
+const HOTKEY_SETTINGS_FILE = path.join(
+    app.isPackaged
+        ? path.join(process.env.LOCALAPPDATA || path.join(app.getPath('home'), 'AppData', 'Local'), 'HandQ')
+        : __dirname,
+    'hotkey.json'
+);
+const DEFAULT_HOTKEY = 'Ctrl+Alt+W';
+let currentHotkey = DEFAULT_HOTKEY;
+
+function loadHotkeySetting() {
+    try {
+        if (fs.existsSync(HOTKEY_SETTINGS_FILE)) {
+            const data = JSON.parse(fs.readFileSync(HOTKEY_SETTINGS_FILE, 'utf8'));
+            if (data && data.hotkey) return data.hotkey;
+        }
+    } catch (_) { /* use default */ }
+    return DEFAULT_HOTKEY;
+}
+
+function saveHotkeySetting(hotkey) {
+    try {
+        const dir = path.dirname(HOTKEY_SETTINGS_FILE);
+        fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(HOTKEY_SETTINGS_FILE, JSON.stringify({ hotkey: hotkey }, null, 2), 'utf8');
+    } catch (err) {
+        logLine('HOTKEY', 'save failed', { err: err && err.message });
+    }
+}
+
+function toggleWindowVisibility() {
+    if (!mainWindow) return;
+    if (mainWindow.isVisible() && mainWindow.isFocused()) {
+        mainWindow.hide();
+        ensureTray();
+    } else {
+        mainWindow.show();
+        if (mainWindow.isMinimized()) mainWindow.restore();
+        mainWindow.focus();
+    }
+}
+
+function registerHotkey(accelerator) {
+    globalShortcut.unregisterAll();
+    if (!accelerator) return false;
+    try {
+        const ok = globalShortcut.register(accelerator, toggleWindowVisibility);
+        if (ok) {
+            logLine('HOTKEY', 'registered', { accelerator: accelerator });
+            currentHotkey = accelerator;
+            return true;
+        }
+        logLine('HOTKEY', 'register failed (already in use?)', { accelerator: accelerator });
+        return false;
+    } catch (err) {
+        logLine('HOTKEY', 'register error', { accelerator: accelerator, err: err && err.message });
+        return false;
+    }
+}
 
 // --- helpers ---------------------------------------------------------------
 
@@ -458,6 +519,27 @@ function ensureTray() {
 
 function createWindow() {
     logLine('MAIN', 'creating BrowserWindow');
+
+    // Platform-specific transparency. We want the OS desktop to show through
+    // a system-blurred surface (Win11 acrylic / macOS vibrancy). Falls back
+    // to a solid background on platforms / Windows builds that don't support
+    // the requested material.
+    const transparencyOpts = {};
+    if (process.platform === 'win32') {
+        // Pure transparency — no backgroundMaterial (acrylic renders opaque
+        // on some Win11 builds). With transparent:true the Chromium compositor
+        // is genuinely see-through wherever CSS has no solid background.
+        transparencyOpts.transparent = true;
+        transparencyOpts.backgroundColor = '#00000000';
+    } else if (process.platform === 'darwin') {
+        transparencyOpts.transparent = true;
+        transparencyOpts.backgroundColor = '#00000000';
+        transparencyOpts.vibrancy = 'sidebar';
+        transparencyOpts.visualEffectState = 'active';
+    } else {
+        transparencyOpts.backgroundColor = '#f4f6fb';
+    }
+
     mainWindow = new BrowserWindow({
         width: 1200,
         height: 800,
@@ -465,12 +547,7 @@ function createWindow() {
         minHeight: 480,
         title: 'HandQ',
         frame: false,
-        titleBarStyle: 'hidden',
-        // Match the page's gradient base so resizing never reveals a strip
-        // of OS desktop colour around the edge. The "liquid glass" look is
-        // produced by CSS gradients + backdrop-filter, not by OS-level
-        // transparency (which causes flicker on Win resize).
-        backgroundColor: '#f4f6fb',
+        ...transparencyOpts,
         autoHideMenuBar: true,
         webPreferences: {
             preload: path.join(__dirname, 'preload.js'),
@@ -522,6 +599,11 @@ if (!gotLock) {
             log_dir: LOG_DIR,
             log_file: LOG_FILE,
         });
+
+        // Register global hotkey for toggling window visibility.
+        currentHotkey = loadHotkeySetting();
+        registerHotkey(currentHotkey);
+
         pythonChild = spawnBridge();
         ensureTray();
         createWindow();
@@ -602,10 +684,27 @@ ipcMain.on('window:hide', () => {
     ensureTray();
 });
 
+// Global hotkey IPC — renderer can read and update the toggle shortcut.
+ipcMain.handle('hotkey:get', () => {
+    return { hotkey: currentHotkey };
+});
+
+ipcMain.handle('hotkey:set', (_event, accelerator) => {
+    const ok = registerHotkey(accelerator);
+    if (ok) {
+        saveHotkeySetting(accelerator);
+        return { success: true, hotkey: accelerator };
+    }
+    // Restore previous hotkey on failure.
+    registerHotkey(currentHotkey);
+    return { success: false, hotkey: currentHotkey, error: 'Failed to register shortcut. It may be in use by another application.' };
+});
+
 // --- graceful shutdown -----------------------------------------------------
 
 app.on('before-quit', (event) => {
     isQuitting = true;
+    globalShortcut.unregisterAll();
     if (isShuttingDown) {
         return; // second click — let the default quit flow proceed.
     }

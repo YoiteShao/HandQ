@@ -170,8 +170,9 @@
     const conversation = document.getElementById('conversation');
     const composer = document.getElementById('composer');
     const composerInput = document.getElementById('composer-input');
-
-    const statusPill = document.getElementById('status-pill');
+    const composerExpanded = document.getElementById('composer-expanded');
+    const composerExpandedInput = document.getElementById('composer-expanded-input');
+    const composerExpandedClose = document.getElementById('composer-expanded-close');
 
     // Shortcut bar
     const scSettings = document.getElementById('sc-settings');
@@ -182,6 +183,14 @@
     const tbMin   = document.getElementById('tb-min');
     const tbMax   = document.getElementById('tb-max');
     const tbClose = document.getElementById('tb-close');
+
+    // Activity strip (lives inline in the shortcuts bar) + popover (anchored
+    // above it, holds the full feed and opens on click).
+    const activityStrip   = document.getElementById('activity-strip');
+    const activityCurrent = document.getElementById('activity-current');
+    const activityPopover = document.getElementById('activity-popover');
+    const activityClose   = document.getElementById('activity-close');
+    const activityFeed    = document.getElementById('activity-feed');
 
     // Overlays
     const overlayStatus    = document.getElementById('overlay-status');
@@ -219,6 +228,9 @@
     const cfgSwToolEdit  = document.getElementById('cfg-sw-tool-edit');
     const cfgSwToolBash  = document.getElementById('cfg-sw-tool-bash');
     const cfgSwHighRisk  = document.getElementById('cfg-sw-high-risk');
+
+    // Hotkey field
+    const cfgHotkey = document.getElementById('cfg-hotkey');
 
     let originalConfig = null;
 
@@ -269,19 +281,21 @@
     function setPill(text, opts) {
         const o = opts || {};
         // The "tooltip" always tracks the latest backend event so users can
-        // hover the pill mid-completion to see what's happening underneath.
-        statusPill.title = text || '';
+        // hover the strip mid-completion to see what's happening underneath.
+        if (activityStrip) activityStrip.title = text || '';
         if (taskCompleted && !o.force) return;
-        statusPill.textContent = text || 'idle';
+        if (activityCurrent) activityCurrent.textContent = text || 'idle';
     }
 
     function markCompleted(summary) {
         taskCompleted = true;
-        statusPill.classList.add('complete');
-        statusPill.textContent = 'complete';
-        statusPill.title = summary
-            ? ('complete — ' + truncate(summary, 200))
-            : 'complete';
+        if (activityStrip) {
+            activityStrip.classList.add('complete');
+            activityStrip.title = summary
+                ? ('complete — ' + truncate(summary, 200))
+                : 'complete';
+        }
+        if (activityCurrent) activityCurrent.textContent = 'complete';
         session.state = 'complete';
         if (summary) addAssistantTextBubble(summary);
         recordEvent('task completed' + (summary ? ': ' + truncate(summary, 80) : ''));
@@ -290,9 +304,11 @@
     function clearCompleted() {
         if (!taskCompleted) return;
         taskCompleted = false;
-        statusPill.classList.remove('complete');
-        statusPill.textContent = 'idle';
-        statusPill.title = '';
+        if (activityStrip) {
+            activityStrip.classList.remove('complete');
+            activityStrip.title = '';
+        }
+        if (activityCurrent) activityCurrent.textContent = 'idle';
         session.state = 'idle';
     }
 
@@ -315,6 +331,329 @@
         stLast.textContent     = session.lastUpdate || '—';
         stEvents.textContent   = session.events.join('\n');
         stEvents.scrollTop     = stEvents.scrollHeight;
+    }
+
+    // ----- Markdown rendering ---------------------------------------------
+    //
+    // Inline parser — no external dep (CSP forbids cross-origin scripts and
+    // we don't want to ship marked.js). Handles the subset LLM responses
+    // typically use: headings, bold/italic/strike, inline + fenced code,
+    // bulleted/ordered lists, blockquotes, links, hr.
+    //
+    // Re-runs on every streamed delta. Cost is O(n) per call which is fine
+    // for the few-KB responses the chat surface receives. Streaming bubbles
+    // debounce via requestAnimationFrame so the parser doesn't run more than
+    // once per frame.
+
+    const _MD_BLOCK = '';
+    const _MD_INLINE = '';
+
+    function escapeHtml(s) {
+        return String(s)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+    }
+
+    function renderMarkdownInline(s) {
+        // Operates on already-HTML-escaped text. Inline code is captured
+        // first so its content is shielded from emphasis processing.
+        const codeSpans = [];
+        s = s.replace(/`([^`\n]+)`/g, (_, p) => {
+            codeSpans.push(p);
+            return _MD_INLINE + (codeSpans.length - 1) + _MD_INLINE;
+        });
+
+        // Bold (**, __) before italic (*, _) so ** isn't half-eaten.
+        s = s.replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>');
+        s = s.replace(/__([^_\n]+)__/g, '<strong>$1</strong>');
+
+        // Italic — single * or _ around content.
+        s = s.replace(/(^|[^*\w])\*([^*\n]+)\*(?!\w)/g, '$1<em>$2</em>');
+        s = s.replace(/(^|[^_\w])_([^_\n]+)_(?!\w)/g, '$1<em>$2</em>');
+
+        // Strikethrough.
+        s = s.replace(/~~([^~\n]+)~~/g, '<del>$1</del>');
+
+        // Links — only http(s) and mailto allowed; anything else falls
+        // through as plain text to avoid javascript: payloads.
+        s = s.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (m, text, url) => {
+            if (/^(https?:\/\/|mailto:)/i.test(url)) {
+                return '<a href="' + url + '" target="_blank" rel="noopener noreferrer">' + text + '</a>';
+            }
+            return m;
+        });
+
+        // Restore inline code spans.
+        s = s.replace(new RegExp(_MD_INLINE + '(\\d+)' + _MD_INLINE, 'g'),
+            (_, i) => '<code>' + codeSpans[+i] + '</code>');
+
+        return s;
+    }
+
+    function renderMarkdown(md) {
+        if (!md) return '';
+
+        // Step 1 — extract fenced code blocks before HTML-escaping so ``` and
+        // their content survive intact. Capture both closed and trailing-open
+        // fences so a partially-streamed code block still renders as code.
+        const codeBlocks = [];
+        md = String(md).replace(/```([^\n`]*)\n([\s\S]*?)```/g, (_, lang, code) => {
+            codeBlocks.push({ lang: lang.trim(), code: code });
+            return _MD_BLOCK + 'C' + (codeBlocks.length - 1) + _MD_BLOCK;
+        });
+        md = md.replace(/```([^\n`]*)\n([\s\S]*)$/, (_, lang, code) => {
+            codeBlocks.push({ lang: lang.trim(), code: code, partial: true });
+            return _MD_BLOCK + 'C' + (codeBlocks.length - 1) + _MD_BLOCK;
+        });
+
+        // Step 2 — HTML-escape everything else.
+        md = escapeHtml(md);
+
+        const lines = md.split('\n');
+        const out = [];
+        let i = 0;
+
+        const cbRe = new RegExp('^' + _MD_BLOCK + 'C(\\d+)' + _MD_BLOCK + '$');
+
+        function emitCode(lang, code) {
+            const langClass = lang ? ' class="lang-' + escapeHtml(lang) + '"' : '';
+            return '<pre class="md-pre"><code' + langClass + '>' +
+                   escapeHtml(code) + '</code></pre>';
+        }
+
+        function isBlockStart(line) {
+            return /^(#{1,6}\s|[-*+]\s+|\d+\.\s+|&gt;\s|---+\s*$|\*\*\*+\s*$)/.test(line)
+                || cbRe.test(line);
+        }
+
+        while (i < lines.length) {
+            const line = lines[i];
+
+            // Code block placeholder.
+            const cbMatch = line.match(cbRe);
+            if (cbMatch) {
+                const cb = codeBlocks[+cbMatch[1]];
+                out.push(emitCode(cb.lang, cb.code));
+                i++;
+                continue;
+            }
+
+            // Heading (#–######).
+            const hMatch = line.match(/^(#{1,6})\s+(.*)$/);
+            if (hMatch) {
+                const lvl = hMatch[1].length;
+                out.push('<h' + lvl + ' class="md-h' + lvl + '">' +
+                         renderMarkdownInline(hMatch[2]) + '</h' + lvl + '>');
+                i++;
+                continue;
+            }
+
+            // Horizontal rule.
+            if (/^---+\s*$/.test(line) || /^\*\*\*+\s*$/.test(line)) {
+                out.push('<hr class="md-hr">');
+                i++;
+                continue;
+            }
+
+            // Blockquote (consecutive `> ` lines, escaped to `&gt; `).
+            if (/^&gt;\s?/.test(line)) {
+                const bq = [];
+                while (i < lines.length && /^&gt;\s?/.test(lines[i])) {
+                    bq.push(lines[i].replace(/^&gt;\s?/, ''));
+                    i++;
+                }
+                out.push('<blockquote class="md-bq">' +
+                         renderMarkdownInline(bq.join('\n')).replace(/\n/g, '<br>') +
+                         '</blockquote>');
+                continue;
+            }
+
+            // Unordered list.
+            if (/^[-*+]\s+/.test(line)) {
+                const items = [];
+                while (i < lines.length && /^[-*+]\s+/.test(lines[i])) {
+                    items.push(lines[i].replace(/^[-*+]\s+/, ''));
+                    i++;
+                }
+                out.push('<ul class="md-ul">' +
+                         items.map((it) => '<li>' + renderMarkdownInline(it) + '</li>').join('') +
+                         '</ul>');
+                continue;
+            }
+
+            // Ordered list.
+            if (/^\d+\.\s+/.test(line)) {
+                const items = [];
+                while (i < lines.length && /^\d+\.\s+/.test(lines[i])) {
+                    items.push(lines[i].replace(/^\d+\.\s+/, ''));
+                    i++;
+                }
+                out.push('<ol class="md-ol">' +
+                         items.map((it) => '<li>' + renderMarkdownInline(it) + '</li>').join('') +
+                         '</ol>');
+                continue;
+            }
+
+            // Empty line — paragraph break.
+            if (!line.trim()) { i++; continue; }
+
+            // Paragraph — collect contiguous non-empty lines until blank or
+            // a block-level construct begins.
+            const para = [line];
+            i++;
+            while (i < lines.length && lines[i].trim() && !isBlockStart(lines[i])) {
+                para.push(lines[i]);
+                i++;
+            }
+            out.push('<p class="md-p">' +
+                     renderMarkdownInline(para.join('\n')).replace(/\n/g, '<br>') +
+                     '</p>');
+        }
+
+        return out.join('');
+    }
+
+    // ----- Activity strip + popover ---------------------------------------
+    //
+    // The strip (inline in the shortcuts bar) is always visible and shows the
+    // most recent agent event as a single muted line. Clicking the strip
+    // opens the popover above it with the full ring-buffer feed.
+
+    const ACTIVITY_RING  = 30;
+    const ACTIVITY_TRUNC = 280;
+    const activityItems  = [];
+    let   activityLiveTimer = null;
+    let   popoverOpen = false;
+
+    function pulseActivityLive() {
+        if (!activityStrip) return;
+        activityStrip.classList.add('live');
+        if (activityLiveTimer) clearTimeout(activityLiveTimer);
+        activityLiveTimer = setTimeout(() => {
+            activityStrip.classList.remove('live');
+        }, 2500);
+    }
+
+    function setActivityState(text) {
+        // Convenience wrapper — same lock semantics as setPill (preserves the
+        // green "complete" message). Used by status events that aren't full
+        // activity entries (state_changed, progress, thinking).
+        setPill(text);
+    }
+
+    function pushActivity(icon, label, content) {
+        if (!activityStrip) return;
+        const time = new Date().toLocaleTimeString([], { hour12: false });
+        const entry = {
+            icon: icon || '·',
+            label: label || '',
+            content: content == null ? '' : String(content),
+            time: time,
+        };
+        activityItems.push(entry);
+        if (activityItems.length > ACTIVITY_RING) activityItems.shift();
+        renderActivityFeed();
+        // Refresh the strip text with a one-line preview of the latest entry.
+        const preview = entry.icon + ' ' + entry.label +
+            (entry.content ? ' · ' + truncate(entry.content.replace(/\s+/g, ' '), 80) : '');
+        setPill(preview);
+        pulseActivityLive();
+    }
+
+    function renderActivityFeed() {
+        if (!activityFeed) return;
+        activityFeed.innerHTML = '';
+        // Newest at the top — common for notification-style feeds.
+        for (let i = activityItems.length - 1; i >= 0; i--) {
+            const entry = activityItems[i];
+            const li = el('li', 'activity-item');
+
+            const head = el('div', 'ai-head');
+            head.appendChild(el('span', 'ai-icon', entry.icon));
+            head.appendChild(el('span', 'ai-label', entry.label));
+            head.appendChild(el('span', 'ai-time', entry.time));
+            li.appendChild(head);
+
+            if (entry.content) {
+                const truncated = truncate(entry.content, ACTIVITY_TRUNC);
+                const content = el('span', 'ai-content', truncated);
+                li.appendChild(content);
+                li.title = entry.content;
+            }
+            li.addEventListener('click', () => {
+                li.classList.toggle('expanded');
+                const c = li.querySelector('.ai-content');
+                if (!c) return;
+                c.textContent = li.classList.contains('expanded')
+                    ? entry.content
+                    : truncate(entry.content, ACTIVITY_TRUNC);
+            });
+
+            activityFeed.appendChild(li);
+        }
+    }
+
+    function clearActivity() {
+        activityItems.length = 0;
+        renderActivityFeed();
+        if (activityStrip) activityStrip.classList.remove('live');
+    }
+
+    function openPopover() {
+        if (!activityPopover) return;
+        activityPopover.classList.remove('hidden');
+        activityPopover.setAttribute('aria-hidden', 'false');
+        if (activityStrip) {
+            activityStrip.classList.add('open');
+            activityStrip.setAttribute('aria-expanded', 'true');
+        }
+        popoverOpen = true;
+    }
+
+    function closePopover() {
+        if (!activityPopover) return;
+        activityPopover.classList.add('hidden');
+        activityPopover.setAttribute('aria-hidden', 'true');
+        if (activityStrip) {
+            activityStrip.classList.remove('open');
+            activityStrip.setAttribute('aria-expanded', 'false');
+        }
+        popoverOpen = false;
+    }
+
+    function togglePopover() {
+        if (popoverOpen) closePopover();
+        else openPopover();
+    }
+
+    if (activityStrip) {
+        activityStrip.addEventListener('click', (e) => {
+            e.stopPropagation();
+            togglePopover();
+        });
+    }
+    if (activityClose) {
+        activityClose.addEventListener('click', (e) => {
+            e.stopPropagation();
+            closePopover();
+        });
+    }
+    // Click outside both strip and popover closes the popover.
+    document.addEventListener('click', (e) => {
+        if (!popoverOpen) return;
+        if (activityPopover && activityPopover.contains(e.target)) return;
+        if (activityStrip && activityStrip.contains(e.target)) return;
+        closePopover();
+    });
+
+    function formatToolParams(params) {
+        if (params === undefined || params === null) return '';
+        if (typeof params === 'string') return params;
+        try { return JSON.stringify(params, null, 2); }
+        catch (_) { return String(params); }
     }
 
     // ----- chat state ------------------------------------------------------
@@ -345,7 +684,10 @@
         const body = el('div', 'bubble-body');
         bubble.appendChild(body);
         bubble._body = body;
-        bubble._textNode = null;
+        // Most-recent text-stream segment. Reset to null whenever a tool
+        // card is appended so subsequent text deltas land *after* the card
+        // in DOM order (preserving the actual chronological interleaving).
+        bubble._currentTextSpan = null;
         conversation.appendChild(bubble);
         activeAssistantBubble = bubble;
         scrollToBottom();
@@ -357,21 +699,42 @@
         return activeAssistantBubble;
     }
 
+    function scheduleMarkdownRender(span) {
+        if (span._renderPending) return;
+        span._renderPending = true;
+        requestAnimationFrame(() => {
+            span._renderPending = false;
+            try {
+                span.innerHTML = renderMarkdown(span._rawText || '');
+            } catch (err) {
+                // Fallback to plain text if the parser ever throws — never
+                // strand a streaming bubble blank.
+                span.textContent = span._rawText || '';
+            }
+        });
+    }
+
     function appendTextDelta(text) {
         if (!text) return;
         const bubble = ensureAssistantBubble();
-        if (!bubble._textNode) {
-            bubble._textNode = document.createTextNode('');
-            const span = el('span', 'text-stream');
-            span.appendChild(bubble._textNode);
+        let span = bubble._currentTextSpan;
+        if (!span) {
+            span = el('div', 'text-stream md-rendered');
+            span._rawText = '';
             bubble._body.appendChild(span);
+            bubble._currentTextSpan = span;
         }
-        bubble._textNode.data += text;
+        span._rawText += text;
+        scheduleMarkdownRender(span);
         scrollToBottom();
     }
 
     function renderToolCall(callId, toolName, args, blockIndex) {
         const bubble = ensureAssistantBubble();
+        // Close out the current text segment so any text that arrives next
+        // appears in a NEW span placed after this tool card.
+        bubble._currentTextSpan = null;
+
         const card = el('details', 'tool-card');
         card.open = false;
 
@@ -401,15 +764,64 @@
         activeAssistantBubble.classList.remove('streaming');
         activeAssistantBubble.classList.add('complete');
         if (extraClass) activeAssistantBubble.classList.add(extraClass);
+        // Force a final render so the last delta isn't stuck in rAF.
+        if (activeAssistantBubble._currentTextSpan) {
+            const span = activeAssistantBubble._currentTextSpan;
+            try { span.innerHTML = renderMarkdown(span._rawText || ''); }
+            catch (_) { span.textContent = span._rawText || ''; }
+        }
         activeAssistantBubble = null;
     }
 
     function addAssistantTextBubble(text) {
-        // Single-shot non-streaming assistant message (e.g. receptionist reply).
+        // Single-shot non-streaming assistant message (e.g. receptionist reply,
+        // task completion summary). Markdown-render the body too.
         const bubble = el('div', 'bubble assistant');
-        bubble.appendChild(el('div', 'bubble-body', text || ''));
+        const body = el('div', 'bubble-body');
+        const span = el('div', 'text-stream md-rendered');
+        try { span.innerHTML = renderMarkdown(text || ''); }
+        catch (_) { span.textContent = text || ''; }
+        body.appendChild(span);
+        bubble.appendChild(body);
         conversation.appendChild(bubble);
         scrollToBottom();
+    }
+
+    // Streaming receptionist reply — uses same pattern as appendTextDelta
+    var activeReceptionistBubble = null;
+
+    function appendReceptionistDelta(text) {
+        if (!text) return;
+        if (!activeReceptionistBubble) {
+            activeReceptionistBubble = el('div', 'bubble assistant streaming');
+            const body = el('div', 'bubble-body');
+            activeReceptionistBubble.appendChild(body);
+            activeReceptionistBubble._body = body;
+            activeReceptionistBubble._currentTextSpan = null;
+            conversation.appendChild(activeReceptionistBubble);
+        }
+        var span = activeReceptionistBubble._currentTextSpan;
+        if (!span) {
+            span = el('div', 'text-stream md-rendered');
+            span._rawText = '';
+            activeReceptionistBubble._body.appendChild(span);
+            activeReceptionistBubble._currentTextSpan = span;
+        }
+        span._rawText += text;
+        scheduleMarkdownRender(span);
+        scrollToBottom();
+    }
+
+    function sealReceptionistBubble() {
+        if (!activeReceptionistBubble) return;
+        activeReceptionistBubble.classList.remove('streaming');
+        activeReceptionistBubble.classList.add('complete');
+        if (activeReceptionistBubble._currentTextSpan) {
+            var span = activeReceptionistBubble._currentTextSpan;
+            try { span.innerHTML = renderMarkdown(span._rawText || ''); }
+            catch (_) { span.textContent = span._rawText || ''; }
+        }
+        activeReceptionistBubble = null;
     }
 
     function addSystemBubble(text) {
@@ -474,42 +886,59 @@
             const desc = String(evt.desc || args[1] || '');
             session.currentStep = desc;
             recordEvent('step started: ' + desc);
-            setPill('▶ ' + truncate(desc, 80));
+            pushActivity('▶', 'Step started', desc);
         } else if (evt.kind === 'step_completed') {
             const desc = String(evt.desc || args[1] || '');
             recordEvent('step completed: ' + desc);
-            setPill('✓ ' + truncate(desc, 80));
+            pushActivity('✓', 'Step completed', desc);
         } else if (evt.kind === 'step_confidence') {
             const conf = parseFloat(args[0]);
             if (!Number.isNaN(conf)) {
                 recordEvent('confidence: ' + conf.toFixed(2));
-                setPill('confidence ' + conf.toFixed(2));
+                pushActivity('◎', 'Step confidence', conf.toFixed(2));
             }
         } else if (evt.kind === 'decision_made') {
             const iter = args[0] || '';
             const reasoning = args[1] || '';
             recordEvent('decision[' + iter + ']: ' + truncate(reasoning, 120));
-            setPill('💭 iter ' + iter + ' · ' + truncate(reasoning, 80));
+            pushActivity('💭', 'Decision iter ' + iter, reasoning);
         } else if (evt.kind === 'tool_execution_started') {
             const iter   = args[0] || '';
             const tool   = args[1] || '';
-            const params = args[2] || '';
+            const params = args[2];
             const output = args[3];
-            const isPre  = !output || output === 'None' || output === 'null';
+            const isPre  = output === undefined || output === null
+                        || output === 'None'  || output === 'null';
             const tag    = isPre ? '⊙' : '✓';
-            recordEvent(tag + ' tool[' + iter + '] ' + tool + ' ' + truncate(String(params), 120));
-            setPill(tag + ' ' + tool + ' · ' + truncate(String(params), 80));
+            const paramText = formatToolParams(params);
+            recordEvent(tag + ' tool[' + iter + '] ' + tool + ' ' + truncate(paramText, 120));
+            const label = isPre
+                ? ('Calling ' + tool + (iter ? ' · iter ' + iter : ''))
+                : ('Result · ' + tool + (iter ? ' · iter ' + iter : ''));
+            const content = isPre ? paramText : String(output);
+            pushActivity(tag, label, content);
         } else if (evt.kind === 'task_completed') {
             const summary = evt.summary
                 || (args.length ? String(args[0]) : '')
                 || '';
+            // Push to feed FIRST, then mark complete — the markCompleted
+            // setter pins the strip text to "complete" via its taskCompleted
+            // lock, and we want the entry to land in the popover regardless.
+            pushActivity('🏁', 'Task completed', summary);
             markCompleted(summary);
         } else if (evt.kind === 'bridge_exit') {
             session.state = 'bridge exited';
             recordEvent('bridge exited');
             setPill('bridge exited', { force: true });
+            pushActivity('⚠', 'Bridge exited', 'code=' + evt.code + ' signal=' + evt.signal);
         } else if (evt.kind === 'reply') {
             addAssistantTextBubble(evt.text || '');
+        } else if (evt.kind === 'reply_delta') {
+            // Clear thinking indicator on first streaming chunk
+            setPill('');
+            appendReceptionistDelta(evt.text || '');
+        } else if (evt.kind === 'reply_done') {
+            sealReceptionistBubble();
         } else if (evt.kind === 'message') {
             addSystemBubble(evt.text || '');
         } else if (evt.kind === 'receptionist_thinking_on') {
@@ -564,6 +993,8 @@
         });
         addErrorBubble(evt.message, evt.where);
         recordEvent('error: ' + (evt.message || '(no message)'));
+        pushActivity('⚠', 'Error' + (evt.where ? ' · ' + evt.where : ''),
+                     evt.message || '(no message)');
         if (evt.fatal) {
             session.state = 'fatal';
             setPill('fatal', { force: true });
@@ -576,11 +1007,17 @@
 
     composer.addEventListener('submit', (e) => {
         e.preventDefault();
+        if (expandedOpen) {
+            composerInput.value = composerExpandedInput.value;
+            expandedOpen = false;
+            composerExpanded.classList.add('hidden');
+        }
         const text = composerInput.value.trim();
         if (!text) return;
 
         addUserBubble(text);
         composerInput.value = '';
+        composerExpandedInput.value = '';
         activeAssistantBubble = null;
         // A new turn — release the "complete" pill lock so live status text
         // resumes flowing.
@@ -604,6 +1041,114 @@
             composer.requestSubmit();
         }
     });
+
+    // ----- floating expanded editor ----------------------------------------
+
+    let expandedOpen = false;
+
+    function openExpanded() {
+        if (expandedOpen) return;
+        expandedOpen = true;
+        composerExpandedInput.value = composerInput.value;
+        composerExpanded.classList.remove('hidden');
+        composerExpandedInput.focus();
+        composerExpandedInput.selectionStart = composerExpandedInput.value.length;
+    }
+
+    function closeExpanded() {
+        if (!expandedOpen) return;
+        expandedOpen = false;
+        composerInput.value = composerExpandedInput.value;
+        composerExpanded.classList.add('hidden');
+        composerInput.focus();
+    }
+
+    function checkOverflow() {
+        if (expandedOpen) return;
+        if (composerInput.scrollHeight > composerInput.clientHeight + 4) {
+            openExpanded();
+        }
+    }
+
+    composerInput.addEventListener('input', checkOverflow);
+    composerExpandedClose.addEventListener('click', closeExpanded);
+
+    composerExpandedInput.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && !e.shiftKey) {
+            e.preventDefault();
+            composerInput.value = composerExpandedInput.value;
+            closeExpanded();
+            composer.requestSubmit();
+        }
+        if (e.key === 'Escape') {
+            closeExpanded();
+        }
+    });
+
+    // Drag-to-move: header acts as the drag handle.
+    // Constrained to the app window boundaries.
+    (function initExpandedDrag() {
+        const header = document.querySelector('.composer-expanded-header');
+        let dragging = false;
+        let startX = 0, startY = 0, origLeft = 0, origTop = 0;
+
+        function clampPosition(left, top) {
+            const rect = composerExpanded.getBoundingClientRect();
+            const w = rect.width;
+            const h = rect.height;
+            const maxLeft = window.innerWidth - w;
+            const maxTop = window.innerHeight - h;
+            return {
+                left: Math.max(0, Math.min(left, maxLeft)),
+                top: Math.max(0, Math.min(top, maxTop)),
+            };
+        }
+
+        header.addEventListener('mousedown', (e) => {
+            if (e.target.closest('.composer-expanded-close')) return;
+            dragging = true;
+            startX = e.clientX;
+            startY = e.clientY;
+            const rect = composerExpanded.getBoundingClientRect();
+            origLeft = rect.left;
+            origTop = rect.top;
+            e.preventDefault();
+        });
+
+        document.addEventListener('mousemove', (e) => {
+            if (!dragging) return;
+            const dx = e.clientX - startX;
+            const dy = e.clientY - startY;
+            const clamped = clampPosition(origLeft + dx, origTop + dy);
+            composerExpanded.style.left = clamped.left + 'px';
+            composerExpanded.style.top = clamped.top + 'px';
+            composerExpanded.style.right = 'auto';
+            composerExpanded.style.bottom = 'auto';
+        });
+
+        document.addEventListener('mouseup', () => { dragging = false; });
+
+        // Constrain resize: cap max-width/max-height based on current position.
+        const ro = new ResizeObserver(() => {
+            const rect = composerExpanded.getBoundingClientRect();
+            const maxW = window.innerWidth - rect.left;
+            const maxH = window.innerHeight - rect.top;
+            if (rect.width > maxW) composerExpanded.style.width = maxW + 'px';
+            if (rect.height > maxH) composerExpanded.style.height = maxH + 'px';
+        });
+        ro.observe(composerExpanded);
+
+        // Re-clamp on window resize so it never sits outside bounds.
+        window.addEventListener('resize', () => {
+            if (composerExpanded.classList.contains('hidden')) return;
+            const rect = composerExpanded.getBoundingClientRect();
+            const clamped = clampPosition(rect.left, rect.top);
+            composerExpanded.style.left = clamped.left + 'px';
+            composerExpanded.style.top = clamped.top + 'px';
+            composerExpanded.style.right = 'auto';
+            composerExpanded.style.bottom = 'auto';
+        });
+    })();
 
     // ----- titlebar window controls ----------------------------------------
 
@@ -640,6 +1185,7 @@
         if (e.key === 'Escape') {
             if (!overlayStatus.classList.contains('hidden'))   closeOverlay(overlayStatus);
             if (!overlaySettings.classList.contains('hidden')) closeOverlay(overlaySettings);
+            if (popoverOpen) closePopover();
         }
     });
 
@@ -691,6 +1237,8 @@
         session.events = [];
         session.lastUpdate = '';
         setPill('idle');
+        clearActivity();
+        if (popoverOpen) closePopover();
         composerInput.focus();
     });
 
@@ -967,4 +1515,75 @@
             showToast('Save failed: ' + (err && err.message), 'err');
         });
     });
+
+    // ----- global hotkey configuration ----------------------------------------
+
+    let pendingHotkey = null;
+
+    function electronAccelerator(e) {
+        const parts = [];
+        if (e.ctrlKey)  parts.push('Ctrl');
+        if (e.altKey)   parts.push('Alt');
+        if (e.shiftKey) parts.push('Shift');
+        if (e.metaKey)  parts.push('Super');
+        const key = e.key;
+        if (['Control', 'Alt', 'Shift', 'Meta'].includes(key)) return null;
+        const mapped =
+            key === ' ' ? 'Space' :
+            key.length === 1 ? key.toUpperCase() :
+            key;
+        parts.push(mapped);
+        return parts.join('+');
+    }
+
+    if (cfgHotkey) {
+        cfgHotkey.addEventListener('keydown', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            const acc = electronAccelerator(e);
+            if (!acc) return;
+            cfgHotkey.value = acc;
+            pendingHotkey = acc;
+        });
+
+        cfgHotkey.addEventListener('focus', () => {
+            cfgHotkey.placeholder = 'Press a key combination…';
+        });
+        cfgHotkey.addEventListener('blur', () => {
+            cfgHotkey.placeholder = 'Ctrl+Alt+W';
+        });
+    }
+
+    function loadHotkeyToForm() {
+        if (!window.hotkeySettings) return;
+        window.hotkeySettings.get().then((result) => {
+            if (result && result.hotkey) {
+                cfgHotkey.value = result.hotkey;
+                pendingHotkey = null;
+            }
+        }).catch(() => {});
+    }
+
+    function saveHotkeyIfChanged() {
+        if (!pendingHotkey || !window.hotkeySettings) return Promise.resolve();
+        return window.hotkeySettings.set(pendingHotkey).then((result) => {
+            if (result && result.success) {
+                pendingHotkey = null;
+                window.__handqLog('INFO', 'hotkey saved', { hotkey: result.hotkey });
+            } else {
+                const err = (result && result.error) || 'Unknown error';
+                showToast('Hotkey: ' + err, 'err');
+                cfgHotkey.value = (result && result.hotkey) || '';
+                pendingHotkey = null;
+            }
+        }).catch((err) => {
+            showToast('Hotkey save failed: ' + (err && err.message), 'err');
+        });
+    }
+
+    // Hook into the existing load/save flow.
+    const _origScSettingsHandler = scSettings.onclick;
+    scSettings.addEventListener('click', () => { loadHotkeyToForm(); });
+    settingsLoadBtn.addEventListener('click', () => { loadHotkeyToForm(); });
+    settingsForm.addEventListener('submit', () => { saveHotkeyIfChanged(); });
 })();

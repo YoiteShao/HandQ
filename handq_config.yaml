@@ -3,9 +3,6 @@ llm:
   API_KEY: ff6bb18f-4a84-401d-9989-f6997487abe5
   roles:
     planner:
-    - anthropic::claude-4-7-opus
-    - anthropic::claude-4-6-opus:1M
-    - anthropic::claude-4-6-opus
     - anthropic::claude-4-6-sonnet:1M
     - anthropic::claude-4-6-sonnet
     - anthropic::claude-4-5-sonnet
@@ -16,8 +13,6 @@ llm:
     - anthropic::claude-4-5-haiku:thinking
     - anthropic::claude-4-5-haiku
     agent:
-    - anthropic::claude-4-6-opus:1M
-    - anthropic::claude-4-6-opus
     - anthropic::claude-4-6-sonnet:1M
     - anthropic::claude-4-6-sonnet
     - anthropic::claude-4-5-sonnet
