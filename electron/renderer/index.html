@@ -10,56 +10,122 @@
 <body>
     <div class="app">
         <!-- ============================================================ -->
-        <!-- Sidebar                                                       -->
+        <!-- Custom title bar (frameless window, drag region)              -->
         <!-- ============================================================ -->
-        <aside class="sidebar" id="sidebar">
-            <div class="sidebar-header">
-                <span class="brand">HandQ</span>
+        <header class="titlebar" id="titlebar">
+            <div class="titlebar-drag">
+                <span class="titlebar-brand">HandQ</span>
             </div>
-            <nav class="sidebar-nav">
-                <button class="nav-btn active" id="nav-chat" type="button">
-                    <span class="nav-icon">💬</span>
-                    <span>Chat</span>
+            <div class="titlebar-controls">
+                <button class="tb-btn tb-min" id="tb-min" type="button"
+                        aria-label="Minimize" title="Minimize">
+                    <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true">
+                        <line x1="2" y1="6.5" x2="10" y2="6.5"
+                              stroke="currentColor" stroke-width="1.2"/>
+                    </svg>
                 </button>
-                <button class="nav-btn" id="nav-settings" type="button">
-                    <span class="nav-icon">⚙️</span>
-                    <span>Settings</span>
+                <button class="tb-btn tb-max" id="tb-max" type="button"
+                        aria-label="Maximize" title="Maximize">
+                    <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true">
+                        <rect x="2.5" y="2.5" width="7" height="7" rx="0.5"
+                              fill="none" stroke="currentColor" stroke-width="1.2"/>
+                    </svg>
                 </button>
-            </nav>
-            <div class="sidebar-footer">
-                <span class="status-pill" id="status-pill">idle</span>
+                <button class="tb-btn tb-close" id="tb-close" type="button"
+                        aria-label="Hide to tray" title="Hide to tray">
+                    <svg width="12" height="12" viewBox="0 0 12 12" aria-hidden="true">
+                        <line x1="3" y1="3" x2="9" y2="9"
+                              stroke="currentColor" stroke-width="1.2"/>
+                        <line x1="9" y1="3" x2="3" y2="9"
+                              stroke="currentColor" stroke-width="1.2"/>
+                    </svg>
+                </button>
             </div>
-        </aside>
+        </header>
 
         <!-- ============================================================ -->
-        <!-- Main pane                                                     -->
+        <!-- Main content                                                  -->
         <!-- ============================================================ -->
         <main class="main">
-            <!-- Chat view -->
-            <section class="view chat-view" id="view-chat">
-                <header class="view-header">
-                    <h1>Conversation</h1>
-                </header>
-
+            <!-- Chat: ~90% of remaining height -->
+            <section class="chat-region" id="chat-region">
                 <div class="conversation" id="conversation">
                     <!-- Message bubbles get appended here by renderer.js -->
                 </div>
-
-                <form class="composer" id="composer">
-                    <textarea id="composer-input"
-                              placeholder="Describe a goal, then press Enter…"
-                              rows="3"></textarea>
-                    <button type="submit" id="composer-send">Send</button>
-                </form>
             </section>
 
-            <!-- Settings view -->
-            <section class="view settings-view hidden" id="view-settings">
-                <header class="view-header">
-                    <h1>Settings</h1>
+            <!-- Composer: ~9% -->
+            <form class="composer" id="composer">
+                <textarea id="composer-input"
+                          placeholder="Type a message…"
+                          rows="2"></textarea>
+                <button type="submit" id="composer-send">Send</button>
+            </form>
+
+            <!-- Shortcut bar: single row -->
+            <nav class="shortcuts" id="shortcuts">
+                <button class="shortcut-btn" id="sc-settings" type="button">
+                    <span class="sc-icon" aria-hidden="true">⚙</span>
+                    <span class="sc-label">Settings</span>
+                </button>
+                <button class="shortcut-btn" id="sc-status" type="button">
+                    <span class="sc-icon" aria-hidden="true">◉</span>
+                    <span class="sc-label">Status</span>
+                </button>
+                <button class="shortcut-btn" id="sc-new" type="button">
+                    <span class="sc-icon" aria-hidden="true">＋</span>
+                    <span class="sc-label">New</span>
+                </button>
+                <span class="shortcuts-status" id="status-pill">idle</span>
+            </nav>
+        </main>
+
+        <!-- ============================================================ -->
+        <!-- Status overlay                                                -->
+        <!-- ============================================================ -->
+        <div class="overlay hidden" id="overlay-status" aria-hidden="true">
+            <div class="overlay-card status-card">
+                <header class="overlay-header">
+                    <h2>Status</h2>
+                    <button type="button" class="overlay-close" id="status-close"
+                            aria-label="Close">×</button>
+                </header>
+                <div class="status-body" id="status-body">
+                    <div class="status-row">
+                        <span class="status-label">State</span>
+                        <span class="status-value" id="st-state">idle</span>
+                    </div>
+                    <div class="status-row">
+                        <span class="status-label">Progress</span>
+                        <span class="status-value" id="st-progress">—</span>
+                    </div>
+                    <div class="status-row">
+                        <span class="status-label">Current step</span>
+                        <span class="status-value" id="st-step">—</span>
+                    </div>
+                    <div class="status-row">
+                        <span class="status-label">Last update</span>
+                        <span class="status-value" id="st-last">—</span>
+                    </div>
+                    <div class="status-row status-row-multiline">
+                        <span class="status-label">Recent events</span>
+                        <pre class="status-events" id="st-events"></pre>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- ============================================================ -->
+        <!-- Settings overlay                                              -->
+        <!-- ============================================================ -->
+        <div class="overlay hidden" id="overlay-settings" aria-hidden="true">
+            <div class="overlay-card settings-card">
+                <header class="overlay-header">
+                    <h2>Settings</h2>
+                    <button type="button" class="overlay-close" id="settings-cancel"
+                            aria-label="Close">×</button>
                 </header>
 
-                <!-- Toast / status banner shown after Save. -->
                 <div class="settings-toast hidden" id="settings-toast" role="status"></div>
 
                 <form class="settings-form" id="settings-form">
@@ -70,14 +136,35 @@
 
                         <label>
                             <span>API_KEY</span>
-                            <div class="password-row">
+                            <div class="input-with-icon">
                                 <input type="password" id="cfg-llm-api-key"
                                        autocomplete="off" spellcheck="false"
                                        placeholder="ff6bb18f-…  or  sk-ant-…" />
                                 <button type="button"
                                         id="cfg-llm-api-key-toggle"
-                                        class="reveal-btn"
-                                        aria-label="Show API key">Show</button>
+                                        class="input-eye-btn"
+                                        aria-label="Show API key"
+                                        aria-pressed="false"
+                                        title="Show API key">
+                                    <svg class="eye-icon eye-show" width="18" height="18"
+                                         viewBox="0 0 24 24" fill="none"
+                                         stroke="currentColor" stroke-width="2"
+                                         stroke-linecap="round" stroke-linejoin="round"
+                                         aria-hidden="true">
+                                        <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
+                                        <circle cx="12" cy="12" r="3"/>
+                                    </svg>
+                                    <svg class="eye-icon eye-hide" width="18" height="18"
+                                         viewBox="0 0 24 24" fill="none"
+                                         stroke="currentColor" stroke-width="2"
+                                         stroke-linecap="round" stroke-linejoin="round"
+                                         aria-hidden="true" hidden>
+                                        <path d="M1 12s4 8 11 8 11-8 11-8"/>
+                                        <line x1="6" y1="17" x2="5" y2="19"/>
+                                        <line x1="12" y1="20" x2="12" y2="22"/>
+                                        <line x1="18" y1="17" x2="19" y2="19"/>
+                                    </svg>
+                                </button>
                             </div>
                             <small class="help-text">
                                 Your provider API key. Stored as
@@ -98,14 +185,37 @@
                         </label>
 
                         <label>
-                            <span>Model Priority</span>
-                            <textarea id="cfg-llm-models" rows="8"
-                                      spellcheck="false"
-                                      placeholder="anthropic::claude-4-6-sonnet:1M&#10;anthropic::claude-4-6-sonnet"></textarea>
+                            <span>Model lists per role</span>
+                            <div class="role-tabs" role="tablist" id="cfg-llm-role-tabs">
+                                <button type="button" class="role-tab active"
+                                        data-role="planner" role="tab"
+                                        aria-selected="true">Planner</button>
+                                <button type="button" class="role-tab"
+                                        data-role="receptionist" role="tab">Receptionist</button>
+                                <button type="button" class="role-tab"
+                                        data-role="agent" role="tab">Agent</button>
+                                <button type="button" class="role-tab"
+                                        data-role="helper" role="tab">Helper</button>
+                            </div>
+                            <textarea id="cfg-llm-planner" rows="6"
+                                      data-role-pane="planner" spellcheck="false"
+                                      placeholder="Planner models — best at structured planning. Gets max_retries=50."></textarea>
+                            <textarea id="cfg-llm-receptionist" rows="6"
+                                      data-role-pane="receptionist" spellcheck="false"
+                                      placeholder="Receptionist models — handles user-message triage."
+                                      hidden></textarea>
+                            <textarea id="cfg-llm-agent" rows="6"
+                                      data-role-pane="agent" spellcheck="false"
+                                      placeholder="Agent models — runs task steps."
+                                      hidden></textarea>
+                            <textarea id="cfg-llm-helper" rows="6"
+                                      data-role-pane="helper" spellcheck="false"
+                                      placeholder="Helper models — used for findings summarisation and error explanation (internal: from_data)."
+                                      hidden></textarea>
                             <small class="help-text">
-                                One model identifier per line. The first entry
-                                is used first; later entries are fallbacks if
-                                the primary is unavailable.
+                                One model identifier per line. Each role has its own
+                                priority list — the first entry is used first, later
+                                entries are fallbacks. Saved to <code>llm.roles</code>.
                             </small>
                         </label>
                     </fieldset>
@@ -138,18 +248,6 @@
                             <small class="help-text">
                                 Confidence below this value triggers a
                                 corrective step. Range 0.0–1.0. Default: 0.8.
-                            </small>
-                        </label>
-
-                        <label>
-                            <span>Workspace Directory</span>
-                            <input type="text" id="cfg-session-workspace-base"
-                                   placeholder=".workspace" />
-                            <small class="help-text">
-                                Base directory under which each session creates
-                                its own workspace. Relative paths resolve
-                                against the project root. Default:
-                                <code>.workspace</code>.
                             </small>
                         </label>
 
@@ -225,8 +323,8 @@
                         <span class="muted" id="settings-status"></span>
                     </div>
                 </form>
-            </section>
-        </main>
+            </div>
+        </div>
     </div>
 
     <script src="renderer.js"></script>

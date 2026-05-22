@@ -1,20 +1,36 @@
 version: '3.0'
 llm:
   API_KEY: ff6bb18f-4a84-401d-9989-f6997487abe5
-  models:
-  - anthropic::claude-4-7-opus
-  - anthropic::claude-4-6-opus:1M
-  - anthropic::claude-4-6-opus
-  - anthropic::claude-4-6-sonnet:1M
-  - anthropic::claude-4-6-sonnet
-  - anthropic::claude-4-5-sonnet
-  - anthropic::claude-4-5-haiku:thinking
-  - anthropic::claude-4-5-haiku
-  - anthropic::claude-4-sonnet
-  - anthropic::claude-3-7-sonnet
-  - anthropic::claude-3-5-sonnet
+  roles:
+    planner:
+    - anthropic::claude-4-7-opus
+    - anthropic::claude-4-6-opus:1M
+    - anthropic::claude-4-6-opus
+    - anthropic::claude-4-6-sonnet:1M
+    - anthropic::claude-4-6-sonnet
+    - anthropic::claude-4-5-sonnet
+    - anthropic::claude-4-5-haiku:thinking
+    - anthropic::claude-4-5-haiku
+    receptionist:
+    - anthropic::claude-4-5-sonnet
+    - anthropic::claude-4-5-haiku:thinking
+    - anthropic::claude-4-5-haiku
+    agent:
+    - anthropic::claude-4-6-opus:1M
+    - anthropic::claude-4-6-opus
+    - anthropic::claude-4-6-sonnet:1M
+    - anthropic::claude-4-6-sonnet
+    - anthropic::claude-4-5-sonnet
+    - anthropic::claude-4-5-haiku:thinking
+    - anthropic::claude-4-5-haiku
+    - anthropic::claude-4-sonnet
+    - anthropic::claude-3-7-sonnet
+    - anthropic::claude-3-5-sonnet
+    helper:
+    - anthropic::claude-4-5-sonnet
+    - anthropic::claude-4-5-haiku:thinking
+    - anthropic::claude-4-5-haiku
 session:
-  workspace_base: .fengxuanworkspace
   log_level: INFO
   step_verification_threshold: 0.8
 interaction_switches:

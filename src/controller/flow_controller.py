@@ -121,7 +121,7 @@ class FlowController:
         planner_llm_services: List[LLMService],
         receptionist_llm_services: List[LLMService],
         from_data_llm_services: List[LLMService],
-        working_directory: str = ".",
+        working_directory: Optional[str] = None,
         storage_directory: Optional[str] = None,
         step_verification_threshold: float = DEFAULT_STEP_VERIFICATION_THRESHOLD,
         venv_path: Optional[str] = None,
@@ -137,8 +137,13 @@ class FlowController:
         self._receptionist_services: List[LLMService] = receptionist_llm_services
         self._from_data_services:    List[LLMService] = from_data_llm_services
 
-        self.working_directory = working_directory
-        self.storage_directory = storage_directory or working_directory
+        # working_directory is optional: Linux/CLI mode passes the cwd-of-invocation
+        # (the user's project); Windows GUI mode passes None because there is no
+        # "user project" concept — all artifacts live under storage_directory.
+        # When working_directory is None, prompts omit the "[Working Directory]"
+        # block entirely (handled in runtime_agent and planner).
+        self.working_directory: Optional[str] = working_directory
+        self.storage_directory: str = storage_directory or working_directory or "."
         self.venv_path = venv_path
         self.step_verification_threshold = step_verification_threshold
 
@@ -152,7 +157,6 @@ class FlowController:
 
         self.receptionist = Receptionist(
             llm_services=receptionist_llm_services,
-            working_directory=working_directory,
             shell_history_path=shell_context_path,
         )
 
@@ -303,14 +307,14 @@ class FlowController:
         """
         if log_file is None and self._execution_recorder is None:
             self.interaction_manager.display_error(
-                "[HandQ] No completed task to save — run a task first, "
+                "No completed task to save — run a task first, "
                 "or provide a session log path: handq --save <path>"
             )
             return
 
         if self.state == SystemState.EXECUTING or self.state == SystemState.REPLANNING:
             self.interaction_manager.display_error(
-                "[HandQ] Task still running — wait for completion before saving."
+                "Task still running — wait for completion before saving."
             )
             return
 
@@ -322,7 +326,7 @@ class FlowController:
         )
         if not resolved_log_file:
             self.interaction_manager.display_error(
-                "[HandQ] No completed task to save — run a task first, "
+                "No completed task to save — run a task first, "
                 "or provide a session log path: handq --save <path>"
             )
             return
@@ -336,7 +340,7 @@ class FlowController:
             save_context = {}
 
         self.interaction_manager.display_message(
-            "[HandQ] Starting template generation session…"
+            "Starting template generation session…"
         )
         self.logger.info(
             "Starting independent save-session flow", component="FlowController"
@@ -373,7 +377,7 @@ class FlowController:
         goal = self._build_save_session_goal(save_context, log_file=_execution_summary_path)
         if goal is None:
             self.interaction_manager.display_error(
-                "[HandQ] No completed task to save — run a task first, "
+                "No completed task to save — run a task first, "
                 "or provide a session log path: handq --save <path>"
             )
             return
@@ -412,7 +416,7 @@ class FlowController:
                 f"Save-session flow failed: {exc}", component="FlowController"
             )
             self.interaction_manager.display_error(
-                f"[HandQ] Template generation session failed: {exc}"
+                f"Template generation session failed: {exc}"
             )
 
     async def _run_save_post_process(

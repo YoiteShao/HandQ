@@ -139,7 +139,7 @@ class RuntimeAgent:
         llm_services: List[LLMService],
         step: Step,
         from_data_services: Optional[List[LLMService]] = None,
-        working_directory: str = ".",
+        working_directory: Optional[str] = None,
         storage_directory: Optional[str] = None,
         max_iterations: int = 100,
         progress_config: Optional[Dict[str, Any]] = None,
@@ -166,8 +166,12 @@ class RuntimeAgent:
         )
 
         self.step = step
-        self.working_directory = working_directory
-        self.storage_directory = storage_directory or working_directory
+        # working_directory is optional. None == GUI mode (no "user project");
+        # storage_directory is the per-session dir and always points somewhere.
+        # Code paths that need a concrete cwd (RiskGuard, Bash) fall back to
+        # storage_directory when working_directory is unset.
+        self.working_directory: Optional[str] = working_directory
+        self.storage_directory: str = storage_directory or working_directory or "."
         self.max_iterations = max_iterations
         self.logger = get_logger()
         self.current_iteration = 0
@@ -207,7 +211,13 @@ class RuntimeAgent:
         )
         self.progress_analyzer = SuccessPatternAnalyzer(config=progress_config)
         self.config_manager = config_manager or ConfigManager()
-        self.risk_guard = RiskGuard(self.config_manager, working_directory=self.working_directory)
+        # RiskGuard always needs a concrete directory: when there is no user
+        # project (GUI mode), scope auto-approval to the session storage dir
+        # so files written inside the session don't trigger confirmation.
+        self.risk_guard = RiskGuard(
+            self.config_manager,
+            working_directory=self.working_directory or self.storage_directory,
+        )
         self.confirmation_callback = confirmation_callback
         # Called at the start of every Observe-Think-Act iteration (non-blocking).
         # If it returns a non-empty string the agent aborts immediately and
@@ -564,9 +574,16 @@ class RuntimeAgent:
         ]
 
         # ── [1] Goal + working directory — stable for this step ──────────────
+        # Only mention "Working directory" when one was actually configured
+        # (Linux/CLI path). In GUI mode it is None and would only confuse the
+        # agent — every relative path resolves against storage_directory anyway.
+        working_dir_line = (
+            f"Working directory: {self.working_directory}\n"
+            if self.working_directory else ""
+        )
         goal_content = (
             f"Goal: {goal}\n\n"
-            f"Working directory: {self.working_directory}\n"
+            f"{working_dir_line}"
             f"Session storage directory: {self.storage_directory}\n\n"
             f"{get_platform_context()}"
         )

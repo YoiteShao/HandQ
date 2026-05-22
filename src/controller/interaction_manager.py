@@ -242,7 +242,7 @@ class InteractionManager:
             self._ui_call("show_receptionist_thinking")
             evaluation = await callback(msg)
             self._ui_call("clear_receptionist_thinking")
-            self.display_receptionist_reply(f"[HandQ] {evaluation.response_to_user}")
+            self.display_receptionist_reply(evaluation.response_to_user)
             if evaluation.intent.value == "replan":
                 # Use context_for_planner (which includes recent conversation
                 # history) so the Planner has full context when the user
@@ -265,7 +265,7 @@ class InteractionManager:
                 component="InteractionManager",
             )
             self.display_message(
-                "[HandQ] Message received — will be incorporated into the plan."
+                "Message received — will be incorporated into the plan."
             )
             self._replan_queue.put(msg)
 
@@ -485,7 +485,7 @@ class InteractionManager:
         Delegates to self._ui.display_message() when a UI is set; falls back
         to print() in CLI / test contexts.
         """
-        msg = f"\n[HandQ] Progress: {current}/{total} steps"
+        msg = f"\nProgress: {current}/{total} steps"
         if self._ui is not None:
             self._ui_call("display_progress_status", current, total)
         else:

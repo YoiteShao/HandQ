@@ -188,50 +188,8 @@ class _ConsoleUI:
 
 
 # ---------------------------------------------------------------------------
-# Role assignment (mirrors handq.py logic)
+# Role assignment — moved to src.infrastructure.role_resolver
 # ---------------------------------------------------------------------------
-
-_PLANNER_MIN_VERSION = (4, 5)
-
-
-def _model_version(model_str: str):
-    """Extract (major, minor) from 'anthropic::claude-X-Y-...'."""
-    import re
-    m = re.search(r"claude-(\d+)[.\-](\d+)", model_str)
-    if m:
-        return int(m.group(1)), int(m.group(2))
-    return (0, 0)
-
-
-def _assign_roles(all_models: list) -> dict:
-    """Assign model lists to agent/planner/receptionist/from_data roles."""
-    capable = [m for m in all_models if _model_version(m) >= _PLANNER_MIN_VERSION]
-    if not capable:
-        import warnings
-        warnings.warn(
-            "No planner-capable models (Claude 4-5+) found. "
-            "All roles will use the full model list.",
-            UserWarning,
-        )
-        return dict(agent=all_models, planner=all_models,
-                    receptionist=all_models, from_data=all_models)
-
-    n = len(capable)
-    opus_n = sum(1 for m in capable if "opus" in m)
-
-    if opus_n:
-        recep_skip = min(opus_n,     n - 1)
-        fdata_skip = min(opus_n + 2, n - 1)
-    else:
-        recep_skip = min(1, n - 1)
-        fdata_skip = min(2, n - 1)
-
-    return dict(
-        agent=all_models,
-        planner=capable,
-        receptionist=capable[recep_skip:],
-        from_data=capable[fdata_skip:],
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +201,7 @@ def _build_session(config_path: str, session_id: str, cwd: str):
     from src.infrastructure.logger import initialize_logger, LogLevel
     from src.controller.flow_controller import FlowController
     from src.infrastructure.anthropic_streaming_service import AnthropicStreamingService
+    from src.infrastructure.role_resolver import resolve_role_models
 
     cfg_path = Path(config_path)
     try:
@@ -254,7 +213,7 @@ def _build_session(config_path: str, session_id: str, cwd: str):
     llm_cfg        = config.get("llm", {})
     api_key_val    = llm_cfg.get("API_KEY") or ""
     max_tokens     = llm_cfg.get("max_tokens", None)
-    all_models     = llm_cfg.get("models", [])
+    roles          = resolve_role_models(llm_cfg)
     log_level_str  = config.get("session", {}).get("log_level", "INFO")
     threshold      = float(config.get("session", {}).get(
         "step_verification_threshold",
@@ -282,14 +241,24 @@ def _build_session(config_path: str, session_id: str, cwd: str):
             max_retries=max_retries,
         )
 
-    all_llm_services = [_make_service(m, max_retries=3) for m in all_models]
-    roles = _assign_roles(all_models)
-    svc_map = {m: svc for m, svc in zip(all_models, all_llm_services)}
+    # Shared services for non-planner roles (dedup across roles).
+    shared_models: list = []
+    for role_key in ("agent", "receptionist", "from_data"):
+        for m in roles.get(role_key, []):
+            if m not in shared_models:
+                shared_models.append(m)
+    svc_map = {m: _make_service(m, max_retries=3) for m in shared_models}
 
-    agent_services        = all_llm_services
-    receptionist_services = [svc_map[m] for m in roles["receptionist"]]
-    from_data_services    = [svc_map[m] for m in roles["from_data"]]
-    planner_services      = [_make_service(m, max_retries=50) for m in roles["planner"]]
+    agent_services        = [svc_map[m] for m in roles.get("agent", [])]
+    receptionist_services = [svc_map[m] for m in roles.get("receptionist", [])]
+    from_data_services    = [svc_map[m] for m in roles.get("from_data", [])]
+    planner_services      = [_make_service(m, max_retries=50) for m in roles.get("planner", [])]
+
+    if not agent_services:
+        raise ValueError(
+            "No agent models configured. Set llm.roles.agent in handq_config.yaml "
+            "(or the legacy llm.models list)."
+        )
 
     flow = FlowController(
         agent_llm_services=agent_services,
@@ -303,7 +272,9 @@ def _build_session(config_path: str, session_id: str, cwd: str):
         config_path=config_path,
     )
 
-    return flow, all_llm_services, str(session_dir)
+    # Return every service the caller must close on shutdown.
+    all_services: list = list(svc_map.values()) + planner_services
+    return flow, all_services, str(session_dir)
 
 
 # ---------------------------------------------------------------------------

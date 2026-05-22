@@ -59,10 +59,13 @@ if _ROOT not in sys.path:
 #   * PyInstaller — sets sys.frozen = True; sys.executable points at the .exe.
 #
 # Config search order (first hit wins):
-#   1. HANDQ_CONFIG env var               — explicit override (CI, portable mode)
-#   2. %LOCALAPPDATA%\HandQ\handq_config.yaml — per-user override (Program Files
-#                                            is read-only for unprivileged users)
-#   3. <install_dir>\handq_config.yaml    — default that ships with the build
+#   1. HANDQ_CONFIG env var                  — explicit override (CI, portable mode)
+#   2. %USERPROFILE%\HandQ\handq_config.yaml — per-user config; lives next to the
+#                                              session History\ directory so the
+#                                              user has one place for everything
+#                                              they own (config + history)
+#   3. <install_dir>\handq_config.yaml       — default that ships with the build,
+#                                              copied to (2) on first launch
 # ---------------------------------------------------------------------------
 
 if getattr(sys, "frozen", False) or "__compiled__" in globals():
@@ -71,12 +74,19 @@ else:
     _INSTALL_DIR = _ROOT
 
 
+def _user_handq_root() -> str:
+    """Return %USERPROFILE%\\HandQ (or ~/HandQ on non-Windows / when USERPROFILE
+    is missing). This is the single per-user root for config + session history.
+    Logs deliberately live elsewhere (%LOCALAPPDATA%\\HandQ\\logs)."""
+    home = os.environ.get("USERPROFILE") or os.path.expanduser("~")
+    return os.path.join(home, "HandQ")
+
+
 def _resolve_config_path() -> str:
     env_override = os.environ.get("HANDQ_CONFIG")
     if env_override:
         return os.path.abspath(env_override)
-    user_dir = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-    user_cfg = os.path.join(user_dir, "HandQ", "handq_config.yaml")
+    user_cfg = os.path.join(_user_handq_root(), "handq_config.yaml")
     if os.path.exists(user_cfg):
         return user_cfg
     return os.path.join(_INSTALL_DIR, "handq_config.yaml")

@@ -111,7 +111,8 @@ Before making changes or taking significant actions, gather sufficient context:
 - **Assess familiarity first**: before deciding where to start, ask — do I know the exact
   path/symbol/location of what I need right now?
   - *Known target*: start with the most specific file you know is relevant; broaden only if needed
-  - *Unknown target*: run {_explore_target} **within the working directory** first
+  - *Unknown target*: run {_explore_target} on a known-good path
+    (the session storage directory, or the working directory if the goal supplies one)
     to build a directory map, then narrow to specific files
 - Use {_search_cmd} before reading entire files
 - Batch related reads into a single `read` call with an array of paths
@@ -155,7 +156,7 @@ Make the smallest action that meaningfully advances the goal:
 
 Before taking any action, consider its reversibility and blast radius:
 
-- **Freely take**: reads, targeted edits, creating new files in the working directory
+- **Freely take**: reads, targeted edits, creating new files inside the session storage directory (or the working directory if the goal supplies one)
 - **Proceed carefully**: overwriting existing files (verify content before writing), running
   commands that modify system state
 - **Destructive operations** (deleting files, dropping data, overwriting without backup):

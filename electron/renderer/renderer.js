@@ -4,43 +4,23 @@
 // arrive through window.handq.on*; outbound messages go through
 // window.handq.sendRequest / getConfig / setConfig.
 //
-// Event-type contract (porting_design.md §(2)):
-//   token_stream / event=text_delta  -> append evt.text to the active bubble
-//   token_stream / event=tool_call   -> render a collapsible tool-call card
-//   token_stream / event=done        -> seal the active bubble
-//   status                           -> update the sidebar status pill
-//   final                            -> mark the bubble complete + log result
-//   error                            -> append a red error bubble
-//
-// Settings panel:
-//   On open  -> handq.getConfig() -> populate every form field from the
-//               loaded config payload.
-//   On Save  -> read the form into a config object whose shape mirrors the
-//               loaded payload, then handq.setConfig(obj). Show a toast
-//               banner "Settings saved." on success.
-//
-// The settings UI is intentionally configuration-format-agnostic from the
-// user's perspective; persistence is the backend's responsibility.
+// Layout (post-redesign):
+//   * Custom titlebar with min / max / close-to-tray buttons (frameless window).
+//   * Conversation pane — bubbles aligned left (assistant/system/error) or
+//     right (user); no role labels.
+//   * Composer + Send.
+//   * Shortcut bar with Settings / Status / New (+ a small status pill).
+//   * Settings is an overlay, opened from the shortcut, closed on Save.
+//   * Status is an overlay summarising the latest session state.
 
 'use strict';
 
 // --- renderer-side logging ------------------------------------------------
-//
-// window.__handqLog(level, ...args) is a small, dependency-free helper that:
-//   * prefixes [RENDER] + ISO timestamp + level
-//   * mirrors to console.{log|debug|warn|error} as appropriate
-//   * appends to a hidden <pre id="debug-panel"> drawer that can be toggled
-//     on Ctrl+Shift+L. The panel is created lazily on first toggle so it
-//     adds zero DOM weight unless the developer asks for it.
-//
-// The drawer is fixed-position at the bottom of the viewport, has a
-// "copy to clipboard" button, and never blocks pointer events on the rest
-// of the UI when hidden.
 
 (function installHandqLog() {
-    const buffer = [];      // ring buffer (most recent ~2000 lines)
+    const buffer = [];
     const MAX_LINES = 2000;
-    let panelEl = null;     // <pre id="debug-panel"> — created on first toggle
+    let panelEl = null;
     let panelBodyEl = null;
     let panelVisible = false;
 
@@ -71,23 +51,24 @@
         panelEl.id = 'debug-panel-wrap';
         panelEl.style.cssText =
             'position:fixed;left:0;right:0;bottom:0;height:30vh;' +
-            'background:rgba(20,20,24,0.95);color:#dfe3ea;' +
+            'background:rgba(255,255,255,0.92);color:#1d1f24;' +
             'font:12px/1.4 ui-monospace,Menlo,Consolas,monospace;' +
-            'border-top:1px solid #3a3f4a;z-index:99999;' +
-            'display:flex;flex-direction:column;';
+            'border-top:1px solid rgba(15,20,30,0.18);z-index:99999;' +
+            'display:flex;flex-direction:column;backdrop-filter:blur(14px);';
 
         const bar = document.createElement('div');
         bar.style.cssText =
             'display:flex;align-items:center;gap:8px;padding:4px 8px;' +
-            'background:#1a1c20;border-bottom:1px solid #3a3f4a;';
+            'background:rgba(255,255,255,0.85);' +
+            'border-bottom:1px solid rgba(15,20,30,0.10);';
         const label = document.createElement('span');
         label.textContent = 'HandQ debug log (Ctrl+Shift+L to hide)';
         label.style.flex = '1';
         const copyBtn = document.createElement('button');
         copyBtn.textContent = 'Copy';
         copyBtn.style.cssText =
-            'font:inherit;padding:2px 10px;background:#2c313a;color:#dfe3ea;' +
-            'border:1px solid #4a5060;border-radius:3px;cursor:pointer;';
+            'font:inherit;padding:2px 10px;background:#fff;color:#1d1f24;' +
+            'border:1px solid rgba(15,20,30,0.18);border-radius:4px;cursor:pointer;';
         copyBtn.addEventListener('click', () => {
             const text = buffer.join('\n');
             try {
@@ -142,18 +123,12 @@
         appendToPanel(line);
     };
 
-    // Truncate any single argument to N characters when stringified, so a
-    // multi-MB token_stream payload doesn't fill the buffer. The truncation
-    // policy (200 chars) matches the goal's instrumentation requirement.
     window.__handqTrunc = function (value, n) {
         const limit = (typeof n === 'number' && n > 0) ? n : 200;
         const s = safeStringify(value);
         return s.length > limit ? s.slice(0, limit) + '…(' + s.length + ')' : s;
     };
 
-    // Strip API_KEY (and legacy api_key / api_key_env) out of any object
-    // we're about to log (defence-in-depth; main.js and preload.js redact
-    // independently).
     window.__handqRedact = function (value) {
         if (!value || typeof value !== 'object') return value;
         if (Array.isArray(value)) return value.map(window.__handqRedact);
@@ -171,7 +146,6 @@
         return out;
     };
 
-    // Ctrl+Shift+L toggles the drawer.
     window.addEventListener('keydown', (e) => {
         if (e.ctrlKey && e.shiftKey && (e.key === 'L' || e.key === 'l')) {
             e.preventDefault();
@@ -188,6 +162,7 @@
             '<pre style="color:red">window.handq is missing — preload failed to load.</pre>';
         return;
     }
+    const winCtl = window.windowControls || null;
     window.__handqLog('INFO', 'renderer init');
 
     // ----- DOM refs --------------------------------------------------------
@@ -196,43 +171,155 @@
     const composer = document.getElementById('composer');
     const composerInput = document.getElementById('composer-input');
 
-    const navChat = document.getElementById('nav-chat');
-    const navSettings = document.getElementById('nav-settings');
-    const viewChat = document.getElementById('view-chat');
-    const viewSettings = document.getElementById('view-settings');
     const statusPill = document.getElementById('status-pill');
 
-    const settingsForm = document.getElementById('settings-form');
-    const settingsLoadBtn = document.getElementById('settings-load');
-    const settingsStatus = document.getElementById('settings-status');
-    const settingsToast = document.getElementById('settings-toast');
+    // Shortcut bar
+    const scSettings = document.getElementById('sc-settings');
+    const scStatus   = document.getElementById('sc-status');
+    const scNew      = document.getElementById('sc-new');
 
-    // Visible fields.
-    const cfgLlmApiKey = document.getElementById('cfg-llm-api-key');
+    // Titlebar
+    const tbMin   = document.getElementById('tb-min');
+    const tbMax   = document.getElementById('tb-max');
+    const tbClose = document.getElementById('tb-close');
+
+    // Overlays
+    const overlayStatus    = document.getElementById('overlay-status');
+    const overlaySettings  = document.getElementById('overlay-settings');
+    const statusCloseBtn   = document.getElementById('status-close');
+    const settingsCancel   = document.getElementById('settings-cancel');
+
+    // Status overlay readouts
+    const stState    = document.getElementById('st-state');
+    const stProgress = document.getElementById('st-progress');
+    const stStep     = document.getElementById('st-step');
+    const stLast     = document.getElementById('st-last');
+    const stEvents   = document.getElementById('st-events');
+
+    // Settings form
+    const settingsForm     = document.getElementById('settings-form');
+    const settingsLoadBtn  = document.getElementById('settings-load');
+    const settingsStatus   = document.getElementById('settings-status');
+    const settingsToast    = document.getElementById('settings-toast');
+
+    const cfgLlmApiKey       = document.getElementById('cfg-llm-api-key');
     const cfgLlmApiKeyToggle = document.getElementById('cfg-llm-api-key-toggle');
-    const cfgLlmMaxTokens = document.getElementById('cfg-llm-max-tokens');
-    const cfgLlmModels = document.getElementById('cfg-llm-models');
-    const cfgSessionLogLevel = document.getElementById('cfg-session-log-level');
-    const cfgSessionStepThreshold =
-        document.getElementById('cfg-session-step-threshold');
-    const cfgSessionWorkspaceBase =
-        document.getElementById('cfg-session-workspace-base');
-    const cfgSessionVenvPath = document.getElementById('cfg-session-venv-path');
+    const cfgLlmMaxTokens    = document.getElementById('cfg-llm-max-tokens');
+    const cfgLlmRoleTabs     = document.getElementById('cfg-llm-role-tabs');
+    const cfgLlmRolePanes = {
+        planner:      document.getElementById('cfg-llm-planner'),
+        receptionist: document.getElementById('cfg-llm-receptionist'),
+        agent:        document.getElementById('cfg-llm-agent'),
+        helper:       document.getElementById('cfg-llm-helper'),
+    };
+    const cfgSessionLogLevel      = document.getElementById('cfg-session-log-level');
+    const cfgSessionStepThreshold = document.getElementById('cfg-session-step-threshold');
+    const cfgSessionVenvPath      = document.getElementById('cfg-session-venv-path');
     const cfgSwToolWrite = document.getElementById('cfg-sw-tool-write');
-    const cfgSwToolEdit = document.getElementById('cfg-sw-tool-edit');
-    const cfgSwToolBash = document.getElementById('cfg-sw-tool-bash');
-    const cfgSwHighRisk = document.getElementById('cfg-sw-high-risk');
+    const cfgSwToolEdit  = document.getElementById('cfg-sw-tool-edit');
+    const cfgSwToolBash  = document.getElementById('cfg-sw-tool-bash');
+    const cfgSwHighRisk  = document.getElementById('cfg-sw-high-risk');
 
-    // Stash the full config as loaded so hidden fields (version,
-    // api_key_env, high_risk_commands, switch descriptions, etc.)
-    // round-trip unchanged on Save.
     let originalConfig = null;
+
+    // ----- session/state tracking (drives Status overlay + pill) -----------
+
+    const session = {
+        state:      'idle',
+        progress:   '',
+        currentStep:'',
+        lastUpdate: '',
+        events:     [],
+    };
+    const EVENT_RING = 30;
+
+    // taskCompleted "locks" the pill to the completion banner until the user
+    // submits a new message (or hits New). Backend often emits a stray
+    // state_changed→idle after task_completed; without the lock the user
+    // would see the pill flip from "complete" back to "idle" instantly.
+    let taskCompleted = false;
+
+    // Session generation watermark. The bridge tags every outbound envelope
+    // with a `gen` field (see stdio_bridge.py: _StdioUI._generation). When
+    // New is clicked, the renderer optimistically bumps `currentGen` BEFORE
+    // sending new_session — so any in-flight emit from the OLD flow that
+    // arrives during cleanup carries an older gen and gets dropped here.
+    // This is the only mechanism that protects the new conversation from
+    // a wedged old subtask whose blocking syscall (e.g. ssh_tool's
+    // run_in_executor + time.sleep retry, ssh_setup getpass) prevents
+    // Python from killing the OS thread on Windows.
+    //
+    // Bridge confirms with `final {generation}`; we sync to it (max-rule)
+    // so rapid double-clicks stay consistent.
+    let currentGen = 0;
+
+    function gateGen(evt) {
+        // Returns true if the event should be DROPPED.
+        if (!evt) return true;
+        const g = evt.gen;
+        // Legacy or bridge-meta envelopes without a gen tag pass through —
+        // the bridge tags everything in this build, but be permissive so
+        // a half-upgraded combo (renderer new, bridge old) still works.
+        if (typeof g !== 'number') return false;
+        if (g < currentGen) return true;
+        if (g > currentGen) currentGen = g;
+        return false;
+    }
+
+    function setPill(text, opts) {
+        const o = opts || {};
+        // The "tooltip" always tracks the latest backend event so users can
+        // hover the pill mid-completion to see what's happening underneath.
+        statusPill.title = text || '';
+        if (taskCompleted && !o.force) return;
+        statusPill.textContent = text || 'idle';
+    }
+
+    function markCompleted(summary) {
+        taskCompleted = true;
+        statusPill.classList.add('complete');
+        statusPill.textContent = 'complete';
+        statusPill.title = summary
+            ? ('complete — ' + truncate(summary, 200))
+            : 'complete';
+        session.state = 'complete';
+        if (summary) addAssistantTextBubble(summary);
+        recordEvent('task completed' + (summary ? ': ' + truncate(summary, 80) : ''));
+    }
+
+    function clearCompleted() {
+        if (!taskCompleted) return;
+        taskCompleted = false;
+        statusPill.classList.remove('complete');
+        statusPill.textContent = 'idle';
+        statusPill.title = '';
+        session.state = 'idle';
+    }
+
+    function truncate(s, n) {
+        if (!s) return '';
+        return s.length > n ? s.slice(0, n - 1) + '…' : s;
+    }
+
+    function recordEvent(line) {
+        if (!line) return;
+        session.events.push('[' + new Date().toLocaleTimeString() + '] ' + line);
+        if (session.events.length > EVENT_RING) session.events.shift();
+        session.lastUpdate = new Date().toLocaleTimeString();
+    }
+
+    function refreshStatusPanel() {
+        stState.textContent    = session.state || 'idle';
+        stProgress.textContent = session.progress || '—';
+        stStep.textContent     = session.currentStep || '—';
+        stLast.textContent     = session.lastUpdate || '—';
+        stEvents.textContent   = session.events.join('\n');
+        stEvents.scrollTop     = stEvents.scrollHeight;
+    }
 
     // ----- chat state ------------------------------------------------------
 
-    /** The assistant bubble currently receiving streaming tokens. */
     let activeAssistantBubble = null;
-    /** Map from call_id -> tool-call card element (for in-place updates). */
     const toolCardsByCallId = new Map();
 
     function el(tag, className, textContent) {
@@ -248,7 +335,6 @@
 
     function addUserBubble(text) {
         const bubble = el('div', 'bubble user');
-        bubble.appendChild(el('div', 'bubble-role', 'You'));
         bubble.appendChild(el('div', 'bubble-body', text));
         conversation.appendChild(bubble);
         scrollToBottom();
@@ -256,11 +342,10 @@
 
     function startAssistantBubble() {
         const bubble = el('div', 'bubble assistant streaming');
-        bubble.appendChild(el('div', 'bubble-role', 'Assistant'));
         const body = el('div', 'bubble-body');
         bubble.appendChild(body);
         bubble._body = body;
-        bubble._textNode = null; // lazily created
+        bubble._textNode = null;
         conversation.appendChild(bubble);
         activeAssistantBubble = bubble;
         scrollToBottom();
@@ -268,17 +353,13 @@
     }
 
     function ensureAssistantBubble() {
-        if (!activeAssistantBubble) {
-            return startAssistantBubble();
-        }
+        if (!activeAssistantBubble) return startAssistantBubble();
         return activeAssistantBubble;
     }
 
     function appendTextDelta(text) {
         if (!text) return;
         const bubble = ensureAssistantBubble();
-        // Use a single text node for incremental append — preserves
-        // whitespace and avoids re-parsing HTML on every chunk.
         if (!bubble._textNode) {
             bubble._textNode = document.createTextNode('');
             const span = el('span', 'text-stream');
@@ -323,22 +404,33 @@
         activeAssistantBubble = null;
     }
 
-    function addErrorBubble(message, where) {
-        const bubble = el('div', 'bubble error');
-        bubble.appendChild(el('div', 'bubble-role',
-            'Error' + (where ? ' (' + where + ')' : '')));
-        bubble.appendChild(el('div', 'bubble-body', message || '(no message)'));
+    function addAssistantTextBubble(text) {
+        // Single-shot non-streaming assistant message (e.g. receptionist reply).
+        const bubble = el('div', 'bubble assistant');
+        bubble.appendChild(el('div', 'bubble-body', text || ''));
         conversation.appendChild(bubble);
         scrollToBottom();
     }
 
-    // ----- token_stream dispatch ------------------------------------------
-    // Per backend_surface.md §(2):
-    //   StreamTextDeltaEvent  -> { event:"text_delta", text }
-    //   StreamToolCallEvent   -> { event:"tool_call", call_id, tool_name, args, block_index }
-    //   StreamDoneEvent       -> { event:"done", result: LLMChatResult }
+    function addSystemBubble(text) {
+        const bubble = el('div', 'bubble system');
+        bubble.appendChild(el('div', 'bubble-body', text || ''));
+        conversation.appendChild(bubble);
+        scrollToBottom();
+    }
+
+    function addErrorBubble(message, where) {
+        const bubble = el('div', 'bubble error');
+        const prefix = where ? '[' + where + '] ' : '';
+        bubble.appendChild(el('div', 'bubble-body', prefix + (message || '(no message)')));
+        conversation.appendChild(bubble);
+        scrollToBottom();
+    }
+
+    // ----- bridge events ---------------------------------------------------
 
     handq.onTokenStream((evt) => {
+        if (gateGen(evt)) return;
         const kind = evt && evt.event;
         window.__handqLog('DEBUG', 'onTokenStream', {
             type: evt && evt.type,
@@ -356,6 +448,7 @@
     });
 
     handq.onStatus((evt) => {
+        if (gateGen(evt)) return;
         if (!evt) return;
         window.__handqLog('DEBUG', 'onStatus', {
             type: evt.type,
@@ -363,25 +456,75 @@
             kind: evt.kind,
             payload: window.__handqTrunc(evt, 200),
         });
+
+        const args = Array.isArray(evt.args) ? evt.args : [];
+
         if (evt.kind === 'state_changed' && evt.state) {
-            statusPill.textContent = evt.state;
+            session.state = evt.state;
+            recordEvent('state → ' + evt.state);
+            setPill(evt.state);
         } else if (evt.kind === 'progress') {
-            statusPill.textContent =
-                'progress ' + (evt.current || 0) + '/' + (evt.total || 0);
-        } else if (evt.kind === 'step_started' && evt.desc) {
-            statusPill.textContent = 'step: ' + evt.desc.slice(0, 40);
+            const cur = evt.current || 0;
+            const tot = evt.total || 0;
+            const text = 'progress ' + cur + '/' + tot;
+            session.progress = cur + '/' + tot;
+            recordEvent(text);
+            setPill(text);
+        } else if (evt.kind === 'step_started') {
+            const desc = String(evt.desc || args[1] || '');
+            session.currentStep = desc;
+            recordEvent('step started: ' + desc);
+            setPill('▶ ' + truncate(desc, 80));
+        } else if (evt.kind === 'step_completed') {
+            const desc = String(evt.desc || args[1] || '');
+            recordEvent('step completed: ' + desc);
+            setPill('✓ ' + truncate(desc, 80));
+        } else if (evt.kind === 'step_confidence') {
+            const conf = parseFloat(args[0]);
+            if (!Number.isNaN(conf)) {
+                recordEvent('confidence: ' + conf.toFixed(2));
+                setPill('confidence ' + conf.toFixed(2));
+            }
+        } else if (evt.kind === 'decision_made') {
+            const iter = args[0] || '';
+            const reasoning = args[1] || '';
+            recordEvent('decision[' + iter + ']: ' + truncate(reasoning, 120));
+            setPill('💭 iter ' + iter + ' · ' + truncate(reasoning, 80));
+        } else if (evt.kind === 'tool_execution_started') {
+            const iter   = args[0] || '';
+            const tool   = args[1] || '';
+            const params = args[2] || '';
+            const output = args[3];
+            const isPre  = !output || output === 'None' || output === 'null';
+            const tag    = isPre ? '⊙' : '✓';
+            recordEvent(tag + ' tool[' + iter + '] ' + tool + ' ' + truncate(String(params), 120));
+            setPill(tag + ' ' + tool + ' · ' + truncate(String(params), 80));
         } else if (evt.kind === 'task_completed') {
-            statusPill.textContent = 'done';
+            const summary = evt.summary
+                || (args.length ? String(args[0]) : '')
+                || '';
+            markCompleted(summary);
         } else if (evt.kind === 'bridge_exit') {
-            statusPill.textContent = 'bridge exited';
+            session.state = 'bridge exited';
+            recordEvent('bridge exited');
+            setPill('bridge exited', { force: true });
+        } else if (evt.kind === 'reply') {
+            addAssistantTextBubble(evt.text || '');
+        } else if (evt.kind === 'message') {
+            addSystemBubble(evt.text || '');
+        } else if (evt.kind === 'receptionist_thinking_on') {
+            recordEvent('receptionist thinking…');
+            setPill('thinking…');
+        } else if (evt.kind === 'receptionist_thinking_off') {
+            recordEvent('receptionist idle');
+        }
+        if (!overlayStatus.classList.contains('hidden')) {
+            refreshStatusPanel();
         }
     });
 
     handq.onFinal((evt) => {
-        // The 'final' envelope can be either:
-        //   * the end of a request (id = the request id) -> seal the bubble
-        //   * a config_get / config_set response -> handled by getConfig/setConfig
-        //     promises in preload.js (we still see the event here for logging)
+        if (gateGen(evt)) return;
         window.__handqLog('INFO', 'onFinal', {
             type: evt && evt.type,
             id: evt && evt.id,
@@ -389,14 +532,8 @@
         });
         if (!evt || !evt.result) return;
 
-        // Seal the streaming bubble if one is still open.
-        if (activeAssistantBubble) {
-            sealActiveBubble('final');
-        }
+        if (activeAssistantBubble) sealActiveBubble('final');
 
-        // Catch config_get responses regardless of id-correlation success in
-        // preload.js, by their unique shape ({config_path, config}). Idempotent
-        // if the id-correlated Promise also resolves with the same payload.
         if (evt.result && evt.result.config && evt.result.config_path !== undefined) {
             window.__handqLog('INFO', 'config_get final received',
                 { path: evt.result.config_path });
@@ -405,10 +542,8 @@
             return;
         }
 
-        // Surface a concise result line if the request envelope finished.
         if (evt.result && typeof evt.result.success === 'boolean') {
             const summary = el('div', 'bubble system');
-            summary.appendChild(el('div', 'bubble-role', 'Final'));
             summary.appendChild(el('div', 'bubble-body',
                 (evt.result.success ? '✓ ' : '✗ ') +
                 (evt.result.message || '(no message)')));
@@ -418,6 +553,7 @@
     });
 
     handq.onError((evt) => {
+        if (gateGen(evt)) return;
         if (!evt) return;
         window.__handqLog('ERROR', 'onError', {
             type: evt.type,
@@ -427,8 +563,10 @@
             payload: window.__handqTrunc(evt, 200),
         });
         addErrorBubble(evt.message, evt.where);
+        recordEvent('error: ' + (evt.message || '(no message)'));
         if (evt.fatal) {
-            statusPill.textContent = 'fatal';
+            session.state = 'fatal';
+            setPill('fatal', { force: true });
         }
     });
 
@@ -443,29 +581,23 @@
 
         addUserBubble(text);
         composerInput.value = '';
-        // Pre-emptively start a fresh assistant bubble for the response.
         activeAssistantBubble = null;
+        // A new turn — release the "complete" pill lock so live status text
+        // resumes flowing.
+        clearCompleted();
 
         if (!firstSendDone) {
             firstSendDone = true;
             window.__handqLog('INFO', 'composer submit (first; type=request)',
                 { len: text.length, preview: window.__handqTrunc(text, 200) });
-            handq.sendRequest({
-                type: 'request',
-                goal: text,
-            });
+            handq.sendRequest({ type: 'request', goal: text });
         } else {
             window.__handqLog('INFO', 'composer submit (type=user_input)',
                 { len: text.length, preview: window.__handqTrunc(text, 200) });
-            handq.sendRequest({
-                type: 'user_input',
-                kind: 'message',
-                text: text,
-            });
+            handq.sendRequest({ type: 'user_input', kind: 'message', text: text });
         }
     });
 
-    // Enter to send, Shift+Enter for newline.
     composerInput.addEventListener('keydown', (e) => {
         if (e.key === 'Enter' && !e.shiftKey) {
             e.preventDefault();
@@ -473,28 +605,96 @@
         }
     });
 
-    // ----- view switching --------------------------------------------------
+    // ----- titlebar window controls ----------------------------------------
 
-    function showView(name) {
-        if (name === 'settings') {
-            viewChat.classList.add('hidden');
-            viewSettings.classList.remove('hidden');
-            navChat.classList.remove('active');
-            navSettings.classList.add('active');
-        } else {
-            viewSettings.classList.add('hidden');
-            viewChat.classList.remove('hidden');
-            navSettings.classList.remove('active');
-            navChat.classList.add('active');
-        }
+    if (winCtl) {
+        if (tbMin)   tbMin.addEventListener('click', () => winCtl.minimize());
+        if (tbMax)   tbMax.addEventListener('click', () => winCtl.toggleMaximize());
+        if (tbClose) tbClose.addEventListener('click', () => winCtl.hide());
+    } else {
+        window.__handqLog('WARN', 'windowControls preload bridge missing');
     }
-    navChat.addEventListener('click', () => showView('chat'));
-    navSettings.addEventListener('click', () => {
-        showView('settings');
+
+    // ----- overlay helpers -------------------------------------------------
+
+    function openOverlay(node) {
+        node.classList.remove('hidden');
+        node.setAttribute('aria-hidden', 'false');
+    }
+    function closeOverlay(node) {
+        node.classList.add('hidden');
+        node.setAttribute('aria-hidden', 'true');
+    }
+
+    // Click-outside on the overlay backdrop closes it.
+    overlayStatus.addEventListener('click', (e) => {
+        if (e.target === overlayStatus) closeOverlay(overlayStatus);
+    });
+    overlaySettings.addEventListener('click', (e) => {
+        if (e.target === overlaySettings) closeOverlay(overlaySettings);
+    });
+    statusCloseBtn.addEventListener('click', () => closeOverlay(overlayStatus));
+    settingsCancel.addEventListener('click', () => closeOverlay(overlaySettings));
+
+    window.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') {
+            if (!overlayStatus.classList.contains('hidden'))   closeOverlay(overlayStatus);
+            if (!overlaySettings.classList.contains('hidden')) closeOverlay(overlaySettings);
+        }
+    });
+
+    // ----- shortcut buttons ------------------------------------------------
+
+    scSettings.addEventListener('click', () => {
+        openOverlay(overlaySettings);
         loadConfig();
     });
 
-    // ----- settings: helpers ----------------------------------------------
+    scStatus.addEventListener('click', () => {
+        refreshStatusPanel();
+        openOverlay(overlayStatus);
+    });
+
+    scNew.addEventListener('click', () => {
+        // Real "new session": ask the bridge to tear down the current
+        // FlowController + services and reset the InteractionManager
+        // singleton, then wipe the conversation pane. The next composer
+        // submit goes out as a fresh `request` against a brand-new flow
+        // (see stdio_bridge.py:_do_new_session).
+        //
+        // CRITICAL: bump currentGen BEFORE sending. The old flow may
+        // still emit notify_* calls during the bridge's bounded drain
+        // (and indefinitely if it's wedged on a Windows blocking I/O
+        // that we can't kill — ssh_tool's run_in_executor, etc.). Any
+        // such envelope carries the OLD generation; with our watermark
+        // already at new gen, gateGen() drops them silently. The bridge
+        // confirms the actual new gen in the new_session final result —
+        // we sync via the max-rule in gateGen.
+        currentGen += 1;
+        window.__handqLog('INFO', 'scNew clicked — sending new_session',
+            { optimistic_gen: currentGen });
+        try {
+            handq.sendRequest({ type: 'new_session' });
+        } catch (err) {
+            window.__handqLog('ERROR', 'new_session dispatch failed',
+                { err: err && err.message });
+        }
+
+        conversation.innerHTML = '';
+        toolCardsByCallId.clear();
+        activeAssistantBubble = null;
+        firstSendDone = false;
+        clearCompleted();
+        session.state = 'idle';
+        session.progress = '';
+        session.currentStep = '';
+        session.events = [];
+        session.lastUpdate = '';
+        setPill('idle');
+        composerInput.focus();
+    });
+
+    // ----- settings form helpers (unchanged from prior implementation) -----
 
     function modelsToText(models) {
         if (!Array.isArray(models)) return '';
@@ -509,44 +709,121 @@
             .filter((s) => s.length > 0);
     }
 
+    const PLANNER_MIN_VERSION = [4, 5];
+
+    function modelVersion(modelStr) {
+        const name = String(modelStr).split('::').pop().split(':')[0];
+        let m = name.match(/claude-(\d+)-(\d+)-/);
+        if (m) return [parseInt(m[1], 10), parseInt(m[2], 10)];
+        m = name.match(/claude-(\d+)-[a-z]/);
+        if (m) return [parseInt(m[1], 10), 0];
+        return [0, 0];
+    }
+    function versionGte(a, b) {
+        if (a[0] !== b[0]) return a[0] > b[0];
+        return a[1] >= b[1];
+    }
+    function assignRoles(allModels) {
+        const all = Array.isArray(allModels) ? allModels.slice() : [];
+        const capable = all.filter((m) => versionGte(modelVersion(m), PLANNER_MIN_VERSION));
+        if (capable.length === 0) {
+            return {
+                agent: all.slice(),
+                planner: all.slice(),
+                receptionist: all.slice(),
+                helper: all.slice(),
+            };
+        }
+        const n = capable.length;
+        const opusN = capable.filter((m) => m.includes('opus')).length;
+        let recepSkip;
+        let fdataSkip;
+        if (opusN > 0) {
+            recepSkip = Math.min(opusN, n - 1);
+            fdataSkip = Math.min(opusN + 2, n - 1);
+        } else {
+            recepSkip = Math.min(1, n - 1);
+            fdataSkip = Math.min(2, n - 1);
+        }
+        return {
+            agent: all.slice(),
+            planner: capable.slice(),
+            receptionist: capable.slice(recepSkip),
+            helper: capable.slice(fdataSkip),
+        };
+    }
+
+    function selectRoleTab(role) {
+        const tabs = cfgLlmRoleTabs ? cfgLlmRoleTabs.querySelectorAll('.role-tab') : [];
+        tabs.forEach((btn) => {
+            const active = btn.dataset.role === role;
+            btn.classList.toggle('active', active);
+            btn.setAttribute('aria-selected', active ? 'true' : 'false');
+        });
+        for (const key of Object.keys(cfgLlmRolePanes)) {
+            const pane = cfgLlmRolePanes[key];
+            if (!pane) continue;
+            pane.hidden = (key !== role);
+        }
+    }
+    if (cfgLlmRoleTabs) {
+        cfgLlmRoleTabs.addEventListener('click', (e) => {
+            const btn = e.target && e.target.closest('.role-tab');
+            if (!btn) return;
+            const role = btn.dataset.role;
+            if (role) selectRoleTab(role);
+        });
+    }
+
     function showToast(message, kind) {
-        // kind: 'ok' | 'err'
         settingsToast.textContent = message;
         settingsToast.classList.remove('hidden', 'ok', 'err');
         settingsToast.classList.add(kind === 'err' ? 'err' : 'ok');
-        // Auto-hide after 4s.
         clearTimeout(showToast._t);
         showToast._t = setTimeout(() => {
             settingsToast.classList.add('hidden');
         }, 4000);
     }
 
-    // ----- settings: load --------------------------------------------------
-
     function applyConfigToForm(cfg) {
         cfg = cfg || {};
-        // Stash the full original so hidden fields round-trip on Save.
         originalConfig = JSON.parse(JSON.stringify(cfg));
 
-        const llm = cfg.llm || {};
-        const session = cfg.session || {};
+        const llm      = cfg.llm || {};
+        const sessCfg  = cfg.session || {};
         const switches = cfg.interaction_switches || {};
 
         cfgLlmApiKey.value =
-            (llm.API_KEY === undefined || llm.API_KEY === null)
-                ? '' : String(llm.API_KEY);
+            (llm.API_KEY === undefined || llm.API_KEY === null) ? '' : String(llm.API_KEY);
         cfgLlmMaxTokens.value =
-            (llm.max_tokens === undefined || llm.max_tokens === null)
-                ? '' : String(llm.max_tokens);
-        cfgLlmModels.value = modelsToText(llm.models);
+            (llm.max_tokens === undefined || llm.max_tokens === null) ? '' : String(llm.max_tokens);
 
-        cfgSessionLogLevel.value = session.log_level || '';
+        const rolesObj = (llm.roles && typeof llm.roles === 'object') ? llm.roles : null;
+        if (rolesObj) {
+            cfgLlmRolePanes.planner.value      = modelsToText(rolesObj.planner);
+            cfgLlmRolePanes.receptionist.value = modelsToText(rolesObj.receptionist);
+            cfgLlmRolePanes.agent.value        = modelsToText(rolesObj.agent);
+            cfgLlmRolePanes.helper.value       = modelsToText(rolesObj.helper);
+        } else if (Array.isArray(llm.models) && llm.models.length > 0) {
+            const derived = assignRoles(llm.models);
+            cfgLlmRolePanes.planner.value      = modelsToText(derived.planner);
+            cfgLlmRolePanes.receptionist.value = modelsToText(derived.receptionist);
+            cfgLlmRolePanes.agent.value        = modelsToText(derived.agent);
+            cfgLlmRolePanes.helper.value       = modelsToText(derived.helper);
+        } else {
+            cfgLlmRolePanes.planner.value      = '';
+            cfgLlmRolePanes.receptionist.value = '';
+            cfgLlmRolePanes.agent.value        = '';
+            cfgLlmRolePanes.helper.value       = '';
+        }
+        selectRoleTab('planner');
+
+        cfgSessionLogLevel.value = sessCfg.log_level || '';
         cfgSessionStepThreshold.value =
-            (session.step_verification_threshold === undefined ||
-             session.step_verification_threshold === null)
-                ? '' : String(session.step_verification_threshold);
-        cfgSessionWorkspaceBase.value = session.workspace_base || '';
-        cfgSessionVenvPath.value = session.venv_path || '';
+            (sessCfg.step_verification_threshold === undefined ||
+             sessCfg.step_verification_threshold === null)
+                ? '' : String(sessCfg.step_verification_threshold);
+        cfgSessionVenvPath.value = sessCfg.venv_path || '';
 
         function readSwitch(name) {
             const v = switches[name];
@@ -556,33 +833,23 @@
             return false;
         }
         cfgSwToolWrite.checked = readSwitch('tool_write');
-        cfgSwToolEdit.checked = readSwitch('tool_edit');
-        cfgSwToolBash.checked = readSwitch('tool_bash');
-        cfgSwHighRisk.checked = readSwitch('high_risk');
+        cfgSwToolEdit.checked  = readSwitch('tool_edit');
+        cfgSwToolBash.checked  = readSwitch('tool_bash');
+        cfgSwHighRisk.checked  = readSwitch('high_risk');
     }
 
     function readFormToConfig() {
-        // Start from a deep clone of the original so version, api_key_env,
-        // high_risk_commands, switch descriptions, and any other fields the
-        // UI does not surface are preserved verbatim.
         const out = originalConfig
             ? JSON.parse(JSON.stringify(originalConfig))
             : {};
-
-        const llm = out.llm && typeof out.llm === 'object' ? out.llm : {};
-        const session = out.session && typeof out.session === 'object'
-            ? out.session : {};
+        const llm      = out.llm     && typeof out.llm     === 'object' ? out.llm     : {};
+        const sess     = out.session && typeof out.session === 'object' ? out.session : {};
         const switches = out.interaction_switches
             && typeof out.interaction_switches === 'object'
                 ? out.interaction_switches : {};
 
-        // Hard cut on the legacy api_key_env / api_key fields — they are no
-        // longer read by the backend, and we don't want to leave stale values
-        // in the YAML that could confuse later editors.
         if ('api_key_env' in llm) delete llm.api_key_env;
         if ('api_key' in llm) delete llm.api_key;
-
-        // llm.API_KEY — empty string means "clear it" so we still set it.
         llm.API_KEY = cfgLlmApiKey.value;
 
         if (cfgLlmMaxTokens.value === '') {
@@ -591,29 +858,27 @@
             const n = parseInt(cfgLlmMaxTokens.value, 10);
             if (!Number.isNaN(n)) llm.max_tokens = n;
         }
-        llm.models = textToModels(cfgLlmModels.value);
 
-        if (cfgSessionLogLevel.value) {
-            session.log_level = cfgSessionLogLevel.value;
-        } else {
-            delete session.log_level;
-        }
+        if ('models' in llm) delete llm.models;
+        llm.roles = {
+            planner:      textToModels(cfgLlmRolePanes.planner.value),
+            receptionist: textToModels(cfgLlmRolePanes.receptionist.value),
+            agent:        textToModels(cfgLlmRolePanes.agent.value),
+            helper:       textToModels(cfgLlmRolePanes.helper.value),
+        };
+
+        if (cfgSessionLogLevel.value) sess.log_level = cfgSessionLogLevel.value;
+        else delete sess.log_level;
+
         if (cfgSessionStepThreshold.value === '') {
-            delete session.step_verification_threshold;
+            delete sess.step_verification_threshold;
         } else {
             const f = parseFloat(cfgSessionStepThreshold.value);
-            if (!Number.isNaN(f)) session.step_verification_threshold = f;
+            if (!Number.isNaN(f)) sess.step_verification_threshold = f;
         }
-        if (cfgSessionWorkspaceBase.value) {
-            session.workspace_base = cfgSessionWorkspaceBase.value;
-        } else {
-            delete session.workspace_base;
-        }
-        if (cfgSessionVenvPath.value) {
-            session.venv_path = cfgSessionVenvPath.value;
-        } else {
-            delete session.venv_path;
-        }
+        if ('workspace_base' in sess) delete sess.workspace_base;
+        if (cfgSessionVenvPath.value) sess.venv_path = cfgSessionVenvPath.value;
+        else delete sess.venv_path;
 
         function writeSwitch(name, checked) {
             if (!switches[name] || typeof switches[name] !== 'object') {
@@ -622,12 +887,12 @@
             switches[name].auto_approve = Boolean(checked);
         }
         writeSwitch('tool_write', cfgSwToolWrite.checked);
-        writeSwitch('tool_edit', cfgSwToolEdit.checked);
-        writeSwitch('tool_bash', cfgSwToolBash.checked);
-        writeSwitch('high_risk', cfgSwHighRisk.checked);
+        writeSwitch('tool_edit',  cfgSwToolEdit.checked);
+        writeSwitch('tool_bash',  cfgSwToolBash.checked);
+        writeSwitch('high_risk',  cfgSwHighRisk.checked);
 
         out.llm = llm;
-        out.session = session;
+        out.session = sess;
         out.interaction_switches = switches;
         return out;
     }
@@ -644,24 +909,40 @@
         }).catch((err) => {
             window.__handqLog('ERROR', 'loadConfig: failure',
                 { err: err && err.message });
-            settingsStatus.textContent =
-                'load failed: ' + (err && err.message);
+            settingsStatus.textContent = 'load failed: ' + (err && err.message);
             showToast('Load failed: ' + (err && err.message), 'err');
         });
     }
 
     settingsLoadBtn.addEventListener('click', loadConfig);
 
-    // Show/Hide toggle for the API_KEY input.
     if (cfgLlmApiKeyToggle) {
-        cfgLlmApiKeyToggle.addEventListener('click', () => {
-            const masked = cfgLlmApiKey.type === 'password';
-            cfgLlmApiKey.type = masked ? 'text' : 'password';
-            cfgLlmApiKeyToggle.textContent = masked ? 'Hide' : 'Show';
-            cfgLlmApiKeyToggle.setAttribute(
-                'aria-label',
-                masked ? 'Hide API key' : 'Show API key',
-            );
+        const eyeShow = cfgLlmApiKeyToggle.querySelector('.eye-show');
+        const eyeHide = cfgLlmApiKeyToggle.querySelector('.eye-hide');
+
+        function applyEyeState(revealed) {
+            if (eyeShow) {
+                eyeShow.style.display = revealed ? 'none' : '';
+                eyeShow.removeAttribute('hidden');
+                if (revealed) eyeShow.setAttribute('hidden', '');
+            }
+            if (eyeHide) {
+                eyeHide.style.display = revealed ? '' : 'none';
+                eyeHide.removeAttribute('hidden');
+                if (!revealed) eyeHide.setAttribute('hidden', '');
+            }
+            const labelText = revealed ? 'Hide API key' : 'Show API key';
+            cfgLlmApiKeyToggle.setAttribute('aria-label', labelText);
+            cfgLlmApiKeyToggle.setAttribute('title', labelText);
+            cfgLlmApiKeyToggle.setAttribute('aria-pressed', revealed ? 'true' : 'false');
+        }
+        applyEyeState(cfgLlmApiKey.type !== 'password');
+
+        cfgLlmApiKeyToggle.addEventListener('click', (e) => {
+            e.preventDefault();
+            const wasMasked = cfgLlmApiKey.type === 'password';
+            cfgLlmApiKey.type = wasMasked ? 'text' : 'password';
+            applyEyeState(cfgLlmApiKey.type === 'text');
         });
     }
 
@@ -673,22 +954,16 @@
             { config: window.__handqRedact(cfg) });
         handq.setConfig(cfg).then((result) => {
             if (result && result.saved) {
-                window.__handqLog('INFO', 'settings submit: saved',
-                    { path: result.path });
                 settingsStatus.textContent = 'saved';
                 showToast('Settings saved.', 'ok');
+                // Per spec: clicking Save returns the user to the chat view.
+                setTimeout(() => closeOverlay(overlaySettings), 350);
             } else {
-                window.__handqLog('WARN',
-                    'settings submit: save returned no confirmation',
-                    { result: result });
                 settingsStatus.textContent = 'save returned no confirmation';
                 showToast('Save returned no confirmation.', 'err');
             }
         }).catch((err) => {
-            window.__handqLog('ERROR', 'settings submit: failure',
-                { err: err && err.message });
-            settingsStatus.textContent =
-                'save failed: ' + (err && err.message);
+            settingsStatus.textContent = 'save failed: ' + (err && err.message);
             showToast('Save failed: ' + (err && err.message), 'err');
         });
     });

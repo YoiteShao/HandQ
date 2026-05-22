@@ -14,7 +14,7 @@
 
 'use strict';
 
-const { app, BrowserWindow, ipcMain } = require('electron');
+const { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const { spawn } = require('child_process');
@@ -79,11 +79,22 @@ function computeLaunchTimestamp() {
 }
 
 const LAUNCH_TS = computeLaunchTimestamp();
-// In dev, logs sit beside the repo for easy inspection. In a packaged build,
-// the resources/ tree is read-only (and may live inside app.asar), so we use
-// the per-user writable location app.getPath('userData') instead.
+// Log layout (see ARCHITECTURE.md §3):
+//   * Dev mode  -> <repo>/logs/<TS>/   (kept under repo for easy inspection)
+//   * Packaged  -> %LOCALAPPDATA%\HandQ\logs\<TS>\
+//
+// Logs deliberately live in LocalAppData, NOT in app.getPath('userData')
+// (Roaming) — they are large, machine-specific, and shouldn't follow the user
+// across machines. User-owned data (config, session History) lives in
+// %USERPROFILE%\HandQ\ instead, which is the bridge's per-user root.
+function packagedLogBase() {
+    const localAppData =
+        process.env.LOCALAPPDATA ||
+        path.join(app.getPath('home'), 'AppData', 'Local');
+    return path.join(localAppData, 'HandQ', 'logs');
+}
 const LOG_BASE = app.isPackaged
-    ? path.join(app.getPath('userData'), 'logs')
+    ? packagedLogBase()
     : path.join(REPO_ROOT, 'logs');
 const LOG_DIR = path.join(LOG_BASE, LAUNCH_TS);
 try {
@@ -136,6 +147,8 @@ function redactApiKey(payload) {
 // --- module-level state ----------------------------------------------------
 
 let mainWindow = null;
+let tray = null;
+let isQuitting = false;
 let pythonChild = null;
 let stdoutReader = null;
 let isShuttingDown = false;
@@ -285,12 +298,180 @@ function spawnBridge() {
     return child;
 }
 
+// Procedurally-built 16x16 tray icon — a white "H" on a tinted-blue square,
+// with the corner pixels chipped to suggest a rounded shape. We build the PNG
+// in-memory (zlib + manual CRC32) so the renderer doesn't need a bundled file
+// asset; if a user-supplied electron/tray-icon.png is dropped in alongside,
+// it takes precedence.
+const TRAY_ICON_FILE = path.join(__dirname, 'tray-icon.png');
+
+const _crcTable = (() => {
+    const t = new Uint32Array(256);
+    for (let i = 0; i < 256; i++) {
+        let c = i;
+        for (let k = 0; k < 8; k++) {
+            c = (c & 1) ? (0xedb88320 ^ (c >>> 1)) : (c >>> 1);
+        }
+        t[i] = c >>> 0;
+    }
+    return t;
+})();
+
+function _pngCrc32(buf) {
+    let c = 0xffffffff;
+    for (let i = 0; i < buf.length; i++) {
+        c = _crcTable[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
+    }
+    return (c ^ 0xffffffff) >>> 0;
+}
+
+function _pngChunk(type, data) {
+    const len = Buffer.alloc(4);
+    len.writeUInt32BE(data.length, 0);
+    const typeBuf = Buffer.from(type, 'ascii');
+    const crcInput = Buffer.concat([typeBuf, data]);
+    const crc = Buffer.alloc(4);
+    crc.writeUInt32BE(_pngCrc32(crcInput), 0);
+    return Buffer.concat([len, typeBuf, data, crc]);
+}
+
+function buildHandqIconPng() {
+    const zlib = require('zlib');
+    const SIZE = 16;
+    // Pixel pattern: 'B' = tint background, 'F' = white foreground,
+    // '.' = transparent (corner chip).
+    const PATTERN = [
+        '..BBBBBBBBBBBB..',
+        '.BBBBBBBBBBBBBB.',
+        'BBFFBBBBBBBBFFBB',
+        'BBFFBBBBBBBBFFBB',
+        'BBFFBBBBBBBBFFBB',
+        'BBFFBBBBBBBBFFBB',
+        'BBFFBBBBBBBBFFBB',
+        'BBFFFFFFFFFFFFBB',
+        'BBFFFFFFFFFFFFBB',
+        'BBFFBBBBBBBBFFBB',
+        'BBFFBBBBBBBBFFBB',
+        'BBFFBBBBBBBBFFBB',
+        'BBFFBBBBBBBBFFBB',
+        'BBFFBBBBBBBBFFBB',
+        '.BBBBBBBBBBBBBB.',
+        '..BBBBBBBBBBBB..',
+    ];
+    const TINT = [60, 124, 224, 255];   // Apple-ish blue
+    const FORE = [255, 255, 255, 255];  // white H
+    const TRANS = [0, 0, 0, 0];
+
+    const rowBytes = SIZE * 4 + 1; // 1 filter byte per row + RGBA
+    const raw = Buffer.alloc(rowBytes * SIZE);
+    for (let y = 0; y < SIZE; y++) {
+        raw[y * rowBytes] = 0; // filter: None
+        for (let x = 0; x < SIZE; x++) {
+            const ch = PATTERN[y][x];
+            const c = ch === 'F' ? FORE : ch === 'B' ? TINT : TRANS;
+            const idx = y * rowBytes + 1 + x * 4;
+            raw[idx]     = c[0];
+            raw[idx + 1] = c[1];
+            raw[idx + 2] = c[2];
+            raw[idx + 3] = c[3];
+        }
+    }
+
+    // IHDR
+    const ihdr = Buffer.alloc(13);
+    ihdr.writeUInt32BE(SIZE, 0);
+    ihdr.writeUInt32BE(SIZE, 4);
+    ihdr[8]  = 8; // bit depth
+    ihdr[9]  = 6; // color type RGBA
+    ihdr[10] = 0; // compression
+    ihdr[11] = 0; // filter
+    ihdr[12] = 0; // interlace
+
+    const idat = zlib.deflateSync(raw);
+    const sig  = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+    return Buffer.concat([
+        sig,
+        _pngChunk('IHDR', ihdr),
+        _pngChunk('IDAT', idat),
+        _pngChunk('IEND', Buffer.alloc(0)),
+    ]);
+}
+
+function buildTrayIcon() {
+    // 1) User override: electron/tray-icon.png if a real artist drops one in.
+    try {
+        if (fs.existsSync(TRAY_ICON_FILE)) {
+            const img = nativeImage.createFromPath(TRAY_ICON_FILE);
+            if (img && !img.isEmpty()) return img;
+        }
+    } catch (_) { /* fall through */ }
+    // 2) Procedurally-built 16x16 H-on-blue.
+    try {
+        const png = buildHandqIconPng();
+        const img = nativeImage.createFromBuffer(png);
+        if (img && !img.isEmpty()) return img;
+    } catch (err) {
+        logLine('TRAY', 'PNG synthesis failed', { err: err && err.message });
+    }
+    return nativeImage.createEmpty();
+}
+
+function ensureTray() {
+    if (tray) return;
+    try {
+        tray = new Tray(buildTrayIcon());
+    } catch (err) {
+        logLine('TRAY', 'tray create failed', { err: err && err.message });
+        return;
+    }
+    tray.setToolTip('HandQ');
+    tray.setContextMenu(Menu.buildFromTemplate([
+        {
+            label: 'Show HandQ',
+            click: () => {
+                if (!mainWindow) return;
+                if (mainWindow.isMinimized()) mainWindow.restore();
+                mainWindow.show();
+                mainWindow.focus();
+            },
+        },
+        { type: 'separator' },
+        {
+            label: 'Quit',
+            click: () => {
+                isQuitting = true;
+                app.quit();
+            },
+        },
+    ]));
+    tray.on('click', () => {
+        if (!mainWindow) return;
+        if (mainWindow.isVisible()) {
+            mainWindow.focus();
+        } else {
+            mainWindow.show();
+            mainWindow.focus();
+        }
+    });
+    logLine('TRAY', 'tray installed');
+}
+
 function createWindow() {
     logLine('MAIN', 'creating BrowserWindow');
     mainWindow = new BrowserWindow({
         width: 1200,
         height: 800,
+        minWidth: 720,
+        minHeight: 480,
         title: 'HandQ',
+        frame: false,
+        titleBarStyle: 'hidden',
+        // Match the page's gradient base so resizing never reveals a strip
+        // of OS desktop colour around the edge. The "liquid glass" look is
+        // produced by CSS gradients + backdrop-filter, not by OS-level
+        // transparency (which causes flicker on Win resize).
+        backgroundColor: '#f4f6fb',
+        autoHideMenuBar: true,
         webPreferences: {
             preload: path.join(__dirname, 'preload.js'),
             contextIsolation: true,
@@ -298,8 +479,22 @@ function createWindow() {
             sandbox: true,
         },
     });
+    // No native menu bar (Alt won't reveal it either).
+    mainWindow.setMenuBarVisibility(false);
 
     mainWindow.loadFile(path.join(__dirname, 'renderer', 'index.html'));
+
+    // Close behavior: hide to tray instead of quitting, unless the user picked
+    // "Quit" from the tray menu (sets isQuitting). Minimize is left alone so
+    // it still goes to the taskbar like a normal window.
+    mainWindow.on('close', (e) => {
+        if (!isQuitting) {
+            e.preventDefault();
+            mainWindow.hide();
+            ensureTray();
+            logLine('MAIN', 'main window close intercepted; hidden to tray');
+        }
+    });
 
     mainWindow.on('closed', () => {
         logLine('MAIN', 'main window closed');
@@ -328,11 +523,15 @@ if (!gotLock) {
             log_file: LOG_FILE,
         });
         pythonChild = spawnBridge();
+        ensureTray();
         createWindow();
 
         app.on('activate', () => {
             if (BrowserWindow.getAllWindows().length === 0) {
                 createWindow();
+            } else if (mainWindow) {
+                mainWindow.show();
+                mainWindow.focus();
             }
         });
     });
@@ -384,9 +583,29 @@ ipcMain.on('handq:log', (_event, payload) => {
     logLine(component, msg, payload.extra);
 });
 
+// Custom titlebar -> main control IPC. The window is frameless, so the
+// renderer ships its own min/max/close buttons and asks main to drive them.
+ipcMain.on('window:minimize', () => {
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.minimize();
+});
+ipcMain.on('window:toggle-maximize', () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    if (mainWindow.isMaximized()) {
+        mainWindow.unmaximize();
+    } else {
+        mainWindow.maximize();
+    }
+});
+ipcMain.on('window:hide', () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    mainWindow.hide();
+    ensureTray();
+});
+
 // --- graceful shutdown -----------------------------------------------------
 
 app.on('before-quit', (event) => {
+    isQuitting = true;
     if (isShuttingDown) {
         return; // second click — let the default quit flow proceed.
     }
@@ -431,8 +650,10 @@ app.on('before-quit', (event) => {
 });
 
 app.on('window-all-closed', () => {
-    // On macOS apps usually stay alive until Cmd-Q; on Windows/Linux quit
-    // immediately so the bridge child is reaped.
+    // We hide-to-tray on the user's "close" click rather than destroy the
+    // window, so this fires only when the window is actually destroyed (e.g.
+    // tray "Quit"). Reap the bridge unconditionally on Windows/Linux; on
+    // macOS apps stay alive until Cmd-Q.
     logLine('MAIN', 'window-all-closed', { platform: process.platform });
     if (process.platform !== 'darwin') {
         app.quit();

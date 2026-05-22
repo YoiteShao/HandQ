@@ -784,10 +784,11 @@ def cmd_config(config_path: Optional[str] = None) -> int:
 def cmd_models(config_path: Optional[str] = None) -> int:
     """Print the model-to-role assignment derived from the current config."""
     import yaml
+    from src.infrastructure.role_resolver import resolve_role_models, used_legacy_models
     cfg_path = Path(config_path) if config_path else DEFAULT_CONFIG
     try:
         cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
-        all_models = cfg.get("llm", {}).get("models", [])
+        llm_cfg = cfg.get("llm", {}) or {}
     except FileNotFoundError:
         print(f"HandQ: config file not found: {cfg_path}", file=sys.stderr)
         return 1
@@ -795,24 +796,30 @@ def cmd_models(config_path: Optional[str] = None) -> int:
         print(f"HandQ: error reading config: {exc}", file=sys.stderr)
         return 1
 
-    if not all_models:
-        print("HandQ: no models configured.", file=sys.stderr)
+    legacy = used_legacy_models(llm_cfg)
+    roles = resolve_role_models(llm_cfg)
+
+    if not any(roles.values()):
+        print("HandQ: no models configured (set llm.roles in handq_config.yaml).",
+              file=sys.stderr)
         return 1
 
-    roles = _assign_roles(all_models)
-    scheme = "opus" if any("opus" in m for m in roles["planner"]) else "sonnet"
-
     def _fmt(models: list) -> str:
+        if not models:
+            return "    (empty)"
         return "\n".join(f"    [{i}] {m}" for i, m in enumerate(models))
 
-    print(f"\nHandQ Model Assignment  (scheme: {scheme})\n")
+    print("\nHandQ Model Assignment\n")
+    if legacy:
+        print("  (derived from legacy llm.models — will be migrated to "
+              "llm.roles on next Save in the Settings UI)\n")
     print(f"  Agent  ({len(roles['agent'])} models, max_retries=3)")
     print(_fmt(roles["agent"]))
     print(f"\n  Planner  ({len(roles['planner'])} models, max_retries=50, dedicated instances)")
     print(_fmt(roles["planner"]))
     print(f"\n  Receptionist  ({len(roles['receptionist'])} models, max_retries=3)")
     print(_fmt(roles["receptionist"]))
-    print(f"\n  from_data / error_explain  ({len(roles['from_data'])} models, max_retries=3)")
+    print(f"\n  Helper  ({len(roles['from_data'])} models, max_retries=3)  [internal: from_data / error_explain]")
     print(_fmt(roles["from_data"]))
     print()
     return 0
@@ -2283,75 +2290,8 @@ async def _run_flow_bg(flow, tty_path: Optional[str] = None) -> None:
 
 
 # ---------------------------------------------------------------------------
-# LLM role assignment
+# LLM role assignment — moved to src.infrastructure.role_resolver
 # ---------------------------------------------------------------------------
-
-def _model_version(model_str: str) -> tuple:
-    """Return (major, minor) version tuple from a model string.
-
-    Examples:
-        "anthropic::claude-4-6-sonnet:1M" -> (4, 6)
-        "anthropic::claude-4-5-haiku:thinking" -> (4, 5)
-        "anthropic::claude-4-sonnet"       -> (4, 0)
-        "anthropic::claude-3-7-sonnet"     -> (3, 7)
-    """
-    import re
-    name = model_str.split("::")[-1].split(":")[0]   # "claude-4-6-sonnet"
-    if m := re.search(r"claude-(\d+)-(\d+)-", name):
-        return int(m.group(1)), int(m.group(2))
-    if m := re.search(r"claude-(\d+)-[a-z]", name):
-        return int(m.group(1)), 0
-    return (0, 0)
-
-
-_PLANNER_MIN_VERSION = (4, 5)  # Claude 4-5 and above are planner-capable
-
-
-def _assign_roles(all_models: list) -> dict:
-    """Assign models to roles based on capability and opus availability.
-
-    Returns a dict with keys: agent, planner, receptionist, from_data.
-    Each value is a list of model strings (ordered best-first).
-
-    Two schemes based on whether opus models are present:
-
-      Opus scheme  — receptionist skips all opus models (starts at best sonnet);
-                     from_data skips opus + top 2 sonnet (starts at 4-5-sonnet).
-      Sonnet scheme — receptionist skips index 0 (1M variant);
-                      from_data skips indices 0-1.
-
-    All roles always retain a full fallback tail.
-    """
-    capable = [m for m in all_models if _model_version(m) >= _PLANNER_MIN_VERSION]
-    if not capable:
-        # No capable models — all roles degrade to full list with a warning.
-        import warnings
-        warnings.warn(
-            "No planner-capable models (Claude 4-5+) found. "
-            "All roles will use the full model list.",
-            UserWarning,
-        )
-        return dict(agent=all_models, planner=all_models,
-                    receptionist=all_models, from_data=all_models)
-
-    n = len(capable)
-    opus_n = sum(1 for m in capable if "opus" in m)
-
-    if opus_n:
-        # Opus scheme: receptionist/from_data never compete for opus quota.
-        recep_skip = min(opus_n,     n - 1)   # start after all opus
-        fdata_skip = min(opus_n + 2, n - 1)   # start after opus + top-2 sonnet
-    else:
-        # Sonnet scheme: receptionist skips top-1; from_data skips top-2.
-        recep_skip = min(1, n - 1)
-        fdata_skip = min(2, n - 1)
-
-    return dict(
-        agent=all_models,
-        planner=capable,
-        receptionist=capable[recep_skip:],
-        from_data=capable[fdata_skip:],
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -2382,6 +2322,7 @@ def _build_session(
     _d("OK: FlowController")
     # from qgenie_service import QGenieLLMService  # type: ignore  # TODO: re-enable Qgenie support
     from src.infrastructure.anthropic_streaming_service import AnthropicStreamingService
+    from src.infrastructure.role_resolver import resolve_role_models
     _d("OK: AnthropicStreamingService")
     cfg_path = Path(config_path) if config_path else DEFAULT_CONFIG
     try:
@@ -2393,8 +2334,9 @@ def _build_session(
     llm_cfg       = config.get("llm", {})
     api_key_val   = llm_cfg.get("API_KEY") or ""
     max_tokens    = llm_cfg.get("max_tokens", None)
-    # Unified model list: index 0 = primary/best, index 1+ = fallbacks in priority order.
-    all_models    = llm_cfg.get("models", [])
+    # Per-role model lists. Internal keys: agent / planner / receptionist / from_data
+    # (helper at the YAML/UI boundary maps to from_data internally).
+    roles         = resolve_role_models(llm_cfg)
     log_level_str = config.get("session", {}).get("log_level", "INFO")
     threshold     = float(config.get("session", {}).get(
         "step_verification_threshold",
@@ -2418,11 +2360,10 @@ def _build_session(
     )
     _d("OK: initialize_logger")
 
-    # Build one LLMService per model in priority order.
-    # Currently only Anthropic models (prefixed with "anthropic::") are supported.
-    # TODO: re-enable QGenie support for non-Anthropic models.
-    # Build one LLMService per model; role assignment happens below.
-    _d(f"API_KEY_present={bool(api_key_val)}  models={all_models}")
+    # Build one LLMService per unique model (across roles), then index into svc_map
+    # for agent/receptionist/from_data.  Planner gets fresh dedicated instances
+    # with max_retries=50, kept separate so its retry budget is never shared.
+    _d(f"API_KEY_present={bool(api_key_val)}  roles={ {k: len(v) for k, v in roles.items()} }")
 
     def _make_service(m: str, max_retries: int) -> "LLMService":
         if m.startswith("anthropic::"):
@@ -2443,16 +2384,26 @@ def _build_session(
             f"Unsupported model '{m}': only Anthropic models (anthropic::...) are supported."
         )
 
-    all_llm_services = [_make_service(m, max_retries=3) for m in all_models]
-    _d(f"OK: LLM services ({len(all_llm_services)})")
+    # Shared services for non-planner roles. Dedup so the same model isn't
+    # instantiated twice when it appears in agent + receptionist + from_data.
+    shared_models: list = []
+    for role_key in ("agent", "receptionist", "from_data"):
+        for m in roles.get(role_key, []):
+            if m not in shared_models:
+                shared_models.append(m)
+    svc_map = {m: _make_service(m, max_retries=3) for m in shared_models}
 
-    # Assign models to roles; planner gets dedicated high-retry instances.
-    roles = _assign_roles(all_models)
-    svc_map = {m: svc for m, svc in zip(all_models, all_llm_services)}
-    agent_services       = all_llm_services
-    receptionist_services = [svc_map[m] for m in roles["receptionist"]]
-    from_data_services    = [svc_map[m] for m in roles["from_data"]]
-    planner_services      = [_make_service(m, max_retries=50) for m in roles["planner"]]
+    agent_services        = [svc_map[m] for m in roles.get("agent", [])]
+    receptionist_services = [svc_map[m] for m in roles.get("receptionist", [])]
+    from_data_services    = [svc_map[m] for m in roles.get("from_data", [])]
+    planner_services      = [_make_service(m, max_retries=50) for m in roles.get("planner", [])]
+
+    if not agent_services:
+        raise ValueError(
+            "No agent models configured. Set llm.roles.agent in handq_config.yaml "
+            "(or the legacy llm.models list)."
+        )
+
     _d(f"OK: role services  planner={len(planner_services)}"
        f"  receptionist={len(receptionist_services)}"
        f"  from_data={len(from_data_services)}"
@@ -2473,7 +2424,11 @@ def _build_session(
     )
     _d("OK: FlowController")
 
-    return flow, agent_services, str(session_dir)
+    # Return every service the caller must close on shutdown — dedup by identity
+    # so the shared svc_map instances aren't closed twice. Planner services are
+    # always distinct (their own max_retries=50 instances), so include them all.
+    all_services: list = list(svc_map.values()) + planner_services
+    return flow, all_services, str(session_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -2771,7 +2726,7 @@ def _run_idle_background(tty_path: Optional[str], config_path: Optional[str], sh
 
     try:
         _dbg("building session (_build_session)...")
-        flow, agent_services, _ = _build_session(
+        flow, all_llm_services, _ = _build_session(
             config_path=config_path, session_id=session_id,
             shell_context_path=shell_context_path,
             _dbg_fn=_dbg,
@@ -2806,7 +2761,7 @@ def _run_idle_background(tty_path: Optional[str], config_path: Optional[str], sh
             pass
 
     try:
-        for svc in agent_services:
+        for svc in all_llm_services:
             asyncio.run(svc.close())
     except Exception:
         pass

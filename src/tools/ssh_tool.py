@@ -59,6 +59,12 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from .base_tool import BaseTool, ToolResult
+from .cancellation import (
+    AbortHandle,
+    current_abort,
+    interruptible_sleep,
+    run_with_abort_handle,
+)
 
 # ── Dependency checks ─────────────────────────────────────────────────────────
 
@@ -117,12 +123,20 @@ _os_cache_lock = threading.Lock()
 
 
 def _rate_limit(host_key: str) -> None:
-    """Block until the minimum inter-connection interval has elapsed."""
+    """Block until the minimum inter-connection interval has elapsed.
+
+    Honors the current invocation's interrupt token (set by
+    cancellation.run_with_abort_handle on the executor thread). When the
+    bridge fires `new_session` mid-rate-limit, the wait short-circuits
+    and we raise InterruptedError so the caller bails out cleanly
+    instead of completing the now-pointless connection setup.
+    """
     with _connect_lock:
         last = _connect_timestamps.get(host_key, 0.0)
         wait = _MIN_CONNECT_INTERVAL - (time.monotonic() - last)
         if wait > 0:
-            time.sleep(wait)
+            if interruptible_sleep(wait):
+                raise InterruptedError("ssh: rate-limit aborted")
         _connect_timestamps[host_key] = time.monotonic()
 
 
@@ -185,6 +199,35 @@ def _pool_evict(host_key: str) -> None:
         _conn_pool_last_used.pop(host_key, None)
     if client is not None:
         _linger_close(client)
+
+
+def flush_connection_pool() -> int:
+    """Close every pooled SSHClient and clear the pool + rate-limit state.
+
+    Called by the bridge's new_session path so the new generation never
+    inherits paramiko clients (or rate-limit cooldowns, or OS-detection
+    cache entries) from the old flow. Returns the number of clients
+    that were closed, for diagnostic logging.
+
+    Cross-platform: paramiko.SSHClient.close() and the underlying
+    socket.close() behave identically on Windows and POSIX. The
+    SO_LINGER setsockopt path is best-effort and may be a no-op on
+    Windows if the platform rejects the option, but the close itself
+    always works.
+    """
+    closed = 0
+    with _conn_pool_lock:
+        clients = list(_conn_pool.values())
+        _conn_pool.clear()
+        _conn_pool_last_used.clear()
+    for client in clients:
+        _linger_close(client)
+        closed += 1
+    with _connect_lock:
+        _connect_timestamps.clear()
+    with _os_cache_lock:
+        _os_cache.clear()
+    return closed
 
 
 def _linger_close(client: Any) -> None:
@@ -486,7 +529,12 @@ def _new_client(
             break
 
         if _attempt < _MAX_RETRIES:
-            time.sleep(_BASE_DELAY * (2 ** _attempt))
+            # Exponential backoff between retries — up to ~32s on attempt 5.
+            # interruptible_sleep returns True if the engine fired stop
+            # while we were waiting, so the user clicking New mid-retry
+            # aborts cleanly instead of riding out the full backoff.
+            if interruptible_sleep(_BASE_DELAY * (2 ** _attempt)):
+                raise InterruptedError("ssh: connect-retry aborted")
 
     if not connected or client is None:
         raise ConnectionError(
@@ -555,6 +603,30 @@ def _connect(creds: Dict[str, Any]):
         client = _new_client(creds, host_key)
         _pool_put(host_key, client)
 
+    # Register a force-terminate hook so the bridge's new_session path
+    # can abort an in-flight paramiko call from another thread. Closing
+    # the transport from the asyncio thread wakes any blocking recv()
+    # / exec_command() on the executor thread (paramiko documents this
+    # as thread-safe; cross-platform). Idempotent — fires at most once.
+    abort = current_abort()
+    abort_unregistered = False
+    if abort is not None:
+        client_ref = client  # bind for the closure
+
+        def _force_close() -> None:
+            try:
+                _linger_close(client_ref)
+            except Exception:
+                pass
+            # The pool entry now points at a closed client; evict it so
+            # the next caller doesn't pick up a dead handle.
+            try:
+                _pool_evict(host_key)
+            except Exception:
+                pass
+
+        abort.register(_force_close)
+
     try:
         yield client, host_key
         # Successful use — refresh the idle timer.
@@ -606,7 +678,11 @@ def _exec_command(
             while channel.recv_stderr_ready():
                 stderr_buf.append(channel.recv_stderr(65536))
             break
-        time.sleep(0.05)
+        # 50ms poll tick. Honor the interrupt token so the engine's stop
+        # signal aborts the wait immediately instead of riding out the
+        # remainder of the timeout window.
+        if interruptible_sleep(0.05):
+            raise InterruptedError("ssh: exec-poll aborted")
 
     stdout_text = b"".join(stdout_buf).decode("utf-8", errors="replace")
     stderr_text = b"".join(stderr_buf).decode("utf-8", errors="replace")
@@ -1067,12 +1143,40 @@ class StatelessSSHTool(BaseTool):
                 execution_time=time.time() - start_time,
             )
 
-        # Run blocking SSH work in a thread pool so we don't block the event loop
-        loop = asyncio.get_event_loop()
+        # Run blocking SSH work in a thread pool so we don't block the event loop.
+        # run_with_abort_handle additionally:
+        #   1. Mirrors self.interrupt_event into a thread-safe token that
+        #      _rate_limit / retry-backoff / exec-poll helpers find via
+        #      cancellation.current_interrupt(); a stop signal therefore
+        #      aborts those waits at their next check point.
+        #   2. Allocates an AbortHandle that _connect() registers a
+        #      _linger_close callback into; if the surrounding asyncio
+        #      task is cancelled (new_session, shutdown) the handle fires
+        #      and closes the transport from the asyncio thread, waking
+        #      paramiko's blocking recv on the executor thread.
+        # The executor thread itself is NOT killed — Python on Windows
+        # cannot do that — but its blocking syscall returns within ~50ms
+        # of the close, after which the thread exits naturally.
         try:
-            result: ToolResult = await loop.run_in_executor(
-                None, lambda: handler(creds, start_time, params, **kwargs)
+            result = await run_with_abort_handle(
+                lambda: handler(creds, start_time, params, **kwargs),
+                interrupt_event=self.interrupt_event,
+                shutdown_deadline=self.shutdown_deadline,
             )
+            if not isinstance(result, ToolResult):
+                # handler should always return a ToolResult; this branch is
+                # defensive and only here so we don't silently mis-type.
+                result = ToolResult(
+                    success=False, output=None,
+                    error=f"SSH action '{action}' returned non-ToolResult",
+                    tool_name=self.name, tool_parameters=params,
+                    execution_time=time.time() - start_time,
+                )
+        except asyncio.CancelledError:
+            # Engine cancelled us. The abort callback closed the transport;
+            # the executor thread either errored out or is on its way out.
+            # Re-raise so the engine's cancel cascade runs.
+            raise
         except Exception as exc:
             result = ToolResult(
                 success=False, output=None,

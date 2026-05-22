@@ -1,6 +1,7 @@
 """
 Read Tool - Read file or directory contents; supports multiple paths in one call.
 """
+import asyncio
 import hashlib
 import os
 import stat
@@ -314,7 +315,22 @@ class ReadTool(BaseTool):
 
             # Single path: return result directly
             if len(all_paths) == 1:
-                result = self._read_single_path(all_paths[0], start_line=start_line, end_line=end_line)
+                # Move blocking file I/O off the asyncio loop. On a slow
+                # network share, AV-scanned file, or OneDrive online-only
+                # file, f.read() can take many seconds — keeping it on the
+                # event loop would freeze the bridge for everything (status
+                # events, IPC, other tool cancellation). The executor
+                # thread is not killable on Windows; if the surrounding
+                # asyncio task is cancelled (new_session) the thread
+                # finishes its read on its own, and the bridge's
+                # generation tag isolates the result from the new flow.
+                loop = asyncio.get_event_loop()
+                result = await loop.run_in_executor(
+                    None,
+                    lambda: self._read_single_path(
+                        all_paths[0], start_line=start_line, end_line=end_line,
+                    ),
+                )
                 if result["success"]:
                     return ToolResult(
                         success=True,
@@ -344,10 +360,21 @@ class ReadTool(BaseTool):
                     tool_parameters={"path": path, "paths": paths, "start_line": start_line, "end_line": end_line}
                 )
 
-            # Multiple paths: read each and aggregate
+            # Multiple paths: read each and aggregate. Each path goes
+            # through the executor so a slow filesystem on one path
+            # doesn't freeze the loop and prevent cancellation from
+            # propagating to the others.
+            loop = asyncio.get_event_loop()
             results = []
             for p in all_paths:
-                r = self._read_single_path(p, start_line=start_line, end_line=end_line)
+                # Bind p in the lambda's default arg so the closure
+                # doesn't capture the loop variable by reference.
+                r = await loop.run_in_executor(
+                    None,
+                    lambda p=p: self._read_single_path(
+                        p, start_line=start_line, end_line=end_line,
+                    ),
+                )
                 if r["success"]:
                     results.append({
                         "path": p,

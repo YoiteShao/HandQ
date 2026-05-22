@@ -252,11 +252,7 @@ OBSERVE_AND_PLAN_TEMPLATE = """Decide the next action based on current state.
 [Original Goal]
 {goal}
 
-[Working Directory]
-{working_directory}
-[Session Storage Directory]
-{storage_directory}
-
+{directory_block}
 [Progress]
 Completed steps: {completed_count}
 {loop_warning}
@@ -267,7 +263,7 @@ Completed steps: {completed_count}
 [Current Lookahead]
 {lookahead_summary}
 
-(Use this directory to save intermediate artifacts, analysis files, and outputs that need to persist across steps. The working directory above is the user's project directory — prefer writing task artifacts to the session storage directory to avoid cluttering the user's workspace.)
+(Use the session storage directory to save intermediate artifacts, analysis files, and outputs that need to persist across steps.{directory_note})
 {gep_template_section}{user_instruction}
 ---
 Before deciding, reason through the following:

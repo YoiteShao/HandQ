@@ -23,14 +23,54 @@ INSTALL_DIR =
 随后按以下优先级（首个命中即用）选取 `handq_config.yaml`：
 
 1. `HANDQ_CONFIG` 环境变量 — 显式覆盖（CI、便携模式）。
-2. `%LOCALAPPDATA%\HandQ\handq_config.yaml` — 用户级覆盖。
-3. `<INSTALL_DIR>\handq_config.yaml` — 与构建一起 ship 的默认配置。
+2. `%USERPROFILE%\HandQ\handq_config.yaml` — 用户级配置；与 session 历史
+   `%USERPROFILE%\HandQ\History\` 同根，方便用户在一个地方找到所有"属于他自己"的东西。
+3. `<INSTALL_DIR>\handq_config.yaml` — 与构建一起 ship 的默认配置（首次启动可拷到 (2)）。
 
 解析出的绝对路径会被写回 `os.environ["HANDQ_CONFIG"]`，再 import
 `src.bridge.stdio_bridge`，下游所有消费方拿到的都是同一个值。
 
 **bridge 不再关心 cwd。** Electron 也不再给 `spawn()` 传 `cwd`。无论是
 桌面快捷方式、开始菜单、还是 `cmd /K` 启动，行为完全一致。
+
+---
+
+## 1.5 三类数据，三个根（Windows）
+
+```
+%USERPROFILE%\HandQ\               ← 用户拥有的数据
+  handq_config.yaml                  用户配置（小、可漫游）
+  History\                           会话历史（大、不漫游）
+    <YYYYMMDD-HHMMSS>-<slug>\        每个 `request` 一个目录
+      session_state.json
+      executions_logs\
+      ... (FlowController 的所有输出)
+
+%LOCALAPPDATA%\HandQ\              ← 机器本地的调试产物
+  logs\<YYYYMMDD-HHMMSS>\            每次 Electron 启动一个目录
+    handq-frontend.log               main + preload + renderer
+    handq-bridge.log                 Python 端框架日志
+
+<install_root>\                    ← 程序文件（默认 %LOCALAPPDATA%\Programs\HandQ）
+  HandQ.exe                          Electron 主程序
+  handq-bridge.exe                   Nuitka 冻结的 bridge
+  handq_config.yaml                  ship 的默认配置（首次启动拷到上面 (1)）
+```
+
+切分原则：
+
+| 数据 | 路径 | 漫游？ | 用户可见？ | 生命周期 |
+|---|---|---|---|---|
+| 用户配置 | `%USERPROFILE%\HandQ\handq_config.yaml` | 是 | 是 | 跨升级 |
+| Session 历史 | `%USERPROFILE%\HandQ\History\<id>\` | 否 | 是 | 跨升级，可手动清理 |
+| 框架日志 | `%LOCALAPPDATA%\HandQ\logs\<launch>\` | 否 | 否 | 一次启动 |
+
+> 关键变化（vs 早期方案）：废弃 `session.workspace_base` 字段——session
+> 根目录强制为 `%USERPROFILE%\HandQ\History\`，不可由 yaml 配置。GUI
+> 模式下用户没有"我在哪个工作目录"的心智，所有任务的中间产物都自动
+> 留存在各自的 session 目录里，agent 的 `working_directory` 与
+> `storage_directory` 都指向该目录（在 `stdio_bridge._allocate_session_dir`
+> 里分配）。
 
 ---
 
@@ -56,13 +96,16 @@ HandQ/                              ← repo 根，dev 模式下也是 INSTALL_D
 │   │   └── styles.css
 │   ├── package.json
 │   └── node_modules/
-├── logs/                           ← 运行时日志，每次启动一个子目录
+├── logs/                           ← Dev 模式下保留在 repo 内便于检查
 │   └── 20260521-180449/
 │       ├── handq-bridge.log        ← Python 端
 │       └── handq-frontend.log      ← Electron 端
-├── .workspace/                     ← 运行时，每个会话一个沙箱
 └── ARCHITECTURE.md                 ← 本文件
 ```
+
+> Dev 模式下 session 历史依然写到 `%USERPROFILE%\HandQ\History\`——bridge
+> 只看 USERPROFILE 而不看是否打包，所以源码运行和正式运行行为一致。
+> 仅日志位置不同（dev → repo `logs/`，prod → `%LOCALAPPDATA%\HandQ\logs\`）。
 
 ### Dev 启动流程
 
@@ -76,7 +119,8 @@ HandQ/                              ← repo 根，dev 模式下也是 INSTALL_D
 4. `bridge_main.py` 计算 `INSTALL_DIR = dirname(__file__) = <repo>`，
    将配置定位为 `<repo>/handq_config.yaml`，并写入 `HANDQ_CONFIG` env。
 5. `stdio_bridge.run()` 读取 `HANDQ_CONFIG` 后正常运行。
-6. 日志落到 `<repo>/logs/<TS>/`。
+6. 日志落到 `<repo>/logs/<TS>/`；session 历史落到
+   `%USERPROFILE%\HandQ\History\<TS>-<slug>/`（与 prod 一致）。
 
 ---
 
@@ -122,24 +166,34 @@ electron-builder 把这个 `.dist/` 目录作为 `extraResources` 一起 ship
 
 ### 用户级运行时数据
 
-`%LOCALAPPDATA%` 普通用户可写，`Program Files` 不可写。Electron 主进程
-会把写入操作引导到这里：
+`Program Files` 不可写，`%LOCALAPPDATA%`、`%USERPROFILE%` 普通用户均可写。
+我们把**用户拥有的数据**（配置 + session 历史）放到 `%USERPROFILE%\HandQ\`，
+**机器本地的调试产物**（日志）放到 `%LOCALAPPDATA%\HandQ\logs\`，两者刻意分离：
 
 ```
+%USERPROFILE%\HandQ\
+├── handq_config.yaml               ← 用户级配置；优先于安装目录里的版本
+└── History\                        ← 会话历史（无大小限制，可手动清理）
+    └── <YYYYMMDD-HHMMSS>-<slug>\
+        ├── session_state.json
+        └── executions_logs\
+
 %LOCALAPPDATA%\HandQ\
-├── handq_config.yaml               ← （可选）用户级覆盖；优先于安装目录里的版本
-├── logs\                           ← packaged 模式下自动选这里
-│   └── 20260521-181203\
-│       ├── handq-bridge.log
-│       └── handq-frontend.log
-└── workspace\                      ← 会话沙箱（待办）
-    └── <session_id>\
+└── logs\                           ← packaged 模式下自动选这里
+    └── 20260521-181203\
+        ├── handq-bridge.log
+        └── handq-frontend.log
 ```
 
-`electron/main.js` 在 packaged 模式下已经把日志路由到
-`app.getPath('userData')/logs`。Python 端遵循 `HANDQ_LOG_DIR`
-环境变量（由 Electron 通过 env 传入），所以前后端会写到同一个
+`electron/main.js` 在 packaged 模式下把日志路由到
+`%LOCALAPPDATA%\HandQ\logs\<TS>\`（见 `packagedLogBase()`）。Python 端遵循
+`HANDQ_LOG_DIR` 环境变量（由 Electron 通过 env 传入），所以前后端会写到同一个
 "每次启动一个目录" 下。
+
+Session 目录由 `stdio_bridge._allocate_session_dir(goal)` 在收到首个
+`request` 信封时分配，路径为 `<USERPROFILE>\HandQ\History\<TS>-<slug>\`，
+然后传给 `FlowController(working_directory=..., storage_directory=...)`——
+两个参数同值，对外只是一个概念。
 
 ### Prod 启动流程
 
@@ -155,9 +209,12 @@ electron-builder 把这个 `.dist/` 目录作为 `extraResources` 一起 ship
    计算 `INSTALL_DIR = dirname(sys.executable) = <install_root>`。
 6. 配置查找：
    - 检查 `HANDQ_CONFIG` env（极少使用）。
-   - 检查 `%LOCALAPPDATA%\HandQ\handq_config.yaml`（用户级覆盖）。
+   - 检查 `%USERPROFILE%\HandQ\handq_config.yaml`（用户级配置）。
    - 回落到 `<install_root>\handq_config.yaml`（随安装包 ship 的默认值）。
-7. 日志落到 `%LOCALAPPDATA%\HandQ\logs\<TS>\`。
+7. 收到首个 `request` 信封时，`stdio_bridge._allocate_session_dir(goal)`
+   在 `%USERPROFILE%\HandQ\History\<TS>-<slug>\` 下创建 session 目录，
+   作为 `FlowController` 的 `working_directory` + `storage_directory`。
+8. 框架日志落到 `%LOCALAPPDATA%\HandQ\logs\<TS>\`。
 
 ---
 
@@ -202,8 +259,9 @@ nuitka `
 
 ### 4.3 首次启动配置复制（推荐，尚未接入）
 
-启动时如发现 `%LOCALAPPDATA%\HandQ\handq_config.yaml` 不存在，
-就把 `<install_root>\handq_config.yaml` 复制过去。之后用户的修改
+启动时如发现 `%USERPROFILE%\HandQ\handq_config.yaml` 不存在，
+就把 `<install_root>\handq_config.yaml` 复制过去（顺便确保
+`%USERPROFILE%\HandQ\History\` 目录存在）。之后用户的修改
 都落在用户可写的副本里，安装目录里的副本保持原样，便于升级时 diff。
 
 这段逻辑应该放在 `bridge_main.py` 的 `_resolve_config_path()`
@@ -216,10 +274,12 @@ nuitka `
 | 关注点 | 文件 | 符号 |
 |---|---|---|
 | Bridge 安装目录探测 | `bridge_main.py` | `_INSTALL_DIR`、`_resolve_config_path` |
+| 用户根目录（config + History） | `bridge_main.py` | `_user_handq_root` |
 | Bridge 配置 env 注入 | `bridge_main.py` | `os.environ["HANDQ_CONFIG"]` |
 | Electron dev/prod bridge 选择 | `electron/main.js` | `resolveBridgeLaunch()` |
-| Electron 日志目录路由 | `electron/main.js` | `LOG_BASE` |
+| Electron 日志目录路由 | `electron/main.js` | `LOG_BASE`、`packagedLogBase()` |
 | Bridge 配置消费 | `src/bridge/stdio_bridge.py` | `run()` 读 `HANDQ_CONFIG` |
+| Session 目录分配 | `src/bridge/stdio_bridge.py` | `_allocate_session_dir`、`_session_history_root` |
 | YAML 读写 | `src/bridge/stdio_bridge.py` | `_load_config_dict`、`_save_config_dict` |
 
 ---
@@ -230,11 +290,11 @@ nuitka `
 |---|---|---|
 | 1 | `bridge_main.py` 自定位 `INSTALL_DIR` 和配置路径 | ✅ 已完成 |
 | 2 | `electron/main.js` `app.isPackaged` 分支选择 py 或 exe | ✅ 已完成 |
-| 3 | `electron/main.js` packaged 模式下日志走 `userData` | ✅ 已完成 |
+| 3 | `electron/main.js` packaged 模式日志走 `%LOCALAPPDATA%\HandQ\logs` | ✅ 已完成 |
 | 4 | 移除 spawn 时 pin 的 `cwd` | ✅ 已完成 |
 | 5 | YAML 字段 `api_key_env` / `api_key` 硬切为 `llm.API_KEY`；后端不再走 `os.environ.get` 间接续 | ✅ 已完成 |
-| 6 | `handq_config.yaml` 进 `.gitignore` + 提供 `.example.yaml` 模板 | ⬜ 待办 |
-| 7 | 首次启动从安装目录复制配置到 `%LOCALAPPDATA%\HandQ\` | ⬜ 待办 |
-| 8 | Nuitka 构建脚本（PowerShell 或 Make） | ⬜ 待办 |
-| 9 | electron-builder `extraResources` 配置 | ⬜ 待办 |
-| 10 | 生产模式下 workspace 目录迁到 `%LOCALAPPDATA%\HandQ\workspace\` | ⬜ 待办 |
+| 6 | 废除 `session.workspace_base`；session 强制为 `%USERPROFILE%\HandQ\History\<id>\` | ✅ 已完成 |
+| 7 | `handq_config.yaml` 进 `.gitignore` + 提供 `.example.yaml` 模板 | ⬜ 待办 |
+| 8 | 首次启动从安装目录复制配置到 `%USERPROFILE%\HandQ\` | ⬜ 待办 |
+| 9 | Nuitka 构建脚本（PowerShell 或 Make） | ⬜ 待办 |
+| 10 | electron-builder `extraResources` + per-user NSIS 安装到 `%LOCALAPPDATA%\Programs\HandQ` | ⬜ 待办 |

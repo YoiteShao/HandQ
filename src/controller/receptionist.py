@@ -165,7 +165,6 @@ class Receptionist:
     def __init__(
         self,
         llm_services: List[LLMService],
-        working_directory: str = ".",
         shell_history_path: Optional[str] = None,
         initial_task_context: Optional[str] = None,
     ):
@@ -173,7 +172,6 @@ class Receptionist:
             raise ValueError("Receptionist requires at least one LLMService in llm_services")
         self._services: List[LLMService] = list(llm_services)
 
-        self.working_directory = working_directory
         self.shell_history_path: Optional[str] = shell_history_path
         self.logger = get_logger()
 

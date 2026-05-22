@@ -192,3 +192,20 @@ contextBridge.exposeInMainWorld('handq', {
         });
     },
 });
+
+// Custom-titlebar window controls (frameless window). The renderer ships its
+// own min / max / close buttons; main.js drives the actual window state.
+contextBridge.exposeInMainWorld('windowControls', {
+    minimize: () => {
+        preloadLog('window:minimize');
+        ipcRenderer.send('window:minimize');
+    },
+    toggleMaximize: () => {
+        preloadLog('window:toggle-maximize');
+        ipcRenderer.send('window:toggle-maximize');
+    },
+    hide: () => {
+        preloadLog('window:hide');
+        ipcRenderer.send('window:hide');
+    },
+});

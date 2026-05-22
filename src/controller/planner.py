@@ -413,7 +413,7 @@ class Planner:
     def __init__(
         self,
         llm_services: List[LLMService],
-        working_directory: str = ".",
+        working_directory: Optional[str] = None,
         storage_directory: Optional[str] = None,
         step_verification_threshold: float = 0.7,
         from_data_services: Optional[List[LLMService]] = None,
@@ -430,8 +430,9 @@ class Planner:
         else:
             self._from_data_services = [self._services[-1]]
 
-        self.working_directory = working_directory
-        self.storage_directory = storage_directory or working_directory
+        # See FlowController.__init__ for the working_directory=None semantics.
+        self.working_directory: Optional[str] = working_directory
+        self.storage_directory: str = storage_directory or working_directory or "."
         self.step_verification_threshold = step_verification_threshold
         self.logger = get_logger()
         # Token count from the most recent observe_and_plan() LLM call.
@@ -1010,6 +1011,27 @@ class Planner:
         system_prompt_content = PLANNER_SYSTEM_PROMPT
         gep_template_section = self._build_gep_template_section()
 
+        # Build directory section dynamically. When working_directory is None
+        # (Windows GUI mode) we show only [Session Storage Directory] and adapt
+        # the parenthetical note that distinguishes "user project" from session
+        # storage — that distinction makes no sense without a user project.
+        if self.working_directory:
+            directory_block = (
+                f"[Working Directory]\n{self.working_directory}\n"
+                f"[Session Storage Directory]\n{self.storage_directory}\n"
+            )
+            directory_note = (
+                " The working directory above is the user's project directory — "
+                "prefer writing task artifacts to the session storage directory "
+                "to avoid cluttering the user's workspace."
+            )
+        else:
+            directory_block = f"[Session Storage Directory]\n{self.storage_directory}\n"
+            directory_note = (
+                " There is no separate user project directory in this session — "
+                "every artifact goes here, and relative paths resolve against it."
+            )
+
         messages = [
             {"role": "system", "content": system_prompt_content},
             {"role": "user", "content": OBSERVE_AND_PLAN_TEMPLATE.format(
@@ -1020,8 +1042,8 @@ class Planner:
                 completed_summary=self._build_completed_summary(completed_steps, self.detail_window),
                 accumulated_findings_section=accumulated_findings_section,
                 lookahead_summary=self._build_lookahead_summary(current_lookahead),
-                working_directory=self.working_directory,
-                storage_directory=self.storage_directory,
+                directory_block=directory_block,
+                directory_note=directory_note,
                 gep_template_section=gep_template_section,
                 user_instruction=user_instruction_block,
                 step_verification_threshold=self.step_verification_threshold

@@ -1,6 +1,7 @@
 """
 Write Tool - Write content to a file.
 """
+import asyncio
 import hashlib
 import os
 import re
@@ -64,6 +65,14 @@ class WriteTool(BaseTool):
                      append=True to add more content.
         """
         start_time = time.time()
+        # All blocking file I/O in this method goes through this loop's
+        # default executor so the asyncio loop stays alive while we wait
+        # on slow filesystems (network shares, AV-scanned files,
+        # OneDrive online-only files). The executor thread cannot be
+        # killed on Windows; if the surrounding asyncio task is
+        # cancelled (new_session), the thread finishes its read on its
+        # own and the bridge's generation tag isolates the result.
+        loop = asyncio.get_event_loop()
 
         try:
             self.validate_params(["path", "content"], {"path": path, "content": content})
@@ -83,7 +92,10 @@ class WriteTool(BaseTool):
             existing_content_from_check: str = ""
             if file_exists:
                 if append:
-                    stale, reason, _read_content = FileState.get_instance().check_stale_and_read(path)
+                    stale, reason, _read_content = await loop.run_in_executor(
+                        None,
+                        lambda: FileState.get_instance().check_stale_and_read(path),
+                    )
                     if stale:
                         return ToolResult(
                             success=False,
@@ -95,7 +107,10 @@ class WriteTool(BaseTool):
                         )
                     existing_content_from_check = _read_content or ""
                 else:
-                    stale, reason = FileState.get_instance().check_stale(path)
+                    stale, reason = await loop.run_in_executor(
+                        None,
+                        lambda: FileState.get_instance().check_stale(path),
+                    )
                     if stale:
                         return ToolResult(
                             success=False,
@@ -109,21 +124,27 @@ class WriteTool(BaseTool):
             # Read old content for diff (only when overwriting an existing file)
             old_content = None
             if file_exists and not append:
-                try:
-                    with open(path_obj, 'r', encoding='utf-8') as f:
-                        old_content = f.read()
-                except Exception:
-                    old_content = None
+                def _read_old() -> "Optional[str]":
+                    try:
+                        with open(path_obj, 'r', encoding='utf-8') as f:
+                            return f.read()
+                    except Exception:
+                        return None
+                old_content = await loop.run_in_executor(None, _read_old)
 
             # Write
             if append:
                 # Use the content already read during the staleness check — no second open().
                 combined_content = existing_content_from_check + content
-                _atomic_write(path_obj, combined_content)
+                await loop.run_in_executor(
+                    None, lambda: _atomic_write(path_obj, combined_content),
+                )
                 action = "appended"
                 final_content = combined_content
             else:
-                _atomic_write(path_obj, content)
+                await loop.run_in_executor(
+                    None, lambda: _atomic_write(path_obj, content),
+                )
                 action = "wrote"
                 final_content = content
 

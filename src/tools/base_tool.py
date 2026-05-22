@@ -215,6 +215,28 @@ class BaseTool(ABC):
     is_read_only: bool = False
     is_concurrency_safe: bool = False
 
+    # Cancellation contract.
+    #
+    # shutdown_deadline: seconds the tool gets to comply with a stop request
+    # AFTER cancellation fires. NOT a wall-clock cap on legitimate work — a
+    # 10-minute compile is fine, but once the engine signals stop, the tool
+    # must abort within this many seconds. Tools that own resources which
+    # can be side-effect-aborted (paramiko transport, subprocess, fd) should
+    # register cleanup callbacks during execute(); a fired AbortHandle then
+    # invokes those callbacks from the asyncio thread to wake the blocked
+    # syscall on the executor thread.
+    #
+    # Default 5s is generous for socket teardown and process kill on both
+    # Windows and Linux. Tools may override.
+    shutdown_deadline: float = 5.0
+
+    # Optional asyncio.Event the engine sets to request cancellation. Tools
+    # that run async-native (bash_tool's asyncio.create_subprocess_exec)
+    # await this directly. Tools that run blocking work via
+    # cancellation.run_with_abort_handle pass this event in and the helper
+    # mirrors it into a thread-safe token.
+    interrupt_event = None
+
     def __init__(self, name: str):
         """
         Args:
