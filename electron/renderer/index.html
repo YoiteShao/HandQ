@@ -252,7 +252,7 @@
                         </label>
 
                         <label>
-                            <span>Model lists per role</span>
+                            <span>Models</span>
                             <div class="role-tabs" role="tablist" id="cfg-llm-role-tabs">
                                 <button type="button" class="role-tab active"
                                         data-role="planner" role="tab"
@@ -263,26 +263,23 @@
                                         data-role="agent" role="tab">Agent</button>
                                 <button type="button" class="role-tab"
                                         data-role="helper" role="tab">Helper</button>
+                                <button type="button" class="role-tab"
+                                        data-role="available" role="tab">Available</button>
                             </div>
-                            <textarea id="cfg-llm-planner" rows="6"
-                                      data-role-pane="planner" spellcheck="false"
-                                      placeholder="Planner models — best at structured planning. Gets max_retries=50."></textarea>
-                            <textarea id="cfg-llm-receptionist" rows="6"
-                                      data-role-pane="receptionist" spellcheck="false"
-                                      placeholder="Receptionist models — handles user-message triage."
-                                      hidden></textarea>
-                            <textarea id="cfg-llm-agent" rows="6"
-                                      data-role-pane="agent" spellcheck="false"
-                                      placeholder="Agent models — runs task steps."
-                                      hidden></textarea>
-                            <textarea id="cfg-llm-helper" rows="6"
-                                      data-role-pane="helper" spellcheck="false"
-                                      placeholder="Helper models — used for findings summarisation and error explanation (internal: from_data)."
-                                      hidden></textarea>
+                            <div id="cfg-llm-role-pane-planner" class="role-model-list"
+                                 data-role-pane="planner"></div>
+                            <div id="cfg-llm-role-pane-receptionist" class="role-model-list"
+                                 data-role-pane="receptionist" hidden></div>
+                            <div id="cfg-llm-role-pane-agent" class="role-model-list"
+                                 data-role-pane="agent" hidden></div>
+                            <div id="cfg-llm-role-pane-helper" class="role-model-list"
+                                 data-role-pane="helper" hidden></div>
+                            <textarea id="cfg-llm-models" rows="6" spellcheck="false"
+                                      data-role-pane="available" hidden
+                                      placeholder="One model per line, highest priority first.&#10;e.g. anthropic::claude-4-6-sonnet:1M"></textarea>
                             <small class="help-text">
-                                One model identifier per line. Each role has its own
-                                priority list — the first entry is used first, later
-                                entries are fallbacks. Saved to <code>llm.roles</code>.
+                                <b>Available</b>: master pool, one per line, order = priority.
+                                <b>Role tabs</b>: check which models each role uses.
                             </small>
                         </label>
                     </fieldset>

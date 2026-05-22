@@ -10,6 +10,9 @@ from .write_tool import WriteTool
 from .edit_tool import EditTool
 from .bash_tool import BashTool
 from .ssh_tool import StatelessSSHTool
+from .glob_tool import GlobTool
+from .grep_tool import GrepTool
+from .notebook_edit_tool import NotebookEditTool
 
 _IS_WINDOWS = sys.platform == "win32"
 
@@ -59,6 +62,9 @@ class ToolRegistry:
     WRITE = "write"
     EDIT = "edit"
     BASH = "bash"
+    GLOB = "glob"
+    GREP = "grep"
+    NOTEBOOK_EDIT = "notebook_edit"
     SSH  = "ssh"
 
     _tools: Dict[str, ToolMetadata] = {}
@@ -134,6 +140,7 @@ Examples:
                 "Supports a single path, a list of paths, or both simultaneously. "
                 "For a single path the result is returned directly; "
                 "for multiple paths a summary with per-path results is returned. "
+                "Supports PDF files (requires PyPDF2, pdfplumber, or pymupdf). "
                 "Files larger than 100 KB cannot be read directly."
             ),
             usage_guide=_read_usage_guide,
@@ -172,6 +179,14 @@ Examples:
                     "end_line": {
                         "type": "integer",
                         "description": "1-based line number to stop reading at (inclusive)"
+                    },
+                    "pages": {
+                        "type": "string",
+                        "description": (
+                            "Page range for PDF files (e.g., '1-5', '3', '10-20'). "
+                            "Required for PDFs with more than 20 pages. "
+                            "Maximum 20 pages per request."
+                        )
                     }
                 },
                 "anyOf": [
@@ -265,24 +280,27 @@ Examples:
             description=(
                 "Edit a file by replacing a specific section (find and replace). "
                 "Replaces the FIRST occurrence of old_content with new_content. "
-                "old_content must match the file exactly, including whitespace and indentation."
+                "old_content must match the file exactly, including whitespace and indentation. "
+                "Set replace_all=true to replace ALL occurrences (useful for renaming)."
             ),
             usage_guide="""\
 When to Use:
   - Make targeted changes to specific parts of an existing file
   - Change a function, a few lines, or a section without rewriting the whole file
   - Fix a bug, update a value, or refactor a specific block
+  - Rename a variable/function across an entire file (use replace_all=true)
 
 When NOT to Use:
   - Creating a new file — use write instead
   - Changing more than ~50% of the file — write the whole file instead
-  - When old_content appears multiple times (edit replaces the FIRST match only;
-    verify uniqueness before using)
+  - When old_content appears multiple times and you only want to change one
+    (edit replaces the FIRST match only; include enough context to be unique)
 
 Strategy:
   - Include 3-5 lines of context around the change in old_content to ensure uniqueness
   - old_content must match EXACTLY: same whitespace, indentation, and line endings
   - For multiple changes to the same file, make separate edit calls in sequence
+  - Use replace_all=true for renaming variables, changing repeated strings across the file
   - After editing, re-read the modified section to verify the change is correct
   - If the edit fails (old_content not found), re-read the file first to get the
     current exact content, then retry
@@ -290,6 +308,7 @@ Strategy:
 Examples:
   GOOD: old_content includes the full function signature + 2 lines before/after
   GOOD: old_content is a unique 5-line block that appears exactly once
+  GOOD: {"old_content": "old_name", "new_content": "new_name", "replace_all": true}
   BAD:  old_content is a single common line like "return None" (likely not unique)
   BAD:  old_content has different indentation than the actual file""",
             parameter_schema={
@@ -305,12 +324,21 @@ Examples:
                             "The exact content to find and replace. "
                             "Must match the file exactly including whitespace. "
                             "Include 3-5 lines of context around the change "
-                            "to ensure uniqueness. Replaces the FIRST match."
+                            "to ensure uniqueness. Replaces the FIRST match "
+                            "(unless replace_all is true)."
                         )
                     },
                     "new_content": {
                         "type": "string",
                         "description": "New content to replace old_content with"
+                    },
+                    "replace_all": {
+                        "type": "boolean",
+                        "description": (
+                            "If true, replace ALL occurrences of old_content in the file "
+                            "(useful for renaming variables or changing repeated strings). "
+                            "Default: false (replace only the first unique match)."
+                        )
                     }
                 },
                 "required": ["path", "old_content", "new_content"],
@@ -523,6 +551,264 @@ Examples:
                 "additionalProperties": False
             },
             tool_class=BashTool
+        )
+
+        # Register GLOB tool
+        _glob_usage_guide = """\
+When to Use:
+  - Find files by name or extension pattern across the project
+  - Discover project structure (e.g., "**/*.py" to find all Python files)
+  - Locate specific files before reading them
+
+When NOT to Use:
+  - When you need to search file CONTENTS — use grep instead
+  - When you know the exact file path — use read directly
+  - When listing a single directory — use read (which shows directory listing)
+
+Strategy:
+  - Start broad ("**/*.py") then narrow if too many results
+  - Results sorted by modification time (newest first) — recently edited files appear first
+  - Maximum 200 results returned; use a more specific pattern if truncated
+  - Common noise directories (.git, node_modules, __pycache__, .venv) are skipped automatically
+
+Examples:
+  GOOD: {"pattern": "**/*.py"}                    — all Python files
+  GOOD: {"pattern": "src/**/*.ts", "path": "."}   — TypeScript in src/
+  GOOD: {"pattern": "**/test_*.py"}               — all test files
+  BAD:  {"pattern": "*"} in a huge directory      — too broad, returns directories too"""
+
+        cls._tools[cls.GLOB] = ToolMetadata(
+            name=cls.GLOB,
+            description=(
+                "Fast file pattern matching. Find files by glob pattern "
+                "(e.g. '**/*.py', 'src/**/*.ts'). "
+                "Returns matching file paths sorted by modification time (newest first)."
+            ),
+            usage_guide=_glob_usage_guide,
+            parameter_schema={
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": (
+                            "Glob pattern to match files against "
+                            "(e.g. '**/*.py', 'src/**/*.ts', '*.md')"
+                        )
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": (
+                            "Directory to search in. Defaults to current working directory."
+                        )
+                    },
+                    "skip_default_dirs": {
+                        "type": "boolean",
+                        "description": (
+                            "If true (default), skip .git, node_modules, __pycache__, "
+                            ".venv and other noise directories. Set to false to search "
+                            "ALL directories including VCS internals."
+                        )
+                    }
+                },
+                "required": ["pattern"],
+                "additionalProperties": False
+            },
+            tool_class=GlobTool
+        )
+
+        # Register GREP tool
+        _grep_usage_guide = """\
+When to Use:
+  - Search for a pattern (function name, variable, string) across files
+  - Find where something is defined or used
+  - Locate specific code patterns with regex
+  - Cross-line pattern matching with multiline=true (e.g., class definition + method)
+
+When NOT to Use:
+  - When you know which file to look at — use read instead
+  - When you need to find files by name — use glob instead
+
+Strategy:
+  - Use 'include' to narrow file types: {"include": "*.py"} for Python only
+  - Default output_mode "files_only" is cheapest — use to locate, then read specific files
+  - Use "content" mode with context_before/context_after when you need surrounding code
+  - head_limit defaults to 250; use offset to page through large result sets
+  - Binary files and files > 1 MB are skipped automatically
+  - Use multiline=true for patterns that span multiple lines
+
+Examples:
+  GOOD: {"pattern": "def process_batch", "include": "*.py"}
+  GOOD: {"pattern": "TODO|FIXME", "output_mode": "content", "context_after": 2}
+  GOOD: {"pattern": "class.*Tool", "include": "*.py", "output_mode": "files_only"}
+  GOOD: {"pattern": "class Foo.*?def bar", "multiline": true, "include": "*.py"}
+  GOOD: {"pattern": "import", "include": "*.py", "offset": 50, "head_limit": 50}
+  BAD:  {"pattern": "import"} without include — too many matches"""
+
+        cls._tools[cls.GREP] = ToolMetadata(
+            name=cls.GREP,
+            description=(
+                "Search file contents by regex pattern. "
+                "Supports three output modes: 'files_only' (default, cheapest), "
+                "'content' (matching lines with optional context), 'count' (match counts). "
+                "Supports multiline matching and result pagination. "
+                "Pure Python — no external tools required."
+            ),
+            usage_guide=_grep_usage_guide,
+            parameter_schema={
+                "type": "object",
+                "properties": {
+                    "pattern": {
+                        "type": "string",
+                        "description": "Regex pattern to search for (Python re syntax)"
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": (
+                            "File or directory to search in. "
+                            "Defaults to current working directory."
+                        )
+                    },
+                    "include": {
+                        "type": "string",
+                        "description": (
+                            "Glob pattern to filter files "
+                            "(e.g. '*.py', '*.js', '*.yaml')"
+                        )
+                    },
+                    "output_mode": {
+                        "type": "string",
+                        "enum": ["files_only", "content", "count"],
+                        "description": (
+                            "Output format: 'files_only' (default — list of matching file paths), "
+                            "'content' (matching lines with context), "
+                            "'count' (match counts per file)"
+                        )
+                    },
+                    "context_before": {
+                        "type": "integer",
+                        "description": (
+                            "Lines of context BEFORE each match (content mode only). "
+                            "Equivalent to grep -B. Default: 0."
+                        )
+                    },
+                    "context_after": {
+                        "type": "integer",
+                        "description": (
+                            "Lines of context AFTER each match (content mode only). "
+                            "Equivalent to grep -A. Default: 0."
+                        )
+                    },
+                    "context_lines": {
+                        "type": "integer",
+                        "description": (
+                            "Shorthand: sets both context_before and context_after. "
+                            "Equivalent to grep -C. Default: 0."
+                        )
+                    },
+                    "case_insensitive": {
+                        "type": "boolean",
+                        "description": "If true, search case-insensitively. Default: false."
+                    },
+                    "multiline": {
+                        "type": "boolean",
+                        "description": (
+                            "If true, enable multiline mode where '.' matches newlines "
+                            "and patterns can span across lines (re.DOTALL + re.MULTILINE). "
+                            "Default: false."
+                        )
+                    },
+                    "head_limit": {
+                        "type": "integer",
+                        "description": (
+                            "Maximum entries to return. Default: 250. "
+                            "Set to 0 for unlimited (use sparingly)."
+                        )
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": (
+                            "Skip first N entries before applying head_limit. "
+                            "Use with head_limit to page through results. Default: 0."
+                        )
+                    }
+                },
+                "required": ["pattern"],
+                "additionalProperties": False
+            },
+            tool_class=GrepTool
+        )
+
+        # Register NOTEBOOK_EDIT tool
+        cls._tools[cls.NOTEBOOK_EDIT] = ToolMetadata(
+            name=cls.NOTEBOOK_EDIT,
+            description=(
+                "Edit Jupyter notebook (.ipynb) cells. "
+                "Supports replace, insert, and delete operations. "
+                "Cell numbering is 0-indexed."
+            ),
+            usage_guide="""\
+When to Use:
+  - Modify the source code or text of a specific notebook cell
+  - Add new cells (code or markdown) to a notebook
+  - Remove cells from a notebook
+
+When NOT to Use:
+  - When you need to read/view notebook contents — use read instead
+  - When editing a .py file that isn't a notebook — use edit instead
+
+Strategy:
+  - Use edit_mode="replace" (default) to update an existing cell's content
+  - Use edit_mode="insert" to add a new cell at a specific position
+  - Use edit_mode="delete" to remove a cell
+  - cell_number is 0-indexed (first cell = 0)
+  - For insert: cell_type is required ('code' or 'markdown')
+  - For replace: cell_type defaults to the existing cell's type
+
+Examples:
+  Replace cell 2: {"notebook_path": "nb.ipynb", "cell_number": 2, "new_source": "print('hello')"}
+  Insert code cell at position 0: {"notebook_path": "nb.ipynb", "cell_number": 0, "edit_mode": "insert", "cell_type": "code", "new_source": "import numpy as np"}
+  Delete cell 5: {"notebook_path": "nb.ipynb", "cell_number": 5, "edit_mode": "delete"}""",
+            parameter_schema={
+                "type": "object",
+                "properties": {
+                    "notebook_path": {
+                        "type": "string",
+                        "description": "Path to the .ipynb notebook file"
+                    },
+                    "new_source": {
+                        "type": "string",
+                        "description": (
+                            "New content for the cell. "
+                            "Ignored for delete mode."
+                        )
+                    },
+                    "cell_number": {
+                        "type": "integer",
+                        "description": (
+                            "0-indexed cell number to operate on. "
+                            "For insert: position to insert at."
+                        )
+                    },
+                    "cell_type": {
+                        "type": "string",
+                        "enum": ["code", "markdown"],
+                        "description": (
+                            "Cell type. Required for insert mode. "
+                            "For replace, defaults to existing cell type."
+                        )
+                    },
+                    "edit_mode": {
+                        "type": "string",
+                        "enum": ["replace", "insert", "delete"],
+                        "description": (
+                            "Operation: 'replace' (default), 'insert', or 'delete'."
+                        )
+                    }
+                },
+                "required": ["notebook_path"],
+                "additionalProperties": False
+            },
+            tool_class=NotebookEditTool
         )
 
         # Register SSH tool (on_demand=True: only activated when a StepContextProvider requests it)

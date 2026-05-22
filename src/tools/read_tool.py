@@ -16,6 +16,7 @@ from .file_state import FileState
 # Hard file-size limit for the 100000-char large-file truncation path
 _MAX_FILE_CHARS = 100_000
 _TRUNCATE_LINES = 200
+_MAX_PDF_PAGES_PER_REQUEST = 20
 
 # Known binary file extensions — checked before reading
 _BINARY_EXTENSIONS = frozenset([
@@ -23,7 +24,7 @@ _BINARY_EXTENSIONS = frozenset([
     ".pyc", ".pyd", ".class", ".jar", ".zip", ".tar", ".gz",
     ".bz2", ".xz", ".7z", ".rar", ".png", ".jpg", ".jpeg",
     ".gif", ".webp", ".bmp", ".ico", ".tiff", ".mp3", ".mp4",
-    ".avi", ".mov", ".mkv", ".pdf", ".doc", ".docx", ".xls",
+    ".avi", ".mov", ".mkv", ".doc", ".docx", ".xls",
     ".xlsx", ".ppt", ".pptx", ".db", ".sqlite", ".wasm",
 ])
 
@@ -75,6 +76,179 @@ def _is_binary(path_obj: Path) -> bool:
         return False
 
 
+def _read_pdf(path_obj: Path, pages: Optional[str] = None) -> dict:
+    """Read a PDF file and extract text content.
+
+    Tries available PDF libraries in order:
+      1. PyPDF2 (most common)
+      2. pdfplumber (better text extraction)
+      3. pymupdf / fitz (fastest)
+
+    Args:
+        path_obj: Path to the PDF file.
+        pages:    Optional page range string (e.g., "1-5", "3", "10-20").
+                  If None, reads all pages (max 20).
+
+    Returns:
+        dict with success/output or success=False/error.
+    """
+    # Parse page range
+    start_page = 0
+    end_page = None  # None means "all"
+
+    if pages:
+        try:
+            if "-" in pages:
+                parts = pages.split("-", 1)
+                start_page = int(parts[0]) - 1  # 0-indexed
+                end_page = int(parts[1])  # exclusive upper bound (1-indexed end → exclusive)
+            else:
+                start_page = int(pages) - 1
+                end_page = start_page + 1
+        except (ValueError, IndexError):
+            return {"success": False, "error": f"Invalid pages format: '{pages}'. Use '1-5', '3', or '10-20'."}
+
+    # Try PyPDF2
+    try:
+        import PyPDF2
+        with open(path_obj, "rb") as f:
+            reader = PyPDF2.PdfReader(f)
+            total_pages = len(reader.pages)
+
+            if end_page is None:
+                end_page = min(total_pages, start_page + _MAX_PDF_PAGES_PER_REQUEST)
+            end_page = min(end_page, total_pages)
+
+            if total_pages > _MAX_PDF_PAGES_PER_REQUEST and pages is None:
+                return {
+                    "success": False,
+                    "error": (
+                        f"PDF has {total_pages} pages (max {_MAX_PDF_PAGES_PER_REQUEST} per request). "
+                        f"Provide the 'pages' parameter (e.g., pages='1-10')."
+                    )
+                }
+
+            text_parts = []
+            for i in range(start_page, end_page):
+                page = reader.pages[i]
+                text = page.extract_text() or ""
+                text_parts.append(f"--- Page {i + 1} ---\n{text}")
+
+            content = "\n\n".join(text_parts)
+            return {
+                "success": True,
+                "output": {
+                    "type": "pdf",
+                    "path": str(path_obj.absolute()),
+                    "content": content,
+                    "total_pages": total_pages,
+                    "pages_read": f"{start_page + 1}-{end_page}",
+                    "size": path_obj.stat().st_size,
+                }
+            }
+    except ImportError:
+        pass
+    except Exception as e:
+        # PyPDF2 failed for non-import reason — try next library
+        pass
+
+    # Try pdfplumber
+    try:
+        import pdfplumber
+        with pdfplumber.open(path_obj) as pdf:
+            total_pages = len(pdf.pages)
+
+            if end_page is None:
+                end_page = min(total_pages, start_page + _MAX_PDF_PAGES_PER_REQUEST)
+            end_page = min(end_page, total_pages)
+
+            if total_pages > _MAX_PDF_PAGES_PER_REQUEST and pages is None:
+                return {
+                    "success": False,
+                    "error": (
+                        f"PDF has {total_pages} pages (max {_MAX_PDF_PAGES_PER_REQUEST} per request). "
+                        f"Provide the 'pages' parameter (e.g., pages='1-10')."
+                    )
+                }
+
+            text_parts = []
+            for i in range(start_page, end_page):
+                page = pdf.pages[i]
+                text = page.extract_text() or ""
+                text_parts.append(f"--- Page {i + 1} ---\n{text}")
+
+            content = "\n\n".join(text_parts)
+            return {
+                "success": True,
+                "output": {
+                    "type": "pdf",
+                    "path": str(path_obj.absolute()),
+                    "content": content,
+                    "total_pages": total_pages,
+                    "pages_read": f"{start_page + 1}-{end_page}",
+                    "size": path_obj.stat().st_size,
+                }
+            }
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
+    # Try pymupdf (fitz)
+    try:
+        import fitz  # pymupdf
+        doc = fitz.open(str(path_obj))
+        total_pages = doc.page_count
+
+        if end_page is None:
+            end_page = min(total_pages, start_page + _MAX_PDF_PAGES_PER_REQUEST)
+        end_page = min(end_page, total_pages)
+
+        if total_pages > _MAX_PDF_PAGES_PER_REQUEST and pages is None:
+            doc.close()
+            return {
+                "success": False,
+                "error": (
+                    f"PDF has {total_pages} pages (max {_MAX_PDF_PAGES_PER_REQUEST} per request). "
+                    f"Provide the 'pages' parameter (e.g., pages='1-10')."
+                )
+            }
+
+        text_parts = []
+        for i in range(start_page, end_page):
+            page = doc[i]
+            text = page.get_text() or ""
+            text_parts.append(f"--- Page {i + 1} ---\n{text}")
+        doc.close()
+
+        content = "\n\n".join(text_parts)
+        return {
+            "success": True,
+            "output": {
+                "type": "pdf",
+                "path": str(path_obj.absolute()),
+                "content": content,
+                "total_pages": total_pages,
+                "pages_read": f"{start_page + 1}-{end_page}",
+                "size": path_obj.stat().st_size,
+            }
+        }
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
+    # No PDF library available
+    return {
+        "success": False,
+        "error": (
+            "Cannot read PDF: no supported PDF library installed. "
+            "Install one of: PyPDF2, pdfplumber, or pymupdf (fitz). "
+            f"Example: pip install PyPDF2"
+        )
+    }
+
+
 class ReadTool(BaseTool):
     """Read one or more files or directories."""
 
@@ -89,6 +263,7 @@ class ReadTool(BaseTool):
         path: str,
         start_line: Optional[int] = None,
         end_line: Optional[int] = None,
+        pages: Optional[str] = None,
     ) -> dict:
         """Read a single file or directory; return a result dict."""
         path_obj = Path(path)
@@ -144,6 +319,10 @@ class ReadTool(BaseTool):
             }
 
         file_size = path_obj.stat().st_size
+
+        # --- PDF files: special handling ---
+        if path_obj.suffix.lower() == ".pdf":
+            return _read_pdf(path_obj, pages=pages)
 
         # Binary detection (extension + null bytes)
         if _is_binary(path_obj):
@@ -263,6 +442,7 @@ class ReadTool(BaseTool):
         paths: Union[List[str], None] = None,
         start_line: Optional[int] = None,
         end_line: Optional[int] = None,
+        pages: Optional[str] = None,
         **kwargs
     ) -> ToolResult:
         """
@@ -273,6 +453,8 @@ class ReadTool(BaseTool):
             paths:      Additional list of paths; duplicates across *path* and *paths* are ignored.
             start_line: Optional 1-indexed first line to return (inclusive).
             end_line:   Optional 1-indexed last line to return (inclusive).
+            pages:      For PDF files: page range (e.g., "1-5", "3", "10-20").
+                        Required for PDFs with more than 20 pages.
 
         Returns:
             ToolResult:
@@ -315,20 +497,12 @@ class ReadTool(BaseTool):
 
             # Single path: return result directly
             if len(all_paths) == 1:
-                # Move blocking file I/O off the asyncio loop. On a slow
-                # network share, AV-scanned file, or OneDrive online-only
-                # file, f.read() can take many seconds — keeping it on the
-                # event loop would freeze the bridge for everything (status
-                # events, IPC, other tool cancellation). The executor
-                # thread is not killable on Windows; if the surrounding
-                # asyncio task is cancelled (new_session) the thread
-                # finishes its read on its own, and the bridge's
-                # generation tag isolates the result from the new flow.
                 loop = asyncio.get_event_loop()
                 result = await loop.run_in_executor(
                     None,
                     lambda: self._read_single_path(
                         all_paths[0], start_line=start_line, end_line=end_line,
+                        pages=pages,
                     ),
                 )
                 if result["success"]:
@@ -360,19 +534,14 @@ class ReadTool(BaseTool):
                     tool_parameters={"path": path, "paths": paths, "start_line": start_line, "end_line": end_line}
                 )
 
-            # Multiple paths: read each and aggregate. Each path goes
-            # through the executor so a slow filesystem on one path
-            # doesn't freeze the loop and prevent cancellation from
-            # propagating to the others.
             loop = asyncio.get_event_loop()
             results = []
             for p in all_paths:
-                # Bind p in the lambda's default arg so the closure
-                # doesn't capture the loop variable by reference.
                 r = await loop.run_in_executor(
                     None,
                     lambda p=p: self._read_single_path(
                         p, start_line=start_line, end_line=end_line,
+                        pages=pages,
                     ),
                 )
                 if r["success"]:

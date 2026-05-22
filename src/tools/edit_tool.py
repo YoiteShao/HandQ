@@ -102,9 +102,15 @@ class EditTool(BaseTool):
         path: str,
         old_content: str,
         new_content: str,
+        replace_all: bool = False,
         **kwargs
     ) -> ToolResult:
-        """Find *old_content* in *path* and replace it with *new_content* (first occurrence)."""
+        """Find *old_content* in *path* and replace with *new_content*.
+
+        When *replace_all* is False (default), replaces the first unique
+        occurrence only — rejects if multiple matches exist.
+        When *replace_all* is True, replaces ALL occurrences.
+        """
         start_time = time.time()
         # All blocking file I/O routes through this loop's default executor
         # so the asyncio loop stays alive on slow filesystems. Each
@@ -115,7 +121,7 @@ class EditTool(BaseTool):
         try:
             self.validate_params(
                 ["path", "old_content", "new_content"],
-                {"path": path, "old_content": old_content, "new_content": new_content}
+                {"path": path, "old_content": old_content, "new_content": new_content, "replace_all": replace_all}
             )
 
             path_obj = Path(path)
@@ -195,17 +201,20 @@ class EditTool(BaseTool):
                     tool_parameters={"path": path, "old_content": old_content, "new_content": new_content},
                 )
 
-            if match_count >= 2:
+            if match_count >= 2 and not replace_all:
                 return ToolResult(
                     success=False,
                     output=None,
-                    error=f"String found {match_count} times — must be unique. Add more context to old_content to make it unique.",
+                    error=f"String found {match_count} times — must be unique. Add more context to old_content to make it unique, or set replace_all=true to replace all occurrences.",
                     execution_time=time.time() - start_time,
                     tool_name=self.name,
                     tool_parameters={"path": path, "old_content": old_content, "new_content": new_content},
                 )
 
-            new_file_content = content.replace(old_content, new_content, 1)
+            if replace_all:
+                new_file_content = content.replace(old_content, new_content)
+            else:
+                new_file_content = content.replace(old_content, new_content, 1)
 
             # Write via temp file for atomicity. The temp-file dance is
             # synchronous and can stall on slow filesystems → executor.
@@ -255,6 +264,8 @@ class EditTool(BaseTool):
                 "message": "File edited successfully",
                 "diff": diff_preview,
             }
+            if replace_all:
+                output["replacements_made"] = match_count
             if file_changed_warning:
                 output["warning"] = file_changed_warning
 

@@ -87,6 +87,9 @@ def _failed_approach_signature(tr: "ToolResult") -> Optional[str]:
     if name in ("read", "write", "edit"):
         path = params.get("path", "")
         return f"{name}:{path}" if path else None
+    if name in ("glob", "grep"):
+        pattern = params.get("pattern", "")
+        return f"{name}:{pattern[:120]}" if pattern else None
     return None
 
 
@@ -128,6 +131,9 @@ _OBS_BUDGET_CHARS: int = 480_000
 _TOOL_NAME_ALIASES: Dict[str, str] = {
     "write_file": "write",
     "read_file": "read",
+    "search": "grep",
+    "find_files": "glob",
+    "list_files": "glob",
 }
 
 

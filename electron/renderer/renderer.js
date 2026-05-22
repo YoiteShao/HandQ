@@ -214,12 +214,13 @@
     const cfgLlmApiKey       = document.getElementById('cfg-llm-api-key');
     const cfgLlmApiKeyToggle = document.getElementById('cfg-llm-api-key-toggle');
     const cfgLlmMaxTokens    = document.getElementById('cfg-llm-max-tokens');
+    const cfgLlmModels       = document.getElementById('cfg-llm-models');
     const cfgLlmRoleTabs     = document.getElementById('cfg-llm-role-tabs');
     const cfgLlmRolePanes = {
-        planner:      document.getElementById('cfg-llm-planner'),
-        receptionist: document.getElementById('cfg-llm-receptionist'),
-        agent:        document.getElementById('cfg-llm-agent'),
-        helper:       document.getElementById('cfg-llm-helper'),
+        planner:      document.getElementById('cfg-llm-role-pane-planner'),
+        receptionist: document.getElementById('cfg-llm-role-pane-receptionist'),
+        agent:        document.getElementById('cfg-llm-role-pane-agent'),
+        helper:       document.getElementById('cfg-llm-role-pane-helper'),
     };
     const cfgSessionLogLevel      = document.getElementById('cfg-session-log-level');
     const cfgSessionStepThreshold = document.getElementById('cfg-session-step-threshold');
@@ -578,15 +579,21 @@
             li.appendChild(head);
 
             if (entry.content) {
-                const truncated = truncate(entry.content, ACTIVITY_TRUNC);
-                const content = el('span', 'ai-content', truncated);
+                const contentIsJson = isJsonString(entry.content);
+                const content = el('span', 'ai-content' + (contentIsJson ? ' ai-json' : ''));
+                if (contentIsJson) {
+                    content.appendChild(renderJsonContent(entry.content));
+                } else {
+                    content.textContent = truncate(entry.content, ACTIVITY_TRUNC);
+                }
                 li.appendChild(content);
-                li.title = entry.content;
+                li.title = contentIsJson ? '' : entry.content;
             }
             li.addEventListener('click', () => {
                 li.classList.toggle('expanded');
                 const c = li.querySelector('.ai-content');
                 if (!c) return;
+                if (c.classList.contains('ai-json')) return;
                 c.textContent = li.classList.contains('expanded')
                     ? entry.content
                     : truncate(entry.content, ACTIVITY_TRUNC);
@@ -654,6 +661,62 @@
         if (typeof params === 'string') return params;
         try { return JSON.stringify(params, null, 2); }
         catch (_) { return String(params); }
+    }
+
+    function isJsonString(s) {
+        if (!s || typeof s !== 'string') return false;
+        const trimmed = s.trim();
+        if ((trimmed[0] === '{' && trimmed[trimmed.length - 1] === '}') ||
+            (trimmed[0] === '[' && trimmed[trimmed.length - 1] === ']')) {
+            try { JSON.parse(trimmed); return true; }
+            catch (_) { return false; }
+        }
+        return false;
+    }
+
+    function renderJsonValue(value) {
+        if (value === null) return el('span', 'ai-json-null', 'null');
+        if (typeof value === 'boolean') return el('span', 'ai-json-bool', String(value));
+        if (typeof value === 'number') return el('span', 'ai-json-num', String(value));
+        if (typeof value === 'string') {
+            const display = value.length > 120 ? value.slice(0, 117) + '…' : value;
+            return el('span', 'ai-json-str', '"' + display + '"');
+        }
+        if (Array.isArray(value)) {
+            if (value.length === 0) return el('span', 'ai-json-bracket', '[]');
+            const ul = el('ul', 'ai-json-tree');
+            for (let i = 0; i < value.length; i++) {
+                const li = el('li', 'ai-json-entry');
+                const idx = el('span', 'ai-json-key', '[' + i + '] ');
+                li.appendChild(idx);
+                li.appendChild(renderJsonValue(value[i]));
+                ul.appendChild(li);
+            }
+            return ul;
+        }
+        if (typeof value === 'object') {
+            const keys = Object.keys(value);
+            if (keys.length === 0) return el('span', 'ai-json-bracket', '{}');
+            const ul = el('ul', 'ai-json-tree');
+            for (const k of keys) {
+                const li = el('li', 'ai-json-entry');
+                const keySpan = el('span', 'ai-json-key', k + ': ');
+                li.appendChild(keySpan);
+                li.appendChild(renderJsonValue(value[k]));
+                ul.appendChild(li);
+            }
+            return ul;
+        }
+        return document.createTextNode(String(value));
+    }
+
+    function renderJsonContent(jsonStr) {
+        try {
+            const parsed = JSON.parse(jsonStr.trim());
+            return renderJsonValue(parsed);
+        } catch (_) {
+            return document.createTextNode(jsonStr);
+        }
     }
 
     // ----- chat state ------------------------------------------------------
@@ -1242,12 +1305,7 @@
         composerInput.focus();
     });
 
-    // ----- settings form helpers (unchanged from prior implementation) -----
-
-    function modelsToText(models) {
-        if (!Array.isArray(models)) return '';
-        return models.map((m) => String(m)).join('\n');
-    }
+    // ----- settings form helpers (model master-list + per-role checkboxes) -----
 
     function textToModels(text) {
         if (!text) return [];
@@ -1255,6 +1313,11 @@
             .split(/\r?\n/)
             .map((s) => s.trim())
             .filter((s) => s.length > 0);
+    }
+
+    function modelsToText(models) {
+        if (!Array.isArray(models)) return '';
+        return models.map((m) => String(m)).join('\n');
     }
 
     const PLANNER_MIN_VERSION = [4, 5];
@@ -1301,6 +1364,60 @@
         };
     }
 
+    // Per-role checked state: { planner: Set, receptionist: Set, agent: Set, helper: Set }
+    let roleSelections = {
+        planner: new Set(),
+        receptionist: new Set(),
+        agent: new Set(),
+        helper: new Set(),
+    };
+
+    function modelDisplayName(model) {
+        const idx = model.indexOf('::');
+        return idx >= 0 ? model.slice(idx + 2) : model;
+    }
+
+    function rebuildRoleCheckboxes() {
+        const models = textToModels(cfgLlmModels.value);
+        for (const role of Object.keys(cfgLlmRolePanes)) {
+            const pane = cfgLlmRolePanes[role];
+            if (!pane) continue;
+            const sel = roleSelections[role] || new Set();
+            pane.innerHTML = '';
+            if (models.length === 0) {
+                const empty = document.createElement('span');
+                empty.className = 'help-text';
+                empty.textContent = 'Add models in Available tab.';
+                pane.appendChild(empty);
+                continue;
+            }
+            for (const model of models) {
+                const lbl = document.createElement('label');
+                lbl.className = 'model-checkbox';
+                const cb = document.createElement('input');
+                cb.type = 'checkbox';
+                cb.value = model;
+                cb.checked = sel.has(model);
+                cb.addEventListener('change', () => {
+                    if (cb.checked) sel.add(model);
+                    else sel.delete(model);
+                });
+                const span = document.createElement('span');
+                span.textContent = modelDisplayName(model);
+                span.title = model;
+                lbl.appendChild(cb);
+                lbl.appendChild(span);
+                pane.appendChild(lbl);
+            }
+        }
+    }
+
+    if (cfgLlmModels) {
+        cfgLlmModels.addEventListener('input', () => {
+            rebuildRoleCheckboxes();
+        });
+    }
+
     function selectRoleTab(role) {
         const tabs = cfgLlmRoleTabs ? cfgLlmRoleTabs.querySelectorAll('.role-tab') : [];
         tabs.forEach((btn) => {
@@ -1308,6 +1425,8 @@
             btn.classList.toggle('active', active);
             btn.setAttribute('aria-selected', active ? 'true' : 'false');
         });
+        // "available" tab controls the master textarea
+        if (cfgLlmModels) cfgLlmModels.hidden = (role !== 'available');
         for (const key of Object.keys(cfgLlmRolePanes)) {
             const pane = cfgLlmRolePanes[key];
             if (!pane) continue;
@@ -1346,24 +1465,46 @@
         cfgLlmMaxTokens.value =
             (llm.max_tokens === undefined || llm.max_tokens === null) ? '' : String(llm.max_tokens);
 
+        // Determine master model list and per-role selections
         const rolesObj = (llm.roles && typeof llm.roles === 'object') ? llm.roles : null;
-        if (rolesObj) {
-            cfgLlmRolePanes.planner.value      = modelsToText(rolesObj.planner);
-            cfgLlmRolePanes.receptionist.value = modelsToText(rolesObj.receptionist);
-            cfgLlmRolePanes.agent.value        = modelsToText(rolesObj.agent);
-            cfgLlmRolePanes.helper.value       = modelsToText(rolesObj.helper);
-        } else if (Array.isArray(llm.models) && llm.models.length > 0) {
-            const derived = assignRoles(llm.models);
-            cfgLlmRolePanes.planner.value      = modelsToText(derived.planner);
-            cfgLlmRolePanes.receptionist.value = modelsToText(derived.receptionist);
-            cfgLlmRolePanes.agent.value        = modelsToText(derived.agent);
-            cfgLlmRolePanes.helper.value       = modelsToText(derived.helper);
-        } else {
-            cfgLlmRolePanes.planner.value      = '';
-            cfgLlmRolePanes.receptionist.value = '';
-            cfgLlmRolePanes.agent.value        = '';
-            cfgLlmRolePanes.helper.value       = '';
+        let masterModels = [];
+        let perRole = { planner: [], receptionist: [], agent: [], helper: [] };
+
+        if (Array.isArray(llm.models) && llm.models.length > 0) {
+            masterModels = llm.models.map(String);
         }
+
+        if (rolesObj) {
+            perRole.planner      = Array.isArray(rolesObj.planner) ? rolesObj.planner.map(String) : [];
+            perRole.receptionist = Array.isArray(rolesObj.receptionist) ? rolesObj.receptionist.map(String) : [];
+            perRole.agent        = Array.isArray(rolesObj.agent) ? rolesObj.agent.map(String) : [];
+            perRole.helper       = Array.isArray(rolesObj.helper) ? rolesObj.helper.map(String) : [];
+            // If master list is empty, derive it as de-duped union of all role lists
+            if (masterModels.length === 0) {
+                const seen = new Set();
+                for (const role of ['planner', 'receptionist', 'agent', 'helper']) {
+                    for (const m of perRole[role]) {
+                        if (!seen.has(m)) { seen.add(m); masterModels.push(m); }
+                    }
+                }
+            }
+        } else if (masterModels.length > 0) {
+            // Legacy: only llm.models exists, auto-assign roles
+            const derived = assignRoles(masterModels);
+            perRole.planner      = derived.planner;
+            perRole.receptionist = derived.receptionist;
+            perRole.agent        = derived.agent;
+            perRole.helper       = derived.helper;
+        }
+
+        cfgLlmModels.value = modelsToText(masterModels);
+
+        // Populate roleSelections Sets and rebuild checkboxes
+        roleSelections.planner      = new Set(perRole.planner);
+        roleSelections.receptionist = new Set(perRole.receptionist);
+        roleSelections.agent        = new Set(perRole.agent);
+        roleSelections.helper       = new Set(perRole.helper);
+        rebuildRoleCheckboxes();
         selectRoleTab('planner');
 
         cfgSessionLogLevel.value = sessCfg.log_level || '';
@@ -1407,13 +1548,17 @@
             if (!Number.isNaN(n)) llm.max_tokens = n;
         }
 
-        if ('models' in llm) delete llm.models;
-        llm.roles = {
-            planner:      textToModels(cfgLlmRolePanes.planner.value),
-            receptionist: textToModels(cfgLlmRolePanes.receptionist.value),
-            agent:        textToModels(cfgLlmRolePanes.agent.value),
-            helper:       textToModels(cfgLlmRolePanes.helper.value),
-        };
+        // Master model list
+        const masterModels = textToModels(cfgLlmModels.value);
+        llm.models = masterModels;
+
+        // Per-role selections (preserve master-list order)
+        if ('models' in llm && llm.models.length === 0) delete llm.models;
+        llm.roles = {};
+        for (const role of ['planner', 'receptionist', 'agent', 'helper']) {
+            const sel = roleSelections[role] || new Set();
+            llm.roles[role] = masterModels.filter((m) => sel.has(m));
+        }
 
         if (cfgSessionLogLevel.value) sess.log_level = cfgSessionLogLevel.value;
         else delete sess.log_level;
