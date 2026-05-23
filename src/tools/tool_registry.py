@@ -13,6 +13,7 @@ from .ssh_tool import StatelessSSHTool
 from .glob_tool import GlobTool
 from .grep_tool import GrepTool
 from .notebook_edit_tool import NotebookEditTool
+from .browser_tool import BrowserTool
 
 _IS_WINDOWS = sys.platform == "win32"
 
@@ -67,6 +68,7 @@ class ToolRegistry:
     GREP = "grep"
     NOTEBOOK_EDIT = "notebook_edit"
     SSH  = "ssh"
+    BROWSER = "browser"
 
     _tools: Dict[str, ToolMetadata] = {}
     _initialized = False
@@ -1011,6 +1013,131 @@ Recommended workflow for long-running remote scripts:
             tool_class=StatelessSSHTool,
             on_demand=True,
         )
+
+        # Register BROWSER tool. Windows-only — Playwright + Edge channel
+        # gating is tested only on Win11. on_demand=True so it only enters
+        # the LLM tool list when BrowserContextProvider activates it
+        # (Phase 4); without the provider, LLM never sees this tool.
+        if _IS_WINDOWS:
+            cls._tools[cls.BROWSER] = ToolMetadata(
+                name=cls.BROWSER,
+                description=(
+                    "Persistent Chromium browser automation (single shared session "
+                    "with off-screen window position so the user's desktop is not "
+                    "disturbed). Cookies persist across HandQ sessions in "
+                    "%USERPROFILE%\\HandQ\\browser_profile\\."
+                ),
+                usage_guide="""\
+WHEN TO USE
+  - Visit a website, follow links, read page content, fill forms, click buttons
+  - Tasks the user phrases in terms of "open", "go to <url>", "查看 <网站>",
+    "登录"、"点击"、"填写"
+
+WORKFLOW
+  1. action='launch_browser' once per session (idempotent — safe to call
+     repeatedly; reuses the existing session). Returns the first tab_id.
+  2. action='navigate' with url='https://...' to load a page. The result
+     auto-includes a 'page_state' summary (open dialogs + toasts) so you
+     usually do NOT need a follow-up extract just to see what is on screen.
+  3. action='snapshot' to enumerate every visible button / link / form
+     control AND any open dialogs in a single call. Each item carries a
+     suggested selector — pass it straight to click / type. STRONGLY
+     PREFERRED over speculative extract probes when you don't already
+     know the page structure.
+  4. action='extract' for content reads:
+       - mode='text' (default): visible text (filter dropdowns are
+         collapsed to the selected option to keep payloads small).
+       - mode='html': outerHTML of the FIRST match (or whole document).
+       - mode='attr': attributes of one element.
+       - mode='list': outerHTML+text of EVERY match up to 'limit' (default
+         20, max 100) — use when enumerating candidates by selector.
+  5. action='click' / 'type' to interact. Selectors support CSS,
+     text='Login', role='button[name=Submit]', xpath=//.  Both echo a
+     'page_state' field after the action so you see modal/toast changes
+     immediately — do not chase with a screenshot+extract pair.
+  6. action='wait_for' to block until a selector appears (state='visible'
+     default) or the URL matches a regex (url_pattern='/dashboard$').
+  7. action='list_tabs' if you have multiple tabs.
+  8. action='close_tab' for tabs you no longer need.
+
+KEY INVARIANTS
+  - tab_id is optional everywhere except close_tab; defaults to the first tab.
+  - extract mode='text' (default) returns visible text capped at ~100KB.
+    Filter dropdowns (<select>, <datalist>) are collapsed to their selected
+    option so a 160-row dashboard does not dump 1KB+ of option lists per call.
+  - extract mode='html' returns outerHTML when selector given, full HTML otherwise.
+  - extract mode='attr' requires a selector; returns one attribute or all.
+  - extract mode='list' requires a selector; returns up to 'limit' matches
+    (default 20, hard cap 100) — use this instead of repeating extract with
+    successively narrower selectors.
+  - snapshot has no selector arg; it lists every interactable element on
+    the page plus open dialogs / toast notifications, with a suggested
+    selector for each. Cheap (one page.evaluate call) and bounded.
+  - navigate / click / type / snapshot return a 'page_state' field with
+    the topmost open dialog and visible toasts when present — read it
+    instead of firing a follow-up extract.
+
+PASSWORD GUARD (HARD REFUSAL)
+  type is server-side refused on input[type=password]. If you encounter a
+  login form, do NOT try to fill the password — call request_user_login
+  so the user can log in manually. The resulting cookies persist in the
+  user-data-dir for future sessions.
+
+LOGIN HANDOFF (request_user_login)
+  When a page requires user credentials:
+    1. action='navigate' to the login page (or land there organically).
+    2. action='request_user_login', reason='<short explanation>',
+       success_url_pattern='<regex matching post-login URL>'   (optional but
+       recommended).
+    3. The browser window moves on-screen at the login page; HandQ shows an
+       Approve/Reject modal explaining what's happening. The user enters
+       credentials in Chrome's native UI — agent sees nothing.
+    4. User clicks Approve when finished. The window moves back off-screen
+       and the action returns the post-login URL plus whether
+       success_url_pattern matched.
+    5. If the user clicks Reject, the action fails — re-plan or ask the
+       user for a different approach.
+  Cookies persist across HandQ sessions, so this dance happens at most
+  once per site (until cookies expire on the server side).
+
+STEALTH
+  The browser launches off-screen (window-position=-32000,-32000) so the
+  user's desktop focus is preserved. Do NOT enable headless — sites detect
+  headless via JS fingerprinting; we want a real-user fingerprint while
+  staying invisible.
+
+EXAMPLES
+  GOOD: action='launch_browser'
+  GOOD: action='navigate', url='https://example.com'
+  GOOD: action='snapshot'        (always do this on a new page before guessing selectors)
+  GOOD: action='click', selector='text=Sign in'
+  GOOD: action='type', selector='input[name=q]', text='hello', press_enter=true
+  GOOD: action='wait_for', selector='.results', state='visible'
+  GOOD: action='wait_for', url_pattern='/dashboard($|/)'
+  GOOD: action='extract', mode='attr', selector='a.next', attribute='href'
+  GOOD: action='extract', mode='list', selector='button.action-btn.book', limit=20
+  GOOD: action='request_user_login', reason='need GitHub credentials',
+        success_url_pattern='github\\.com/(?!login)'
+  GOOD: action='attach_browser'   (when user said "我刚才打开的" — needs config)
+  GOOD: action='new_tab', url='https://...', background=true   (attach mode)
+  BAD:  action='type', selector='input[type=password]'  — REFUSED
+  BAD:  url='example.com'  — must include scheme
+  BAD:  action='navigate' before launch_browser/attach_browser  — no session
+  BAD:  selector='SA8797P.HGY.5.1.7.0' — '.5' is a CSS numeric literal,
+        use [id='SA8797P.HGY.5.1.7.0'] or text='SA8797P.HGY.5.1.7.0'
+
+LAUNCH vs ATTACH (advanced)
+  Default to launch_browser. Use attach_browser ONLY when the task explicitly
+  needs the user's RUNNING Chrome state (e.g., "刚才/正在/我现在打开的/接着我那个"):
+    - "去 GitHub 看我的 PR review" → launch (just need login state)
+    - "把刚才在 Notion 写的草稿发给团队" → attach (needs current Notion tab)
+  attach is high-risk: it requires user approval each time and
+  browser.attach_enabled: true in handq_config.yaml. New tabs created in
+  attach mode default to background=true so the user's focus is preserved.""",
+                parameter_schema=BrowserTool.parameter_schema,
+                tool_class=BrowserTool,
+                on_demand=True,
+            )
 
         cls._initialized = True
 

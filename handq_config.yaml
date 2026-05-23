@@ -2,6 +2,9 @@ version: '3.0'
 llm:
   API_KEY: ff6bb18f-4a84-401d-9989-f6997487abe5
   models:
+  - anthropic::claude-4-7-opus
+  - anthropic::claude-4-6-opus:1M
+  - anthropic::claude-4-6-opus
   - anthropic::claude-4-6-sonnet:1M
   - anthropic::claude-4-6-sonnet
   - anthropic::claude-4-5-sonnet
@@ -12,7 +15,6 @@ llm:
   - anthropic::claude-3-5-sonnet
   roles:
     planner:
-    - anthropic::claude-4-6-sonnet:1M
     - anthropic::claude-4-6-sonnet
     - anthropic::claude-4-5-sonnet
     - anthropic::claude-4-5-haiku:thinking
@@ -22,7 +24,6 @@ llm:
     - anthropic::claude-4-5-haiku:thinking
     - anthropic::claude-4-5-haiku
     agent:
-    - anthropic::claude-4-6-sonnet:1M
     - anthropic::claude-4-6-sonnet
     - anthropic::claude-4-5-sonnet
     - anthropic::claude-4-5-haiku:thinking
@@ -47,9 +48,23 @@ interaction_switches:
   tool_bash:
     auto_approve: true
     description: Control bash tool auto-execution
+  tool_browser:
+    auto_approve: false
+    description: Browser automation (independent profile, off-screen window). When
+      unchecked, every browser action prompts for approval. attach_browser is gated
+      separately by the high_risk switch and always asks regardless of this setting.
   high_risk:
-    auto_approve: true
+    auto_approve: false
     description: Control high-risk operation auto-execution
+browser:
+  attach_enabled: false
+  cdp_port: 9222
+  cdp_url: ''
+  prefer_attach: false
+  # Flip to true only when the active LLM accepts image inputs. While false,
+  # action='screenshot' is hidden from the browser tool's parameter schema
+  # so the model never wastes a turn capturing PNGs it cannot read.
+  vision_enabled: false
 high_risk_commands:
   always_dangerous_keywords:
   - shutdown

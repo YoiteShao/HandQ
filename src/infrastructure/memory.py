@@ -67,6 +67,14 @@ class Memory:
         # credentials without re-prompting.
         self._ssh_contexts: Dict[str, Dict[str, Any]] = {}
 
+        # Browser context — set by BrowserContextProvider on first activation.
+        # Browser is process-wide (one persistent profile, one Playwright
+        # session), so this is keyed by a constant slot. Phase 5 may add
+        # additional keys for attach-mode CDP probe results so the agent
+        # avoids re-probing the user's debug port every step.
+        # Stored value shape: {"prepared": bool, "channel": str|None, ...}
+        self._browser_contexts: Dict[str, Dict[str, Any]] = {}
+
     def set_ssh_context(self, hostname: str, creds_file: str, hint: str) -> None:
         """
         Store SSH credential context for a specific host.
@@ -99,6 +107,23 @@ class Memory:
     def get_all_ssh_contexts(self) -> Dict[str, Dict[str, Any]]:
         """Return a copy of all per-hostname SSH contexts established so far."""
         return dict(self._ssh_contexts)
+
+    # ── Browser context ──────────────────────────────────────────────────────
+
+    def set_browser_context(self, key: str, value: Dict[str, Any]) -> None:
+        """Store browser-related context (prepare flag, attach probe, etc.).
+
+        BrowserContextProvider uses ``key="default"`` to record that the
+        first-touch hint has already been delivered, so subsequent steps
+        receive a brief reminder instead of the full workflow guide.
+
+        Phase 5 may use additional keys for attach-mode probe results.
+        """
+        self._browser_contexts[key] = dict(value)
+
+    def get_browser_context(self, key: str) -> Optional[Dict[str, Any]]:
+        """Return the stored browser context for *key*, or None."""
+        return self._browser_contexts.get(key)
 
 
     def add_step(self, step: Step) -> None:
@@ -500,5 +525,6 @@ class Memory:
         self._compressed_findings_summary = None
         self._compressed_findings_boundary = 0
         self._ssh_contexts.clear()
+        self._browser_contexts.clear()
 
 AgentMemory = Memory  # alias for backward-compatible imports

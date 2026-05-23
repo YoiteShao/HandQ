@@ -102,6 +102,14 @@ class RiskGuard:
                               return False if ALL paths are inside the working
                               directory, True otherwise.
 
+        Decision logic for the browser tool
+        ------------------------------------
+        Only ``action='attach_browser'`` is treated as high-risk: connecting
+        to the user's running Chrome is a P0 trust event.  All other browser
+        actions (launch_browser, navigate, click, type, extract,
+        request_user_login, …) run inside the isolated HandQ profile and
+        are gated by the ``tool_browser`` switch instead.
+
         Args:
             decision: Agent's decision.
 
@@ -109,6 +117,17 @@ class RiskGuard:
             True  → high-risk, user confirmation required.
             False → safe to proceed automatically.
         """
+        # ── Browser tool: attach_browser is high-risk ────────────────────────
+        if decision.tool_name == "browser":
+            params = decision.parameters or {}
+            if params.get("action") == "attach_browser":
+                self.logger.warning(
+                    "browser attach_browser action detected (confirmation required)",
+                    component="RiskGuard",
+                )
+                return True
+            return False
+
         # Only bash/shell commands are inspected for risk.
         if decision.tool_name not in ("bash", "shell"):
             return False
@@ -354,12 +373,40 @@ class RiskGuard:
              can see exactly what triggered the alert.
           2. The triggering keyword(s).
 
+        For browser tool's attach_browser action, a dedicated description
+        explains the implications of taking over the user's running Chrome.
+
         Args:
             decision: Agent's decision.
 
         Returns:
-            Two-line risk description string.
+            Risk description string.
         """
+        # ── Browser attach — dedicated description ──────────────────────────
+        if decision.tool_name == "browser":
+            params = decision.parameters or {}
+            if params.get("action") == "attach_browser":
+                creds_file = params.get("browser_credentials_file") or "(none — using config defaults)"
+                return (
+                    "Agent wants to ATTACH to your running Chrome / Edge browser.\n"
+                    "\n"
+                    "What this means:\n"
+                    "  • HandQ will see ALL your currently open tabs and their content.\n"
+                    "  • HandQ can open new tabs (in the background — your focus is\n"
+                    "    not stolen) and operate on existing tabs.\n"
+                    "  • HandQ uses your real cookies / login state — agent can act\n"
+                    "    as you on logged-in sites.\n"
+                    "  • Your Chrome session continues running after agent disconnects;\n"
+                    "    HandQ does NOT close your browser.\n"
+                    "\n"
+                    f"Credentials file: {creds_file}\n"
+                    "(Empty → connects to localhost:9222 — the default debug port.)\n"
+                    "\n"
+                    "Approve only if you started Chrome with\n"
+                    "  --remote-debugging-port=9222\n"
+                    "and intend to share its tabs with the agent for THIS task."
+                )
+
         command: str = (decision.parameters or {}).get("command", "")
         command_lower = command.lower()
 

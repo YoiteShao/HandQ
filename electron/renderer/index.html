@@ -370,6 +370,20 @@
                         </label>
 
                         <label class="checkbox-row">
+                            <input type="checkbox" id="cfg-sw-tool-browser" />
+                            <span>Auto-approve browser tool</span>
+                            <small class="help-text">
+                                When unchecked, ask before each browser action
+                                (navigate, click, type, extract, screenshot, …).
+                                The browser launches off-screen with a separate
+                                profile so it does not disturb your main Chrome.
+                                attach_browser (taking over your running Chrome)
+                                is gated separately by the high-risk switch and
+                                always asks regardless of this setting.
+                            </small>
+                        </label>
+
+                        <label class="checkbox-row">
                             <input type="checkbox" id="cfg-sw-high-risk" />
                             <span>Auto-approve high-risk commands</span>
                             <small class="help-text">

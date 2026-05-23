@@ -238,6 +238,7 @@
     const cfgSwToolWrite = document.getElementById('cfg-sw-tool-write');
     const cfgSwToolEdit  = document.getElementById('cfg-sw-tool-edit');
     const cfgSwToolBash  = document.getElementById('cfg-sw-tool-bash');
+    const cfgSwToolBrowser = document.getElementById('cfg-sw-tool-browser');
     const cfgSwHighRisk  = document.getElementById('cfg-sw-high-risk');
 
     // Hotkey field
@@ -1719,6 +1720,7 @@
         cfgSwToolWrite.checked = readSwitch('tool_write');
         cfgSwToolEdit.checked  = readSwitch('tool_edit');
         cfgSwToolBash.checked  = readSwitch('tool_bash');
+        cfgSwToolBrowser.checked = readSwitch('tool_browser');
         cfgSwHighRisk.checked  = readSwitch('high_risk');
     }
 
@@ -1777,6 +1779,7 @@
         writeSwitch('tool_write', cfgSwToolWrite.checked);
         writeSwitch('tool_edit',  cfgSwToolEdit.checked);
         writeSwitch('tool_bash',  cfgSwToolBash.checked);
+        writeSwitch('tool_browser', cfgSwToolBrowser.checked);
         writeSwitch('high_risk',  cfgSwHighRisk.checked);
 
         out.llm = llm;

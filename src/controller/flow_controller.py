@@ -720,7 +720,7 @@ class FlowController:
             )
 
     def _register_default_providers(self) -> None:
-        """Register built-in StepContextProviders (SSH, etc.)."""
+        """Register built-in StepContextProviders (SSH, browser, etc.)."""
         try:
             from ..infrastructure.ssh_setup import SSHContextProvider
             self.register_step_context_provider(SSHContextProvider())
@@ -728,6 +728,15 @@ class FlowController:
             # paramiko / keyring not installed — SSH provider unavailable.
             self.logger.debug(
                 "SSHContextProvider not registered (paramiko or keyring missing)",
+                component="FlowController",
+            )
+        try:
+            from ..infrastructure.browser_setup import BrowserContextProvider
+            self.register_step_context_provider(BrowserContextProvider())
+        except ImportError:
+            # browser_paths or other transitive deps missing — silently skip.
+            self.logger.debug(
+                "BrowserContextProvider not registered (transitive deps missing)",
                 component="FlowController",
             )
 
