@@ -44,3 +44,11 @@ keyring>=24.0.0
 # Fallback file-based keyring backend for headless/Linux environments (optional)
 # Used automatically when the system keyring (D-Bus / Secret Service) is unavailable
 keyrings.alt>=4.0.0
+
+# ── Browser tool dependencies (Windows-only, optional) ─────────────────────────
+
+# Playwright drives the browser tool. Edge / Chrome are detected at runtime;
+# bundled Chromium is a fallback that requires `playwright install chromium`.
+# The agent runs without this dependency — BrowserTool reports an actionable
+# install hint when imports fail.
+playwright>=1.40.0

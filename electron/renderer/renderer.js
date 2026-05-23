@@ -195,8 +195,18 @@
     // Overlays
     const overlayStatus    = document.getElementById('overlay-status');
     const overlaySettings  = document.getElementById('overlay-settings');
+    const overlayConfirm   = document.getElementById('overlay-confirmation');
     const statusCloseBtn   = document.getElementById('status-close');
     const settingsCancel   = document.getElementById('settings-cancel');
+    const confirmTitle     = document.getElementById('confirm-title');
+    const confirmDescEl    = document.getElementById('confirm-description');
+    const confirmDecisionEl= document.getElementById('confirm-decision');
+    const confirmSecretWrap= document.getElementById('confirm-secret-wrap');
+    const confirmSecretIn  = document.getElementById('confirm-secret-input');
+    const confirmGuidanceEl= document.getElementById('confirm-guidance');
+    const confirmGuidBtn   = document.getElementById('confirm-guidance-btn');
+    const confirmRejectBtn = document.getElementById('confirm-reject');
+    const confirmSubmitBtn = document.getElementById('confirm-submit');
 
     // Status overlay readouts
     const stState    = document.getElementById('st-state');
@@ -902,6 +912,127 @@
         scrollToBottom();
     }
 
+    // ----- confirmation modal ---------------------------------------------
+    //
+    // Surfaces three envelope kinds emitted by _StdioUI in stdio_bridge.py:
+    //   - risk_confirmation : high-risk operation gate
+    //   - tool_confirmation : tool-specific gate (write/edit/bash/...)
+    //   - secret_input      : hidden-text input (e.g. SSH password)
+    //
+    // Replies travel back via:
+    //   handq.sendRequest({type:"user_input", kind:"confirmation",
+    //                      answer: <"yes" | "no" | <free-text>>})
+    // which the bridge dispatcher routes to InteractionManager.
+    //
+    // Free-text answers are interpreted by IM._resolve_confirmation: any
+    // string other than yes/y/no/n becomes UC.with_message(text). The
+    // engine then either treats it as user_message (tool path) or
+    // injects it as risk_guidance (risk path).
+
+    // Track the prompt id of the currently shown modal so each Approve /
+    // Reject / Submit click sends back a single response. Reset to null
+    // after responding to avoid double-sends if the user rapid-clicks.
+    let activePromptId = null;
+    // Track whether the active prompt expects a yes/no answer (confirm)
+    // or a free-form string (secret_input).
+    let activePromptKind = null;
+
+    function renderDecisionSummary(decision) {
+        // decision: { tool_calls: [{tool_name, params: {...}}], reasoning }
+        confirmDecisionEl.textContent = '';
+        if (!decision) {
+            confirmDecisionEl.classList.add('hidden');
+            return;
+        }
+        const calls = Array.isArray(decision.tool_calls) ? decision.tool_calls : [];
+        if (calls.length === 0 && !decision.reasoning) {
+            confirmDecisionEl.classList.add('hidden');
+            return;
+        }
+        const lines = [];
+        for (const tc of calls) {
+            const params = tc && tc.params || {};
+            const paramStr = Object.entries(params)
+                .map(([k, v]) => '  ' + k + ': ' + String(v))
+                .join('\n');
+            lines.push('▸ ' + (tc.tool_name || 'unknown'));
+            if (paramStr) lines.push(paramStr);
+        }
+        if (decision.reasoning) {
+            lines.push('');
+            lines.push('reasoning: ' + decision.reasoning);
+        }
+        confirmDecisionEl.textContent = lines.join('\n');
+        confirmDecisionEl.classList.remove('hidden');
+    }
+
+    function showConfirmationModal(evt) {
+        // Idempotency: if a previous prompt was never answered (shouldn't
+        // happen — the bridge serialises confirmations), the new one
+        // overwrites the active id. The earlier waiter on the Python side
+        // will time out only if we never send any response, but in
+        // practice the user clicks one of the new buttons and that reply
+        // unblocks whichever waiter is still pending in IM.
+        activePromptId = String(evt.id || '');
+        activePromptKind = String(evt.kind || '');
+
+        if (evt.kind === 'secret_input') {
+            confirmTitle.textContent = 'Input required';
+            confirmDescEl.textContent = String(evt.prompt || 'Enter value:');
+            renderDecisionSummary(null);
+            confirmSecretWrap.classList.remove('hidden');
+            confirmSecretIn.value = '';
+            confirmGuidanceEl.classList.add('hidden');
+            confirmGuidanceEl.value = '';
+            confirmRejectBtn.classList.add('hidden');
+            confirmGuidBtn.classList.add('hidden');
+            confirmSubmitBtn.textContent = 'Submit';
+        } else {
+            // risk_confirmation or tool_confirmation
+            const isRisk = evt.kind === 'risk_confirmation';
+            confirmTitle.textContent = isRisk
+                ? 'High-risk operation'
+                : 'Confirm ' + (evt.tool || 'tool') + ' execution';
+            confirmDescEl.textContent = isRisk
+                ? String(evt.description || '')
+                : ('The agent wants to run "' + (evt.tool || 'tool') +
+                   '" with the parameters below.');
+            renderDecisionSummary(evt.decision);
+            confirmSecretWrap.classList.add('hidden');
+            confirmSecretIn.value = '';
+            confirmGuidanceEl.classList.add('hidden');
+            confirmGuidanceEl.value = '';
+            confirmRejectBtn.classList.remove('hidden');
+            confirmGuidBtn.classList.remove('hidden');
+            confirmGuidBtn.textContent = 'Provide guidance';
+            confirmSubmitBtn.textContent = 'Approve';
+        }
+
+        openOverlay(overlayConfirm);
+        // Focus management: passwords get the input; risk gates need an
+        // explicit click on Approve so we don't auto-focus the primary.
+        if (evt.kind === 'secret_input') {
+            try { confirmSecretIn.focus(); } catch (_) { /* ignore */ }
+        }
+    }
+
+    function sendConfirmationAnswer(answer) {
+        if (!activePromptId) return;
+        try {
+            handq.sendRequest({
+                type: 'user_input',
+                kind: 'confirmation',
+                answer: String(answer || ''),
+            });
+        } catch (e) {
+            window.__handqLog('ERROR', 'confirm send failed',
+                { id: activePromptId, error: String(e) });
+        }
+        activePromptId = null;
+        activePromptKind = null;
+        closeOverlay(overlayConfirm);
+    }
+
     // ----- bridge events ---------------------------------------------------
 
     handq.onTokenStream((evt) => {
@@ -933,6 +1064,19 @@
         });
 
         const args = Array.isArray(evt.args) ? evt.args : [];
+
+        if (evt.kind === 'risk_confirmation' ||
+            evt.kind === 'tool_confirmation' ||
+            evt.kind === 'secret_input') {
+            // Show the confirmation modal and stop further dispatch — these
+            // envelopes are not informational status updates.
+            recordEvent('confirmation requested: ' + evt.kind +
+                        (evt.tool ? ' (' + evt.tool + ')' : ''));
+            try { showConfirmationModal(evt); }
+            catch (e) { window.__handqLog('ERROR', 'showConfirmationModal failed',
+                                           { error: String(e) }); }
+            return;
+        }
 
         if (evt.kind === 'state_changed' && evt.state) {
             session.state = evt.state;
@@ -1243,6 +1387,57 @@
     });
     statusCloseBtn.addEventListener('click', () => closeOverlay(overlayStatus));
     settingsCancel.addEventListener('click', () => closeOverlay(overlaySettings));
+
+    // ----- confirmation modal button wiring --------------------------------
+    //
+    // The modal is intentionally NOT click-outside-dismissible: a high-risk
+    // confirmation requires an explicit Approve / Reject / Guidance choice,
+    // and Esc is also disabled while a prompt is active so the user cannot
+    // accidentally cancel an SSH credential prompt mid-typing.
+
+    confirmSubmitBtn.addEventListener('click', () => {
+        if (activePromptKind === 'secret_input') {
+            sendConfirmationAnswer(confirmSecretIn.value || '');
+        } else if (!confirmGuidanceEl.classList.contains('hidden')) {
+            // Guidance mode active — submit the guidance text
+            const text = (confirmGuidanceEl.value || '').trim();
+            if (!text) {
+                // Empty guidance falls back to "yes" (Approve semantics).
+                sendConfirmationAnswer('yes');
+            } else {
+                sendConfirmationAnswer(text);
+            }
+        } else {
+            sendConfirmationAnswer('yes');
+        }
+    });
+
+    confirmRejectBtn.addEventListener('click', () => {
+        sendConfirmationAnswer('no');
+    });
+
+    confirmGuidBtn.addEventListener('click', () => {
+        // Toggle guidance textarea: first click reveals + relabels Submit.
+        if (confirmGuidanceEl.classList.contains('hidden')) {
+            confirmGuidanceEl.classList.remove('hidden');
+            confirmGuidBtn.textContent = 'Cancel guidance';
+            confirmSubmitBtn.textContent = 'Send guidance';
+            try { confirmGuidanceEl.focus(); } catch (_) { /* ignore */ }
+        } else {
+            confirmGuidanceEl.classList.add('hidden');
+            confirmGuidanceEl.value = '';
+            confirmGuidBtn.textContent = 'Provide guidance';
+            confirmSubmitBtn.textContent = 'Approve';
+        }
+    });
+
+    // Pressing Enter in the secret input submits.
+    confirmSecretIn.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && activePromptKind === 'secret_input') {
+            e.preventDefault();
+            sendConfirmationAnswer(confirmSecretIn.value || '');
+        }
+    });
 
     window.addEventListener('keydown', (e) => {
         if (e.key === 'Escape') {

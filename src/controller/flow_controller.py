@@ -64,7 +64,6 @@ import asyncio
 import json
 import math
 import os
-import socket as _socket_mod
 import time
 import uuid
 from datetime import datetime, timezone
@@ -87,9 +86,6 @@ from .receptionist import Receptionist, UserMessageIntent, UserMessageEvaluation
 from .interaction_manager import InteractionManager
 from ..infrastructure.gep_template import load_template, GEPTemplate
 from .planner_prompts import GEP_ENRICHED_GOAL_TEMPLATE
-
-_FALLBACK_TMUX_SESSION = f"handq-{os.environ.get('USER', 'default')}@{_socket_mod.gethostname().split('.')[0]}"
-_FALLBACK_TMUX_SOCKET  = f"handq-{os.environ.get('USER', 'default')}@{_socket_mod.gethostname().split('.')[0]}"
 
 
 class FlowController:

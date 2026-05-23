@@ -265,8 +265,9 @@ class RiskGuard:
             return False
 
         # ── Absolute paths ────────────────────────────────────────────
-        # Match tokens that start with / (preceded by whitespace or quote).
+        # Match tokens that start with / (Unix) or drive letter (Windows).
         abs_paths = re.findall(r'(?:^|\s|[\'"])(/[^\s;|&<>\'\"\\]+)', command)
+        abs_paths += re.findall(r'(?:^|\s|[\'"])([A-Za-z]:[\\\/][^\s;|&<>\'\"]*)', command)
 
         if abs_paths:
             for raw in abs_paths:

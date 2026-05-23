@@ -865,8 +865,14 @@ class RuntimeAgent:
                 )
                 return None
 
-        # Check 2-4: Tool-specific switches (write/edit/bash)
-        tool_switch_map = {"write": "tool_write", "edit": "tool_edit", "bash": "tool_bash", "shell": "tool_shell"}
+        # Check 2-4: Tool-specific switches (write/edit/bash/shell/browser)
+        tool_switch_map = {
+            "write":   "tool_write",
+            "edit":    "tool_edit",
+            "bash":    "tool_bash",
+            "shell":   "tool_shell",
+            "browser": "tool_browser",
+        }
         if tool_name in tool_switch_map:
             switch_name = tool_switch_map[tool_name]
             if self.config_manager.is_auto_approve_enabled(switch_name):

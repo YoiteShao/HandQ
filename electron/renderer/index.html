@@ -389,6 +389,40 @@
                 </form>
             </div>
         </div>
+
+        <!-- ============================================================ -->
+        <!-- Confirmation overlay                                          -->
+        <!-- Surfaces risk_confirmation / tool_confirmation / secret_input -->
+        <!-- envelopes from the bridge. Driven by renderer.js              -->
+        <!-- showConfirmationModal(). Replies via                          -->
+        <!--   handq.sendRequest({type:"user_input",kind:"confirmation",   -->
+        <!--                      answer: <yes|no|text>})                  -->
+        <!-- ============================================================ -->
+        <div class="overlay hidden" id="overlay-confirmation" aria-hidden="true">
+            <div class="overlay-card confirmation-card" role="dialog" aria-modal="true">
+                <header class="overlay-header">
+                    <h2 id="confirm-title">Confirm action</h2>
+                </header>
+                <div class="confirmation-body">
+                    <p class="confirmation-description" id="confirm-description"></p>
+                    <div class="confirmation-decision hidden" id="confirm-decision"></div>
+                    <label class="confirmation-secret hidden" id="confirm-secret-wrap">
+                        <span>Input</span>
+                        <input type="password" id="confirm-secret-input"
+                               autocomplete="off" spellcheck="false" />
+                    </label>
+                    <textarea class="confirmation-guidance hidden"
+                              id="confirm-guidance"
+                              placeholder="Provide guidance for the agent instead of yes/no"
+                              rows="3"></textarea>
+                </div>
+                <div class="confirmation-actions">
+                    <button type="button" id="confirm-reject">Reject</button>
+                    <button type="button" id="confirm-guidance-btn">Provide guidance</button>
+                    <button type="button" id="confirm-submit" class="primary">Approve</button>
+                </div>
+            </div>
+        </div>
     </div>
 
     <script src="renderer.js"></script>

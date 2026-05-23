@@ -76,6 +76,8 @@ def _redact_payload(obj: Any, n: int = 200) -> str:
 # so that config-only round-trips do not need an API key).
 from src.controller.flow_controller import FlowController  # noqa: F401
 from src.controller.interaction_manager import InteractionManager
+from src.models.decision import Decision
+from src.models.state import UserConfirmation
 from src.infrastructure.anthropic_streaming_service import (  # noqa: F401
     AnthropicStreamingService,
     StreamTextDeltaEvent,
@@ -235,8 +237,15 @@ class _StdioUI:
     drops those, so the new conversation never sees old-flow content.
     """
 
-    def __init__(self, generation: int = 0) -> None:
+    def __init__(self, generation: int = 0, im: Optional[InteractionManager] = None) -> None:
         self._generation = generation
+        # InteractionManager reference is required for the confirmation
+        # methods (request_risk_confirmation / request_tool_confirmation /
+        # request_secret_input) to install a pending-callback into the IM
+        # so inbound `user_input.kind=confirmation` envelopes can unblock
+        # the waiter. None is allowed only for legacy code paths that
+        # never call those methods.
+        self._im: Optional[InteractionManager] = im
 
     # --- generic display ----------------------------------------------------
     def display_message(self, msg: str) -> None:
@@ -340,6 +349,127 @@ class _StdioUI:
         _emit({"type": "status", "kind": "reply_done"},
               gen=self._generation)
 
+    # ── Confirmation dialogs (UI delegate path) ──────────────────────────────
+    #
+    # InteractionManager.request_*_confirmation() probes the UI delegate
+    # via getattr(...). When these methods are present, the IM defers to
+    # them instead of falling back to its CLI blocking path (which reads
+    # stdin — useless under Electron because stdin is the bridge's IPC
+    # pipe, not a keyboard).
+    #
+    # Synchronisation: the IM has a generic `_pending_confirmation_callback`
+    # slot it invokes when an inbound `user_input.kind=confirmation`
+    # envelope arrives (stdio_bridge dispatcher → submit_confirmation_response
+    # → _deliver_confirmation_response → callback). We install a closure
+    # that captures the user's answer and unblocks a threading.Event;
+    # the calling thread (RuntimeAgent._check_before_act, executed inside
+    # an async task on the event loop thread) blocks on .wait() until
+    # the renderer responds.
+    #
+    # Caller threading: these methods are called from the asyncio event
+    # loop thread via a synchronous call chain (act → _execute_one →
+    # _check_before_act → confirmation_callback → IM → _StdioUI). Blocking
+    # the event loop is the existing CLI-path behaviour and is acceptable
+    # here because no other agent work can proceed until the user answers.
+    # The stdin reader thread (and inbound IPC dispatcher) keep running
+    # because they live on separate threads / asyncio tasks.
+
+    def _summarise_decision(self, decision: Decision) -> Dict[str, Any]:
+        """Produce a compact, JSON-safe summary of a Decision for the modal.
+
+        Keys: tool_calls (list of {tool_name, params_preview}), reasoning.
+        Parameter values are truncated to 200 chars each — the dialog only
+        needs enough context for the user to recognise what's about to run.
+        """
+        def _trunc(v: Any, n: int = 200) -> str:
+            s = str(v)
+            return s if len(s) <= n else s[:n] + "…"
+
+        tool_calls: List[Dict[str, Any]] = []
+        for tc in (decision.tool_calls or []):
+            params_preview = {k: _trunc(v) for k, v in (tc.parameters or {}).items()}
+            tool_calls.append({
+                "tool_name": tc.tool_name,
+                "params": params_preview,
+            })
+        return {
+            "tool_calls": tool_calls,
+            "reasoning": _trunc(decision.reasoning or "", 500),
+        }
+
+    def _await_user_response(
+        self,
+        kind: str,
+        payload: Dict[str, Any],
+        prompt_id: str,
+    ) -> str:
+        """Emit a confirmation envelope and block until the renderer responds.
+
+        - Installs a callback into IM._pending_confirmation_callback.
+        - Emits {"type":"status","kind":<kind>, "id":prompt_id, ...payload}.
+        - Blocks on a threading.Event released by the callback.
+        - Returns the raw answer string from the user.
+
+        ``prompt_id`` is included so the renderer can correlate a response
+        with its prompt; this matters when bursts of confirmations arrive.
+        """
+        event = threading.Event()
+        holder: List[str] = []
+
+        def _on_response(answer: str) -> None:
+            holder.append(answer)
+            event.set()
+
+        # IM has a generic single-slot pending callback (it serialises
+        # confirmations — there is never more than one in flight). Install
+        # ours; IM will clear it after delivering the response.
+        with self._im._pending_confirmation_lock:
+            self._im._pending_confirmation_question = payload.get("description") or payload.get("prompt") or ""
+            self._im._pending_confirmation_callback = _on_response
+
+        env: Dict[str, Any] = {"type": "status", "kind": kind, "id": prompt_id}
+        env.update(payload)
+        _emit(env, gen=self._generation)
+        _ui_logger.debug("await_user_response: kind=%s id=%s", kind, prompt_id)
+
+        event.wait()
+        return holder[0] if holder else ""
+
+    def request_risk_confirmation(
+        self, decision: Decision, risk_description: str
+    ) -> UserConfirmation:
+        """High-risk operation gate. Blocks until renderer returns yes/no/text."""
+        prompt_id = f"risk-{int(time.time() * 1000)}-{id(decision) & 0xffff:04x}"
+        payload = {
+            "description": str(risk_description),
+            "decision": self._summarise_decision(decision),
+        }
+        answer = self._await_user_response("risk_confirmation", payload, prompt_id)
+        return self._im._resolve_confirmation(answer)
+
+    def request_tool_confirmation(
+        self, tool_name: str, decision: Decision
+    ) -> UserConfirmation:
+        """Tool-specific gate (write/edit/bash/...). Same shape as risk."""
+        prompt_id = f"tool-{int(time.time() * 1000)}-{id(decision) & 0xffff:04x}"
+        payload = {
+            "tool": str(tool_name),
+            "decision": self._summarise_decision(decision),
+        }
+        answer = self._await_user_response("tool_confirmation", payload, prompt_id)
+        return self._im._resolve_confirmation(answer)
+
+    def request_secret_input(self, prompt: str) -> str:
+        """Hidden text input (passwords, SSH credentials).
+
+        Returns the raw string entered by the user. The renderer is
+        responsible for rendering an <input type=password> so the value
+        is not displayed on screen.
+        """
+        prompt_id = f"secret-{int(time.time() * 1000)}"
+        payload = {"prompt": str(prompt)}
+        return self._await_user_response("secret_input", payload, prompt_id)
+
 
 # ---------------------------------------------------------------------------
 # Bridge
@@ -369,9 +499,13 @@ class StdioBridge:
         # old subtask that may keep emitting until its blocking syscall
         # finally returns (Windows: no portable thread kill).
         self._generation: int = 0
-        self._ui = _StdioUI(self._generation)
 
+        # Construct IM first so _StdioUI can hold a reference to it; the
+        # confirmation-dialog methods (request_risk_confirmation etc.) need
+        # to install a pending callback into IM so inbound user_input
+        # envelopes can unblock the waiter.
         im = InteractionManager.get_instance()
+        self._ui = _StdioUI(self._generation, im=im)
         im.set_ui(self._ui)
         self._im = im
 
@@ -424,6 +558,26 @@ class StdioBridge:
                     obj.get("id") if isinstance(obj, dict) else None,
                     _redact_payload(obj),
                 )
+                # ── Fast path: confirmation responses bypass asyncio ─────────
+                # _StdioUI.{request_risk,request_tool,request_secret}_confirmation
+                # blocks the event loop on threading.Event.wait() while waiting
+                # for the user. If we routed the answer through the asyncio
+                # inbox, the dispatcher coroutine couldn't run (loop blocked) —
+                # the answer would queue up forever. Resolve it directly from
+                # this thread instead, which mirrors the IM CLI fallback's
+                # daemon-stdin-thread → _confirmation_queue model.
+                if (isinstance(obj, dict)
+                        and obj.get("type") == "user_input"
+                        and obj.get("kind") == "confirmation"):
+                    try:
+                        self._im.submit_confirmation_response(
+                            str(obj.get("answer", ""))
+                        )
+                    except Exception:
+                        logger.exception(
+                            "stdin reader: submit_confirmation_response failed"
+                        )
+                    continue
                 if self._loop is not None and self._inbox is not None:
                     self._loop.call_soon_threadsafe(self._inbox.put_nowait, obj)
         except Exception as exc:
@@ -851,6 +1005,10 @@ class StdioBridge:
                     "new_session: reset_instance failed", exc_info=True,
                 )
             self._im = InteractionManager.get_instance()
+            # Bind the fresh IM into the new UI so its confirmation
+            # methods (request_risk_confirmation etc.) install pending
+            # callbacks into the right IM instance.
+            new_ui._im = self._im
             self._ui = new_ui
             self._im.set_ui(self._ui)
 
@@ -877,6 +1035,15 @@ class StdioBridge:
                 logger.info("new_session: SSH pool flushed (%d clients closed)", closed)
             except Exception:
                 logger.warning("new_session: SSH pool flush failed", exc_info=True)
+            try:
+                from ..tools.browser_tool import flush_browser_pool as _flush_browser
+                browser_closed = await _flush_browser()
+                logger.info(
+                    "new_session: browser pool flushed (%d sessions closed)",
+                    browser_closed,
+                )
+            except Exception:
+                logger.warning("new_session: browser pool flush failed", exc_info=True)
         except Exception:
             logger.exception("new_session chain raised unexpectedly")
         finally:
