@@ -2,7 +2,7 @@
 Planner Prompts - Prompt templates for adaptive strategic orchestration
 
 These prompts are used exclusively by the Planner (observe_and_plan and
-generate_verification_step).  User-message classification prompts have been
+synthesize_acceptance).  User-message classification prompts have been
 moved to receptionist_prompts.py and are used by the Receptionist.
 """
 
@@ -399,246 +399,158 @@ Rules:
 """
 
 
-# ── Verification / acceptance step prompt ────────────────────────────────────
+# ── Goal-level acceptance synthesis prompt ───────────────────────────────────
 #
-# Used by Planner.generate_verification_step() in FlowController after the
-# normal completion condition is first detected, BEFORE the session ends.
+# Used by Planner.synthesize_acceptance() in FlowController after the normal
+# completion condition is first detected.  Replaces the prior independent-agent
+# verification step with a single Planner-side LLM reasoning call:
 #
-# Design principles (universal, domain-agnostic):
+#   • The Planner has already evaluated each step's last_step_confidence
+#     individually, so per-step verdicts are settled.  The remaining question
+#     is goal-level: do the N completed steps as a whole deliver what the
+#     user asked for in the ORIGINAL GOAL?
 #
-#   W3/W7 — Independence from agent narrative: criteria are derived solely from
-#     the ORIGINAL GOAL, not from what the agent claims to have done.  The
-#     agent's completed_steps_summary is labelled "UNVERIFIED AGENT CLAIMS" and
-#     the verifier is explicitly told to treat it as untrusted input to challenge.
+#   • For tasks whose ground truth lives outside the agent's reach (remote
+#     server state, database, external API), an "independent" verifier agent
+#     would only re-run the same local tools.  We embrace that limit
+#     honestly: synthesis returns PARTIAL with a clear gap_summary rather
+#     than pretending to verify what cannot be verified locally.
 #
-#   W1/W2 — Adversarial stance: the verifier is instructed to ATTEMPT TO FALSIFY
-#     the result.  It must ask "what could be wrong that the agent would not
-#     notice?" rather than confirming the agent's narrative.
-#
-#   W4 — Structured verdict: the goal template mandates a machine-readable
-#     VERIFICATION REPORT block with per-criterion PASS/FAIL, evidence quotes,
-#     a confidence score, and an explicit list of what was NOT checked.
-#
-#   W3 — No trust in agent summaries: the agent is instructed to re-read every
-#     artifact independently using its own tool calls, not to rely on prior step
-#     context or the agent's own descriptions of what it did.
-#
-#   W4/W7 — Task-type awareness: the prompt detects coding vs. general tasks and
-#     injects the appropriate negative checks (py_compile is insufficient for
-#     type errors; grep checks must be non-circular; API signatures must be
-#     independently confirmed from source, not from usage)
-#
-#   W4 — Negative checks: the goal must include at least one check for known
-#     silent failure patterns: wrong API signatures, type errors invisible to
-#     py_compile, circular grep (confirming the agent's own output), and
-#     missing runtime behaviour verification.
+#   • For code modifications, ground truth IS cheaply reachable
+#     (py_compile / pytest / tsc).  Synthesis can propose ONE narrow shell
+#     command in code_test_step so the agent runs a real syntax/type check
+#     in 1-2 iterations.  Limited to has_code_edits=true and gated by
+#     already_tested to prevent loops.
 
-VERIFICATION_STEP_SYSTEM_PROMPT = """\
-Design a minimal, outcome-focused verification step for a completed task.
+ACCEPTANCE_SYNTHESIS_SYSTEM_PROMPT = """\
+You are a goal-level acceptance synthesizer. Decide whether the work
+completed across all steps satisfies the user's ORIGINAL GOAL, and propose
+the next action accordingly.
 
 You receive:
-1. ORIGINAL GOAL — the only trusted definition of success.
-2. AGENT CLAIMS — what the agent says it completed (unverified; use only to identify
-   what artifacts to check, not as evidence of correctness).
-3. Artifact context — PRIMARY RESULT paths to verify, and any INTERMEDIATE FILES
-   produced by earlier steps that can be read as shortcuts.
+- ORIGINAL GOAL — the only trusted definition of success.
+- COMPLETED STEPS SUMMARY — for each step: expected_outcomes,
+  factual_outcome, artifacts, key_findings.  Per-step confidence has
+  ALREADY been validated (every step in the list passed its individual
+  confidence threshold).
+- ACCUMULATED FINDINGS — cross-step context and discoveries.
+- has_code_edits / already_tested flags.
 
-Core rule: verify the END STATE, not the process.
-  • DO check: does the primary result exist, is it correct, does it satisfy the goal?
-  • Do NOT re-trace how the agent produced the result.
-  • 2–4 targeted commands are almost always sufficient.
+Your job is the GOAL-LEVEL question: do these N completed steps as a whole
+deliver what the user actually asked for?  Per-step verdicts are settled —
+the gap you may catch is at the seam between steps, or in attributes the
+user named that no single step explicitly verified.
 
-## TWO ANTI-PATTERNS — if you find yourself doing either of these, stop and redirect
+## Verdict semantics
 
-Anti-pattern 1 — VERIFYING INTERMEDIATE FILES AS A PROXY FOR THE GOAL
-  Wrong: "check that /tmp/scan_results.txt contains 42 entries"
-  Right: "check that the source files the agent claims to have modified
-          actually contain the expected change"
-  Intermediate files are pre-computed shortcuts for reading, not the goal.
-  Always trace your verdict back to: does the PRIMARY RESULT satisfy the ORIGINAL GOAL?
+PASS    — ORIGINAL GOAL is satisfied.  Every concrete attribute the user
+          asked for (specific identifier, version, property, count) is
+          observable in the PRIMARY artifact, factual_outcome, or key
+          findings of some completed step.
 
-Anti-pattern 2 — RE-RUNNING OPERATIONS THAT ALREADY PRODUCED AN ARTIFACT
-  Wrong: re-scan the 300-file directory to check completeness
-  Right: read /tmp/scan_results.txt (or spot-check 3-5 files from it)
-  If an artifact already exists, READ it — do not re-execute the operation that created it.
-  Repeating expensive operations is wasted work; the artifact is the evidence.
+PARTIAL — Most of the goal is met but a specific named attribute or
+          sub-goal is missing or unverifiable from local evidence.
+          gap_summary names what is missing.  corrective_step targets
+          ONLY that gap.
 
-Common check patterns by task type:
-  Code modified   → python -m py_compile <file>; grep for key change; import or call
-  File created    → test -f <path> && wc -l; read key sections
-  Config/data     → grep for expected value; validate syntax if applicable
-  Remote/SSH      → check job status or read the remote log (do not re-submit the job)
+FAIL    — A core requirement was not delivered.  corrective_step must be
+          generated.
 
-Decide should_verify:
-  • false: read-only tasks, conversational responses, no state changed
-  • true:  files created/modified, code changed, any external state mutated
+## Code-test step (only when has_code_edits=true AND already_tested=false)
 
-Output ONLY valid JSON (no prose, no markdown fences):
+When the work modified source files, propose ONE narrow shell command:
+  - .py:        python -m py_compile <file>   (or pytest <test_file> if a
+                test file is in artifacts)
+  - .ts/.tsx:   npx tsc --noEmit <file>
+  - .go:        go build ./<package>
+  - others:     pick the standard syntax/type check for the language
+
+The code_test_step's goal MUST be a concrete shell command instruction —
+not "verify the code works".  The agent should run it in 1-2 iterations
+and report the exit code.  Set step_id to "acceptance_test_<short>" so
+the runtime can detect that a test step has run.
+
+When has_code_edits=false, code_test_step MUST be null.
+When already_tested=true, code_test_step MUST be null (the test already ran).
+
+## Anti-patterns
+
+1. Do NOT propose a code_test_step for non-code tasks (browser automation,
+   .md/.txt/.json edits, SSH operations) even if you feel the result needs
+   more verification.  The synthesis verdict IS the verification for
+   those tasks.
+
+2. Do NOT verdict PASS just because the local artifact looks right when
+   the real ground truth lives in a remote system you cannot read
+   (server state, database, third-party API).  In that case verdict=PARTIAL
+   with gap_summary explaining which attribute could not be locally
+   verified.  Do not invent corrective_step that re-reads the same local
+   file expecting a different answer.
+
+3. Do NOT propose a corrective_step that repeats an approach already
+   visible in completed_steps as a successful operation.  The corrective
+   should target a specific named gap.
+
+4. Do NOT issue PARTIAL/FAIL without corrective_step UNLESS the gap is
+   genuinely unverifiable from local tools (see anti-pattern #2).  When
+   the ground truth lives outside the agent's reach (remote server state,
+   external DB, third-party API, physical world), omit corrective_step
+   and let gap_summary surface the limitation to the user — do NOT
+   manufacture a corrective that re-runs work the agent has already done.
+   In that case the runtime completes the task and shows the user your
+   gap_summary so they can confirm the unreachable attribute themselves.
+
+5. Gaps must reference the PRIMARY DELIVERABLE — the artifact or outcome
+   that directly satisfies the ORIGINAL GOAL.  Do NOT issue PARTIAL/FAIL
+   for quirks in intermediate working files, scratch outputs, parsed
+   inputs, or any artifact that a later step consumed and superseded.
+   If an intermediate had a hiccup but the final deliverable is correct,
+   verdict is PASS.  The user does not care about scratch state — they
+   care whether the goal was met.
+
+6. corrective_step.goal must rely on tools that completed_steps have
+   already used successfully in this session.  If the work so far went
+   through browser, the corrective should be a browser action; if only
+   shell, only shell.  Do NOT propose correctives that require
+   capabilities the executing agent has not demonstrated (e.g.
+   screenshots, OCR, vision, specialized SDKs).  The synthesis caller
+   does not see the agent's full tool list, so stay within tools the
+   completed steps have proven available.
+
+## Output
+
+Output ONLY valid JSON, no prose, no markdown fences:
 {
-  "should_verify": true,
-  "verification_step": {
-    "step_id": "verification",
-    "description": "<short label — 'Light spot-check', 'Standard check', or 'Adversarial check'>",
-    "goal": "<concrete minimal verification instructions matching the tier depth>",
-    "rationale": "<what could silently fail and why>"
+  "verdict": "PASS" | "PARTIAL" | "FAIL",
+  "gap_summary": "<one sentence; empty string when PASS>",
+  "corrective_step": null | {
+    "step_id": "<short id>",
+    "description": "<one-line label>",
+    "goal": "<concrete, agent-actionable instruction>",
+    "expected_outcomes": ["<one or more observable success criteria>"]
+  },
+  "code_test_step": null | {
+    "step_id": "acceptance_test_<short>",
+    "description": "<short label>",
+    "goal": "<concrete shell command instruction>",
+    "expected_outcomes": ["<test passes / exit 0>"]
   }
 }
-
-If no verification needed:
-{"should_verify": false, "skip_reason": "<one sentence>"}
-Do NOT include a verification_step object when should_verify is false.
 """
 
-VERIFICATION_STEP_TEMPLATE = """\
-ORIGINAL GOAL (trusted — defines what success looks like):
+ACCEPTANCE_SYNTHESIS_TEMPLATE = """\
+[Original Goal]
 {original_goal}
 
-AGENT CLAIMS (unverified — use only to identify what artifacts exist and what to check):
-{completed_steps_summary}
+[Completed Steps Summary]
+{completed_steps_block}
+{accumulated_findings_block}
+[Conditions]
+has_code_edits: {has_code_edits}
+already_tested: {already_tested}
 
----
-
-Design a verification step at tier {tier} following the instructions above.
-Focus on the final state of artifacts and results — not on how the agent produced them.
-The goal field must include the tier-appropriate output format block shown in the tier instructions.
-Output ONLY the JSON — no prose, no markdown fences."""
-
-
-# ── Verification tier prompt injections ───────────────────────────────────────
-#
-# Each tier block is prepended to the VERIFICATION_STEP_TEMPLATE user prompt
-# (after the task_type_hint) so the executing verification agent knows exactly
-# how deep to go.  The tier is determined by _determine_verification_tier() in
-# planner.py before the LLM call — no extra LLM call is needed.
-#
-# Tier selection criteria (see _determine_verification_tier):
-#   skip        — no artifacts, read-only task; verification agent never runs
-#   light       — single step, low iterations, single artifact, no failures
-#   standard    — moderate scope: a few steps/artifacts, no failure history
-#   adversarial — high risk: many steps, high iterations, failures, or
-#                 irreversible/multi-file changes
-
-VERIFICATION_TIER_LIGHT = """\
-[VERIFICATION TIER: LIGHT]
-Standard: existence + non-corruption check only.
-You are NOT checking correctness — only that the task did not produce obviously
-wrong output (missing artifact, empty file, broken syntax on first import).
-
-Input available: PRIMARY RESULT artifact paths only.
-Your tools: read, grep, test, bash (read-only). Do NOT write, modify, or re-run
-operations. If an artifact exists, read it — do not re-derive it.
-
-Run at most 2 tool calls:
-  1. Does the artifact exist and is it non-empty?
-     bash: test -f <path> && wc -l <path>
-  2. Is the content plausibly consistent with the goal?
-     One grep or first-20-lines read — not an exhaustive check.
-
-The goal you write MUST instruct the executing agent to end with:
-  VERIFICATION RESULT (LIGHT)
-  ===========================
-  Artifact: [EXISTS | MISSING: <path>]
-  Content: [PLAUSIBLE | OBVIOUSLY WRONG] — <one sentence of evidence>
-  Verdict: [PASS | FAIL]
-  Confidence: <0.0–1.0>
-"""
-
-VERIFICATION_TIER_STANDARD = """\
-[VERIFICATION TIER: STANDARD]
-Standard: key claims verified by independent tool calls.
-
-Input available: PRIMARY RESULT paths (verify these) + INTERMEDIATE FILES (read as
-shortcuts to skip re-running expensive operations — do NOT verify intermediates as goals).
-Your tools: read, grep, test, bash (read-only). Do NOT write, modify, or re-run the
-operations the agent already performed. Do NOT re-run scans or searches that produced
-an intermediate file — read that file instead.
-
-Run 3–5 tool calls:
-  1. Existence: PRIMARY RESULT artifacts present and non-empty.
-  2. Correctness: key content or change is present, derived from the ORIGINAL GOAL
-     (grep for expected value, py_compile, import test, etc.).
-     If an intermediate file contains pre-computed data you need, READ it rather than
-     re-running the operation.
-  3. One adversarial probe: confirm the "before" state is absent (old value gone,
-     old file removed, old pattern replaced).
-
-The goal you write MUST instruct the executing agent to end with:
-  VERIFICATION RESULT (STANDARD)
-  ================================
-  Existence: [ALL PRESENT | MISSING: <path>]
-  Correctness: [PASS | FAIL] — <one line of evidence>
-  Adversarial probe: <what was checked> → [PASS | FAIL]
-  Overall verdict: [PASS | FAIL | PARTIAL]
-  Confidence: <0.0–1.0>
-"""
-
-VERIFICATION_TIER_ADVERSARIAL = """\
-[VERIFICATION TIER: ADVERSARIAL]
-Standard: full independent verification.
-
-Input available: all artifact paths labelled PRIMARY or INTERMEDIATE (see context above).
-Your tools: read, grep, test, bash (read-only). Do NOT write, modify, or re-run any
-operation the agent already performed. If a pre-computed artifact exists, READ it.
-Derive ALL verification criteria from the ORIGINAL GOAL — not from agent key findings.
-
-Run as many tool calls as needed:
-  - Verify every requirement the ORIGINAL GOAL implies, not just what the agent reported.
-  - Check for partial edits at other call sites.
-  - Confirm referenced symbols exist in their DEFINITION files, not call sites.
-  - Run syntax/compile/type check.
-  - Run at least TWO adversarial probes (boundary, idempotency, or completeness spot-check).
-  - Explicitly list what was NOT checked.
-
-A check without actual tool output is not a PASS — it is a skip.
-
-The goal you write MUST instruct the executing agent to produce the full
-VERIFICATION REPORT format (as specified in the system prompt).
-"""
-
-
-# ── Verification goal suffix — appended to the executing agent's step goal ────
-# Tier-specific output format requirement injected into the full_goal by
-# planner.py so the executing agent produces a proportionate report regardless
-# of how verbose the planning LLM's generated goal was.
-
-VERIFICATION_GOAL_SUFFIX_LIGHT = """
-
-[REQUIRED OUTPUT — end your response with this block, no prose after it]
-  VERIFICATION RESULT (LIGHT)
-  ===========================
-  Artifact: [EXISTS | MISSING: <path>]
-  Content: [PLAUSIBLE | OBVIOUSLY WRONG] — <one sentence of evidence>
-  Verdict: [PASS | FAIL]
-  Confidence: <0.0–1.0>"""
-
-VERIFICATION_GOAL_SUFFIX_STANDARD = """
-
-[REQUIRED OUTPUT — end your response with this block]
-  VERIFICATION RESULT (STANDARD)
-  ================================
-  Existence: [ALL PRESENT | MISSING: <path>]
-  Claim checks:
-    <claim> → [VERIFIED | REFUTED] — <one line of evidence per claim>
-  Adversarial probe: <what was checked> → [PASS | FAIL]
-  Overall verdict: [PASS | FAIL | PARTIAL]
-  Confidence: <0.0–1.0>"""
-
-VERIFICATION_GOAL_SUFFIX_ADVERSARIAL = """
-
-[REQUIRED OUTPUT FORMAT]
-Your response MUST end with a VERIFICATION REPORT block using this exact structure:
-  VERIFICATION REPORT
-  ===================
-  Task goal: <one-line restatement>
-  Verifier stance: ADVERSARIAL — attempting to falsify
-  Criterion N — <name>: [PASS|FAIL|UNVERIFIABLE]
-    Evidence: <verbatim command output or file excerpt>
-  Negative checks performed:
-    - <check>: [PASS|FAIL] — <finding>
-  What was NOT checked:
-    - <item>
-  Overall verdict: [PASS|FAIL|PARTIAL]
-  Confidence: <0.0–1.0>"""
+Synthesize the acceptance verdict per the rules in your system prompt.
+Output ONLY JSON, no prose, no markdown fences."""
 
 
 # ── GEP execution prompt constants ───────────────────────────────────────────

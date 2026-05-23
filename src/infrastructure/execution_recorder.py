@@ -373,23 +373,29 @@ class ExecutionRecorder:
         lines.extend([_SEP, ""])
         self._append("\n".join(lines))
 
-    # ── Verification decision ─────────────────────────────────────────────────
+    # ── Acceptance synthesis decision ─────────────────────────────────────────
 
-    def write_verification_decision(
+    def write_acceptance_decision(
         self,
-        will_verify: bool,
+        verdict: str,
         rationale: str = "",
-        step_id: str = "",
+        has_test_step: bool = False,
     ) -> None:
-        """Record whether a verification step was injected or skipped, and why."""
+        """Record the goal-level acceptance synthesis verdict.
+
+        Replaces the prior verification-step decision log: instead of
+        recording whether an independent verifier agent was injected, we
+        now record the synthesized goal-level verdict
+        (PASS / PARTIAL / FAIL / SKIPPED) and whether a code-test step
+        was emitted.
+        """
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         lines = [
-            "VERIFY",
+            "ACCEPTANCE",
             f"ts        : {now}",
-            f"decision  : {'run' if will_verify else 'skip'}",
+            f"verdict   : {verdict}",
+            f"test_step : {'yes' if has_test_step else 'no'}",
         ]
-        if step_id:
-            lines.append(f"step_id   : {step_id}")
         if rationale:
             lines.append(f"rationale : {rationale}")
         lines.extend([_SEP, ""])

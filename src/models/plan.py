@@ -47,7 +47,7 @@ class Step:
     is_aggregation: bool = False     # True = aggregation step that follows a parallel batch
     planner_reasoning: str = ""      # Why Planner decided to execute this step (set on steps[0])
     expected_outcomes: List[str] = field(default_factory=list)  # Planner's per-dimension expectations of success (reference only — agent may deviate and must explain)
-    risk_assessment: str = ""        # Planner's assessment of what could go wrong and the fallback strategy; used by _determine_verification_tier()
+    risk_assessment: str = ""        # Planner's assessment of what could go wrong and the fallback strategy
     required_context_keys: List[str] = field(default_factory=list)  # step_id values of prior steps whose findings this step needs; empty = full isolation
     ssh_target: str = ""             # "user@hostname" — Planner fills when step requires SSH remote work; empty for local steps
 

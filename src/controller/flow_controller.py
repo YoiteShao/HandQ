@@ -187,8 +187,6 @@ class FlowController:
         # already taken ownership of the message processor.
         self._externally_cancelled: bool = False
 
-        self._in_verification_step = False
-
         # Async hook called at every task-completion point, BEFORE notifying the
         # user, so side-effects (e.g. GEP template post-processing) are
         # guaranteed to finish before the user sees "complete" and can quit.
@@ -719,6 +717,65 @@ class FlowController:
                 component="FlowController",
             )
 
+    # File extensions that warrant a narrow ground-truth test step
+    # (py_compile / tsc / equivalent) when synthesize_acceptance fires.
+    _CODE_EXTENSIONS = frozenset({
+        '.py', '.pyx', '.pyi',
+        '.ts', '.tsx', '.js', '.jsx', '.mjs',
+        '.go', '.rs', '.java', '.kt', '.swift',
+        '.c', '.cpp', '.cc', '.cxx', '.h', '.hpp',
+        '.cs', '.rb', '.php', '.scala', '.sql',
+    })
+
+    def _has_code_edits(self, completed_steps: List[Step]) -> bool:
+        """True iff any completed step wrote or edited a source-code file.
+
+        Detects code modification by:
+          1. Looking for write/edit tool calls in the step's metrics, and
+          2. Cross-checking that an artifact with a code extension is present.
+
+        The cross-check prevents a step that only edited e.g. a .md file from
+        triggering a code-test step.  Read-only or shell-only steps are
+        ignored.
+
+        Used as the gate for synthesize_acceptance(has_code_edits=...): when
+        False, the synthesis prompt is forbidden from proposing a code-test
+        step.
+        """
+        for s in completed_steps:
+            tools = getattr(s, '_metrics_tools_used', []) or []
+            wrote = any(
+                entry.lower().startswith(('write:', 'edit:'))
+                for entry in tools
+            )
+            if not wrote:
+                continue
+            for path in (s.artifacts or []):
+                lower = path.lower()
+                # Match by suffix; tolerate paths with trailing whitespace.
+                if any(lower.endswith(ext) for ext in self._CODE_EXTENSIONS):
+                    return True
+        return False
+
+    def _dedup_step_id(self, step: Step, completed_steps: List[Step]) -> Step:
+        """Ensure step.step_id does not collide with any completed step's id.
+
+        Mutates and returns the same Step object.  When a collision is found,
+        appends a numeric suffix (`_2`, `_3`, …) until the id is unique.
+        Used before injecting a corrective_step or code_test_step from
+        synthesize_acceptance() so log readability and any future id-based
+        lookups stay clean across replan cycles.
+        """
+        existing = {s.step_id for s in completed_steps}
+        if step.step_id not in existing:
+            return step
+        base = step.step_id
+        counter = 2
+        while f"{base}_{counter}" in existing:
+            counter += 1
+        step.step_id = f"{base}_{counter}"
+        return step
+
     def _register_default_providers(self) -> None:
         """Register built-in StepContextProviders (SSH, browser, etc.)."""
         try:
@@ -1152,7 +1209,6 @@ class FlowController:
         replan_history: List[Tuple[str, int]] = []
         last_seen_msg_idx: int = 0
         in_flight_batch: Optional[List[Step]] = None
-        self._in_verification_step = False
 
         # ── Wait for the first REPLAN message to become the goal ─────────────
         self.logger.info("Idle mode: waiting for first user message", component="FlowController")
@@ -1598,7 +1654,6 @@ class FlowController:
                             f"Aborting: {progress_status.abort_reason}",
                             component="FlowController",
                         )
-                        self._in_verification_step = False
                         self._transition_state(SystemState.ERROR)
                         error_msg = f"Task aborted: {progress_status.abort_reason}"
                         
@@ -1631,19 +1686,17 @@ class FlowController:
                             )
 
                 if confidence_failed:
-                    # FIX BUG-3: Distinguish verify-step failure from regular step
-                    # failure in the log so operators can tell whether the confidence
-                    # check failed on the dedicated verification step or on a normal
-                    # execution step.  Both cases reset _in_verification_step and
-                    # trigger the same corrective-replan path; the distinction is
-                    # purely for observability.
-                    _step_kind = "verification step" if self._in_verification_step else "step"
-                    self._in_verification_step = False
+                    # Step's last_step_confidence failed the threshold.  This may
+                    # be a regular execution step OR the optional acceptance_test_
+                    # step injected by synthesize_acceptance().  Both go through
+                    # the same corrective-replan path; the next is_complete
+                    # cycle will re-run synthesize_acceptance() against the
+                    # corrected state.
                     self.logger.warning(
-                        f"Planner confidence for last {_step_kind}: "
+                        f"Planner confidence for last step: "
                         f"{confidence:.2f} < threshold "
                         f"{self.step_verification_threshold:.2f} "
-                        f"— {_step_kind} committed as FAILED; "
+                        f"— step committed as FAILED; "
                         f"using corrective next_steps from current plan",
                         component="FlowController",
                     )
@@ -1682,18 +1735,14 @@ class FlowController:
                         # Keep history intact; user may provide guidance to retry
                         continue
 
-                    # FIX BUG-4: Recovery steps are available — adopt them and
-                    # continue immediately.  The interrupt-handling block that
-                    # follows new_next_steps = list(...) belongs exclusively to
-                    # the confidence-passed (else) branch; falling through into
-                    # it from the confidence_failed branch is incorrect and can
-                    # trigger a spurious interrupt or skip the reasoning notify.
+                    # Recovery steps are available — adopt them and continue
+                    # immediately.  The interrupt-handling block that follows
+                    # new_next_steps = list(...) belongs exclusively to the
+                    # confidence-passed (else) branch; falling through into it
+                    # from the confidence_failed branch is incorrect.
                     # After replan → recovery steps → those steps complete →
-                    # is_complete=True, _in_verification_step is already False
-                    # (reset above), so the verify-injection block will fire
-                    # correctly in the next is_complete evaluation — implementing
-                    # the recursive verify pattern:
-                    #   verify fails → replan → new steps → verify again → pass → done.
+                    # is_complete=True, synthesize_acceptance() will run again
+                    # against the corrected state.
                     next_steps_list = list(self.current_plan.next_steps)
                     if next_steps_list and next_steps_list[0].planner_reasoning:
                         self.interaction_manager.notify_reasoning(
@@ -1715,147 +1764,114 @@ class FlowController:
                         or not step_result_received
                     )
                     if is_complete:
-                        # ── Verification gate ─────────────────────────────────
-                        # Three mutually exclusive paths:
+                        # ── Goal-level acceptance synthesis ───────────────────
+                        # Replaces the prior independent verification-agent
+                        # step.  Per-step confidence has already passed for
+                        # every step in completed_steps; this is the single
+                        # goal-level seam check + optional narrow code-test.
                         #
-                        # PATH A — Not yet in a verification step:
-                        #   Ask the planner whether verification is needed.
-                        #   A1: should_verify=True  → inject step, set flag, loop back.
-                        #   A2: should_verify=False → skip, fall through to complete.
-                        #
-                        # PATH B — Currently in a verification step and it just
-                        #   completed with sufficient confidence (is_complete=True):
-                        #   Clear flag, fall through to complete.
-                        #
-                        # In both A2 and B the code falls through to the
-                        # _do_complete block below.  PATH A1 uses `continue`
-                        # to restart the loop, so it never reaches _do_complete.
+                        # Possible outcomes:
+                        #   PASS (no test step)     → complete the task
+                        #   PASS + code_test_step   → inject test step, loop
+                        #   PARTIAL / FAIL          → inject corrective step, loop
 
                         _do_complete = False  # set True when ready to declare done
 
-                        if not self._in_verification_step:
-                            # PATH A — decide whether to verify
-                            completed_steps = self.memory.get_completed_steps()
-                            try:
-                                summary_lines = []
-                                for i, s in enumerate(completed_steps, 1):
-                                    outcome = "; ".join(s.factual_outcome) if s.factual_outcome else ""
-                                    summary_lines.append(
-                                        f'{i}. Goal: {s.goal}\n   Outcome: {outcome}'
-                                    )
-                                completed_steps_summary = (
-                                    '\n'.join(summary_lines)
-                                    if summary_lines else 'No steps recorded.'
-                                )
-                                vs = await self.planner.generate_verification_step(
-                                    goal, completed_steps_summary,
-                                    completed_steps=completed_steps,
-                                )
-                            except Exception as e:
-                                self.logger.error(
-                                    f'Verification step generation failed: {e}',
-                                    component='FlowController',
-                                )
-                                if self._execution_recorder:
-                                    self._execution_recorder.write_verification_decision(
-                                        will_verify=False,
-                                        rationale=f'Exception during generation: {e}',
-                                    )
-                                _do_complete = True
-                                vs = None
-
-                            if vs is not None:
-                                if vs.should_verify:
-                                    # PATH A1 — inject verification step
-                                    verification_step = getattr(vs, '_step', None)
-                                    if verification_step is not None:
-                                        if self._execution_recorder:
-                                            self._execution_recorder.write_verification_decision(
-                                                will_verify=True,
-                                                rationale=vs.rationale,
-                                                step_id=vs.step_id,
-                                            )
-                                        self._in_verification_step = True
-                                        self.logger.info(
-                                            f'Verification step injected '
-                                            f'(tier: {getattr(vs, "tier", "unknown")})',
-                                            component='FlowController',
-                                        )
-                                        # Pass execution artifacts as step_supplement so the
-                                        # verification agent can reuse already-discovered file
-                                        # lists instead of re-running expensive find/grep scans.
-                                        # _execute_step() prepends step_supplement to effective_goal.
-                                        all_artifacts: List[str] = []
-                                        all_key_findings: List[str] = []
-                                        for _s in completed_steps:
-                                            all_artifacts.extend(_s.artifacts or [])
-                                            all_key_findings.extend(_s.key_findings or [])
-                                        if all_artifacts or all_key_findings:
-                                            ctx_lines = []
-                                            if all_artifacts:
-                                                ctx_lines.append(
-                                                    "Files created/modified by execution steps:\n"
-                                                    + "\n".join(f"  - {a}" for a in all_artifacts)
-                                                )
-                                            if all_key_findings:
-                                                ctx_lines.append(
-                                                    "Key findings from execution steps:\n"
-                                                    + "\n".join(f"  - {f}" for f in all_key_findings)
-                                                )
-                                            verification_step.step_supplement = "\n\n".join(ctx_lines)
-                                            self.logger.debug(
-                                                f"Verification step step_supplement set: "
-                                                f"{len(all_artifacts)} artifact(s), "
-                                                f"{len(all_key_findings)} finding(s)",
-                                                component="FlowController",
-                                            )
-                                        
-                                        next_steps_list = [verification_step]
-                                        continue  # restart loop; agent will execute the step
-                                    else:
-                                        # should_verify=True but no step assembled — treat as skip
-                                        self.logger.warning(
-                                            'should_verify=True but no step assembled; '
-                                            'skipping verification',
-                                            component='FlowController',
-                                        )
-                                        if self._execution_recorder:
-                                            self._execution_recorder.write_verification_decision(
-                                                will_verify=False,
-                                                rationale='should_verify=True but no step was assembled',
-                                            )
-                                        _do_complete = True
-                                else:
-                                    # PATH A2 — LLM decided no verification needed
-                                    skip_reason = vs.skip_reason or 'LLM determined verification not needed'
-                                    self.logger.info(
-                                        f'Verification skipped: {skip_reason}',
-                                        component='FlowController',
-                                    )
-                                    if self._execution_recorder:
-                                        self._execution_recorder.write_verification_decision(
-                                            will_verify=False,
-                                            rationale=skip_reason,
-                                        )
-                                    _do_complete = True
-
-                        else:
-                            # PATH B — verification step just completed successfully
-                            self.logger.info(
-                                'Verification step completed with sufficient confidence',
+                        completed_steps = self.memory.get_completed_steps()
+                        has_code_edits = self._has_code_edits(completed_steps)
+                        already_tested = any(
+                            s.step_id.startswith('acceptance_test_')
+                            and s.has_status(StepStatus.COMPLETED)
+                            for s in completed_steps
+                        )
+                        try:
+                            verdict = await self.planner.synthesize_acceptance(
+                                original_goal=goal,
+                                completed_steps=completed_steps,
+                                has_code_edits=has_code_edits,
+                                accumulated_findings=(
+                                    self.memory.get_accumulated_findings_for_planner()
+                                ),
+                                already_tested=already_tested,
+                            )
+                        except Exception as e:
+                            self.logger.error(
+                                f'Acceptance synthesis failed: {e}',
                                 component='FlowController',
                             )
-                            self._in_verification_step = False
-                            next_steps_list = []
+                            if self._execution_recorder:
+                                self._execution_recorder.write_acceptance_decision(
+                                    verdict='SKIPPED',
+                                    rationale=f'Exception during synthesis: {e}',
+                                )
                             _do_complete = True
+                            verdict = None
+
+                        if verdict is not None:
+                            if self._execution_recorder:
+                                self._execution_recorder.write_acceptance_decision(
+                                    verdict=verdict.verdict,
+                                    rationale=verdict.gap_summary,
+                                    has_test_step=verdict.code_test_step is not None,
+                                )
+
+                            if verdict.verdict == 'PASS' and verdict.code_test_step is None:
+                                _do_complete = True
+                            elif verdict.verdict == 'PASS' and verdict.code_test_step is not None:
+                                test_step = self._dedup_step_id(
+                                    verdict.code_test_step, completed_steps
+                                )
+                                self.logger.info(
+                                    f"Acceptance PASS with code-test step: {test_step.step_id}",
+                                    component='FlowController',
+                                )
+                                next_steps_list = [test_step]
+                                continue
+                            else:
+                                # PARTIAL / FAIL
+                                if verdict.corrective_step is None:
+                                    self.logger.warning(
+                                        f'Acceptance verdict={verdict.verdict} but no '
+                                        f'corrective_step — completing anyway',
+                                        component='FlowController',
+                                    )
+                                    _do_complete = True
+                                else:
+                                    corrective = self._dedup_step_id(
+                                        verdict.corrective_step, completed_steps
+                                    )
+                                    self.logger.info(
+                                        f"Acceptance {verdict.verdict} — "
+                                        f"injecting corrective: {corrective.step_id} "
+                                        f"({verdict.gap_summary[:80]})",
+                                        component='FlowController',
+                                    )
+                                    next_steps_list = [corrective]
+                                    continue
 
                         if _do_complete:
-                            self._in_verification_step = False
                             self._transition_state(SystemState.COMPLETED)
                             reason = (
                                 self.current_plan.completion_reason
                                 or "Task completed successfully"
                             )
+                            # Surface non-PASS acceptance gap to the user so
+                            # they can decide during review whether the gap
+                            # warrants a follow-up.  Per anti-pattern #5 the
+                            # synthesis prompt restricts gap_summary to the
+                            # PRIMARY deliverable, so intermediate-artifact
+                            # quirks should not show up here.  Synthesis
+                            # exceptions (verdict is None) skip this branch.
+                            if (
+                                verdict is not None
+                                and verdict.verdict != 'PASS'
+                                and verdict.gap_summary
+                            ):
+                                reason = (
+                                    f"{reason}\n\n"
+                                    f"[Acceptance: {verdict.verdict}] "
+                                    f"{verdict.gap_summary}"
+                                )
                             if self._execution_recorder:
                                 self._execution_recorder.completion_reason = reason
                             if self._current_plan_id:

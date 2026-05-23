@@ -31,14 +31,8 @@ from ..models.plan import Plan, Step, StepStatus
 from .planner_prompts import (
     PLANNER_SYSTEM_PROMPT,
     OBSERVE_AND_PLAN_TEMPLATE,
-    VERIFICATION_STEP_SYSTEM_PROMPT,
-    VERIFICATION_STEP_TEMPLATE,
-    VERIFICATION_TIER_LIGHT,
-    VERIFICATION_TIER_STANDARD,
-    VERIFICATION_TIER_ADVERSARIAL,
-    VERIFICATION_GOAL_SUFFIX_LIGHT,
-    VERIFICATION_GOAL_SUFFIX_STANDARD,
-    VERIFICATION_GOAL_SUFFIX_ADVERSARIAL,
+    ACCEPTANCE_SYNTHESIS_SYSTEM_PROMPT,
+    ACCEPTANCE_SYNTHESIS_TEMPLATE,
     GEP_MARKER,
     GEP_REPLAN_CONSTRAINT,
     GEP_ADAPTIVE_INSTANTIATION_SYSTEM,
@@ -64,331 +58,89 @@ class PlannerProgressStatus:
     should_assess_feasibility: bool = False
 
 
-# ── Verification step dataclass ──────────────────────────────────────────────
+# ── Acceptance verdict dataclass ─────────────────────────────────────────────
 
 @dataclass
-class VerificationStep:
-    """Structured result of the LLM call in generate_verification_step.
+class AcceptanceVerdict:
+    """Structured result of Planner.synthesize_acceptance().
 
-    Fields mirror the JSON keys returned by the LLM:
-      should_verify      — whether a verification step should be injected at all.
-      goal               — the verification goal text (nested under verification_step).
-      step_id            — identifier for the step (nested under verification_step).
-      description        — human-readable label (nested under verification_step).
-      rationale          — failure patterns being targeted (nested under verification_step).
-      skip_reason        — why verification was skipped (only when should_verify=False).
+    Goal-level verdict for whether the completed work satisfies the user's
+    ORIGINAL GOAL.  Replaces the prior independent-agent verification step:
+    per-step confidence is already validated by observe_and_plan; this is
+    the single seam-checking pass at task completion.
+
+    Fields:
+      verdict          — 'PASS' | 'PARTIAL' | 'FAIL'.
+      gap_summary      — one-sentence description of what is missing
+                         (PARTIAL/FAIL); empty when PASS.
+      corrective_step  — concrete corrective Step to inject when verdict is
+                         PARTIAL/FAIL.  None when PASS.
+      code_test_step   — narrow shell test step (e.g. py_compile / pytest)
+                         emitted ONLY when has_code_edits=True and the work
+                         has not yet been tested.  None otherwise.
     """
-    should_verify: bool = False
-    goal: str = ""
-    step_id: str = "verification"
-    description: str = "Adversarial acceptance check"
-    rationale: str = ""
-    skip_reason: str = ""
+    verdict: str = "PASS"
+    gap_summary: str = ""
+    corrective_step: Optional[Step] = None
+    code_test_step: Optional[Step] = None
 
     @classmethod
-    def from_dict(cls, data: dict) -> 'VerificationStep':
-        """Create a VerificationStep from a parsed LLM response dict."""
-        verification_info = data.get('verification_step') or {}
+    def from_dict(cls, data: dict) -> 'AcceptanceVerdict':
+        """Create an AcceptanceVerdict from a parsed LLM response dict.
+
+        Defensive parsing: unknown verdicts coerce to PASS (fail-open) so a
+        malformed LLM response does not block task completion indefinitely.
+        """
+        verdict_raw = (data.get('verdict') or '').strip().upper()
+        if verdict_raw not in ('PASS', 'PARTIAL', 'FAIL'):
+            verdict_raw = 'PASS'
+
+        def _build_step(node: Any) -> Optional[Step]:
+            if not isinstance(node, dict):
+                return None
+            step_id = (node.get('step_id') or '').strip()
+            goal = (node.get('goal') or '').strip()
+            if not step_id or not goal:
+                return None
+            description = (node.get('description') or '').strip() or step_id
+            expected = node.get('expected_outcomes') or []
+            if not isinstance(expected, list):
+                expected = [str(expected)]
+            else:
+                expected = [str(e).strip() for e in expected if str(e).strip()]
+            return Step.from_planner(
+                step_id=step_id,
+                description=description,
+                goal=goal,
+                expected_outcomes=expected,
+                risk_assessment="Low risk — synthesized acceptance step",
+                required_context_keys=[],
+            )
+
+        corrective = _build_step(data.get('corrective_step'))
+        code_test = _build_step(data.get('code_test_step'))
+        # Normalize the test step id so the runtime can detect it for the
+        # already_tested loop guard regardless of the LLM's chosen suffix.
+        if code_test is not None and not code_test.step_id.startswith('acceptance_test_'):
+            code_test.step_id = f"acceptance_test_{code_test.step_id}"
         return cls(
-            should_verify=data.get('should_verify', False),
-            goal=verification_info.get('goal', '').strip(),
-            step_id=(
-                verification_info.get('step_id', 'verification').strip()
-                or 'verification'
-            ),
-            description=(
-                verification_info.get('description', 'Adversarial acceptance check').strip()
-                or 'Adversarial acceptance check'
-            ),
-            rationale=verification_info.get('rationale', '').strip(),
-            skip_reason=data.get('skip_reason', '').strip(),
+            verdict=verdict_raw,
+            gap_summary=(data.get('gap_summary') or '').strip(),
+            corrective_step=corrective,
+            code_test_step=code_test,
         )
 
     @classmethod
-    async def from_data(cls, raw_content: str) -> 'VerificationStep':
-        """Parse a raw LLM response string into a VerificationStep.
+    async def from_data(cls, raw_content: str) -> 'AcceptanceVerdict':
+        """Parse a raw LLM response string into an AcceptanceVerdict.
 
-        Uses try_parse_json (already imported) to handle JSON fence-stripping
-        and parsing.  Returns a default (should_verify=False) instance if
-        parsing fails or the result is not a dict.
+        Returns a default PASS instance if parsing fails so a malformed LLM
+        response does not stall the task (fail-open).
         """
         parsed = try_parse_json(raw_content)
         if isinstance(parsed, dict):
             return cls.from_dict(parsed)
         return cls()
-
-
-
-# ── Verification helpers ──────────────────────────────────────────────────────
-
-def _build_verifier_context(completed_steps: List[Step], tier: str) -> str:
-    """
-    Build tier-appropriate context for the verification planning LLM.
-
-    Artifacts are labelled by their originating step so the verifier can
-    distinguish intermediate files (produced by earlier steps) from the
-    primary result (the artifact that directly satisfies the goal).
-
-    Fix #2 — final step has no local artifacts (e.g. upload/deploy step):
-      If the logical final step produced no local artifacts and is NOT an
-      aggregation step, walk backwards to find the last artifact-producing
-      step and treat its output as PRIMARY.  This prevents intermediate files
-      from being mislabelled when the last step was a side-effect-only
-      operation (SSH push, remote deploy, API call with no local output).
-
-    Fix #4 — no local artifacts at all (SSH/remote/API/DB tasks):
-      When the entire task produced no local artifacts, include key_findings
-      from all steps labelled as REMOTE CONTEXT — navigation only.  This gives
-      the verifier job IDs, log paths, and remote host references so it can
-      locate the remote state to check, without treating agent conclusions as
-      evidence of correctness.
-
-    What is passed by tier:
-      light       — PRIMARY RESULT paths only (2-check spot-test; no need for
-                    intermediate context).
-      standard    — PRIMARY RESULT + INTERMEDIATE FILE paths labelled by
-                    provenance.  Remote context included when no local artifacts.
-      adversarial — Same as standard; verifier derives criteria from goal only.
-
-    key_findings are withheld for local-artifact tasks (they are the agent's
-    narrative and anchor the verifier on the agent's framing).  They are
-    included only for no-artifact tasks where they are the sole locating signal.
-    factual_outcome is never passed.
-    """
-    if not completed_steps:
-        return ""
-
-    # ── Identify the logical final step ──────────────────────────────────────
-    # Prefer the last aggregation step; fall back to the last step overall.
-    final_idx = len(completed_steps) - 1
-    for i in range(len(completed_steps) - 1, -1, -1):
-        if getattr(completed_steps[i], 'is_aggregation', False):
-            final_idx = i
-            break
-
-    # Fix #2: if the logical final step is NOT an aggregation and has no
-    # local artifacts (e.g. it was a deploy/upload/SSH push step), walk
-    # backwards to the last step that actually produced local files.
-    # Aggregation steps are exempt — if they produced no local artifact
-    # that is intentional (they may only update remote state).
-    final_is_aggregation = getattr(completed_steps[final_idx], 'is_aggregation', False)
-    if not completed_steps[final_idx].artifacts and not final_is_aggregation:
-        for i in range(len(completed_steps) - 1, -1, -1):
-            if completed_steps[i].artifacts:
-                final_idx = i
-                break
-
-    final_step = completed_steps[final_idx]
-    final_artifacts = list(final_step.artifacts or [])
-    intermediate_steps = [s for i, s in enumerate(completed_steps) if i != final_idx]
-
-    # Intermediate artifact paths with provenance labels (deduped against final)
-    intermediate_artifacts: List[tuple] = []
-    for s in intermediate_steps:
-        for p in (s.artifacts or []):
-            if p not in final_artifacts:
-                intermediate_artifacts.append((s.description, p))
-
-    all_local_paths = final_artifacts + [p for _, p in intermediate_artifacts]
-
-    # Fix #4: no local artifacts at all → remote/SSH/API/DB task.
-    # Include key_findings as navigation context (job IDs, log paths, hosts)
-    # so the verifier can locate what to check.  Label clearly as unverified.
-    if not all_local_paths:
-        remote_lines: List[str] = []
-        for s in completed_steps:
-            for kf in (s.key_findings or [])[:3]:
-                remote_lines.append(f"  · {kf}")
-        if not remote_lines:
-            return ""
-        header = [
-            "[REMOTE OPERATION CONTEXT — navigation only, not evidence]",
-            "No local artifacts were produced (remote/SSH/API/DB task).",
-            "Use these findings only to locate what to check (job IDs, log",
-            "paths, remote hosts). Verify the actual remote state independently",
-            "against the original goal — do NOT treat these as evidence of success.",
-            "",
-        ]
-        return "\n".join(header + remote_lines) + "\n\n"
-
-    # ── Local artifact task: build labelled context ───────────────────────────
-    if tier == 'light':
-        if not final_artifacts:
-            return ""
-        lines = ["[PRIMARY RESULT — check these against the goal]"]
-        for p in final_artifacts:
-            lines.append(f"  • {p}")
-        return "\n".join(lines) + "\n\n"
-
-    # standard / adversarial
-    lines: List[str] = []
-    has_content = False
-
-    if final_artifacts:
-        lines.append("[PRIMARY RESULT — verify these against the goal]")
-        for p in final_artifacts:
-            lines.append(f"  • {p}")
-        has_content = True
-
-    if intermediate_artifacts:
-        lines.append("")
-        lines.append("[INTERMEDIATE FILES — read as shortcuts; do NOT verify as goals]")
-        lines.append("These were produced by earlier steps. READ them directly to avoid")
-        lines.append("re-running expensive operations. Your verdict must trace back to the")
-        lines.append("PRIMARY RESULT above, not to these files.")
-        for desc, p in intermediate_artifacts:
-            lines.append(f"  · {p}  (from: {desc})")
-        has_content = True
-
-    if not has_content:
-        return ""
-    return "\n".join(lines) + "\n\n"
-
-
-# ── Verification tier determination ───────────────────────────────────────────
-
-def _count_effective_iterations(steps: List[Step]) -> int:
-    """
-    Count "effective" (mutating) iterations across all steps.
-
-    An iteration is effective when the tool used is a write/edit/bash operation
-    that modifies state.  Pure read-only iterations (find, grep, ls, cat, read,
-    head, tail, wc, test, echo, python read-only scripts, etc.) are exploratory
-    overhead — they do NOT indicate that the task was complex or risky, and
-    should not inflate the verification tier.
-
-    The tool name comes from _metrics_tools_used entries, which are formatted as
-    "<tool_name>: <truncated_input>" by RuntimeAgent._format_tool_entry().
-    We extract the tool name prefix and classify it.
-    """
-    # Tools that are purely read-only / exploratory — do not count toward
-    # effective iterations.
-    _READ_ONLY_TOOLS = frozenset({
-        "read", "glob", "grep", "bash_read", "shell_read",
-    })
-    # Bash/shell commands that are read-only by nature (prefix match on the command).
-    _READ_ONLY_BASH_PREFIXES = (
-        "find ", "grep ", "ls ", "cat ", "head ", "tail ", "wc ",
-        "test ", "echo ", "stat ", "file ", "du ", "df ", "pwd",
-        "which ", "type ", "env ", "printenv ", "sort ", "uniq ",
-        "diff ", "comm ", "cut ", "awk ", "sed -n", "python3 -c \"import",
-        "Get-ChildItem", "Select-String", "Test-Path", "Get-Content",
-        "Get-Location",
-        "#",  # comment-only lines (no-op probes)
-    )
-    # SSH actions that are purely observational — polling or reading remote state.
-    _SSH_READONLY_ACTIONS = frozenset({"job_status", "tail_log", "fetch_log"})
-
-    effective = 0
-    for s in steps:
-        tools: List[str] = getattr(s, '_metrics_tools_used', [])
-        for entry in tools:
-            # entry format: "<tool_name>: <input>" or just "<tool_name>"
-            tool_name = entry.split(":", 1)[0].strip().lower()
-            if tool_name in _READ_ONLY_TOOLS:
-                continue
-            if tool_name in ("bash", "shell"):
-                # Inspect the command text after "bash: " or "shell: "
-                cmd = entry.split(":", 1)[1].strip() if ":" in entry else ""
-                if any(cmd.startswith(pfx) for pfx in _READ_ONLY_BASH_PREFIXES):
-                    continue
-            if tool_name == "ssh":
-                # Classify SSH sub-action: job_status / tail_log / fetch_log are
-                # read-only polling; everything else (exec, exec_bg, write_file,
-                # run_script, safe_exit) mutates remote state.
-                action = entry[len("ssh:"):].strip().split()[0].lower() if ":" in entry else ""
-                if action in _SSH_READONLY_ACTIONS:
-                    continue
-            effective += 1
-    return effective
-
-
-def _determine_verification_tier(completed_steps: List[Step]) -> str:
-    """
-    Determine the verification depth tier based on execution signals.
-
-    Returns one of: "skip" | "light" | "standard" | "adversarial"
-
-    Decision matrix (evaluated in priority order):
-
-      skip        — no local artifacts AND no remote mutations (SSH or otherwise);
-                    task was purely read-only or conversational.
-                    Calling the verification LLM would add latency with zero value.
-
-      adversarial — any of the following high-risk signals:
-                    • any step in history failed (agent may be masking errors)
-                    • total artifacts > 3 (multi-file change, broad blast radius)
-                    • avg effective iterations per step > 8 (agent genuinely
-                      struggled with the mutation work, not just exploration)
-                    • step count > 5 (complex multi-phase task)
-                    • planner-declared high-risk operation
-
-                    NOTE: "effective iterations" excludes read-only tool calls
-                    (find, grep, ls, cat, SSH job_status/tail_log/fetch_log, etc.).
-                    A step that spent 15 iterations on grep/find discovery but only
-                    2 on actual writes is NOT adversarial — the verification agent
-                    can trust the execution artifacts and verify them directly.
-
-                    NOTE: SSH-primary tasks have no local artifacts but still mutate
-                    remote state.  effective_iterations > 0 is sufficient to trigger
-                    verification; tier is then determined by step/iteration counts.
-
-      standard    — moderate scope:
-                    • 2–5 steps, OR 2–3 artifacts, OR avg effective iters 4–8
-
-      light       — everything else: single step, ≤1 artifact, low effective
-                    iterations, no failure history.
-    """
-    if not completed_steps:
-        return "skip"
-
-    all_artifacts: List[str] = []
-    had_failures = False
-
-    for s in completed_steps:
-        all_artifacts.extend(s.artifacts or [])
-        if s.has_status(StepStatus.FAILED):
-            had_failures = True
-
-    artifact_count = len(all_artifacts)
-    step_count = len(completed_steps)
-
-    # Effective (mutating) iterations — excludes read-only exploration and
-    # SSH polling actions (job_status / tail_log / fetch_log).
-    # Computed before the skip check so SSH-primary tasks (no local artifacts
-    # but remote mutations) are not incorrectly skipped.
-    effective_iterations = _count_effective_iterations(completed_steps)
-    avg_effective_iters = effective_iterations / step_count
-
-    # skip — no local artifacts AND no remote-state mutations at all
-    if artifact_count == 0 and effective_iterations == 0:
-        return "skip"
-
-    # adversarial — any high-risk signal (including planner-declared risk)
-    _HIGH_RISK_KEYWORDS = (
-        "production", "irreversible", "delete", "drop", "truncate",
-        "overwrite", "external api", "database", "credential", "secret",
-    )
-    had_high_risk_step = any(
-        any(kw in (getattr(s, 'risk_assessment', '') or '').lower()
-            for kw in _HIGH_RISK_KEYWORDS)
-        for s in completed_steps
-    )
-    if (
-        had_failures
-        or artifact_count > 3
-        or avg_effective_iters > 8
-        or step_count > 5
-        or had_high_risk_step
-    ):
-        return "adversarial"
-
-    # standard — moderate scope
-    if step_count >= 2 or artifact_count >= 2 or avg_effective_iters >= 4:
-        return "standard"
-
-    # light — single step, single artifact, low effective iterations
-    return "light"
 
 
 # ── Planner ───────────────────────────────────────────────────────────────────
@@ -1153,183 +905,132 @@ class Planner:
             self.logger.error(f"observe_and_plan failed: {e}", component="Planner")
             raise
 
-    # ── Verification step generation ──────────────────────────────────────────
+    # ── Goal-level acceptance synthesis ───────────────────────────────────────
 
-    async def generate_verification_step(
+    async def synthesize_acceptance(
         self,
         original_goal: str,
-        completed_steps_summary: str,
-        completed_steps: Optional[List[Step]] = None,
-    ) -> VerificationStep:
-        """Generate a tiered verification step independent of the agent's self-reporting.
+        completed_steps: List[Step],
+        has_code_edits: bool,
+        accumulated_findings: str = "",
+        already_tested: bool = False,
+    ) -> AcceptanceVerdict:
+        """Single Planner-side LLM call that decides whether the completed work
+        satisfies the user's ORIGINAL GOAL.
 
-        Tier is determined by _determine_verification_tier() before any LLM call:
-          skip        — no artifacts; returns should_verify=False immediately (zero LLM cost).
-          light       — single step, single artifact, low iterations; fast spot-check.
-          standard    — moderate scope; existence + goal-satisfaction checks, no full claim table.
-          adversarial — high risk (failures, many steps/artifacts/iterations); full framework.
+        Replaces the prior ``generate_verification_step`` flow which spawned an
+        independent verification agent.  The new flow:
 
-        Returns a VerificationStep dataclass. Callers should check .should_verify:
-          - True  → build a Step from the fields and inject it
-          - False → skip verification; .skip_reason explains why
+          • Per-step confidence is already validated by ``observe_and_plan`` for
+            every step in ``completed_steps`` — that part is settled.
+          • This method asks the goal-level question: do these N steps as a
+            whole deliver what the user asked for?  Catches gaps at the seam
+            between steps (e.g. user named attribute "v2" but no step
+            explicitly verified the v2 attribute survives into the final
+            artifact).
+          • For tasks whose ground truth is reachable cheaply (code edits →
+            py_compile / pytest / tsc), it may also propose ONE narrow shell
+            test step.  ``has_code_edits`` is the gate; ``already_tested``
+            prevents re-injection loops after the test step itself completes.
 
-        Design rationale (addresses W1–W7 from verification architecture analysis):
+        No tool calls; one LLM call.  Fail-open on parse / LLM errors so a
+        malformed response cannot indefinitely block task completion.
 
-        W3/W7 — Independence: criteria are derived from ``original_goal`` (the only trusted
-          input).  ``completed_steps_summary`` is passed to the LLM labelled as
-          "UNVERIFIED AGENT CLAIMS" so the verifier treats it as hypotheses to falsify,
-          not as evidence of completion.
-
-        W1/W2 — Adversarial stance: VERIFICATION_STEP_SYSTEM_PROMPT instructs the LLM to
-          *attempt to falsify* the result and explicitly lists known silent failure patterns
-          (type errors invisible to py_compile, circular grep, wrong API signatures).
-
-        W4 — Structured verdict: the generated goal mandates a machine-readable
-          VERIFICATION REPORT block with per-criterion PASS/FAIL, verbatim evidence,
-          confidence score, and an explicit "what was NOT checked" section.
-
-        W4/W7 — Task-type awareness: a ``task_type_hint`` derived from the original goal
-          is prepended to the user prompt so the LLM applies the correct negative checks
-          (coding tasks → mypy/import test/API source read; general tasks → structural
-          requirement checks from the goal).
-
-        W5 — Silent failure: exceptions are caught and logged; a default VerificationStep
-          with should_verify=False is returned so the session completes cleanly.
+        Returns an :class:`AcceptanceVerdict` whose ``corrective_step`` and
+        ``code_test_step`` are pre-built :class:`Step` objects ready to be
+        injected into ``next_steps`` by the FlowController.
         """
-        # ── Tier determination (pre-LLM, zero cost) ───────────────────────────
-        tier = _determine_verification_tier(completed_steps or [])
-        _eff_iters = _count_effective_iterations(completed_steps or [])
-        _n_steps = len(completed_steps or [])
+        # ── Build per-step block ──────────────────────────────────────────────
+        if completed_steps:
+            step_lines: List[str] = []
+            for i, s in enumerate(completed_steps, 1):
+                expected = '; '.join(s.expected_outcomes) if s.expected_outcomes else '(none)'
+                outcome = '; '.join(s.factual_outcome) if s.factual_outcome else '(none)'
+                artifacts = ', '.join(s.artifacts) if s.artifacts else '(none)'
+                findings = '; '.join(s.key_findings) if s.key_findings else '(none)'
+                step_lines.append(
+                    f"{i}. [{s.step_id}] {s.description}\n"
+                    f"   Goal: {s.goal}\n"
+                    f"   Expected: {expected}\n"
+                    f"   Factual outcome: {outcome}\n"
+                    f"   Artifacts: {artifacts}\n"
+                    f"   Key findings: {findings}"
+                )
+            completed_steps_block = '\n'.join(step_lines)
+        else:
+            completed_steps_block = '(no completed steps)'
+
+        accumulated_findings_block = (
+            f"\n[Accumulated Findings]\n{accumulated_findings}\n"
+            if accumulated_findings else ""
+        )
+
+        prompt = ACCEPTANCE_SYNTHESIS_TEMPLATE.format(
+            original_goal=original_goal,
+            completed_steps_block=completed_steps_block,
+            accumulated_findings_block=accumulated_findings_block,
+            has_code_edits=str(has_code_edits).lower(),
+            already_tested=str(already_tested).lower(),
+        )
+
         self.logger.info(
-            f'Verification tier: {tier} '
-            f'(steps={_n_steps}, '
-            f'artifacts={sum(len(s.artifacts or []) for s in (completed_steps or []))}, '
-            f'effective_iters={_eff_iters}, '
-            f'avg_effective={_eff_iters / _n_steps:.1f} per step'
-            f')',
+            f"Synthesizing acceptance verdict — "
+            f"steps={len(completed_steps)}, "
+            f"has_code_edits={has_code_edits}, "
+            f"already_tested={already_tested}",
             component='Planner',
         )
 
-        if tier == 'skip':
-            return VerificationStep(
-                should_verify=False,
-                skip_reason='No artifacts produced — read-only task, verification not needed.',
-            )
-
-        # ── Task-type hint ────────────────────────────────────────────────────
-        # Prepend a brief task-type hint so the planning LLM selects the right
-        # check patterns (py_compile for code, test -f for files, etc.).
-        _goal_lower = original_goal.lower()
-        _coding_keywords = (
-            'python', 'code', 'function', 'method', 'class', 'script',
-            'module', 'import', 'def ', '.py', 'edit ', 'modify ', 'implement',
-            'refactor', 'bug', 'fix ', 'patch', 'type', 'api', 'call',
-        )
-        _is_coding_task = any(kw in _goal_lower for kw in _coding_keywords)
-        task_type_hint = (
-            "TASK TYPE: Code modification / software engineering.\n"
-            "Key checks: py_compile; grep for the changed symbol; import or call test.\n\n"
-            if _is_coding_task else
-            "TASK TYPE: General / content / file task.\n"
-            "Key checks: test -f + wc -l; read key sections; grep for expected value.\n\n"
-        )
-
-        # ── Tier-specific depth instruction ───────────────────────────────────
-        _TIER_PROMPTS = {
-            'light':       VERIFICATION_TIER_LIGHT,
-            'standard':    VERIFICATION_TIER_STANDARD,
-            'adversarial': VERIFICATION_TIER_ADVERSARIAL,
-        }
-        tier_instruction = _TIER_PROMPTS[tier]
-
-        # ── Build prompt ──────────────────────────────────────────────────────
-        # Verifier context is tier-aware:
-        #   light/adversarial → artifact paths only (no agent claims)
-        #   standard          → paths + key_findings as labeled hypotheses
-        # factual_outcome is never passed (it is the agent's self-assessment).
-        verifier_context = _build_verifier_context(completed_steps or [], tier)
-        prompt = (
-            task_type_hint
-            + tier_instruction
-            + verifier_context
-            + VERIFICATION_STEP_TEMPLATE.format(
-                original_goal=original_goal,
-                completed_steps_summary=completed_steps_summary,
-                tier=tier.upper(),
-            )
-        )
-
         try:
-            # Use the same LLM call pattern as observe_and_plan
             messages = [
-                {"role": "system", "content": VERIFICATION_STEP_SYSTEM_PROMPT},
+                {"role": "system", "content": ACCEPTANCE_SYNTHESIS_SYSTEM_PROMPT},
                 {"role": "user", "content": prompt},
             ]
             _raw = cast(LLMChatResult, await call_with_fallback(
                 self._services,
                 dict(messages=messages),
                 on_fallback=lambda idx, e: self.logger.warning(
-                    f"Planner verification LLM fallback to index {idx}: {e}",
+                    f"Acceptance synthesis LLM fallback to index {idx}: {e}",
                     component="Planner",
                 ),
             ))
             response_text = _raw.content or ""
+            verdict = await AcceptanceVerdict.from_data(response_text)
 
-            vs = await VerificationStep.from_data(response_text)
-
-            if not vs.should_verify:
-                return vs  # caller reads .skip_reason for logging
-
-            goal = vs.goal
-            if not goal:
-                # LLM said should_verify=True but provided no goal — treat as skip.
-                vs.should_verify = False
-                vs.skip_reason = "LLM returned should_verify=true but no goal was provided"
-                return vs
-
-            step_id = vs.step_id
-            description = vs.description
-            rationale = vs.rationale
-
-            # ── Assemble full goal (tier-aware) ──────────────────────────────
-            # Prefix and required output format are proportionate to tier so the
-            # executing agent produces a lightweight report for simple tasks and
-            # the full adversarial report only for high-risk ones.
-            _tier_prefix = '[ADVERSARIAL VERIFICATION]' if tier == 'adversarial' else '[VERIFICATION]'
-            full_goal = _tier_prefix + ' ' + goal
-            if rationale:
-                full_goal += (
-                    f'\n\n[Verification rationale — failure patterns being targeted]\n'
-                    f'{rationale}'
+            # Defensive sanitisation of LLM violations of the prompt rules.
+            # has_code_edits=False forbids code_test_step.
+            if verdict.code_test_step is not None and not has_code_edits:
+                self.logger.warning(
+                    "Acceptance synthesis returned code_test_step but has_code_edits=False; "
+                    "dropping the test step.",
+                    component='Planner',
                 )
-            _tier_suffixes = {
-                'light':       VERIFICATION_GOAL_SUFFIX_LIGHT,
-                'standard':    VERIFICATION_GOAL_SUFFIX_STANDARD,
-                'adversarial': VERIFICATION_GOAL_SUFFIX_ADVERSARIAL,
-            }
-            full_goal += _tier_suffixes.get(tier, VERIFICATION_GOAL_SUFFIX_STANDARD)
+                verdict.code_test_step = None
+            # already_tested=True forbids code_test_step (loop guard).
+            if verdict.code_test_step is not None and already_tested:
+                self.logger.warning(
+                    "Acceptance synthesis returned code_test_step but already_tested=True; "
+                    "dropping the test step to avoid an injection loop.",
+                    component='Planner',
+                )
+                verdict.code_test_step = None
 
-            # Attach the assembled Step onto the VerificationStep so the caller
-            # can use it directly without re-constructing it.
-            vs._step = Step.from_planner(  # type: ignore[attr-defined]
-                step_id=step_id,
-                description=description,
-                goal=full_goal,
-                risk_assessment="Low risk — adversarial read-only verification step",
-                required_context_keys=[],
+            self.logger.info(
+                f"Acceptance verdict: {verdict.verdict} "
+                f"(gap={verdict.gap_summary[:80]!r}, "
+                f"corrective={'yes' if verdict.corrective_step else 'no'}, "
+                f"code_test={'yes' if verdict.code_test_step else 'no'})",
+                component='Planner',
             )
-            return vs
+            return verdict
 
         except Exception as e:
             self.logger.warning(
-                f'generate_verification_step failed ({type(e).__name__}): {e}, '
-                f'skipping verification',
+                f'synthesize_acceptance failed ({type(e).__name__}): {e}; '
+                f'falling back to PASS to avoid blocking task completion.',
                 component='Planner',
             )
-            return VerificationStep(
-                should_verify=False,
-                skip_reason=f'Exception during generation ({type(e).__name__}): {e}',
-            )
+            return AcceptanceVerdict(verdict='PASS')
 
     def _detect_loops(self, completed_steps: List[Step]) -> str:
         """
