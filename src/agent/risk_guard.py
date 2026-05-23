@@ -109,8 +109,8 @@ class RiskGuard:
             True  → high-risk, user confirmation required.
             False → safe to proceed automatically.
         """
-        # Only bash commands are inspected for risk.
-        if decision.tool_name != "bash":
+        # Only bash/shell commands are inspected for risk.
+        if decision.tool_name not in ("bash", "shell"):
             return False
 
         command: str = (decision.parameters or {}).get("command", "")

@@ -44,8 +44,8 @@ class ToolResult:
         params_str = ""
         result_str = ""
         
-        # Special handling for bash tool
-        if tool_name == "bash":
+        # Special handling for bash/shell tool
+        if tool_name in ("bash", "shell"):
             # Extract command from parameters
             command = ""
             if self.tool_parameters:

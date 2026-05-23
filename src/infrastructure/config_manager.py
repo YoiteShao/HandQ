@@ -114,11 +114,15 @@ class ConfigManager:
         Check whether auto-approve is enabled for a specific interaction switch.
 
         Args:
-            switch_name: One of tool_write / tool_edit / tool_bash / high_risk.
+            switch_name: One of tool_write / tool_edit / tool_shell / tool_bash / high_risk.
 
         Returns:
             True if auto_approve is set to true for that switch.
         """
         # get_interaction_switches_config already calls _ensure_loaded
         switches = self.get_interaction_switches_config()
-        return switches.get(switch_name, {}).get("auto_approve", False)
+        result = switches.get(switch_name, {}).get("auto_approve", False)
+        # Fallback: tool_shell checks tool_bash for backward compatibility
+        if not result and switch_name == "tool_shell":
+            result = switches.get("tool_bash", {}).get("auto_approve", False)
+        return result

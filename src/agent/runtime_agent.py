@@ -75,7 +75,7 @@ def _failed_approach_signature(tr: "ToolResult") -> Optional[str]:
     """
     params = tr.tool_parameters or {}
     name = tr.tool_name or ""
-    if name == "bash":
+    if name == "bash" or name == "shell":
         cmd = params.get("command", "").strip()
         return f"bash:{cmd[:120]}" if cmd else None
     if name == "ssh":
@@ -134,6 +134,7 @@ _TOOL_NAME_ALIASES: Dict[str, str] = {
     "search": "grep",
     "find_files": "glob",
     "list_files": "glob",
+    "bash": "shell",
 }
 
 
@@ -206,9 +207,9 @@ class RuntimeAgent:
         # killed immediately when the Planner fires an interrupt signal, without
         # waiting for the current tool call to finish naturally.
         if interrupt_event is not None:
-            bash = self.tools.get("bash")
-            if bash is not None:
-                bash.interrupt_event = interrupt_event  # type: ignore[attr-defined]
+            shell = self.tools.get("shell")
+            if shell is not None:
+                shell.interrupt_event = interrupt_event  # type: ignore[attr-defined]
         # Pre-build the tools list in OpenAI function-calling format once at init time.
         # Passed to every chat_stream() call so the model uses
         # native function-calling instead of JSON-in-content.
@@ -326,7 +327,7 @@ class RuntimeAgent:
         """Build a short human-readable snippet for an in-flight tool call."""
         params = tc.parameters or {}
         name = tc.tool_name
-        if name == "bash":
+        if name in ("bash", "shell"):
             cmd = params.get("command", "")
             return cmd[:150] if cmd else "(no command)"
         if name == "ssh":
@@ -343,6 +344,39 @@ class RuntimeAgent:
         # Generic: show first param value
         first_val = next(iter(params.values()), "") if params else ""
         return str(first_val)[:100]
+
+    def _inject_background_completions(self) -> None:
+        """Check shell tool for completed background tasks, inject as observations."""
+        shell = self.tools.get("shell")
+        if shell is None or not hasattr(shell, 'get_completed_tasks'):
+            return
+        completed = shell.get_completed_tasks()
+        for task in completed:
+            stdout = task.stdout_data or ""
+            stderr = task.stderr_data or ""
+            obs = ToolResult(
+                success=(task.exit_code == 0) if task.exit_code is not None else False,
+                output={
+                    "task_id": task.task_id,
+                    "command": task.command,
+                    "description": task.description,
+                    "exit_code": task.exit_code,
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "background": True,
+                    "status": task.status,
+                },
+                error=stderr if task.exit_code != 0 else None,
+                exit_code=task.exit_code,
+                tool_name="shell",
+                tool_parameters={"task_id": task.task_id, "command": task.command, "run_in_background": True},
+            )
+            self.step.add_observation(obs)
+            self.logger.info(
+                f"[{self.current_iteration}][Background] Task '{task.task_id}' completed "
+                f"(exit_code={task.exit_code}): {task.command[:80]}",
+                component="RuntimeAgent",
+            )
 
     def observe(self, tool_result: ToolResult | None = None) -> List[ToolResult]:
         """
@@ -459,7 +493,7 @@ class RuntimeAgent:
             status = "OK" if obs.success else "FAIL"
             params = obs.tool_parameters or {}
             # Derive a compact parameter annotation
-            if obs.tool_name == "bash":
+            if obs.tool_name in ("bash", "shell"):
                 cmd = params.get("command", "").strip()
                 param_ann = f" cmd={cmd[:120]!r}" if cmd else ""
             elif obs.tool_name in ("read", "write", "edit"):
@@ -832,7 +866,7 @@ class RuntimeAgent:
                 return None
 
         # Check 2-4: Tool-specific switches (write/edit/bash)
-        tool_switch_map = {"write": "tool_write", "edit": "tool_edit", "bash": "tool_bash"}
+        tool_switch_map = {"write": "tool_write", "edit": "tool_edit", "bash": "tool_bash", "shell": "tool_shell"}
         if tool_name in tool_switch_map:
             switch_name = tool_switch_map[tool_name]
             if self.config_manager.is_auto_approve_enabled(switch_name):
@@ -995,7 +1029,7 @@ class RuntimeAgent:
                     output = {
                         k: (str(v)[:100] + "..." if len(str(v)) > 100 else str(v))
                         for k, v in result.output.items()
-                        if not (tool_name.lower() == "bash" and k == "command")
+                        if not (tool_name.lower() in ("bash", "shell") and k == "command")
                     }
                 self._interaction_manager.notify_tool_execution_started(
                     self.current_iteration, None, None, output)
@@ -1120,7 +1154,7 @@ class RuntimeAgent:
         tool = self.tools.get(tc.tool_name)
         if tool is None:
             return False
-        if tc.tool_name == "bash":
+        if tc.tool_name in ("bash", "shell"):
             # Model-annotated: True only when the model explicitly marks the command safe.
             return bool(tc.parameters.get("concurrent_safe", False))
         return bool(getattr(tool, "is_concurrency_safe", False))
@@ -1535,7 +1569,8 @@ class RuntimeAgent:
                     self._record_agent_end(_agent_result, _tools_used)
                     return _agent_result
 
-            # 1. Observe
+            # 1. Observe (including background task completions)
+            self._inject_background_completions()
             observations = self.observe()
 
             # 1b. Compact old observations:
@@ -1715,7 +1750,7 @@ class RuntimeAgent:
                 if tr.tool_name:
                     params = tr.tool_parameters or {}
                     tool_nm = tr.tool_name
-                    if tool_nm == "bash":
+                    if tool_nm in ("bash", "shell"):
                         primary_input = params.get("command")
                     elif tool_nm in ("read", "write", "edit"):
                         primary_input = params.get("path")

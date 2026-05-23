@@ -2313,7 +2313,7 @@ class FlowController:
         from ..models.state import UserConfirmation as UC
         from ..models.decision import Decision as D
 
-        _TOOL_NAMES = {"write", "edit", "bash"}
+        _TOOL_NAMES = {"write", "edit", "bash", "shell"}
 
         def callback(decision: D, context: str) -> UC:
             if context in _TOOL_NAMES:
@@ -2500,7 +2500,7 @@ class FlowController:
                 _path = (_obs.tool_parameters or {}).get("path", "")
                 if _path:
                     _written_paths.add(_path)
-            elif _obs.tool_name == "bash":
+            elif _obs.tool_name in ("bash", "shell"):
                 _had_bash = True
 
         def _filter_artifacts(raw: List[str]) -> List[str]:

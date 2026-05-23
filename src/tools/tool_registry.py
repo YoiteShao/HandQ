@@ -8,7 +8,7 @@ from .base_tool import BaseTool
 from .read_tool import ReadTool
 from .write_tool import WriteTool
 from .edit_tool import EditTool
-from .bash_tool import BashTool
+from .shell_tool import ShellTool
 from .ssh_tool import StatelessSSHTool
 from .glob_tool import GlobTool
 from .grep_tool import GrepTool
@@ -61,7 +61,8 @@ class ToolRegistry:
     READ = "read"
     WRITE = "write"
     EDIT = "edit"
-    BASH = "bash"
+    SHELL = "shell"
+    BASH = "bash"  # backward-compat alias for SHELL
     GLOB = "glob"
     GREP = "grep"
     NOTEBOOK_EDIT = "notebook_edit"
@@ -347,172 +348,260 @@ Examples:
             tool_class=EditTool
         )
 
-        # Register BASH tool
-        _bash_description = (
+        # Register SHELL tool (replaces legacy BASH tool)
+        _shell_description = (
             "Execute a shell command and return its stdout, stderr, and exit code. "
-            "Use for running programs, scripts, searches, system operations, "
-            "and verifying results."
+            "Supports foreground execution with timeout, background execution with task management, "
+            "and persistent working directory across calls."
         )
         if _IS_WINDOWS:
-            _bash_usage_guide = """\
-Platform: Windows. Default shell: cmd.exe.
-Use the 'shell' parameter to select: "cmd" (default), "powershell", or "bash" (Git Bash).
+            _shell_usage_guide = """\
+Platform: Windows. Default shell: PowerShell (pwsh 7+ / powershell.exe).
+Use the 'shell' parameter to select: "powershell" (default), "cmd", or "bash" (Git Bash).
+
+Working Directory: Each command runs in the agent's project directory by default.
+Use 'cd subdir && cmd' within a single command for subdirectory operations.
+Shell state (variables, functions) does NOT persist between calls — each call runs
+in a fresh process.
 
 When to Use:
   - Run programs, scripts, tests, or build commands
   - Search for patterns, check system state, verify results
   - Process text, install packages or manage dependencies
+  - Long-running tasks: use run_in_background=true
 
 When NOT to Use:
   - Reading file contents — use read instead (cleaner, no shell escaping issues)
-  - When the command requires interactive input without a non-interactive flag
+  - Interactive commands that will hang (see Forbidden Commands below)
 
-CRITICAL — Command Syntax (cmd.exe default):
-  • List files: dir (NOT ls)
-  • Find files: dir /s /b *.ext (NOT find . -name)
-  • Search text: findstr /s /i "pattern" *.py (NOT grep)
-  • Check path exists: if exist "path" (echo yes) (NOT test -f)
-  • Remove file: del /f "path" (NOT rm)
-  • Remove dir: rmdir /s /q "path" (NOT rm -rf)
-  • Print file: type "path" (NOT cat)
-  • Current dir: cd (NOT pwd)
-  • Move/rename: move (NOT mv)
-  • Copy: copy (NOT cp)
-  • Env vars: %VAR% (NOT $VAR)
-  • Path separator: \\ (NOT /)
-  • Null device: NUL (NOT /dev/null)
+Forbidden Commands (will hang — tool runs non-interactively):
+  - Read-Host, Get-Credential, Out-GridView, $Host.UI.PromptForChoice, pause
+  - git rebase -i, git add -i, or any command that opens an interactive editor
+  - Destructive cmdlets without -Confirm:$false may prompt and hang
+
+PowerShell Syntax (default):
+  • List files: Get-ChildItem (aliases: ls, dir)
+  • Find files: Get-ChildItem -Recurse -Filter *.ext
+  • Search text: Select-String -Pattern "x" -Path *.py (or -Recurse)
+  • Check path: Test-Path "path"
+  • Remove file: Remove-Item "path"
+  • Remove dir: Remove-Item -Recurse -Force -Confirm:$false "path"
+  • Print file: Get-Content "path"
+  • Current dir: Get-Location (alias: pwd)
+  • Move/rename: Move-Item
+  • Copy: Copy-Item
+  • Env vars: read with $env:NAME, set with $env:NAME = "value"
+  • Path separator: \\ (forward slashes also work)
+  • Null device: $null (NOT /dev/null)
   • Python: python (NOT python3)
-  • Command chaining: cmd1 && cmd2 (stop on fail), cmd1 & cmd2 (always both)
+  • Command chaining: cmd1 && cmd2 (stop on fail), cmd1; cmd2 (always both)
+  • String interpolation: "Hello $name" or "Value: $($obj.Property)"
+  • Pipeline: passes objects, not text — use Select-Object, Where-Object, ForEach-Object
+  • Ternary: $condition ? $true_val : $false_val
+  • Null-coalescing: $var ?? "default"
+  • Null-conditional: $obj?.Property
 
-PowerShell alternative (use shell="powershell"):
-  • List: Get-ChildItem (aliases: ls, dir)
-  • Search: Select-String -Pattern "x" -Path *.py
-  • Find: Get-ChildItem -Recurse -Filter *.ext
-  • Test path: Test-Path "path"
-  • Remove: Remove-Item -Recurse -Force "path"
-  • Print: Get-Content "path"
-  • Env vars: $env:VAR
+Destructive Cmdlet Safety:
+  Destructive cmdlets (Remove-Item, Stop-Process, Clear-Content) may prompt for
+  confirmation. Add -Confirm:$false when you intend the action to proceed.
+  Use -Force for read-only or hidden items.
 
-Do NOT use Unix commands (ls, grep, find, cat, rm, test, chmod, mv, cp, head, tail,
-awk, sed, wc, etc.) unless you specify shell="bash" (requires Git Bash installed).
+Multiline Strings (Here-Strings):
+  Use single-quoted here-strings for literal content (no variable expansion):
+    git commit -m @'
+    Commit message here.
+    Second line with $literal dollar signs.
+    '@
+  CRITICAL: Closing '@ MUST be at column 0 (no leading whitespace) on its own line.
+  Use @"..."@ (double-quoted) only when you need variable expansion.
+
+Stop-Parsing Token:
+  For arguments containing -, @, or other PowerShell operators:
+    git log --% --format=%H
+
+Registry Access:
+  Use PSDrive prefixes (NOT raw paths):
+  ✓ Get-ItemProperty HKLM:\\SOFTWARE\\...
+  ✓ Get-ItemProperty HKCU:\\...
+  ✗ HKEY_LOCAL_MACHINE\\... (will fail)
+
+Exit Code Handling:
+  -ErrorAction SilentlyContinue suppresses error output but the tool still reports
+  exit 1. For truly non-fatal errors, wrap in try-catch:
+    try { Cmdlet ... -ErrorAction Stop } catch { }
+
+Unix → PowerShell Equivalents (Do NOT use Unix commands without shell="bash"):
+  head -N file         → Get-Content file -TotalCount N
+  tail -N file         → Get-Content file -Tail N
+  head (piped)         → | Select-Object -First N
+  tail (piped)         → | Select-Object -Last N
+  which cmd            → (Get-Command cmd).Source
+  touch path           → if (-not (Test-Path path)) { New-Item -ItemType File path }
+  wc -l file           → (Get-Content file | Measure-Object -Line).Lines
+  mkdir -p dir         → New-Item -ItemType Directory -Force dir
+  rm -rf dir           → Remove-Item -Recurse -Force dir
+  ln -s target link    → New-Item -ItemType SymbolicLink -Path link -Target target
+  2>/dev/null          → 2>$null
+  VAR=x cmd            → $env:VAR = 'x'; cmd
+  if [ -f x ]          → if (Test-Path x) { ... }
+  for x in *           → foreach ($x in ...) { ... }
+  `cmd` (backtick)     → $(cmd)
+  chmod/chown          → icacls (Windows ACL model)
+
+cmd.exe alternative (use shell="cmd"):
+  • List: dir /s /b
+  • Search: findstr /s /i "pattern" *.py
+  • Chaining: cmd1 && cmd2
+  • Env vars: %VAR%
+
+Background Execution:
+  Set run_in_background=true for long-running commands (tests, builds, servers).
+  Returns a task_id immediately. You will be notified when it completes.
+  No timeout limit for background tasks (foreground: 600s max).
+  Use task_id="..." to query status.
+  Use task_id="...", command="kill" to terminate.
+
+Output Handling:
+  - Output is truncated at 30,000 characters (head 10k + tail 5k + notice)
+  - Background tasks: output capped at 30,000 bytes per task
+  - Use Select-String or Select-Object -First N to filter proactively
+
+Git Security:
+  NEVER use --no-verify to skip hooks or --no-gpg-sign to bypass signing
+  unless explicitly requested. If a hook fails, investigate the underlying issue.
 
 Strategy:
-  - Always use non-interactive flags for commands that might prompt:
-      --yes, -y, --no-input, --force, -f
+  - Always use non-interactive flags: --yes, -y, --no-input, -Confirm:$false
   - Check exit codes: zero = success; non-zero = failure
-  - Limit output: use findstr to filter, or pipe to powershell Select-Object -First N
-  - For long-running commands, add a timeout or run in background if appropriate
+  - Limit output: pipe to Select-Object -First N or Select-String to filter
+  - For long-running commands, use run_in_background=true
   - Context budget: large outputs consume context. Filter aggressively.
 
 Python as a power tool (PREFERRED for complex operations):
-  Python is available via this tool and should be your first choice when:
-  - Processing structured data (JSON, YAML, CSV, XML) — always prefer python over
-    fragile shell parsing with findstr/for loops
+  Python is available and should be your first choice when:
+  - Processing structured data (JSON, YAML, CSV, XML)
   - Complex text manipulation across multiple files
   - Any logic requiring conditionals, loops, or error handling
-  - File system operations on many files (batch rename, filter, transform)
-  - Calculations, data aggregation, or report generation
   - Anything that would require more than 2 piped commands
 
-  Patterns:
-    • Quick one-liner: python -c "import json; print(json.load(open('x.json'))['key'])"
-    • Multi-step: write a .py script with the write tool, then run it with bash
-    • For complex tasks, prefer writing a script (easier to debug than long one-liners)
-
-  Available: Python standard library is always available. Common third-party packages
-  (requests, pyyaml, etc.) may also be installed — try importing before assuming unavailable.
-
 Examples:
-  GOOD: findstr /s /n "def process_batch" *.py
+  GOOD: Get-ChildItem -Recurse -Filter *.py | Select-String 'pattern'
   GOOD: python -m pytest tests/test_core.py -x -q
-  GOOD: dir /s /b *.py | findstr "test_"
-  GOOD: python -c "import os; [print(f) for f in os.listdir('.') if f.endswith('.py')]"
-  GOOD: python -c "import json,sys; d=json.load(open('config.json')); d['version']='2.0'; json.dump(d,open('config.json','w'),indent=2)"
-  GOOD: {"command": "Get-ChildItem -Recurse -Filter *.py | Select-String 'pattern'", "shell": "powershell"}
-  BAD:  grep -rn "pattern" src/   — Unix command, will fail on cmd.exe
-  BAD:  find . -name "*.py"       — Unix command, will fail on cmd.exe
-  BAD:  cat large_file.log        — Unix command; use type or read tool instead
-  BAD:  Complex for /f loops to parse JSON — use python instead"""
+  GOOD: {"command": "npm test", "run_in_background": true, "description": "Running tests"}
+  GOOD: {"task_id": "bg_1"} — check background task status
+  GOOD: {"task_id": "bg_1", "command": "kill"} — kill background task
+  BAD:  grep -rn "pattern" src/   — Unix command, will fail on PowerShell
+  BAD:  find . -name "*.py"       — Unix; use Get-ChildItem -Recurse
+  BAD:  Read-Host "prompt"        — will hang (non-interactive)"""
         else:
-            _bash_usage_guide = """\
-Platform: Linux. Default shell: /bin/sh.
+            _shell_usage_guide = """\
+Platform: Linux/macOS. Default shell: /bin/sh.
+Use the 'shell' parameter to select: "sh" (default), "bash", "zsh".
+
+Working Directory: Each command runs in the agent's project directory by default.
+Use 'cd subdir && cmd' within a single command for subdirectory operations.
+Shell state (variables, functions) does NOT persist between calls — each call runs
+in a fresh process.
 
 When to Use:
   - Run programs, scripts, tests, or build commands
   - Search for patterns: grep, find, rg (ripgrep)
   - Check system state: ls, ps, df, env, which
-  - Verify results: run tests, check syntax (python -m py_compile), list outputs
+  - Verify results: run tests, check syntax, list outputs
   - Process text: awk, sed, sort, uniq, wc
-  - Install packages or manage dependencies
+  - Long-running tasks: use run_in_background=true
 
 When NOT to Use:
   - Reading file contents — use read instead (cleaner, no shell escaping issues)
-  - When the command requires interactive input without a non-interactive flag
+  - Interactive commands: git rebase -i, git add -i, editors (vi, nano)
+  - Commands that prompt for input without a --yes/-y flag
+
+Background Execution:
+  Set run_in_background=true for long-running commands (tests, builds, servers).
+  Returns a task_id immediately. You will be notified when it completes.
+  No timeout limit for background tasks (foreground: 600s max).
+  Use task_id="..." to query status.
+  Use task_id="...", command="kill" to terminate.
+
+Output Handling:
+  - Output is truncated at 30,000 characters (head 10k + tail 5k + notice)
+  - Background tasks: output capped at 30,000 bytes per task
+  - Use head/tail/grep to filter proactively
+
+Scope Warning:
+  Search commands (grep, find, rg) must target the working directory or subdirectories.
+  Searching / or ~ can hang on large directory trees — always scope to '.' or a subdir.
+
+Git Security:
+  NEVER use --no-verify to skip hooks or --no-gpg-sign to bypass signing
+  unless explicitly requested. If a hook fails, investigate the underlying issue.
 
 Strategy:
-  - Always use non-interactive flags for commands that might prompt:
-      --yes, -y, --no-input, --force, -f, DEBIAN_FRONTEND=noninteractive
-  - Check exit codes: a zero exit code means success; non-zero means failure
-  - Limit output size to avoid consuming context budget:
-      command | head -100        — first 100 lines
-      command | tail -50         — last 50 lines
-      command 2>&1 | grep ERROR  — filter to relevant lines
-  - For long-running commands, add a timeout or run in background if appropriate
-  - Chain commands with && to stop on first failure: cmd1 && cmd2 && cmd3
-  - Context budget: large command outputs (e.g., full test suite logs) consume
-    significant context. Filter output aggressively with grep/head/tail.
+  - Always use non-interactive flags: --yes, -y, --no-input, --force, -f,
+    DEBIAN_FRONTEND=noninteractive
+  - Check exit codes: zero = success; non-zero = failure
+  - Limit output: command | head -100, command | tail -50, command | grep ERROR
+  - For long-running commands, use run_in_background=true
+  - Chain commands with && to stop on first failure
+  - Context budget: large outputs consume context. Filter aggressively.
 
 Python as a power tool (PREFERRED for complex operations):
-  Python is available via this tool and should be your first choice when:
-  - Processing structured data (JSON, YAML, CSV, XML) — always prefer python over
-    fragile shell pipelines with awk/sed/jq
+  Python is available and should be your first choice when:
+  - Processing structured data (JSON, YAML, CSV, XML)
   - Complex text manipulation across multiple files
   - Any logic requiring conditionals, loops, or error handling
-  - File system operations on many files (batch rename, filter, transform)
-  - Calculations, data aggregation, or report generation
   - Anything that would require more than 2-3 piped shell commands
-
-  Patterns:
-    • Quick one-liner: python3 -c "import json; print(json.load(open('x.json'))['key'])"
-    • Multi-step: write a .py script with the write tool, then run it with bash
-    • For complex tasks, prefer writing a script (easier to debug than long one-liners)
-
-  Available: Python standard library is always available. Common third-party packages
-  (requests, pyyaml, etc.) may also be installed — try importing before assuming unavailable.
 
 Examples:
   GOOD: grep -rn "def process_batch" src/ | head -20
   GOOD: python -m pytest tests/test_core.py -x -q 2>&1 | tail -30
   GOOD: find . -name "*.py" -newer requirements.txt | head -20
-  GOOD: python3 -c "import os; [print(f) for f in os.listdir('.') if f.endswith('.py')]"
-  GOOD: python3 -c "import json,sys; d=json.load(open('config.json')); d['version']='2.0'; json.dump(d,open('config.json','w'),indent=2)"
+  GOOD: {"command": "npm test", "run_in_background": true, "description": "Running tests"}
+  GOOD: {"task_id": "bg_1"} — check background task status
+  GOOD: {"task_id": "bg_1", "command": "kill"} — kill background task
   BAD:  cat large_file.log  — use read or grep instead
-  BAD:  pip install package  (without -q or output filtering)
-        → use: pip install package -q && echo "installed"
-  BAD:  Running a command that hangs waiting for user input
-  BAD:  Complex awk/sed pipelines to parse JSON — use python instead"""
+  BAD:  git rebase -i HEAD~3  — interactive, will hang
+  BAD:  Running a command that hangs waiting for user input"""
 
-        cls._tools[cls.BASH] = ToolMetadata(
-            name=cls.BASH,
-            description=_bash_description,
-            usage_guide=_bash_usage_guide,
+        cls._tools[cls.SHELL] = ToolMetadata(
+            name=cls.SHELL,
+            description=_shell_description,
+            usage_guide=_shell_usage_guide,
             parameter_schema={
                 "type": "object",
                 "properties": {
                     "command": {
                         "type": "string",
                         "description": (
-                            "Shell command to execute. "
-                            "Use non-interactive flags for commands that might prompt. "
+                            "Shell command to execute. Required for new commands. "
+                            "When used with task_id, set to 'kill' to terminate the task. "
                             + (
-                                "Use cmd.exe syntax by default on Windows. "
-                                "Specify shell=\"powershell\" or shell=\"bash\" for alternatives. "
+                                "Uses PowerShell syntax by default on Windows. "
+                                "Specify shell=\"cmd\" or shell=\"bash\" for alternatives. "
                                 if _IS_WINDOWS else
                                 "Pipe through head/tail/grep to limit output size. "
                             )
-                            + "IMPORTANT: grep/find/search must be scoped to the working "
+                            + "IMPORTANT: search commands must be scoped to the working "
                             "directory ('.' or a subdirectory) — never to parent "
                             "directories or filesystem root."
+                        )
+                    },
+                    "run_in_background": {
+                        "type": "boolean",
+                        "description": (
+                            "If true, launch the command in the background and return "
+                            "a task_id immediately. You will be notified when it completes. "
+                            "Use for long-running commands (tests, builds, servers). "
+                            "Default: false."
+                        )
+                    },
+                    "task_id": {
+                        "type": "string",
+                        "description": (
+                            "ID of a background task to query or stop. "
+                            "When provided without 'command', returns the task's current "
+                            "status and output. When provided with command='kill', "
+                            "terminates the background task."
                         )
                     },
                     "concurrent_safe": {
@@ -521,16 +610,14 @@ Examples:
                             "Set to true when this command is read-only and safe "
                             "to run concurrently with other commands in the same "
                             "response (e.g. search, list, read, python -c). "
-                            "Set to false (or omit) for commands that write files, "
-                            "modify state, or have side effects. "
                             "Default: false (serialised)."
                         )
                     },
                     "timeout": {
                         "type": "integer",
                         "description": (
-                            "Maximum seconds to wait for the command to complete. "
-                            "Default: 120. Maximum: 300 seconds."
+                            "Maximum seconds for foreground commands. "
+                            "Default: 120. Maximum: 600 seconds (10 minutes)."
                         )
                     },
                     "shell": {
@@ -538,19 +625,26 @@ Examples:
                         "description": (
                             "Shell to use for execution. "
                             + (
-                                "Options: \"cmd\" (default), \"powershell\"/\"pwsh\", \"bash\" (Git Bash). "
-                                "Use \"powershell\" for advanced scripting; \"bash\" only if Git Bash is installed."
+                                "Options: \"powershell\"/\"pwsh\" (default), \"cmd\", \"bash\" (Git Bash). "
+                                "Use \"cmd\" for legacy batch scripts; \"bash\" only if Git Bash is installed."
                                 if _IS_WINDOWS else
                                 "Options: \"sh\" (default), \"bash\", \"zsh\". "
                                 "Usually omit to use the default."
                             )
                         )
                     },
+                    "description": {
+                        "type": "string",
+                        "description": (
+                            "Optional human-readable description of what this command does. "
+                            "Shown in progress displays. Useful for background tasks."
+                        )
+                    },
                 },
-                "required": ["command"],
+                "required": [],
                 "additionalProperties": False
             },
-            tool_class=BashTool
+            tool_class=ShellTool
         )
 
         # Register GLOB tool
@@ -988,8 +1082,8 @@ Recommended workflow for long-running remote scripts:
         for name, metadata in cls._tools.items():
             if metadata.on_demand and name not in requested:
                 continue
-            if name == cls.BASH:
-                instances[name] = BashTool(venv_path=venv_path)
+            if name in (cls.SHELL, cls.BASH):
+                instances[name] = ShellTool(venv_path=venv_path)
             elif name == cls.SSH:
                 instances[name] = StatelessSSHTool()
             else:

@@ -19,7 +19,7 @@ def get_platform_context() -> str:
     is provided in the tool descriptions themselves (see ToolRegistry).
     """
     if sys.platform == "win32":
-        return "Platform: Windows (default shell: cmd.exe; PowerShell also available)"
+        return "Platform: Windows (default shell: PowerShell; cmd.exe available via shell=\"cmd\")"
     else:
         return "Platform: Linux (default shell: /bin/sh)"
 
@@ -34,12 +34,12 @@ def _generate_system_prompt() -> str:
     Linux-only syntax on Windows (and vice versa).
     """
     if sys.platform == "win32":
-        _explore_cmd = 'dir or dir /s /b'
-        _explore_target = '`dir` or `dir /s /b`'
-        _search_cmd = 'bash with findstr/dir to locate code'
-        _verify_path = "verify the path exists with `dir` or `if exist`"
-        _verify_file_ops = 'After file operations: `if exist "path" echo yes`'
-        _search_grep = '**Search** (`bash` tool with findstr/Select-String):'
+        _explore_cmd = 'Get-ChildItem or Get-ChildItem -Recurse'
+        _explore_target = '`Get-ChildItem` or `Get-ChildItem -Recurse`'
+        _search_cmd = 'shell with Select-String/Get-ChildItem to locate code'
+        _verify_path = "verify the path exists with `Test-Path`"
+        _verify_file_ops = 'After file operations: `Test-Path "path"`'
+        _search_grep = '**Search** (`shell` tool with Select-String):'
         _cache_example = (
             '```\n'
             'REM Example: save dir results once, reuse many times\n'
@@ -53,10 +53,10 @@ def _generate_system_prompt() -> str:
     else:
         _explore_cmd = 'ls -la or find . -maxdepth 2'
         _explore_target = '`ls -la` or `find . -maxdepth 2`'
-        _search_cmd = '`bash` with grep/find to locate code'
+        _search_cmd = '`shell` with grep/find to locate code'
         _verify_path = "verify the path exists with `ls` or `test -f`"
         _verify_file_ops = 'After file operations: `ls -la path` or `test -f path && echo exists`'
-        _search_grep = '**Search/grep** (`bash` tool):'
+        _search_grep = '**Search/grep** (`shell` tool):'
         _cache_example = (
             '```\n'
             '# Example: save find results once, reuse many times\n'

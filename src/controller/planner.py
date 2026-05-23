@@ -264,15 +264,17 @@ def _count_effective_iterations(steps: List[Step]) -> int:
     # Tools that are purely read-only / exploratory — do not count toward
     # effective iterations.
     _READ_ONLY_TOOLS = frozenset({
-        "read", "glob", "grep", "bash_read",
+        "read", "glob", "grep", "bash_read", "shell_read",
     })
-    # Bash commands that are read-only by nature (prefix match on the command).
+    # Bash/shell commands that are read-only by nature (prefix match on the command).
     _READ_ONLY_BASH_PREFIXES = (
         "find ", "grep ", "ls ", "cat ", "head ", "tail ", "wc ",
         "test ", "echo ", "stat ", "file ", "du ", "df ", "pwd",
         "which ", "type ", "env ", "printenv ", "sort ", "uniq ",
         "diff ", "comm ", "cut ", "awk ", "sed -n", "python3 -c \"import",
-        "#",  # comment-only bash lines (no-op probes)
+        "Get-ChildItem", "Select-String", "Test-Path", "Get-Content",
+        "Get-Location",
+        "#",  # comment-only lines (no-op probes)
     )
     # SSH actions that are purely observational — polling or reading remote state.
     _SSH_READONLY_ACTIONS = frozenset({"job_status", "tail_log", "fetch_log"})
@@ -285,9 +287,9 @@ def _count_effective_iterations(steps: List[Step]) -> int:
             tool_name = entry.split(":", 1)[0].strip().lower()
             if tool_name in _READ_ONLY_TOOLS:
                 continue
-            if tool_name == "bash":
-                # Inspect the command text after "bash: "
-                cmd = entry[len("bash:"):].strip().lstrip() if ":" in entry else ""
+            if tool_name in ("bash", "shell"):
+                # Inspect the command text after "bash: " or "shell: "
+                cmd = entry.split(":", 1)[1].strip() if ":" in entry else ""
                 if any(cmd.startswith(pfx) for pfx in _READ_ONLY_BASH_PREFIXES):
                     continue
             if tool_name == "ssh":
