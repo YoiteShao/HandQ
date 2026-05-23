@@ -125,6 +125,16 @@ class Memory:
         """Return the stored browser context for *key*, or None."""
         return self._browser_contexts.get(key)
 
+    def clear_browser_contexts(self) -> None:
+        """Drop every cached browser context entry.
+
+        Called by FlowController after the live browser session is closed at
+        task completion, so a follow-up task that re-activates the browser
+        provider receives the full first-activation hint rather than the
+        stale "session reused" brief reminder.
+        """
+        self._browser_contexts.clear()
+
 
     def add_step(self, step: Step) -> None:
         """Record a completed step and accumulate its structured findings.

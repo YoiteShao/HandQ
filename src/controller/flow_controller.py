@@ -1886,6 +1886,7 @@ class FlowController:
                             # BEFORE notifying the user so side-effects are flushed to disk
                             # before the user can see "complete" and quit the process.
                             await self._fire_task_complete_hook()
+                            await self._close_browser_session()
                             self.interaction_manager.notify_task_completed(reason)
                             self.logger.info(
                                 "Task complete (UI mode) — continuing loop for follow-up",
@@ -1997,6 +1998,7 @@ class FlowController:
                         # Run the one-shot completion hook (e.g. GEP post-processing)
                         # BEFORE notifying the user — same guarantee as the normal path.
                         await self._fire_task_complete_hook()
+                        await self._close_browser_session()
                         self.interaction_manager.notify_task_completed(reason)
                         self.logger.info(
                             "Task complete after interrupt (UI mode) — continuing loop for follow-up",
@@ -2635,6 +2637,36 @@ class FlowController:
                 f"on_task_complete_hook failed: {_hook_exc}",
                 component="FlowController",
             )
+
+    async def _close_browser_session(self) -> None:
+        """Close the process-wide browser session at task completion.
+
+        Cookies in the persistent user-data-dir survive the close, so a
+        follow-up task that needs the browser will re-launch via
+        launch_browser without losing login state. Also clears the per-task
+        browser context cache so the provider re-emits the full first-
+        activation hint instead of a misleading "session reused" reminder.
+
+        Best-effort: any failure is logged and swallowed so completion is
+        never blocked.
+        """
+        try:
+            from ..tools.browser_tool import flush_browser_pool
+            closed = await flush_browser_pool()
+            if closed:
+                self.logger.info(
+                    f"Browser session closed at task completion ({closed} closed)",
+                    component="FlowController",
+                )
+        except Exception as exc:
+            self.logger.warning(
+                f"Browser cleanup at task completion failed: {exc}",
+                component="FlowController",
+            )
+        try:
+            self.memory.clear_browser_contexts()
+        except Exception:
+            pass
 
     def get_metrics(self):
         """Return aggregated TaskMetrics across all tasks recorded this session."""
