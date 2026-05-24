@@ -796,6 +796,18 @@ class FlowController:
                 "BrowserContextProvider not registered (transitive deps missing)",
                 component="FlowController",
             )
+        try:
+            from ..infrastructure.desktop_setup import DesktopContextProvider
+            self.register_step_context_provider(DesktopContextProvider())
+        except ImportError:
+            # desktop_tool transitive deps (pyautogui / mss / pywin32) may
+            # be missing on a slim install. The provider itself does its
+            # own dep check at prepare-time and emits an UNAVAILABLE hint;
+            # this except is just for the import-line itself.
+            self.logger.debug(
+                "DesktopContextProvider not registered (transitive deps missing)",
+                component="FlowController",
+            )
 
 
 
@@ -1882,11 +1894,11 @@ class FlowController:
                             # Write metrics_summary.json BEFORE notifying completion so
                             # the foreground process can read it when it detects state3.
                             self._report_metrics()
-                            # Run the one-shot completion hook (e.g. GEP post-processing)
-                            # BEFORE notifying the user so side-effects are flushed to disk
-                            # before the user can see "complete" and quit the process.
-                            await self._fire_task_complete_hook()
-                            await self._close_browser_session()
+                            # Run end-of-task finaliser (user hook → internal
+                            # resource flushes) BEFORE notifying the user so
+                            # side-effects are flushed to disk before the user
+                            # can see "complete" and quit the process.
+                            await self._finalize_task()
                             self.interaction_manager.notify_task_completed(reason)
                             self.logger.info(
                                 "Task complete (UI mode) — continuing loop for follow-up",
@@ -1995,10 +2007,9 @@ class FlowController:
                         # Write metrics_summary.json BEFORE notifying completion so
                         # the foreground process can read it when it detects state3.
                         self._report_metrics()
-                        # Run the one-shot completion hook (e.g. GEP post-processing)
-                        # BEFORE notifying the user — same guarantee as the normal path.
-                        await self._fire_task_complete_hook()
-                        await self._close_browser_session()
+                        # Run end-of-task finaliser (user hook → internal
+                        # resource flushes) — same guarantee as the normal path.
+                        await self._finalize_task()
                         self.interaction_manager.notify_task_completed(reason)
                         self.logger.info(
                             "Task complete after interrupt (UI mode) — continuing loop for follow-up",
@@ -2329,26 +2340,20 @@ class FlowController:
         """
         Return a confirmation callback for RuntimeAgent.
 
-        Routes tool confirmations (write/edit/bash) and high-risk confirmations.
+        Routes tool confirmations and high-risk confirmations.
+        If `context` is a registered tool name → request_tool_confirmation.
+        Otherwise (RiskGuard description string) → request_risk_confirmation.
         "Other input" on the tool path is queued for Planner evaluation; the tool
         is rejected so the agent re-thinks within the current step.
         """
         from ..models.state import UserConfirmation as UC
         from ..models.decision import Decision as D
-
-        _TOOL_NAMES = {"write", "edit", "bash", "shell"}
+        from ..tools.tool_registry import ToolRegistry
 
         def callback(decision: D, context: str) -> UC:
-            if context in _TOOL_NAMES:
+            if context in ToolRegistry.get_tool_names():
                 result = self.interaction_manager.request_tool_confirmation(context, decision)
                 if result.has_new_message() and result.message:
-                    # Use inject_user_message() rather than direct queue access so
-                    # that system commands typed in the confirmation dialog (e.g.
-                    # :exit) are routed through _route_line() and handled correctly.
-                    # At this point _confirmation_active is already False (the dialog
-                    # set it back in its finally-block), so inject_user_message()
-                    # will call _route_line() and dispatch :exit / :quit properly
-                    # instead of forwarding them to the Planner as plain messages.
                     self.interaction_manager.inject_user_message(result.message)
                     self.logger.info(
                         f"Tool confirmation 'other input' injected "
@@ -2638,46 +2643,108 @@ class FlowController:
                 component="FlowController",
             )
 
-    async def _close_browser_session(self) -> None:
-        """Close the process-wide browser session at task completion.
+    async def _finalize_task(self) -> None:
+        """End-of-task finaliser. Call this from every completion path.
 
-        Cookies in the persistent user-data-dir survive the close, so a
-        follow-up task that needs the browser will re-launch via
-        launch_browser without losing login state. Also clears the per-task
-        browser context cache so the provider re-emits the full first-
-        activation hint instead of a misleading "session reused" reminder.
+        Pipeline (order matters):
+
+          1. ``_fire_task_complete_hook`` — user-registered hook
+             (e.g. GEP post-processing). Runs FIRST so user side-effects
+             land before we tear down the framework's per-task resources
+             they may depend on.
+          2. ``_close_session_resources`` — internal subsystem flushes
+             (browser pool, vision LLM client, desktop screenshot store,
+             …). The dispatcher there knows nothing about specific
+             subsystems beyond a registered list; new subsystems plug
+             in by adding a row to the table inside it.
+
+        Both steps are best-effort: each catches its own exceptions so
+        task completion is never blocked. After this returns the user
+        gets the "task complete" notification and can quit.
+
+        Why a wrapper: prior to this method the two phases lived as
+        sibling calls at every completion site (regular completion,
+        post-interrupt completion, ...) — easy to drift in count or
+        order as new sites are added. Centralising here removes the
+        risk and gives Phase 3 activity_monitor a single hook point.
+        """
+        await self._fire_task_complete_hook()
+        await self._close_session_resources()
+
+    async def _close_session_resources(self) -> None:
+        """Flush every per-task resource at task completion.
+
+        This is a **dispatcher** — it does not know what each subsystem
+        does. Each subsystem owns its cleanup contract and exposes a
+        single ``async`` entry point. Phase 3 activity_monitor will add
+        its own ``flush_activity_monitor`` and we just append a row.
+
+        Contract for cleanup callbacks:
+          * ``async`` callable with no required arguments.
+          * Best-effort — must catch its own exceptions and never raise.
+          * Returns something stringifiable for the log line, or None.
+
+        The browser-pool / vision-client / desktop-store callbacks all
+        already follow this shape. Cookies, login state, and other
+        cross-task state survive whatever an individual cleanup chooses
+        to discard — see each callback's docstring for specifics.
 
         Best-effort: any failure is logged and swallowed so completion is
         never blocked.
         """
-        try:
-            from ..tools.browser_tool import flush_browser_pool
-            closed = await flush_browser_pool()
-            if closed:
-                self.logger.info(
-                    f"Browser session closed at task completion ({closed} closed)",
+        # Lazy imports keep the dispatcher decoupled from subsystem load
+        # order — none of these modules need to be ready when
+        # FlowController is constructed.
+        from ..tools.browser_tool import flush_browser_pool
+        from ..tools.desktop_tool import flush_desktop_store
+        from ..infrastructure.vision import flush_vision_client
+
+        # Order matters slightly: browser uses the vision client (for
+        # vision_query); flush browser first so its in-flight calls
+        # resolve, then close the LLM client, then the screenshot
+        # stores (no dependents).
+        cleanups = [
+            ("browser pool",       flush_browser_pool),
+            ("vision LLM client",  flush_vision_client),
+            ("desktop screenshot store", flush_desktop_store),
+        ]
+        for label, fn in cleanups:
+            try:
+                result = await fn()
+                if result:
+                    self.logger.info(
+                        f"{label} flushed at task completion: {result}",
+                        component="FlowController",
+                    )
+            except Exception as exc:
+                self.logger.warning(
+                    f"{label} cleanup at task completion failed: {exc}",
                     component="FlowController",
                 )
-        except Exception as exc:
-            self.logger.warning(
-                f"Browser cleanup at task completion failed: {exc}",
-                component="FlowController",
-            )
-        try:
-            from ..infrastructure.vision import flush_vision_client
-            v_closed = await flush_vision_client()
-            if v_closed:
-                self.logger.info(
-                    "Vision client closed at task completion",
-                    component="FlowController",
-                )
-        except Exception as exc:
-            self.logger.warning(
-                f"Vision client cleanup at task completion failed: {exc}",
-                component="FlowController",
-            )
+
+        # Per-task LLM-prompt context cache for the browser provider.
+        # Lives on FlowController state, not in any tool, so it stays
+        # outside the cleanup table.
         try:
             self.memory.clear_browser_contexts()
+        except Exception:
+            pass
+        try:
+            # Same idea as clear_browser_contexts — drop the
+            # progressive-disclosure cache so the next task's first
+            # desktop-provider activation gets the full first-touch hint.
+            self.memory.clear_desktop_contexts()
+        except Exception:
+            pass
+
+        # Desktop takeover state: reset both flags so the next task
+        # starts with a clean slate. If a takeover was still active we
+        # also emit the 'task_ended' end event so the Electron overlay
+        # hides. This is a one-line module-level call, not a registered
+        # async cleanup, because there's nothing to await.
+        try:
+            from ..tools.desktop_tool import reset_takeover_state
+            reset_takeover_state()
         except Exception:
             pass
 

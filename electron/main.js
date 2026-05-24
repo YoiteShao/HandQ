@@ -153,6 +153,128 @@ let pythonChild = null;
 let stdoutReader = null;
 let isShuttingDown = false;
 
+// --- desktop takeover overlay ----------------------------------------------
+//
+// When the agent invokes a desktop input action (click_at / type_text / drag /
+// scroll / hotkey / key_press), the Python side emits
+//   {type:"status", kind:"desktop_takeover_started", reason:"input_action"}
+// We respond by spawning a fullscreen frameless transparent BrowserWindow that
+// renders a rainbow border + corner watermark (electron/overlay/overlay.html)
+// and registering Ctrl+Shift+C as a process-wide revoke hotkey. On
+//   {type:"status", kind:"desktop_takeover_ended", reason:"..."}
+// we close the window and unregister the shortcut. See docs/desktop_tool.md
+// §11 for the full IPC contract.
+//
+// We DO NOT use Ctrl+C for revoke even though docs §11.4 mentioned it — that
+// would hijack the system-wide copy shortcut for the entire duration of the
+// task, which is too aggressive a tradeoff.
+
+let takeoverOverlay = null;
+const TAKEOVER_REVOKE_ACCELERATOR = 'Control+Shift+C';
+
+function showTakeoverOverlay() {
+    if (takeoverOverlay && !takeoverOverlay.isDestroyed()) {
+        // Backend's _start_takeover is idempotent but a duplicate event
+        // could still arrive on edge cases. Don't double-create.
+        return;
+    }
+    logLine('OVERLAY', 'show takeover overlay');
+
+    try {
+        takeoverOverlay = new BrowserWindow({
+            frame: false,
+            transparent: true,
+            alwaysOnTop: true,
+            focusable: false,
+            skipTaskbar: true,
+            fullscreen: true,
+            hasShadow: false,
+            resizable: false,
+            movable: false,
+            minimizable: false,
+            maximizable: false,
+            closable: false,
+            backgroundColor: '#00000000',
+            // Overlay is purely presentational — no preload, no IPC.
+            webPreferences: {
+                contextIsolation: true,
+                sandbox: true,
+                nodeIntegration: false,
+            },
+        });
+    } catch (err) {
+        logLine('OVERLAY', 'create BrowserWindow failed',
+                { err: err && err.message });
+        takeoverOverlay = null;
+        return;
+    }
+
+    // Forward mouse events so the agent's clicks reach the underlying app.
+    try {
+        takeoverOverlay.setIgnoreMouseEvents(true, { forward: true });
+    } catch (err) {
+        logLine('OVERLAY', 'setIgnoreMouseEvents failed',
+                { err: err && err.message });
+    }
+    // "screen-saver" beats most fullscreen apps; fall back silently if the
+    // platform rejects the level.
+    try {
+        takeoverOverlay.setAlwaysOnTop(true, 'screen-saver');
+    } catch (_) { /* ignore */ }
+
+    takeoverOverlay.loadFile(path.join(__dirname, 'overlay', 'overlay.html'))
+        .catch((err) => {
+            logLine('OVERLAY', 'loadFile failed', { err: err && err.message });
+        });
+
+    // Hold off on setting visibleOnAllWorkspaces; default behaviour follows the
+    // user's active virtual desktop, which is what we want.
+
+    takeoverOverlay.on('closed', () => {
+        takeoverOverlay = null;
+    });
+
+    // Register the revoke hotkey. Registration can fail if another app
+    // already owns the combo — log it but continue showing the overlay so
+    // the user still sees the indicator.
+    try {
+        const ok = globalShortcut.register(TAKEOVER_REVOKE_ACCELERATOR, () => {
+            logLine('OVERLAY', 'revoke hotkey fired');
+            writeToBridge({ type: 'user_input', kind: 'desktop_takeover_revoked' });
+        });
+        if (!ok) {
+            logLine('OVERLAY', 'revoke hotkey register returned false',
+                    { accelerator: TAKEOVER_REVOKE_ACCELERATOR });
+        }
+    } catch (err) {
+        logLine('OVERLAY', 'revoke hotkey register error',
+                { err: err && err.message });
+    }
+}
+
+function hideTakeoverOverlay() {
+    // Always free the shortcut even if the window object is already gone.
+    try {
+        if (globalShortcut.isRegistered(TAKEOVER_REVOKE_ACCELERATOR)) {
+            globalShortcut.unregister(TAKEOVER_REVOKE_ACCELERATOR);
+        }
+    } catch (err) {
+        logLine('OVERLAY', 'revoke hotkey unregister error',
+                { err: err && err.message });
+    }
+    if (!takeoverOverlay || takeoverOverlay.isDestroyed()) {
+        takeoverOverlay = null;
+        return;
+    }
+    logLine('OVERLAY', 'hide takeover overlay');
+    try {
+        takeoverOverlay.destroy();
+    } catch (err) {
+        logLine('OVERLAY', 'destroy failed', { err: err && err.message });
+    }
+    takeoverOverlay = null;
+}
+
 // --- global hotkey (toggle window visibility) --------------------------------
 
 const HOTKEY_SETTINGS_FILE = path.join(
@@ -321,6 +443,25 @@ function spawnBridge() {
             id: evt && evt.id,
             raw: truncated,
         });
+        // Desktop takeover overlay control. We act on these BEFORE
+        // forwarding to the renderer so the overlay reaction isn't
+        // blocked by a slow renderer process. The renderer is also free
+        // to react (e.g. show a status pill) — both can happen.
+        if (evtType === 'status' && evt && typeof evt.kind === 'string') {
+            if (evt.kind === 'desktop_takeover_started') {
+                try { showTakeoverOverlay(); }
+                catch (err) {
+                    logLine('OVERLAY', 'showTakeoverOverlay threw',
+                            { err: err && err.message });
+                }
+            } else if (evt.kind === 'desktop_takeover_ended') {
+                try { hideTakeoverOverlay(); }
+                catch (err) {
+                    logLine('OVERLAY', 'hideTakeoverOverlay threw',
+                            { err: err && err.message });
+                }
+            }
+        }
         sendToRenderer(evt);
     });
 
@@ -348,6 +489,9 @@ function spawnBridge() {
 
     child.on('exit', (code, signal) => {
         logLine('MAIN', 'bridge exit', { code: code, signal: signal });
+        // If the bridge died mid-takeover, the user is left with a
+        // rainbow border and no Python to honour Ctrl+Shift+C. Hide it.
+        try { hideTakeoverOverlay(); } catch (_) { /* ignore */ }
         sendToRenderer({
             type: 'status',
             kind: 'bridge_exit',
@@ -705,6 +849,8 @@ ipcMain.handle('hotkey:set', (_event, accelerator) => {
 app.on('before-quit', (event) => {
     isQuitting = true;
     globalShortcut.unregisterAll();
+    // Tear down the takeover overlay if a task is still mid-flight on shutdown.
+    try { hideTakeoverOverlay(); } catch (_) { /* ignore */ }
     if (isShuttingDown) {
         return; // second click — let the default quit flow proceed.
     }

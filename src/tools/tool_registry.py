@@ -14,6 +14,7 @@ from .glob_tool import GlobTool
 from .grep_tool import GrepTool
 from .notebook_edit_tool import NotebookEditTool
 from .browser_tool import BrowserTool
+from .desktop_tool import DesktopTool
 
 _IS_WINDOWS = sys.platform == "win32"
 
@@ -69,6 +70,7 @@ class ToolRegistry:
     NOTEBOOK_EDIT = "notebook_edit"
     SSH  = "ssh"
     BROWSER = "browser"
+    DESKTOP = "desktop"
 
     _tools: Dict[str, ToolMetadata] = {}
     _initialized = False
@@ -1218,6 +1220,239 @@ LAUNCH vs ATTACH (advanced)
   attach mode default to background=true so the user's focus is preserved.""",
                 parameter_schema=BrowserTool.parameter_schema,
                 tool_class=BrowserTool,
+                on_demand=True,
+            )
+
+        # Register DESKTOP tool. Windows-only — uses pyautogui + pywin32 +
+        # mss + RapidOCR. on_demand=True so it only enters the LLM tool
+        # list when the planner / a context provider explicitly activates
+        # it (mirrors the BROWSER pattern).
+        if _IS_WINDOWS:
+            cls._tools[cls.DESKTOP] = ToolMetadata(
+                name=cls.DESKTOP,
+                description=(
+                    "Windows desktop automation: capture the active window or "
+                    "full screen, locate UI elements via local OCR (RapidOCR) "
+                    "with optional LLM-vision fallback, and drive the mouse / "
+                    "keyboard. Sensitive windows (password managers, banking) "
+                    "are refused outright."
+                ),
+                usage_guide="""\
+TOOL CHOICE HIERARCHY (read before EACH desktop call)
+  desktop drives OS-level mouse / keyboard — every input action looks
+  identical to real human input, steals focus, and is non-deterministic
+  (OCR + vision matching, never as exact as a CSS selector). It is the
+  most powerful tool in the kit and therefore the most disruptive — use
+  it ONLY when no specialised tool fits.
+
+  ✅ desktop is correct when the target is a NATIVE Windows app:
+    - Notepad, Excel, Word, PowerPoint, Outlook, OneNote
+    - File Explorer, Windows Settings, Task Manager, Control Panel
+    - VSCode, Visual Studio, third-party desktop software
+    - Anything that lives OUTSIDE a browser window
+
+  ❌ desktop is the WRONG tool for these — use the named alternative:
+    - Web pages, URLs, anything in browser  → browser   (DOM is exact,
+                                                          ~10x faster than OCR;
+                                                          off-screen, no focus theft)
+    - Read / write / edit files             → read / write / edit
+    - Run commands, scripts, programs       → shell
+    - Search files / find pattern           → glob / grep
+    - Remote machine                        → ssh
+    - Inspect Jupyter notebook cells        → notebook_edit
+
+  ANTI-PATTERN: do NOT use desktop on web pages just because you can see
+  them on screen. Even if the user said "click the OK button on
+  github.com", that's a browser task — open the page in browser_tool
+  and use selectors. Even if the user said "open my Notepad++ at line
+  50", it's still desktop because Notepad++ is a native app, but if the
+  user said "open the GitHub issue at line 50 of foo.py", that's
+  browser. Read the verb-target pair carefully.
+
+  PENALTY for misuse vs the correct tool:
+    - 5-10x slower (OCR ~1s + pyautogui PAUSE 50ms vs browser DOM ~50ms)
+    - Non-deterministic (OCR fuzzy match vs CSS selector exact)
+    - Steals user's actual mouse / keyboard
+    - Requires per-task user approval the first time
+    - Triggers a visible 'Agent driving' indicator the user CAN revoke
+      mid-task with Ctrl+C — over-using desktop trains the user to revoke
+
+WHEN TO USE
+  - Tasks that require interacting with NATIVE Windows applications:
+    Notepad, File Explorer, Visual Studio, Excel, Outlook, Settings panel,
+    third-party desktop apps. The browser tool only covers web pages —
+    use desktop for everything outside the browser.
+  - Tasks the user phrases as "open <app>", "click <thing on screen>",
+    "type <text> into the box", "拖动 / 滚动 / 按 Ctrl+S".
+
+PREREQUISITES (the agent must NOT skip these)
+  1. Get the app on screen first: usually a `shell` call to launch it
+     (e.g. `notepad.exe`, `explorer.exe path`). Verify with action='list_windows'
+     or by asking the user.
+  2. Make sure the target window is the FOREGROUND window before any
+     mouse / keyboard action. Sensitive-window guard checks the foreground
+     before each action and refuses on banking / password manager match.
+
+WORKFLOW (typical)
+  1. action='list_windows' — see what is open and which is foregrounded.
+  2. action='snapshot' — STRUCTURED listing of every interactable control
+     in the foreground window via Windows accessibility tree (UIA). Each
+     element comes back with role / text / x / y / selector hint. UIA
+     names work even on iconless buttons (gear / refresh / close X) —
+     PREFER snapshot over screenshot+OCR 90% of the time. Falls back
+     automatically to screenshot+OCR when UIA returns nothing (custom-
+     rendered Electron, games). ~100 ms on the UIA path.
+  3. **For native Windows apps, drop into pywinauto via shell** — once
+     snapshot tells you the target's name / automation_id, drive it
+     directly with one shell call instead of click_at + verification
+     loops:
+        shell: python -c "
+        import pywinauto
+        app = pywinauto.Application(backend='uia').connect(handle=<HWND>)
+        win = app.window(handle=<HWND>)
+        win.child_window(title='New Notebook', control_type='Button').click()
+        "
+     Deterministic, 5-10x faster than the screenshot/click/screenshot
+     loop, survives UI shifts. Reach for desktop.click_at only when
+     pywinauto cannot reach the target (canvas-rendered subregions,
+     custom controls, Electron apps without UIA).
+  4. action='screenshot', region='foreground'[, with_ocr=true] — only
+     when you actually need the PIXELS (vision_query input, sending the
+     image to a vision LLM, debugging). Default to with_ocr=false now
+     that snapshot covers the "what's on screen" question with a much
+     smaller payload.
+  5. action='find_element' / 'find_and_click' — fallback when snapshot
+     missed the target or you only have a visual descriptor. Same OCR +
+     vision_fallback pipeline as before.
+  6. action='hover_at', x, y — TOOLTIP READER. Move cursor to (x, y),
+     wait ~800 ms for the Windows tooltip, OCR a 250×120 px region
+     around the cursor, return text in 'nearby_text'. Use for
+     iconless toolbar buttons that snapshot couldn't name AND no
+     visible text label exists. ~1 s.
+  7. action='click_at' / 'type_text' / 'drag' / 'scroll' / 'hotkey' /
+     'key_press' — drive the input once you have the target.
+
+SCREENSHOT EFFICIENCY
+  snapshot is the first move on any new screen — it gives the LLM a
+  bounded, structured listing without the OCR-text-blob bloat.
+  Reserve screenshot for cases where you need the actual pixels (vision
+  LLM input, image debugging). DO NOT screenshot+OCR before every
+  action — it is the most common cause of slowness in desktop
+  workflows. Re-snapshot only when the UI state has actually changed
+  (after a click that opens a menu, after a hotkey, after typing).
+
+DO NOT RE-SCREENSHOT — READ state_after FIRST
+  Every input action returns a `state_after` dict that tells you what
+  changed on screen WITHOUT another capture. Fields:
+    - foreground_title   — current foreground window title
+    - foreground_pid     — its PID
+    - foreground_changed — bool: did focus move to a different window?
+    - title_changed      — bool: same window, but title text changed?
+    - new_windows        — list of window titles that appeared since the
+                           action (dialogs, popups, toasts)
+
+  Decision rule after every input action:
+    1. Read state_after. If foreground_changed=false AND title_changed=
+       false AND new_windows=[] → nothing visible changed. Proceed to
+       the next action. DO NOT screenshot.
+    2. If foreground_changed=true OR new_windows is non-empty → a new
+       dialog/window appeared. You likely need its content, so ONE
+       screenshot (or snapshot) is justified.
+    3. If title_changed=true → the app reacted (e.g. file opened, tab
+       switched). Screenshot only if you need to read new content.
+
+  Anti-pattern: click → screenshot → click → screenshot → click →
+  screenshot. That is a 4× slowdown over click → click → click. Each
+  screenshot is ~200 ms PLUS a full LLM round-trip on the bloated
+  output (~3-5 s) — a screenshot you didn't need costs you ~5 s and a
+  screen of context every time.
+
+  Correct pattern: click → read state_after → click → read state_after
+  → (state says new dialog) → screenshot ONCE → continue.
+
+KEY INVARIANTS
+  - Coordinates are PHYSICAL screen pixels. The tool sets per-monitor v2
+    DPI awareness on first use so scaling > 100% does not shift coords.
+  - find_element returns coords in SCREEN space (already adjusted for
+    region origin) — pass them to click_at / scroll directly.
+  - region='foreground' captures only the active window. Use this by
+    default; region='fullscreen' is needed only for window-switching or
+    multi-window comparisons.
+  - All input actions queue on a single asyncio lock — no two desktop
+    actions run in parallel even if the LLM marks them concurrent_safe.
+
+SENSITIVE WINDOW REFUSAL (HARD)
+  Before screenshot / find_element / any input action, the foreground
+  window title + process name are matched against
+  desktop.sensitive_window_patterns (default covers Bitwarden, 1Password,
+  KeePass, LastPass, Dashlane, banking / wallet keywords). On match the
+  action is refused and the user must switch focus before retrying.
+  This is the desktop analogue of browser_tool's password-field guard.
+
+USER REVOKE (HARD)
+  Once the user presses the global revoke hotkey (Ctrl+C while the
+  on-screen 'Agent driving' indicator is visible), every input action
+  for the rest of this task returns:
+    "REFUSED: user revoked desktop control for this task. ..."
+  Read-only actions (screenshot / list_windows / find_element) still
+  work. Stop using input actions; ask the user whether to continue.
+
+OCR vs VISION FALLBACK
+  find_element first asks RapidOCR for every visible text region in the
+  capture, then fuzzy-matches description with rapidfuzz token_set_ratio
+  (default threshold 70). On match: ~1 s, source='ocr'.
+  When OCR misses (visual-only descriptors like "the orange button" /
+  "the icon shaped like a gear"), it falls back to a single LLM-vision
+  call (~5-7 s, source='vision'). Disable with vision_fallback=false
+  when you know the target is plain text.
+
+EXAMPLES
+  GOOD: action='list_windows'
+  GOOD: action='snapshot'              (FIRST move on any new app window —
+                                        UIA tree, no context bloat, names
+                                        every iconless button)
+  GOOD: action='hover_at', x=720, y=24 (read tooltip on a toolbar icon
+                                        when snapshot didn't name it)
+  GOOD: shell: python -c "
+        import pywinauto
+        app = pywinauto.Application(backend='uia').connect(handle=12195718)
+        app.window(handle=12195718).child_window(title='New Notebook',
+            control_type='Button').click()
+        "  (preferred path for native apps once snapshot exposed the name)
+  GOOD: action='screenshot', region='foreground'
+  GOOD: action='screenshot', region='foreground', with_ocr=true
+        — only when you really need pixels + raw OCR; for "what's on
+        screen?" prefer snapshot
+  GOOD: action='find_element', description='OK button'
+  GOOD: action='find_element', description='保存', fuzzy_threshold=80
+  GOOD: action='find_element', description='the gear-shaped settings icon',
+        vision_fallback=true
+  GOOD: action='find_and_click', description='New notebook'
+  GOOD: action='find_and_click', description='保存', double=false
+  GOOD: action='click_at', x=820, y=412
+  GOOD: action='click_at', x=200, y=300, button='right'
+  GOOD: action='type_text', text='hello world'
+  GOOD: action='hotkey', keys=['ctrl','s']
+  GOOD: action='hotkey', keys=['alt','tab']
+  GOOD: action='key_press', key='enter'
+  GOOD: action='drag', from_x=100, from_y=200, to_x=400, to_y=200, duration=0.5
+  GOOD: action='scroll', x=600, y=400, dy=-3   (scroll down 3 clicks)
+  BAD:  action='screenshot' as your first move on a native app — use
+        snapshot instead (same info, no context bloat, handles
+        iconless controls)
+  BAD:  click_at without first finding the element / verifying coordinates
+        — prefer find_and_click which combines the two
+  BAD:  type_text into a window the user hasn't focused (you'll type
+        somewhere unexpected — always verify with snapshot first)
+  BAD:  type_text with a payload >4000 chars (use clipboard via shell)
+  BAD:  using desktop to click a button on a web page — that's a browser
+        task. Open the URL in browser_tool and use action='click' with a
+        selector.
+  BAD:  60-iteration screenshot+click loops. If you're past 15 iterations
+        on one step, STOP — switch to pywinauto via shell, or ask the
+        user for guidance.""",
+                parameter_schema=DesktopTool.parameter_schema,
+                tool_class=DesktopTool,
                 on_demand=True,
             )
 

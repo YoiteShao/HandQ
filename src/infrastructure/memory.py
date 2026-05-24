@@ -74,6 +74,11 @@ class Memory:
         # avoids re-probing the user's debug port every step.
         # Stored value shape: {"prepared": bool, "channel": str|None, ...}
         self._browser_contexts: Dict[str, Dict[str, Any]] = {}
+        # Desktop provider's progressive-disclosure cache. Same shape /
+        # purpose as _browser_contexts but kept separate so the two
+        # providers don't collide on key="default" and can be cleared
+        # independently.
+        self._desktop_contexts: Dict[str, Dict[str, Any]] = {}
 
     def set_ssh_context(self, hostname: str, creds_file: str, hint: str) -> None:
         """
@@ -134,6 +139,25 @@ class Memory:
         stale "session reused" brief reminder.
         """
         self._browser_contexts.clear()
+
+    # ── Desktop context ──────────────────────────────────────────────────────
+    # Same shape / lifecycle as the browser-context methods above, but kept
+    # in a separate dict so the two providers' progressive-disclosure flags
+    # don't collide on key="default".
+
+    def set_desktop_context(self, key: str, value: Dict[str, Any]) -> None:
+        """Store desktop-related context (first-touch hint flag, etc.)."""
+        self._desktop_contexts[key] = dict(value)
+
+    def get_desktop_context(self, key: str) -> Optional[Dict[str, Any]]:
+        """Return the stored desktop context for *key*, or None."""
+        return self._desktop_contexts.get(key)
+
+    def clear_desktop_contexts(self) -> None:
+        """Drop every cached desktop context entry. Called at task completion
+        so a follow-up task that re-activates the desktop provider gets the
+        full first-activation hint again."""
+        self._desktop_contexts.clear()
 
 
     def add_step(self, step: Step) -> None:
@@ -536,5 +560,6 @@ class Memory:
         self._compressed_findings_boundary = 0
         self._ssh_contexts.clear()
         self._browser_contexts.clear()
+        self._desktop_contexts.clear()
 
 AgentMemory = Memory  # alias for backward-compatible imports

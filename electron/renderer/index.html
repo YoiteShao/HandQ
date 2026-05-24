@@ -384,6 +384,25 @@
                         </label>
 
                         <label class="checkbox-row">
+                            <input type="checkbox" id="cfg-sw-tool-desktop" />
+                            <span>Auto-approve desktop tool</span>
+                            <small class="help-text">
+                                When unchecked, the agent asks once per task
+                                before driving your real mouse / keyboard
+                                (click_at, type_text, drag, scroll, hotkey,
+                                key_press); a single approval covers every
+                                desktop action until the task ends. Press
+                                <code>Ctrl+Shift+C</code> anytime to revoke.
+                                Read-only actions (screenshot, list_windows,
+                                find_element) are not gated. Sensitive windows
+                                (password managers, banking) are always
+                                refused regardless of this switch. Off by
+                                default — desktop input affects whatever app
+                                is focused, not just HandQ's own browser.
+                            </small>
+                        </label>
+
+                        <label class="checkbox-row">
                             <input type="checkbox" id="cfg-sw-high-risk" />
                             <span>Auto-approve high-risk commands</span>
                             <small class="help-text">

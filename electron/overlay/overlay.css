@@ -1,0 +1,139 @@
+/* HandQ desktop takeover overlay.
+ *
+ * Rendered in a frameless / transparent / always-on-top BrowserWindow
+ * that fills the entire screen. The OS desktop and any focused app show
+ * through; only the rounded rainbow border and the corner watermark
+ * are visible.
+ *
+ * pointer-events:none everywhere so even if setIgnoreMouseEvents loses
+ * its forward:true contract on some platform, no part of this overlay
+ * can accidentally swallow a click meant for the underlying app.
+ */
+
+* {
+    box-sizing: border-box;
+    user-select: none;
+    -webkit-user-select: none;
+}
+
+html, body {
+    margin: 0;
+    padding: 0;
+    width: 100vw;
+    height: 100vh;
+    background: transparent;
+    overflow: hidden;
+    pointer-events: none;
+    cursor: default;
+    -webkit-font-smoothing: antialiased;
+}
+
+/* ── Animated rainbow rounded-rectangle border ─────────────────────────────
+ *
+ * One full-screen div carrying a rainbow gradient. The mask-composite
+ * trick "punches a hole" the size of the inner area, leaving only the
+ * border ring visible — and crucially the ring inherits the border
+ * radius, so we get true rounded corners (which the previous four-edge
+ * implementation could not provide).
+ *
+ * BORDER_THICKNESS is tuned for visibility without dominating the
+ * screen; rounded corners track the border so the inner cutout matches.
+ *
+ *   --rb-thickness   ring stroke width (px)
+ *   --rb-radius      outer corner radius (px); inner radius is
+ *                    --rb-radius minus --rb-thickness, computed at use
+ */
+
+:root {
+    --rb-thickness: 10px;
+    --rb-radius: 28px;
+}
+
+@keyframes rb-march {
+    0%   { background-position:   0% 50%; }
+    100% { background-position: 400% 50%; }
+}
+
+.rb-frame {
+    position: fixed;
+    inset: 0;
+    pointer-events: none;
+    border-radius: var(--rb-radius);
+    padding: var(--rb-thickness);
+    background-image: linear-gradient(
+        90deg,
+        #ff2d55,  /* red    */
+        #ff9500,  /* orange */
+        #ffcc00,  /* yellow */
+        #34c759,  /* green  */
+        #5ac8fa,  /* cyan   */
+        #007aff,  /* blue   */
+        #af52de,  /* purple */
+        #ff2d55   /* loop   */
+    );
+    background-size: 400% 100%;
+    animation: rb-march 6s linear infinite;
+    /* mask-composite: exclude / xor punches a transparent hole the size
+     * of the content box, leaving only the padding ring filled. The
+     * ring inherits border-radius, giving rounded corners. Both the
+     * standard and -webkit- prefixes are included for breadth, though
+     * Chromium-based Electron honours either.
+     */
+    -webkit-mask:
+        linear-gradient(#000 0 0) content-box,
+        linear-gradient(#000 0 0);
+    -webkit-mask-composite: xor;
+            mask:
+        linear-gradient(#000 0 0) content-box,
+        linear-gradient(#000 0 0);
+            mask-composite: exclude;
+    /* Subtle outer glow for legibility on bright backgrounds. */
+    filter: drop-shadow(0 0 6px rgba(0, 0, 0, 0.35));
+}
+
+/* ── Corner watermark ────────────────────────────────────────────────────
+ *
+ * Fixed top-right pill so it never overlaps with where users typically
+ * focus their attention (screen centre). Translucent dark background so
+ * the text is legible regardless of the underlying app.
+ */
+
+.watermark {
+    position: fixed;
+    top: 28px;
+    right: 28px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 16px;
+    background: rgba(15, 20, 30, 0.82);
+    color: #f4f6fb;
+    border-radius: 999px;
+    font: 500 13px/1 -apple-system, "Segoe UI Variable", "Segoe UI",
+          "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
+    letter-spacing: 0.01em;
+    box-shadow:
+        0 8px 24px rgba(0, 0, 0, 0.45),
+        0 0 0 1px rgba(255, 255, 255, 0.08) inset;
+    pointer-events: none;
+}
+
+.wm-bot {
+    font-size: 16px;
+    line-height: 1;
+}
+
+.wm-sep {
+    opacity: 0.45;
+    margin: 0 -2px;
+}
+
+.wm-key {
+    padding: 2px 8px;
+    border-radius: 4px;
+    background: rgba(255, 255, 255, 0.14);
+    border: 1px solid rgba(255, 255, 255, 0.22);
+    font: 600 12px/1 ui-monospace, SFMono-Regular, Menlo, Consolas,
+          "Cascadia Mono", monospace;
+    letter-spacing: 0.02em;
+}

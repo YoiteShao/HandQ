@@ -292,12 +292,21 @@ nuitka `
     --output-dir=build `
     --output-filename=handq-bridge.exe `
     --include-package=src `
+    --include-package-data=rapidocr_onnxruntime `
     --include-data-files=handq_config.yaml=handq_config.yaml `
     bridge_main.py
 ```
 
 输出：`build/bridge_main.dist/`，含 `handq-bridge.exe`、`_internal/`、
 以及随包带的 `handq_config.yaml`。
+
+> **注意**：`--include-package-data=rapidocr_onnxruntime` 是必须的——
+> RapidOCR 的 det / rec / cls 三个 .onnx 文件以包数据形式存放于
+> wheel 内（约 10 MB），不显式声明 Nuitka 不会把它们打进 standalone
+> 输出，desktop_tool 的 find_element 在打包后会以 "model not found"
+> 失败。pip 安装的 dev 模式不受影响（运行时直接读 site-packages）。
+>
+> Phase 3 activity_monitor 复用同一个 RapidOCR，无需再加 flag。
 
 ### 4.2 把 dist 交给 electron-builder
 
@@ -345,7 +354,8 @@ nuitka `
 | Bridge 配置消费 | `src/bridge/stdio_bridge.py` | `run()` 读 `HANDQ_CONFIG` |
 | Session 目录分配 | `src/bridge/stdio_bridge.py` | `_allocate_session_dir`、`_session_history_root` |
 | YAML 读写 | `src/bridge/stdio_bridge.py` | `_load_config_dict`、`_save_config_dict` |
-| Vision LLM 客户端 | `src/infrastructure/vision/client.py` | `VisionClient`、`get_vision_client`、`flush_vision_client` |
+| Vision LLM 客户端 | `src/infrastructure/vision/llm.py` | `VisionClient`、`get_vision_client`、`flush_vision_client` |
+| Vision 本地 OCR | `src/infrastructure/vision/ocr.py` | `LocalOCR`（RapidOCR）、`get_local_ocr`、`flush_local_ocr` |
 | Vision 截图分级 | `src/infrastructure/vision/storage.py` | `ScreenshotStore`（ephemeral/task/activity） |
 
 ---

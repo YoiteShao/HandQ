@@ -349,6 +349,24 @@ class _StdioUI:
         _emit({"type": "status", "kind": "reply_done"},
               gen=self._generation)
 
+    # ── Desktop takeover indicator ──────────────────────────────────────────
+    #
+    # InteractionManager._ui_call invokes these via getattr() when the
+    # desktop tool's input-action guard fires the start/end events. The
+    # Electron main process (electron/main.js) listens for the resulting
+    # status envelopes and shows / hides the fullscreen takeover overlay.
+    # Without these methods the events would be silently dropped — which
+    # was the bug pre-2026-05.
+    def notify_desktop_takeover_started(self, reason: str = "input_action") -> None:
+        _ui_logger.debug("notify_desktop_takeover_started: reason=%s", reason)
+        _emit({"type": "status", "kind": "desktop_takeover_started",
+               "reason": str(reason)}, gen=self._generation)
+
+    def notify_desktop_takeover_ended(self, reason: str = "task_ended") -> None:
+        _ui_logger.debug("notify_desktop_takeover_ended: reason=%s", reason)
+        _emit({"type": "status", "kind": "desktop_takeover_ended",
+               "reason": str(reason)}, gen=self._generation)
+
     # ── Confirmation dialogs (UI delegate path) ──────────────────────────────
     #
     # InteractionManager.request_*_confirmation() probes the UI delegate
@@ -452,10 +470,38 @@ class _StdioUI:
     ) -> UserConfirmation:
         """Tool-specific gate (write/edit/bash/...). Same shape as risk."""
         prompt_id = f"tool-{int(time.time() * 1000)}-{id(decision) & 0xffff:04x}"
-        payload = {
+        payload: Dict[str, Any] = {
             "tool": str(tool_name),
-            "decision": self._summarise_decision(decision),
         }
+        # Desktop is task-scoped — be loud about it in the modal so the
+        # user knows a single yes covers every desktop action until task
+        # end (or until they hit the Ctrl+Shift+C revoke). The renderer
+        # uses ``description`` (and styles the card differently when
+        # ``scope=='task'``).
+        if str(tool_name) == "desktop":
+            payload["scope"] = "task"
+            payload["description"] = (
+                "The agent is requesting control of your desktop "
+                "(mouse / keyboard / screen capture). Approving grants "
+                "full desktop access for the remainder of this task — "
+                "every subsequent desktop action will run without "
+                "asking again. Press Ctrl+Shift+C anytime to revoke."
+            )
+            # Task-scope approval covers ALL desktop actions, not just
+            # the FIRST one that happened to fire. Showing
+            # "action: list_windows" in the modal is misleading — it
+            # implies the user is approving that specific call.
+            # Drop tool_calls / params and keep only the LLM's
+            # reasoning so the user has high-level context without
+            # the per-action red herring.
+            reasoning = (decision.reasoning or "").strip()
+            if reasoning:
+                payload["reasoning"] = reasoning if len(reasoning) <= 500 else reasoning[:500] + "..."
+        else:
+            # Per-action confirmations (browser / write / edit / shell)
+            # genuinely scope to the specific call, so the modal needs
+            # to show what is about to run.
+            payload["decision"] = self._summarise_decision(decision)
         answer = self._await_user_response("tool_confirmation", payload, prompt_id)
         return self._im._resolve_confirmation(answer)
 
@@ -690,6 +736,25 @@ class StdioBridge:
                     self._im.inject_user_message(str(msg.get("text", "")))
                 elif kind == "confirmation":
                     self._im.submit_confirmation_response(str(msg.get("answer", "")))
+                elif kind == "desktop_takeover_revoked":
+                    # Frontend overlay's revoke hotkey (Ctrl+C or
+                    # equivalent) sends this. We flip the takeover flag
+                    # so subsequent input actions refuse for the rest
+                    # of this task; read-only desktop actions stay
+                    # available. The notify_desktop_takeover_ended
+                    # event with reason='user_revoked' is emitted by
+                    # revoke_takeover() itself.
+                    try:
+                        from ..tools.desktop_tool import revoke_takeover
+                        changed = revoke_takeover()
+                        logger.info(
+                            "user_input desktop_takeover_revoked: changed=%s",
+                            changed,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "user_input desktop_takeover_revoked failed: %s", exc,
+                        )
                 else:
                     logger.warning("user_input: unknown kind=%r", kind)
                     _emit({"type": "error", "id": msg_id, "where": "bridge",
@@ -1044,6 +1109,19 @@ class StdioBridge:
                 )
             except Exception:
                 logger.warning("new_session: browser pool flush failed", exc_info=True)
+            try:
+                # Drop the desktop takeover memo so the next task starts
+                # unapproved. If the OLD task still had the overlay up,
+                # this emits notify_desktop_takeover_ended via the NEW
+                # IM/UI (we already rebuilt them above), which the
+                # Electron main process listens to and uses to close the
+                # overlay window. Keep this AFTER the IM reset so the
+                # event routes through the new UI.
+                from ..tools.desktop_tool import reset_takeover_state as _reset_takeover
+                _reset_takeover()
+                logger.info("new_session: desktop takeover state reset")
+            except Exception:
+                logger.warning("new_session: desktop takeover reset failed", exc_info=True)
         except Exception:
             logger.exception("new_session chain raised unexpectedly")
         finally:

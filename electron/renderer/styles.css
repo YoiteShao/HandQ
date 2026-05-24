@@ -1320,6 +1320,27 @@ code {
     width: min(560px, 92vw);
 }
 
+/* Task-scoped desktop approval — extra-loud border + header so the user
+ * understands they're not approving a single click but full desktop
+ * control until the task ends.
+ */
+.confirmation-card.desktop-takeover {
+    border: 2px solid #ff9500;
+    box-shadow:
+        0 18px 46px rgba(255, 149, 0, 0.22),
+        0 0 0 1px rgba(255, 149, 0, 0.5);
+}
+.confirmation-card.desktop-takeover .overlay-header {
+    background: linear-gradient(
+        90deg,
+        rgba(255, 149, 0, 0.18),
+        rgba(255, 45, 85, 0.14)
+    );
+}
+.confirmation-card.desktop-takeover .overlay-header h2 {
+    color: #d97200;
+}
+
 .confirmation-body {
     padding: 14px 18px 6px;
     overflow-y: auto;

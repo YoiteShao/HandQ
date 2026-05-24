@@ -564,6 +564,39 @@ class InteractionManager:
         """
         self._ui_call("show_task_completed", summary)
 
+    def notify_desktop_takeover_started(self, reason: str) -> None:
+        """Tell the UI the agent has started driving the user's mouse / keyboard.
+
+        The frontend is expected to render a HIGHLY VISIBLE indicator
+        (full-screen border, corner watermark, "Agent driving — press
+        Ctrl+C to revoke") for as long as this is active. The Python
+        side does not own any pixel-level UI here — it just emits the
+        signal; rendering is the Electron overlay window's job.
+
+        Reason is one of:
+          * ``"input_action"``  — first desktop input action was approved.
+          * ``"resumed"``       — placeholder; not used today, reserved
+                                  for a future "re-approve after revoke"
+                                  flow.
+
+        See `docs/desktop_tool.md` §11 for the full IPC contract.
+        """
+        self._ui_call("notify_desktop_takeover_started", reason)
+
+    def notify_desktop_takeover_ended(self, reason: str) -> None:
+        """Tell the UI the agent has stopped driving — overlay should hide.
+
+        Reason is one of:
+          * ``"task_ended"``    — normal task completion path
+                                  (FlowController._finalize_task).
+          * ``"user_revoked"``  — user pressed the revoke hotkey;
+                                  desktop input actions are now refused
+                                  for the rest of this task.
+          * ``"session_closed"`` — session torn down (mostly for paranoia
+                                   in shutdown paths).
+        """
+        self._ui_call("notify_desktop_takeover_ended", reason)
+
     def notify_decision_made(
         self, iteration: int, reasoning: str, token_count: int = 0
     ) -> None:

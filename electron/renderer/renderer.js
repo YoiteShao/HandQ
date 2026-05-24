@@ -239,6 +239,7 @@
     const cfgSwToolEdit  = document.getElementById('cfg-sw-tool-edit');
     const cfgSwToolBash  = document.getElementById('cfg-sw-tool-bash');
     const cfgSwToolBrowser = document.getElementById('cfg-sw-tool-browser');
+    const cfgSwToolDesktop = document.getElementById('cfg-sw-tool-desktop');
     const cfgSwHighRisk  = document.getElementById('cfg-sw-high-risk');
 
     // Hotkey field
@@ -977,6 +978,10 @@
         activePromptId = String(evt.id || '');
         activePromptKind = String(evt.kind || '');
 
+        // Reset any scope-specific styling from a previous modal.
+        const confirmCard = overlayConfirm.querySelector('.confirmation-card');
+        if (confirmCard) confirmCard.classList.remove('desktop-takeover');
+
         if (evt.kind === 'secret_input') {
             confirmTitle.textContent = 'Input required';
             confirmDescEl.textContent = String(evt.prompt || 'Enter value:');
@@ -991,13 +996,26 @@
         } else {
             // risk_confirmation or tool_confirmation
             const isRisk = evt.kind === 'risk_confirmation';
+            const isDesktopTakeover = evt.scope === 'task' && evt.tool === 'desktop';
             confirmTitle.textContent = isRisk
                 ? 'High-risk operation'
-                : 'Confirm ' + (evt.tool || 'tool') + ' execution';
-            confirmDescEl.textContent = isRisk
-                ? String(evt.description || '')
-                : ('The agent wants to run "' + (evt.tool || 'tool') +
-                   '" with the parameters below.');
+                : (isDesktopTakeover
+                    ? 'Grant desktop control for this task?'
+                    : 'Confirm ' + (evt.tool || 'tool') + ' execution');
+            // Backend now ships an explicit description for desktop
+            // tool_confirmation (and could for any future task-scoped
+            // gate). Prefer it whenever present, falling back to the
+            // generic sentence for legacy / other tools.
+            const description = evt.description ? String(evt.description) : '';
+            if (isRisk) {
+                confirmDescEl.textContent = description;
+            } else if (description) {
+                confirmDescEl.textContent = description;
+            } else {
+                confirmDescEl.textContent =
+                    'The agent wants to run "' + (evt.tool || 'tool') +
+                    '" with the parameters below.';
+            }
             renderDecisionSummary(evt.decision);
             confirmSecretWrap.classList.add('hidden');
             confirmSecretIn.value = '';
@@ -1006,7 +1024,12 @@
             confirmRejectBtn.classList.remove('hidden');
             confirmGuidBtn.classList.remove('hidden');
             confirmGuidBtn.textContent = 'Provide guidance';
-            confirmSubmitBtn.textContent = 'Approve';
+            confirmSubmitBtn.textContent = isDesktopTakeover ? 'Approve task-wide' : 'Approve';
+            // Tag the card so styles.css can paint it more loudly for the
+            // task-scoped desktop approval.
+            if (confirmCard && isDesktopTakeover) {
+                confirmCard.classList.add('desktop-takeover');
+            }
         }
 
         openOverlay(overlayConfirm);
@@ -1721,6 +1744,7 @@
         cfgSwToolEdit.checked  = readSwitch('tool_edit');
         cfgSwToolBash.checked  = readSwitch('tool_bash');
         cfgSwToolBrowser.checked = readSwitch('tool_browser');
+        cfgSwToolDesktop.checked = readSwitch('tool_desktop');
         cfgSwHighRisk.checked  = readSwitch('high_risk');
     }
 
@@ -1780,6 +1804,7 @@
         writeSwitch('tool_edit',  cfgSwToolEdit.checked);
         writeSwitch('tool_bash',  cfgSwToolBash.checked);
         writeSwitch('tool_browser', cfgSwToolBrowser.checked);
+        writeSwitch('tool_desktop', cfgSwToolDesktop.checked);
         writeSwitch('high_risk',  cfgSwHighRisk.checked);
 
         out.llm = llm;

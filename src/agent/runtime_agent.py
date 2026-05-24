@@ -125,6 +125,104 @@ _INFRA_TOOL_NAMES: frozenset = frozenset({
 #       when this limit is exceeded at serialisation time.
 _OBS_BUDGET_CHARS: int = 480_000
 
+
+# ── Stale-snapshot supersession ──────────────────────────────────────────────
+#
+# Snapshot / screenshot results from desktop and browser tools are LARGE
+# (the snapshot summary alone can be 1-3 KB; an OCR-laden screenshot can
+# be 5-15 KB). They are also INHERENTLY STALE — once the agent acts,
+# the captured UI state no longer reflects reality. Keeping every prior
+# snapshot's full body in observation history means each LLM call's
+# input grows linearly with iteration count, while ~all the historical
+# value comes from the LATEST snapshot.
+#
+# This pass runs every time we serialise the message list. It walks
+# observations newest → oldest and replaces every supersedable result
+# whose tool/action signature has already appeared in a NEWER turn with
+# a tiny "[superseded]" placeholder. The newest one is preserved
+# intact. Effect on the OneNote/Teams traces: input tokens per
+# iteration drop ~50% on long sessions (proportional to how often the
+# agent re-screenshots).
+#
+# We deliberately leave list_windows / find_element / find_and_click
+# alone — those return small structured values the agent may compare
+# across turns. Only the "expensive snapshot of UI" calls are trimmed.
+
+_SUPERSEDABLE_TOOL_ACTIONS: frozenset = frozenset({
+    ("desktop", "screenshot"),
+    ("desktop", "snapshot"),
+    ("desktop", "hover_at"),
+    ("browser", "screenshot"),
+    ("browser", "snapshot"),
+})
+
+
+def _supersede_stale_snapshots(paired: List[tuple]) -> int:
+    """Modify *paired* in-place. Returns the count of entries replaced.
+
+    *paired* is a list of ``(assistant_msg, [(idx, full_json, slim_json), ...])``
+    tuples in the order the messages will be sent to the LLM (oldest
+    first, newest last). For each (tool, action) in
+    :data:`_SUPERSEDABLE_TOOL_ACTIONS`, the LAST occurrence is kept
+    intact; every earlier occurrence is replaced with a placeholder
+    that names the supersession but ships ~no data.
+
+    Idempotent: running this on already-trimmed data adds zero new
+    replacements (placeholders carry the literal token in their out
+    field and we re-detect them by checking the action).
+    """
+    seen_signatures: set = set()
+    replaced = 0
+    # Walk from newest (end of list) to oldest so the first time we
+    # meet a (tool, action) it IS the surviving copy.
+    for i in range(len(paired) - 1, -1, -1):
+        asst_msg, obs_group = paired[i]
+        new_group: List[tuple] = []
+        for entry in obs_group:
+            try:
+                idx, full_json, slim_json = entry
+            except (TypeError, ValueError):
+                new_group.append(entry)
+                continue
+            try:
+                d = json.loads(full_json)
+            except Exception:
+                new_group.append(entry)
+                continue
+            tool = d.get("tool")
+            params = d.get("params") if isinstance(d.get("params"), dict) else {}
+            action = params.get("action")
+            sig = (tool, action)
+            if sig not in _SUPERSEDABLE_TOOL_ACTIONS:
+                new_group.append(entry)
+                continue
+            if sig not in seen_signatures:
+                # Newest copy of this signature → keep intact.
+                seen_signatures.add(sig)
+                new_group.append(entry)
+                continue
+            # Older copy → replace with placeholder.
+            placeholder_full = {
+                "step":   idx,
+                "tool":   tool,
+                "params": params,
+                "ok":     d.get("ok", True),
+                "out":    f"[superseded by newer {tool}.{action}; result elided to save tokens]",
+            }
+            placeholder_slim = {
+                "ok":  d.get("ok", True),
+                "out": f"[superseded by newer {tool}.{action}; result elided]",
+            }
+            new_group.append((
+                idx,
+                json.dumps(placeholder_full, ensure_ascii=False),
+                json.dumps(placeholder_slim, ensure_ascii=False),
+            ))
+            replaced += 1
+        paired[i] = (asst_msg, new_group)
+    return replaced
+
+
 # Aliases for tool names the LLM may emit instead of the canonical registry names.
 # Normalised to the canonical name at the start of act() so that all downstream
 # logic (_check_before_act, parameter validation, tool lookup) is unaffected.
@@ -682,6 +780,38 @@ class RuntimeAgent:
                     for idx, obs in group_obs
                 ]))
 
+        # Replace stale snapshot/screenshot results with tiny placeholders
+        # before the budget pass — the elided results are still represented
+        # in the conversation (the assistant's tool call + a short "[superseded]"
+        # tool-result message) so the message structure stays intact, but
+        # their byte cost drops 100x. See _supersede_stale_snapshots.
+        #
+        # Cache-warmth gate: supersession changes the bytes of older
+        # observations across iterations, which breaks the Anthropic
+        # prompt-cache prefix at the supersession boundary on the next
+        # call. For SHORT sessions this is a net loss (cache hit on the
+        # whole intact prefix > smaller-but-cache-cold input). We only
+        # supersede when the un-superseded history is large enough
+        # that the size win clearly beats the cache miss. Threshold
+        # chosen to skip the gate for typical 5-15 iter sessions but
+        # kick in once the agent re-screenshots more than a couple of
+        # times.
+        _SUPERSEDE_GATE_CHARS = _OBS_BUDGET_CHARS // 16  # ~30K chars ≈ ~7.5K tokens
+        history_chars = sum(
+            sum(len(slim_j if asst_msg.get("tool_calls") else full_j)
+                for _, full_j, slim_j in obs_group)
+            for asst_msg, obs_group in paired
+        )
+        if history_chars >= _SUPERSEDE_GATE_CHARS:
+            n_superseded = _supersede_stale_snapshots(paired)
+            if n_superseded:
+                self.logger.debug(
+                    f"[{self.current_iteration}] superseded {n_superseded} "
+                    f"stale snapshot/screenshot result(s) "
+                    f"(history={history_chars} chars)",
+                    component="RuntimeAgent",
+                )
+
         # Budget: sum all serialised sizes of history pairs.
         #
         # We do NOT include the fixed overhead (system prompt, tools schema, goal
@@ -878,7 +1008,40 @@ class RuntimeAgent:
                 )
                 return None
 
-        # Check 2-4: Tool-specific switches (write/edit/bash/shell/browser)
+        # Check 1.6: Desktop is task-scoped — one approval covers every
+        # subsequent desktop ToolCall in the same task. revoke / task end
+        # clears the memo (see desktop_tool: is_task_approved /
+        # mark_task_approved / reset_takeover_state).
+        if tool_name == "desktop":
+            from ..tools.desktop_tool import (
+                is_task_approved,
+                mark_task_approved,
+                was_user_rescinded,
+            )
+            if is_task_approved():
+                return None
+            # YAML auto-approve normally short-circuits to a silent yes,
+            # but if the user revoked earlier in this task we suppress
+            # that and force a real confirmation — their just-now "stop"
+            # signal beats the static YAML choice until the task ends.
+            if (not was_user_rescinded()
+                    and self.config_manager.is_auto_approve_enabled("tool_desktop")):
+                mark_task_approved()
+                return None
+            if self.confirmation_callback:
+                result = self.confirmation_callback(_decision_proxy, tool_name)
+                if result.is_approved():
+                    mark_task_approved()
+                return result
+            self.logger.warning(
+                f"[{self.current_iteration}][BeforeAct] No confirmation callback, auto-rejecting",
+                component="RuntimeAgent"
+            )
+            return UserConfirmation.no()
+
+        # Check 2-4: Tool-specific switches (write/edit/bash/shell/browser).
+        # Note: desktop is handled by the task-scoped block above and is
+        # intentionally absent here.
         tool_switch_map = {
             "write":   "tool_write",
             "edit":    "tool_edit",

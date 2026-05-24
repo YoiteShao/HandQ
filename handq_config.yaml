@@ -53,8 +53,14 @@ interaction_switches:
     description: Browser automation (independent profile, off-screen window). When
       unchecked, every browser action prompts for approval. attach_browser is gated
       separately by the high_risk switch and always asks regardless of this setting.
-  high_risk:
+  tool_desktop:
     auto_approve: false
+    description: Desktop automation (mouse / keyboard / screen capture). OFF by default
+      because input actions affect any focused application, not just the agent's own
+      browser. Sensitive windows (password managers, banking) are always refused regardless
+      of this switch.
+  high_risk:
+    auto_approve: true
     description: Control high-risk operation auto-execution
 browser:
   attach_enabled: false
@@ -106,40 +112,26 @@ high_risk_commands:
   - rm *.tmp
   - rm -rf __pycache__
 vision:
-  # OpenAI-Chat-Completions-compatible endpoint. QGenie gateway routes by
-  # the model-name prefix (azure::/openai::/anthropic::). See plan §1.1.
   endpoint: https://qgenie-api.qualcomm.com/v1
   api_key: ff6bb18f-4a84-401d-9989-f6997487abe5
   model: azure::gpt-5.4-mini
-  # Per-call HTTP timeout (seconds). The model itself takes 3-7s on
-  # warm path, so 120 leaves plenty of headroom for cold-start / retries.
   timeout: 120
-  # QGenie uses Qualcomm's internal CA which is not in the public
-  # truststore — same trick as scripts/vision_bench/test_vision_gpt.py.
   verify_ssl: false
-  # Long-edge resize cap before sending. Below 768 most UI detail is
-  # lost; above 1568 hits the gateway's auto-scaling path with no
-  # accuracy gain. 1024 is the sweet spot for the canvas / find_element
-  # use cases.
   max_image_dim: 1024
 screenshots:
-  # Tiered SCRATCH storage for vision artifacts. Long-term keepers do
-  # NOT live here — agents save those into the task's session
-  # working_directory under %USERPROFILE%\HandQ\History\<id>\ instead.
-  # Limits below are intentionally conservative — bump only if you see
-  # the agent losing useful context to retention.
   ephemeral:
-    # vision_query / find_element work files. Producer-internal; LLM
-    # has no API to write here.
     max_files: 30
     max_age_minutes: 15
   task:
-    # Explicit screenshot calls during a task. Aged sweep at session
-    # close based on retain_after_task_days.
     retain_after_task_days: 1
     max_files: 50
   activity:
-    # Phase 3 activity_monitor periodic frames. Conservative defaults;
-    # raise after Phase 3 lands and real numbers are in.
     max_files: 100
     max_age_days: 1
+desktop:
+  sensitive_window_patterns:
+  - (?i)bitwarden|1password|keepass|lastpass|dashlane
+  - (?i)bank|wallet|crypto|trading
+ocr:
+  engine: rapidocr
+  lang: ch

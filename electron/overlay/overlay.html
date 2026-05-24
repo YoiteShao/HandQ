@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="Content-Security-Policy"
+          content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'none';" />
+    <title>HandQ — Desktop Takeover</title>
+    <link rel="stylesheet" href="overlay.css" />
+</head>
+<body>
+    <!--
+      Transparent always-on-top window. setIgnoreMouseEvents(true,
+      {forward:true}) on the BrowserWindow side passes mouse events
+      through to whatever the agent is driving.
+
+      The border is a single masked rounded rectangle (mask-composite:
+      exclude) so we get true rounded corners + a thick gradient stroke
+      without the four-edge seam the original implementation had.
+
+      Watermark: bilingual + Ctrl+Shift+C revoke reminder.
+    -->
+    <div class="rb-frame" aria-hidden="true"></div>
+
+    <div class="watermark" aria-hidden="true">
+        <span class="wm-bot">🤖</span>
+        <span class="wm-text">Agent 正在接管</span>
+        <span class="wm-sep">·</span>
+        <span class="wm-key">Ctrl+Shift+C</span>
+        <span class="wm-text">退出</span>
+    </div>
+</body>
+</html>

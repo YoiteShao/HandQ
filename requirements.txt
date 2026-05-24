@@ -1,5 +1,9 @@
 # HandQ Requirements
-# Python 3.10 or higher required
+# Python 3.10 or higher required.
+#
+# Production runtime path: Electron app -> bridge_main.py (stdio bridge) ->
+# src/. The legacy `python handq.py` CLI is no longer in scope; nothing in
+# this file is kept for it.
 
 # ── Custom index (Qualcomm internal) ─────────────────────────────────────────
 # Uncomment the two lines below when re-enabling qgenie-sdk.
@@ -8,44 +12,49 @@
 
 # ── LLM clients ───────────────────────────────────────────────────────────────
 
-# QGenie SDK (Qualcomm internal) — temporarily disabled, see handq.py
+# QGenie SDK (Qualcomm internal). Currently disabled — qgenie_service.py is the
+# only importer and nothing else imports qgenie_service. Uncomment together
+# with the index lines above to re-enable.
 # qgenie-sdk
 
-# Anthropic Claude API client (AnthropicStreamingService in src/infrastructure/)
+# Anthropic Claude API client (src/infrastructure/anthropic_streaming_service.py)
 anthropic>=0.40.0
 
-# Async HTTP client (used directly by AnthropicStreamingService; also a dep of anthropic)
+# Async HTTP client. Used directly by AnthropicStreamingService and
+# infrastructure/vision/llm.py; also a transitive dep of anthropic / openai.
 httpx>=0.23.0
+
+# OpenAI-compatible client used by VisionClient against the QGenie gateway
+# (azure::gpt-5.4-mini). Endpoint and key live in handq_config.yaml under the
+# `vision:` section. Drives browser.vision_query and desktop find_element's
+# vision fallback.
+openai>=1.30.0
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
-# YAML configuration loader (used by ConfigManager)
+# YAML configuration loader (src/infrastructure/config_manager.py,
+# src/bridge/stdio_bridge.py)
 pyyaml>=6.0.1
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
 
-# JSON repair for truncated/malformed LLM responses
+# JSON repair for truncated/malformed LLM responses (src/infrastructure/utils.py)
 json-repair>=0.30.0
-
-# ── UI / display ──────────────────────────────────────────────────────────────
-
-# Rich text formatting and rendering (TUI status view, markdown display)
-rich>=13.7.0
 
 # ── SSH tool dependencies ──────────────────────────────────────────────────────
 
-# SSH client (used by StatelessSSHTool and ssh_setup)
+# SSH client (src/tools/ssh_tool.py, src/infrastructure/ssh_setup.py)
 paramiko>=3.0.0
 
-# OS keyring integration for SSH password storage
-# Stores credentials in Windows Credential Manager / Linux Secret Service / macOS Keychain
+# OS keyring integration for SSH password storage. Stores credentials in
+# Windows Credential Manager / Linux Secret Service / macOS Keychain.
 keyring>=24.0.0
 
-# Fallback file-based keyring backend for headless/Linux environments (optional)
-# Used automatically when the system keyring (D-Bus / Secret Service) is unavailable
+# Fallback file-based keyring backend for headless / Linux environments. Used
+# automatically when the system keyring (D-Bus / Secret Service) is unavailable.
 keyrings.alt>=4.0.0
 
-# ── Browser tool dependencies (Windows-only, optional) ─────────────────────────
+# ── Browser tool ──────────────────────────────────────────────────────────────
 
 # Playwright drives the browser tool. Edge / Chrome are detected at runtime;
 # bundled Chromium is a fallback that requires `playwright install chromium`.
@@ -53,14 +62,43 @@ keyrings.alt>=4.0.0
 # install hint when imports fail.
 playwright>=1.40.0
 
-# ── Vision (Phase 1+) ─────────────────────────────────────────────────────────
+# ── Vision (find_element + browser canvas) ────────────────────────────────────
 
-# OpenAI-compatible client used by VisionClient against the QGenie gateway
-# (azure::gpt-5.4-mini). Endpoint and key live in handq_config.yaml under the
-# `vision:` section. Phase 1 wires browser.vision_query through this.
-openai>=1.30.0
-
-# Image resize / format normalisation before vision calls. Also used by the
-# Phase 0 OCR benchmark and (when shipped) the desktop_tool / activity_monitor
-# screenshot pipelines.
+# Image resize / format normalisation before vision calls. Used by
+# infrastructure/vision/llm.py and desktop_tool's screenshot pipeline.
 pillow>=10.0.0
+
+# ── Desktop tool dependencies (Windows-only) ──────────────────────────────────
+# desktop_tool degrades to a clear "install X" error when these are missing,
+# so the agent runs without them — they're only needed when the Planner
+# activates the desktop tool.
+
+# Cross-platform fast screen capture (~5ms/frame on 1080p). Used by both
+# desktop_tool and the Phase 3 activity_monitor.
+mss>=9.0.0
+
+# Mouse / keyboard automation. desktop_tool sets pyautogui.FAILSAFE=True so a
+# panicked user can abort by ramming the mouse into a screen corner. Process-
+# wide Ctrl+Shift+C revoke from the Electron overlay is the cleaner exit.
+pyautogui>=0.9.54
+
+# Win32 API bindings — desktop_tool uses win32gui for foreground-window
+# inspection + EnumWindows, win32process for PID lookups. Imported lazily;
+# missing pywin32 reduces list_windows / sensitive-window detection but
+# leaves screenshot + input working.
+pywin32>=306; sys_platform == 'win32'
+
+# Local OCR engine selected by Phase 0 benchmark. Used by desktop_tool
+# find_element (primary path) and Phase 3 activity_monitor.
+rapidocr-onnxruntime>=1.3.0
+
+# Fuzzy string matching for find_element's OCR-text → description match.
+# Falls back to substring match when missing — but install for proper
+# token_set_ratio + partial_ratio scoring.
+rapidfuzz>=3.0.0
+
+# Optional. desktop_tool uses psutil to resolve process names from window PIDs
+# (list_windows + sensitive-window guard); without it those fields are empty
+# but the tool still works. Imported lazily inside try/except so the agent
+# runs without it.
+psutil>=5.9.0
