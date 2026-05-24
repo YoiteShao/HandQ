@@ -247,6 +247,27 @@
 
     let originalConfig = null;
 
+    // Settings loading overlay (created lazily on first settings open)
+    let settingsLoadingEl = null;
+
+    function ensureSettingsLoadingOverlay() {
+        if (settingsLoadingEl) return settingsLoadingEl;
+        const card = overlaySettings.querySelector('.settings-card');
+        if (!card) return null;
+        settingsLoadingEl = el('div', 'settings-loading-overlay hidden');
+        settingsLoadingEl.appendChild(el('span', 'loading-text', 'Loading configuration…'));
+        card.appendChild(settingsLoadingEl);
+        return settingsLoadingEl;
+    }
+
+    function showSettingsLoading() {
+        const ov = ensureSettingsLoadingOverlay();
+        if (ov) ov.classList.remove('hidden');
+    }
+    function hideSettingsLoading() {
+        if (settingsLoadingEl) settingsLoadingEl.classList.add('hidden');
+    }
+
     // ----- session/state tracking (drives Status overlay + pill) -----------
 
     const session = {
@@ -277,6 +298,12 @@
     // Bridge confirms with `final {generation}`; we sync to it (max-rule)
     // so rapid double-clicks stay consistent.
     let currentGen = 0;
+
+    // Thinking bubble shown in chat while receptionist prepares a reply.
+    let thinkingBubble = null;
+
+    // First "replanning" state is displayed as "designing" (initial plan).
+    let firstReplanSeen = false;
 
     function gateGen(evt) {
         // Returns true if the event should be DROPPED.
@@ -438,7 +465,7 @@
         }
 
         function isBlockStart(line) {
-            return /^(#{1,6}\s|[-*+]\s+|\d+\.\s+|&gt;\s|---+\s*$|\*\*\*+\s*$)/.test(line)
+            return /^(#{1,6}\s|[-*+]\s+|\d+\.\s+|&gt;\s|---+\s*$|\*\*\*+\s*$|\|)/.test(line)
                 || cbRe.test(line);
         }
 
@@ -510,6 +537,34 @@
                 continue;
             }
 
+            // Table — pipe-delimited GFM style.
+            if (line.indexOf('|') >= 0 && i + 1 < lines.length &&
+                /^\|?\s*:?-+:?\s*(\|\s*:?-+:?\s*)*\|?\s*$/.test(lines[i + 1])) {
+                var headerCells = line.split('|').map(function (c) { return c.trim(); })
+                    .filter(function (c, idx, arr) {
+                        return !(idx === 0 && c === '') && !(idx === arr.length - 1 && c === '');
+                    });
+                i += 2; // skip header + separator
+                var bodyRows = [];
+                while (i < lines.length && lines[i].indexOf('|') >= 0 && lines[i].trim() !== '') {
+                    var cells = lines[i].split('|').map(function (c) { return c.trim(); })
+                        .filter(function (c, idx, arr) {
+                            return !(idx === 0 && c === '') && !(idx === arr.length - 1 && c === '');
+                        });
+                    bodyRows.push(cells);
+                    i++;
+                }
+                var tableHtml = '<table class="md-table"><thead><tr>' +
+                    headerCells.map(function (h) { return '<th>' + renderMarkdownInline(h) + '</th>'; }).join('') +
+                    '</tr></thead><tbody>' +
+                    bodyRows.map(function (row) {
+                        return '<tr>' + row.map(function (c) { return '<td>' + renderMarkdownInline(c) + '</td>'; }).join('') + '</tr>';
+                    }).join('') +
+                    '</tbody></table>';
+                out.push(tableHtml);
+                continue;
+            }
+
             // Empty line — paragraph break.
             if (!line.trim()) { i++; continue; }
 
@@ -536,7 +591,7 @@
     // opens the popover above it with the full ring-buffer feed.
 
     const ACTIVITY_RING  = 30;
-    const ACTIVITY_TRUNC = 280;
+    const ACTIVITY_TRUNC = 600;
     const activityItems  = [];
     let   activityLiveTimer = null;
     let   popoverOpen = false;
@@ -546,8 +601,94 @@
         activityStrip.classList.add('live');
         if (activityLiveTimer) clearTimeout(activityLiveTimer);
         activityLiveTimer = setTimeout(() => {
-            activityStrip.classList.remove('live');
+            if (!activityStrip.classList.contains('working')) {
+                activityStrip.classList.remove('live');
+            }
         }, 2500);
+    }
+
+    function setWorking(text) {
+        if (!activityStrip) return;
+        if (taskCompleted) return;
+        if (activityLiveTimer) clearTimeout(activityLiveTimer);
+        activityStrip.classList.add('live', 'working');
+        if (activityCurrent) activityCurrent.textContent = text || '';
+        activityStrip.title = text || '';
+    }
+
+    function clearWorking() {
+        if (!activityStrip) return;
+        activityStrip.classList.remove('working');
+    }
+
+    // Track last tool name for post-execution display (backend sends None for tool in post events)
+    var lastCalledTool = '';
+    // Count of currently in-flight tool executions. When > 0, the strip stays
+    // in "working" state showing the active execution rather than flipping to
+    // a completed result.
+    var activeExecCount = 0;
+
+    function briefToolContext(tool, params) {
+        if (!params) return '';
+        var obj = params;
+        if (typeof obj === 'string') {
+            if (obj === 'None' || obj === 'null') return '';
+            try { obj = JSON.parse(obj); } catch (_) { return truncate(obj, 240); }
+        }
+        if (typeof obj !== 'object' || obj === null) return truncate(String(params), 240);
+        var key = (tool === 'browser') ? 'url' :
+                  (tool === 'bash' || tool === 'shell') ? 'command' :
+                  (tool === 'write' || tool === 'edit' || tool === 'read') ? 'path' :
+                  Object.keys(obj)[0] || '';
+        var val = key ? String(obj[key] || '') : '';
+        return truncate(val, 240);
+    }
+
+    function formatResultReadable(tool, output) {
+        if (!output || output === 'None' || output === 'null') return '';
+        var obj = output;
+        if (typeof obj === 'string') {
+            try { obj = JSON.parse(obj); } catch (_) {
+                return truncate(stripAnsi(obj).replace(/\s+/g, ' ').trim(), 400);
+            }
+        }
+        if (typeof obj !== 'object' || obj === null) {
+            return truncate(stripAnsi(String(output)).replace(/\s+/g, ' ').trim(), 400);
+        }
+        // For bash/shell results: show stdout (cleaned) or stderr if failed
+        if ('stdout' in obj || 'exit_code' in obj || 'returncode' in obj) {
+            var code = obj.exit_code || obj.returncode || '0';
+            var out = stripAnsi(String(obj.stdout || '')).replace(/\s+/g, ' ').trim();
+            var err = stripAnsi(String(obj.stderr || '')).replace(/\s+/g, ' ').trim();
+            if (String(code) !== '0' && err) {
+                return '✗ ' + truncate(err, 380);
+            }
+            if (out) return truncate(out, 400);
+            if (err) return truncate(err, 400);
+            return code === '0' || code === 0 ? 'done' : '✗ exit ' + code;
+        }
+        // For common tools, pick the most informative field
+        if (obj.output) return truncate(stripAnsi(String(obj.output)).replace(/\s+/g, ' ').trim(), 400);
+        if (obj.result) return truncate(String(obj.result).replace(/\s+/g, ' ').trim(), 400);
+        if (obj.content) return truncate(String(obj.content).replace(/\s+/g, ' ').trim(), 400);
+        if (obj.text) return truncate(String(obj.text).replace(/\s+/g, ' ').trim(), 400);
+        if (obj.status) return String(obj.status);
+        // Fallback: show first few key=value pairs, skipping noise
+        var skipKeys = new Set(['cwd_used', 'shell', 'venv', 'cwd', 'truncated']);
+        var parts = [];
+        var keys = Object.keys(obj);
+        for (var ki = 0; ki < keys.length && parts.length < 3; ki++) {
+            var k = keys[ki];
+            if (skipKeys.has(k)) continue;
+            var v = obj[k];
+            if (v === 'None' || v === null || v === '' || v === 'null') continue;
+            parts.push(k + ': ' + truncate(stripAnsi(String(v)), 100));
+        }
+        return parts.join(' | ') || 'done';
+    }
+
+    function stripAnsi(s) {
+        return s.replace(/\x1b\[[0-9;]*m/g, '');
     }
 
     function setActivityState(text) {
@@ -571,7 +712,7 @@
         renderActivityFeed();
         // Refresh the strip text with a one-line preview of the latest entry.
         const preview = entry.icon + ' ' + entry.label +
-            (entry.content ? ' · ' + truncate(entry.content.replace(/\s+/g, ' '), 80) : '');
+            (entry.content ? ' · ' + truncate(entry.content.replace(/\s+/g, ' '), 120) : '');
         setPill(preview);
         pulseActivityLive();
     }
@@ -899,6 +1040,26 @@
         activeReceptionistBubble = null;
     }
 
+    function showThinkingBubble() {
+        if (thinkingBubble) return;
+        thinkingBubble = el('div', 'bubble assistant thinking-indicator');
+        var body = el('div', 'bubble-body');
+        var dots = el('span', 'thinking-dots');
+        dots.appendChild(el('span', 'dot'));
+        dots.appendChild(el('span', 'dot'));
+        dots.appendChild(el('span', 'dot'));
+        body.appendChild(dots);
+        thinkingBubble.appendChild(body);
+        conversation.appendChild(thinkingBubble);
+        scrollToBottom();
+    }
+
+    function removeThinkingBubble() {
+        if (!thinkingBubble) return;
+        if (thinkingBubble.parentNode) thinkingBubble.parentNode.removeChild(thinkingBubble);
+        thinkingBubble = null;
+    }
+
     function addSystemBubble(text) {
         const bubble = el('div', 'bubble system');
         bubble.appendChild(el('div', 'bubble-body', text || ''));
@@ -1104,8 +1265,22 @@
 
         if (evt.kind === 'state_changed' && evt.state) {
             session.state = evt.state;
-            recordEvent('state → ' + evt.state);
-            setPill(evt.state);
+            if (evt.state === 'replanning') {
+                if (!firstReplanSeen) {
+                    firstReplanSeen = true;
+                    recordEvent('state → designing');
+                    setWorking('designing…');
+                } else {
+                    recordEvent('state → replanning');
+                    setWorking('replanning…');
+                }
+            } else {
+                recordEvent('state → ' + evt.state);
+                if (evt.state === 'executing') {
+                    clearWorking();
+                }
+                setPill(evt.state);
+            }
         } else if (evt.kind === 'progress') {
             const cur = evt.current || 0;
             const tot = evt.total || 0;
@@ -1118,10 +1293,12 @@
             session.currentStep = desc;
             recordEvent('step started: ' + desc);
             pushActivity('▶', 'Step started', desc);
+            setWorking('▶ ' + truncate(desc, 120));
         } else if (evt.kind === 'step_completed') {
             const desc = String(evt.desc || args[1] || '');
             recordEvent('step completed: ' + desc);
             pushActivity('✓', 'Step completed', desc);
+            setPill('✓ ' + truncate(desc, 120));
         } else if (evt.kind === 'step_confidence') {
             const conf = parseFloat(args[0]);
             if (!Number.isNaN(conf)) {
@@ -1133,21 +1310,38 @@
             const reasoning = args[1] || '';
             recordEvent('decision[' + iter + ']: ' + truncate(reasoning, 120));
             pushActivity('💭', 'Decision iter ' + iter, reasoning);
+            setWorking('💭 ' + truncate(reasoning, 120));
         } else if (evt.kind === 'tool_execution_started') {
             const iter   = args[0] || '';
-            const tool   = args[1] || '';
+            var rawTool  = args[1] || '';
             const params = args[2];
             const output = args[3];
-            const isPre  = output === undefined || output === null
-                        || output === 'None'  || output === 'null';
+            // Backend sends "None" (string) for tool/params in post-execution events
+            var tool = (rawTool && rawTool !== 'None' && rawTool !== 'null') ? rawTool : '';
+            var isPre = output === undefined || output === null
+                        || output === 'None' || output === 'null';
+            if (isPre && tool) lastCalledTool = tool;
+            var effectiveTool = tool || lastCalledTool || 'action';
             const tag    = isPre ? '⊙' : '✓';
             const paramText = formatToolParams(params);
-            recordEvent(tag + ' tool[' + iter + '] ' + tool + ' ' + truncate(paramText, 120));
-            const label = isPre
-                ? ('Calling ' + tool + (iter ? ' · iter ' + iter : ''))
-                : ('Result · ' + tool + (iter ? ' · iter ' + iter : ''));
-            const content = isPre ? paramText : String(output);
-            pushActivity(tag, label, content);
+            recordEvent(tag + ' ' + effectiveTool + '[' + iter + '] ' + truncate(paramText, 120));
+            if (isPre) {
+                activeExecCount++;
+                var ctx = briefToolContext(effectiveTool, params);
+                var preLabel = 'Executing ' + effectiveTool;
+                var preContent = ctx || paramText;
+                pushActivity(tag, preLabel, preContent);
+                setWorking('⊙ ' + effectiveTool + (ctx ? ' · ' + ctx : ''));
+            } else {
+                activeExecCount = Math.max(0, activeExecCount - 1);
+                var readable = formatResultReadable(effectiveTool, output);
+                var postLabel = effectiveTool + ' done';
+                pushActivity(tag, postLabel, readable || String(output));
+                if (activeExecCount === 0) {
+                    clearWorking();
+                    setPill('✓ ' + effectiveTool + (readable ? ' · ' + readable : ''));
+                }
+            }
         } else if (evt.kind === 'task_completed') {
             const summary = evt.summary
                 || (args.length ? String(args[0]) : '')
@@ -1166,6 +1360,8 @@
             addAssistantTextBubble(evt.text || '');
         } else if (evt.kind === 'reply_delta') {
             // Clear thinking indicator on first streaming chunk
+            removeThinkingBubble();
+            clearWorking();
             setPill('');
             appendReceptionistDelta(evt.text || '');
         } else if (evt.kind === 'reply_done') {
@@ -1174,9 +1370,12 @@
             addSystemBubble(evt.text || '');
         } else if (evt.kind === 'receptionist_thinking_on') {
             recordEvent('receptionist thinking…');
-            setPill('thinking…');
+            setWorking('thinking…');
+            showThinkingBubble();
         } else if (evt.kind === 'receptionist_thinking_off') {
             recordEvent('receptionist idle');
+            removeThinkingBubble();
+            clearWorking();
         }
         if (!overlayStatus.classList.contains('hidden')) {
             refreshStatusPanel();
@@ -1511,8 +1710,14 @@
         conversation.innerHTML = '';
         toolCardsByCallId.clear();
         activeAssistantBubble = null;
+        activeReceptionistBubble = null;
+        thinkingBubble = null;
+        lastCalledTool = '';
+        activeExecCount = 0;
         firstSendDone = false;
+        firstReplanSeen = false;
         clearCompleted();
+        clearWorking();
         session.state = 'idle';
         session.progress = '';
         session.currentStep = '';
@@ -1816,17 +2021,20 @@
     function loadConfig() {
         window.__handqLog('INFO', 'loadConfig: dispatching getConfig');
         settingsStatus.textContent = 'loading…';
+        showSettingsLoading();
         handq.getConfig().then((result) => {
             const cfg = (result && result.config) || {};
             window.__handqLog('INFO', 'loadConfig: success',
                 { path: result && result.config_path });
             applyConfigToForm(cfg);
             settingsStatus.textContent = 'loaded';
+            hideSettingsLoading();
         }).catch((err) => {
             window.__handqLog('ERROR', 'loadConfig: failure',
                 { err: err && err.message });
             settingsStatus.textContent = 'load failed: ' + (err && err.message);
             showToast('Load failed: ' + (err && err.message), 'err');
+            hideSettingsLoading();
         });
     }
 

@@ -173,8 +173,29 @@ contextBridge.exposeInMainWorld('handq', {
         const id = nextId('cfg-get');
         preloadLog('getConfig', { id: id });
         return new Promise((resolve, reject) => {
-            pendingByid.set(id, resolve);
-            ipcRenderer.invoke('handq:getConfig', id).catch(reject);
+            const timer = setTimeout(() => {
+                if (pendingByid.has(id)) {
+                    pendingByid.delete(id);
+                    reject(new Error('Config load timed out'));
+                }
+            }, 10000);
+            pendingByid.set(id, (result) => {
+                clearTimeout(timer);
+                resolve(result);
+            });
+            ipcRenderer.invoke('handq:getConfig', id)
+                .then((ok) => {
+                    if (ok === false) {
+                        clearTimeout(timer);
+                        pendingByid.delete(id);
+                        reject(new Error('Bridge unavailable'));
+                    }
+                })
+                .catch((err) => {
+                    clearTimeout(timer);
+                    pendingByid.delete(id);
+                    reject(err);
+                });
         });
     },
 
@@ -187,8 +208,29 @@ contextBridge.exposeInMainWorld('handq', {
         const id = nextId('cfg-set');
         preloadLog('setConfig', { id: id, config: redactApiKey(config) });
         return new Promise((resolve, reject) => {
-            pendingByid.set(id, resolve);
-            ipcRenderer.invoke('handq:setConfig', { id: id, config: config }).catch(reject);
+            const timer = setTimeout(() => {
+                if (pendingByid.has(id)) {
+                    pendingByid.delete(id);
+                    reject(new Error('Config save timed out'));
+                }
+            }, 10000);
+            pendingByid.set(id, (result) => {
+                clearTimeout(timer);
+                resolve(result);
+            });
+            ipcRenderer.invoke('handq:setConfig', { id: id, config: config })
+                .then((ok) => {
+                    if (ok === false) {
+                        clearTimeout(timer);
+                        pendingByid.delete(id);
+                        reject(new Error('Bridge unavailable'));
+                    }
+                })
+                .catch((err) => {
+                    clearTimeout(timer);
+                    pendingByid.delete(id);
+                    reject(err);
+                });
         });
     },
 });

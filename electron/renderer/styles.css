@@ -674,7 +674,7 @@ html, body {
     right: 14px;
     bottom: 50px;
     width: min(720px, 55vw);
-    max-height: 420px;
+    max-height: 560px;
     display: flex;
     flex-direction: column;
     background: #f8f8fa;
@@ -794,7 +794,7 @@ html, body {
     line-height: 1.4;
     white-space: pre-wrap;
     word-break: break-word;
-    -webkit-line-clamp: 3;
+    -webkit-line-clamp: 6;
     -webkit-box-orient: vertical;
     overflow: hidden;
 }
@@ -958,7 +958,7 @@ html, body {
 
 /* ---------- Settings overlay ---------- */
 
-.settings-card { width: min(820px, 94vw); }
+.settings-card { width: min(820px, 94vw); position: relative; }
 
 .settings-toast {
     margin: 10px 18px 0;
@@ -1462,5 +1462,69 @@ code {
 }
 .confirmation-actions button#confirm-reject:hover {
     background: rgba(220, 60, 60, 0.20);
+}
+
+/* ---------- Settings loading overlay ---------- */
+
+.settings-loading-overlay {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background: rgba(255, 255, 255, 0.72);
+    backdrop-filter: blur(4px);
+    -webkit-backdrop-filter: blur(4px);
+    border-radius: inherit;
+    z-index: 5;
+}
+.settings-loading-overlay.hidden { display: none; }
+.settings-loading-overlay .loading-text {
+    font: 600 17px/1.4 -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Helvetica Neue', sans-serif;
+    color: var(--fg-soft);
+    letter-spacing: -0.2px;
+    animation: settings-pulse 1.4s ease-in-out infinite;
+}
+@keyframes settings-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.4; }
+}
+
+/* ---------- Thinking bubble indicator ---------- */
+
+.bubble.thinking-indicator {
+    pointer-events: none;
+}
+.thinking-dots {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+}
+.thinking-dots .dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: var(--fg-mute);
+    animation: thinking-bounce 1.4s ease-in-out infinite;
+}
+.thinking-dots .dot:nth-child(2) { animation-delay: 0.16s; }
+.thinking-dots .dot:nth-child(3) { animation-delay: 0.32s; }
+@keyframes thinking-bounce {
+    0%, 60%, 100% { opacity: 0.3; transform: translateY(0); }
+    30% { opacity: 1; transform: translateY(-3px); }
+}
+
+/* ---------- Activity strip working state ---------- */
+
+.activity-strip.working .activity-current {
+    animation: strip-blink 1.5s ease-in-out infinite;
+}
+@keyframes strip-blink {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.4; }
+}
+.activity-strip.working .activity-dot {
+    background: #28c840;
+    animation: ai-pulse 1.6s ease-out infinite;
 }
 
