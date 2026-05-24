@@ -52,3 +52,15 @@ keyrings.alt>=4.0.0
 # The agent runs without this dependency — BrowserTool reports an actionable
 # install hint when imports fail.
 playwright>=1.40.0
+
+# ── Vision (Phase 1+) ─────────────────────────────────────────────────────────
+
+# OpenAI-compatible client used by VisionClient against the QGenie gateway
+# (azure::gpt-5.4-mini). Endpoint and key live in handq_config.yaml under the
+# `vision:` section. Phase 1 wires browser.vision_query through this.
+openai>=1.30.0
+
+# Image resize / format normalisation before vision calls. Also used by the
+# Phase 0 OCR benchmark and (when shipped) the desktop_tool / activity_monitor
+# screenshot pipelines.
+pillow>=10.0.0

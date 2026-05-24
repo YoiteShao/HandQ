@@ -2664,6 +2664,19 @@ class FlowController:
                 component="FlowController",
             )
         try:
+            from ..infrastructure.vision import flush_vision_client
+            v_closed = await flush_vision_client()
+            if v_closed:
+                self.logger.info(
+                    "Vision client closed at task completion",
+                    component="FlowController",
+                )
+        except Exception as exc:
+            self.logger.warning(
+                f"Vision client cleanup at task completion failed: {exc}",
+                component="FlowController",
+            )
+        try:
             self.memory.clear_browser_contexts()
         except Exception:
             pass

@@ -253,6 +253,12 @@ class RuntimeAgent:
         # an ANTI-REPEAT GUARD reminder when the agent repeats a failing approach.
         self._failed_approaches: Dict[str, int] = {}
 
+        # Per-iteration tool-call count.  Used by run_streaming() to detect when
+        # the agent has stayed serial for several iterations in a row and inject
+        # a parallelism-opportunity nudge.  Bounded to the last 16 entries so it
+        # never grows unboundedly during long-running tasks.
+        self._iteration_tool_counts: List[int] = []
+
         # In-flight tool calls: tracks currently executing tools so that
         # get_progress_summary() can report what is running RIGHT NOW, even
         # before the tool completes and an observation is recorded.
@@ -774,7 +780,14 @@ class RuntimeAgent:
                 # If no observation (group_size=0), nothing to append
 
         # ── [N] Next-action prompt — always last ──────────────────────────────
-        next_action = "What is the next action?"
+        # The "batch independent tool calls" tail stays constant across turns so
+        # it remains a stable cache prefix; it costs ~20 tokens and acts as a
+        # persistent reinforcement of the parallel-first system-prompt section.
+        next_action = (
+            "What is the next action? "
+            "Batch every independent tool call into this single response — "
+            "only serialize on real data dependencies."
+        )
         if reminder:
             next_action = f"{reminder}\n\n{next_action}"
 
@@ -1610,10 +1623,38 @@ class RuntimeAgent:
                     "tool, command, or decomposition:\n" + "\n".join(_lines)
                 )
                 reminder = (_anti_repeat + "\n\n" + reminder) if reminder else _anti_repeat
+
+            # Parallelism nudge: when 3+ recent iterations have each used a single
+            # tool call, the agent is leaving easy parallelism on the table.
+            # The reminder fires once per 3-iteration window (resets after firing
+            # so it does not spam every turn).
+            if len(self._iteration_tool_counts) >= 3:
+                _recent = self._iteration_tool_counts[-3:]
+                if all(c == 1 for c in _recent):
+                    _parallel_nudge = (
+                        "PARALLELISM NUDGE — the last 3 turns each issued only one tool call. "
+                        "Independent reads/greps/globs/checks must be batched in a single response — "
+                        "the runtime dispatches concurrent-safe tools in parallel and you save ~80% "
+                        "of wall-clock time. Before sending the next response, list the tool calls you "
+                        "are about to make and ask which of them are truly dependent on each other. "
+                        "Only the dependent ones serialize. For read-only shell commands set "
+                        "concurrent_safe=true so they batch with other reads."
+                    )
+                    reminder = (_parallel_nudge + "\n\n" + reminder) if reminder else _parallel_nudge
+                    # Reset the tracker so the nudge does not fire on every subsequent turn.
+                    self._iteration_tool_counts = []
+
             decision, tool_results, _iter_token_usage = await self._think_streaming(
                 goal, observations, reminder
             )
             _token_usage += _iter_token_usage
+
+            # Track tool-count for parallelism heuristic.  Recorded after each
+            # _think_streaming() so the next iteration's nudge logic sees the
+            # most recent decision.  Bounded to the last 16 entries.
+            self._iteration_tool_counts.append(len(decision.tool_calls or []))
+            if len(self._iteration_tool_counts) > 16:
+                self._iteration_tool_counts = self._iteration_tool_counts[-16:]
 
             # ── Error handling (mirrors run() exactly) ────────────────────────
             if decision.error:

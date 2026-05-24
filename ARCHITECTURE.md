@@ -74,6 +74,70 @@ INSTALL_DIR =
 
 ---
 
+## 1.6 Vision artifacts: 三级截图存储
+
+视觉相关的图像产物（浏览器/桌面截图、vision_query 工作图、活动监控
+帧）按 **producer + 用途** 落到三个分级，每个分级独立配置 retention。
+统一定义在 `src/infrastructure/vision/storage.py` 的 `ScreenshotStore`，
+三个 producer（browser_tool / desktop_tool / activity_monitor）各持
+一个实例，根目录不同但分级语义和配置共享。
+
+**核心原则：这里全是 SCRATCH 空间。** 任何需要长期留存的捕获，
+agent 应该用绝对路径写到当前 task 的 session 目录
+(`%USERPROFILE%\HandQ\History\<id>\`)，而不是依赖 screenshots/
+里的某个分级。screenshots/ 不该承担「长期资产」的语义。
+
+### 分级表
+
+| 类别 | 谁写 | 触发时机 | Retention | LLM 可选 |
+|---|---|---|---|---|
+| **ephemeral** | vision_query / find_element 的工作图 | 每次 vision 调用内部生成 | LRU(max_files) + 年龄(max_age_minutes)，每写一张触发；session 边界全清 | ❌ producer 内部，schema 不暴露 |
+| **task** | 显式 `screenshot` 调用 | agent 主动留档 | session 关闭时按 `retain_after_task_days` 老化扫；max_files 兜底 | ✅ 默认且唯一选项 |
+| **activity** | 周期帧（Phase 3） | activity_monitor 主循环 | 年龄 + LRU 双门 | ❌ activity_monitor 独占；其它 producer 写到此目录视为 bug |
+
+> 取消了早期方案里的 `persistent` 分级——长期保留的语义错配（应该走
+> session 目录而不是全局 screenshots/）。
+
+### 三个根目录
+
+| Producer | 根目录 |
+|---|---|
+| browser_tool | `%USERPROFILE%\HandQ\browser_profile\screenshots\<category>\` |
+| desktop_tool（Phase 2+） | `%USERPROFILE%\HandQ\desktop_shots\<category>\` |
+| activity_monitor（Phase 3+） | `%USERPROFILE%\HandQ\activity\<category>\` |
+
+### 不变量
+
+- **producer 决定根目录，分级名跨 producer 共享**：同一份
+  `handq_config.yaml` 的 `screenshots:` 段驱动三个 store。
+- **ephemeral 是 producer-internal**：parameter_schema 不暴露给 LLM，
+  防止 LLM 误把重要捕获写到容易被清的层。
+- **`screenshot` action 不接受分级参数**：相对路径默认进 task；要长留
+  agent 用绝对路径写到 session working_directory。
+- **activity 仅 activity_monitor 写**：其它 producer 写入此目录视为 bug。
+- **清理时机**：写时摊销（每写一张触发自身分级的 LRU+age 清理）+ session
+  边界全清（ephemeral 全清 + task 老化扫）。无后台定时器。
+
+### 配置（默认值，节自 handq_config.yaml）
+
+```yaml
+screenshots:
+  ephemeral:
+    max_files: 30
+    max_age_minutes: 15
+  task:
+    retain_after_task_days: 1
+    max_files: 100
+  activity:
+    max_files: 1000
+    max_age_days: 1
+```
+
+数值刻意取保守值。要 bump 上限请有具体证据（看到 agent 因 retention 丢
+上下文）。
+
+---
+
 ## 2. 开发模式目录结构
 
 ```
@@ -281,6 +345,8 @@ nuitka `
 | Bridge 配置消费 | `src/bridge/stdio_bridge.py` | `run()` 读 `HANDQ_CONFIG` |
 | Session 目录分配 | `src/bridge/stdio_bridge.py` | `_allocate_session_dir`、`_session_history_root` |
 | YAML 读写 | `src/bridge/stdio_bridge.py` | `_load_config_dict`、`_save_config_dict` |
+| Vision LLM 客户端 | `src/infrastructure/vision/client.py` | `VisionClient`、`get_vision_client`、`flush_vision_client` |
+| Vision 截图分级 | `src/infrastructure/vision/storage.py` | `ScreenshotStore`（ephemeral/task/activity） |
 
 ---
 

@@ -609,10 +609,19 @@ Examples:
                     "concurrent_safe": {
                         "type": "boolean",
                         "description": (
-                            "Set to true when this command is read-only and safe "
-                            "to run concurrently with other commands in the same "
-                            "response (e.g. search, list, read, python -c). "
-                            "Default: false (serialised)."
+                            "ALWAYS set to true for read-only / observation-only commands "
+                            "so they batch in parallel with other concurrent-safe tool calls "
+                            "in the same response. Examples to mark true: "
+                            "ls, find, grep, wc, cat, head, tail, which, type, "
+                            "test -f / test -d, git status, git log, git diff, "
+                            "python -c \"import …\" probes, --version checks, "
+                            "PowerShell Get-ChildItem / Test-Path / Select-String. "
+                            "Leave false (default) for anything that mutates state: "
+                            "package installs, file moves, builds, deploys, tests "
+                            "that write artifacts. When in doubt about safety, leave "
+                            "it false. Multiple read-only checks in one turn should "
+                            "all carry concurrent_safe=true so they finish in parallel "
+                            "rather than one-after-the-other."
                         )
                     },
                     "timeout": {
@@ -1057,8 +1066,26 @@ WORKFLOW
      immediately — do not chase with a screenshot+extract pair.
   6. action='wait_for' to block until a selector appears (state='visible'
      default) or the URL matches a regex (url_pattern='/dashboard$').
-  7. action='list_tabs' if you have multiple tabs.
-  8. action='close_tab' for tabs you no longer need.
+  7. action='vision_query' for content the DOM cannot give you — text or
+     visuals rendered inside <canvas>, charts, captcha detection, image
+     classification ("is this a dog?", "is the person male or female?",
+     "is this chart trending up?"). The tool screenshots the viewport
+     (or selector subtree), ships it to a small multimodal model, and
+     returns a TEXT answer plus parsed_json when output_schema is given.
+     The image bytes never enter your context — only the distilled
+     answer. STRICT: read VISION_QUERY DECISION RULE below before
+     calling — most "where is X" / "what does this page say" / "what
+     does this video cover" questions have better tools.
+  8. action='video_context' to read the active <video>'s title,
+     description, duration, and CAPTION text via the textTracks API —
+     no vision involved, no per-frame sampling needed. This is THE
+     answer for "what is this video about" / "is there a part about X"
+     / "summarise the lecture" / "watch this section". Pair with
+     seek_to_s + pause=true to position on a specific frame, then
+     follow with a SINGLE screenshot+vision_query if you need to know
+     what that frame looks like.
+  9. action='list_tabs' if you have multiple tabs.
+  10. action='close_tab' for tabs you no longer need.
 
 KEY INVARIANTS
   - tab_id is optional everywhere except close_tab; defaults to the first tab.
@@ -1106,6 +1133,51 @@ STEALTH
   headless via JS fingerprinting; we want a real-user fingerprint while
   staying invisible.
 
+VISION_QUERY DECISION RULE (read before each call)
+  Before calling vision_query, identify which kind of question you have:
+
+  ✅ vision_query IS THE RIGHT TOOL for IMAGE-LEVEL questions:
+    - Image classification ("Is this a dog or a cat?",
+      "Is the person in this photo male or female?",
+      "Is this chart trending up?")
+    - <canvas> / <svg> / <video> SINGLE-FRAME content that the DOM
+      cannot read (chart screenshot, slide on a paused video frame)
+    - Captcha / verification page DETECTION (recognise that one is
+      present and bail out — never try to solve)
+    - "Click on the dog image" / "find the orange button" — one-shot
+      visual grounding, returns coordinates
+
+  ❌ vision_query IS THE WRONG TOOL for these — use what's listed:
+    - "What is on this page?"            → snapshot
+    - "What does the heading say?"       → extract mode='text'
+    - "Where is the Login link?"         → snapshot (each element gets
+                                            a suggested selector)
+    - "Did the click open a modal?"      → click already returns
+                                            page_state with dialogs
+    - "Is the form submitted?"           → wait_for url_pattern or
+                                            selector
+    - "What's in the search results?"    → extract mode='text' / 'list'
+    - "What is this video about?"        → video_context (reads
+                                            captions + metadata)
+    - "Was section 1 covered?"           → video_context (cues with
+                                            timestamps)
+    - "Watch this until X is mentioned"  → video_context, then check
+                                            captions for X
+
+  ⛔ ANIMATION ANTI-PATTERN:
+    Do NOT call vision_query repeatedly to "watch" a moving canvas or
+    video. Each call is 5-7 seconds — sampling at 1 fps takes longer
+    than the video itself, costs ~1500 input tokens per frame, and
+    misses everything between samples. For VIDEO use video_context.
+    For CANVAS animation, the data driving it almost always lives in
+    a JS variable or network response that DOM extract can reach
+    indirectly (chart libraries expose .data on the canvas instance).
+
+  Penalty for misuse: 5-7s latency, ~1500 input tokens, non-deterministic
+  hallucinations. snapshot is your default for "what is on this page";
+  extract for "give me the content of X"; video_context for any video
+  question. vision_query is for image-level questions only.
+
 EXAMPLES
   GOOD: action='launch_browser'
   GOOD: action='navigate', url='https://example.com'
@@ -1116,6 +1188,16 @@ EXAMPLES
   GOOD: action='wait_for', url_pattern='/dashboard($|/)'
   GOOD: action='extract', mode='attr', selector='a.next', attribute='href'
   GOOD: action='extract', mode='list', selector='button.action-btn.book', limit=20
+  GOOD: action='vision_query', selector='canvas#chart', question='What does this chart show? One sentence.'
+  GOOD: action='vision_query', question='Is the person in the photo male or female?',
+        selector='img.profile-pic'
+  GOOD: action='vision_query', question='Where is the Sign In button? Reply with pixel coordinates.',
+        output_schema={"type":"object","properties":{"x":{"type":"number"},"y":{"type":"number"}},"required":["x","y"]}
+  GOOD: action='video_context'                                          (whole-video summary via captions)
+  GOOD: action='video_context', max_cues=2000                           (long lecture)
+  GOOD: action='video_context', seek_to_s=150, pause=true               (jump to 2:30 and stop, ready for screenshot)
+  GOOD: action='screenshot'                                             (default; auto-cleaned shortly after task)
+  GOOD: action='screenshot', path='/abs/path/inside/session/dir/confirm.png'   (long-term keep — write into session working dir)
   GOOD: action='request_user_login', reason='need GitHub credentials',
         success_url_pattern='github\\.com/(?!login)'
   GOOD: action='attach_browser'   (when user said "我刚才打开的" — needs config)

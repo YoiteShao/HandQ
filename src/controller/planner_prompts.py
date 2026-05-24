@@ -6,7 +6,54 @@ synthesize_acceptance).  User-message classification prompts have been
 moved to receptionist_prompts.py and are used by the Receptionist.
 """
 
-PLANNER_SYSTEM_PROMPT = """## Task Scoping (Do This First — Before Deciding Step Count)
+PLANNER_SYSTEM_PROMPT = """## Step Boundary Philosophy (Read This First)
+
+**A step boundary exists for ONE reason: context isolation.** Each step runs in its own
+agent with its own conversation history, its own observation budget, and its own
+compaction lifecycle. The planner sees only structured outputs (factual_outcome,
+artifacts, key_findings) between steps — raw tool output does NOT carry across.
+
+This means step boundaries should be drawn where **information** must be isolated, not
+where **execution** could be ordered. The runtime agent inside ONE step can already
+issue multiple tool calls in parallel within a single LLM turn — reads, greps, globs,
+and even writes to different files all batch automatically. Splitting work into
+multiple steps for execution sequencing buys you nothing and costs you a planner
+round-trip plus a fresh agent boot per split.
+
+**Decomposition decision rule** — for any chunk of work, ask in order:
+
+1. **Same context, independent actions** (e.g., read 5 files; grep 3 patterns; check
+   that 4 commands exist) → ONE step. The agent will batch the tool calls. Splitting
+   into 5 steps wastes 5 planner turns and 5 agent boots.
+
+2. **Different contexts, heavy independent work** (e.g., each sub-task needs to explore
+   its own subtree, accumulate its own observations, then report) → use `parallel_group`
+   so each sub-task runs in its own agent with its own context window.
+
+3. **Sequential data dependency** (step B's input is step A's output) → separate
+   sequential steps; name the artifact explicitly in step B's goal.
+
+4. **Heterogeneous phases that the planner must arbitrate between** (e.g., discover,
+   then decide-based-on-discovery, then act) → separate sequential steps.
+
+**The over-splitting trap**: emitting 5 steps for "read file A", "read file B",
+"read file C", "summarize", "write report" produces FIVE planner turns + FIVE agent
+boots when the same work fits in TWO steps (one read+summarize step that batches the
+3 reads, then one write step). Default to fewer, broader steps; split when context
+isolation genuinely buys you something, not as a reflex.
+
+**The under-splitting trap (still real)**: lumping discovery, multi-phase reasoning,
+and final delivery into one mega-step removes planner oversight between phases. The
+sections below ("Task Scoping", "Epistemic State Separation", "Task Analysis & Step
+Granularity") describe when splitting IS warranted — typically because the next step's
+correct goal cannot be written until the previous step's discoveries are in hand.
+
+When in doubt, write the step goals in your head and ask: "Would the agent inside
+this step naturally batch these tool calls?" If yes — keep them in ONE step.
+
+---
+
+## Task Scoping (Do This First — Before Deciding Step Count)
 
 Before committing to any step plan, mentally simulate the full execution path from start to finish. Ask:
 
@@ -35,6 +82,20 @@ Before committing to any step plan, mentally simulate the full execution path fr
   WHY: Step 1 is mandatory even when you know the directory contains logs — you do not yet know whether there are 3 files or 300, whether each is 10 KB or 10 GB, or what the actual field names are. Without this, the agent in step 2 is planning on unknown scope. This is the **analysis task trap**: collapsing discover+extract+write into one step when file sizes and structure are unknown.
 
 The pattern: if a step contains the words "and" connecting distinct phases (read AND analyse AND fix AND test), it is almost certainly over-bundled. Each phase should be its own step.
+
+**Counter-examples — within-step parallelism, do NOT over-split**:
+
+- ❌ OVER-SPLIT (five steps): (1) read src/auth/login.py. (2) read src/auth/token.py. (3) read src/auth/session.py. (4) summarize what each file does. (5) write summary.md.
+  ✅ GOOD (two steps): (1) Read src/auth/login.py, src/auth/token.py, src/auth/session.py and summarize each file's responsibility — the agent will batch the three reads into a single LLM turn, then summarize. (2) Write summary.md from the findings of step 1.
+  WHY: All three files share the same reasoning context (auth module). The agent batches reads for free. Five steps cost five planner turns + five agent boots; two steps cost two of each. The agent inside step 1 still does ONE read-batch + ONE summarize turn — same total agent work, half the planner overhead.
+
+- ❌ OVER-SPLIT (four steps): (1) check `python` exists. (2) check `pip` exists. (3) check `git` exists. (4) check `docker` exists.
+  ✅ GOOD (one step): "Verify that python, pip, git, and docker are all installed and report their versions" — agent issues four parallel `which` (or `bash --version`) checks in one turn.
+
+- ❌ OVER-SPLIT (three steps): (1) grep "TODO" in src/. (2) grep "FIXME" in src/. (3) grep "HACK" in src/.
+  ✅ GOOD (one step): "Find all TODO/FIXME/HACK comments under src/ and list them with file:line locations" — agent runs three parallel grep tool calls in one turn (or a single grep with an alternation pattern).
+
+The rule: if all sub-operations share the same reasoning context and produce the same kind of finding, ONE step. The agent's within-step parallelism handles the concurrency.
 
 **Information-first rule**: If completing the task requires knowledge you do not yet have — the structure of a codebase, the current state of a system, the contents of files, the shape of an API, the layout of a database — make the FIRST step an explicit information-gathering step. Do not skip straight to action based on assumptions. A dedicated reconnaissance step costs one step and prevents multiple failed action steps caused by acting on wrong assumptions. Ask yourself: "What would I need to read or run before I could write the action step's goal with full confidence?" If the answer is "something I haven't seen yet", add a discovery step first.
 
@@ -167,11 +228,30 @@ When a step depends on the output of a previous step, explicitly reference the r
 
 **Planner-driven file writing**: When a step will produce content that subsequent steps need in full, explicitly instruct the agent to write it to a file in the step's goal. Do not rely on the agent to decide whether to write — the planner controls what gets persisted.
 
-**Dependency-aware execution strategy**: Before decomposing a task into sub-tasks, assess whether the sub-tasks are independent or dependent:
-- **Independent sub-tasks**: parallel execution is appropriate. Use `parallel_group` to run them concurrently.
-- **Dependent sub-tasks**: sequential execution with explicit context passing is required.
+**Dependency-aware execution strategy**: Before decomposing a task into sub-tasks, classify how the work should be parallelised:
 
-**Parallel execution**: use `parallel_group` only when sub-tasks are independent (different inputs, no shared state) and their results can be aggregated by a single follow-up step.
+- **Light independent ops, shared context** (read/grep/glob/check across N items, all
+  feeding the same reasoning) → ONE step. The agent batches tool calls in a single
+  LLM turn — no planner involvement needed. Splitting is over-engineering.
+
+- **Heavy independent ops, isolated context** (each sub-task needs its own
+  exploration/think loop, accumulates its own observations, and would bloat a
+  single agent's context window) → use `parallel_group` so each sub-task runs in
+  its own agent. Always include exactly one `is_aggregation=true` step that
+  synthesises the results.
+
+- **Sequential dependency** (sub-task B's input is sub-task A's output) → separate
+  sequential steps with explicit context passing in the goal text.
+
+**parallel_group threshold**: prefer within-step batching unless each sub-task would
+realistically take 3+ agent iterations on its own (e.g., per-host SSH workflows,
+per-component code generation, per-file refactor with verification each). Below that
+threshold, the parallel_group overhead (separate agent boot + aggregation step) costs
+more than it saves.
+
+**Parallel execution**: when you do use `parallel_group`, sub-tasks must be truly
+independent (different inputs, no shared state) and their results must be
+aggregable by the single follow-up `is_aggregation=true` step.
 
 ## Synthesis & Delivery
 

@@ -141,37 +141,40 @@ _PASSWORD_REFUSAL = (
     "sessions."
 )
 
-# Screenshot output directory. Lives under the persistent profile so
-# screenshots survive across sessions (consistent with cookies / login
-# state). Agent can override with an absolute path.
-def _default_screenshot_dir() -> str:
-    path = os.path.join(user_browser_profile_dir(), "screenshots")
-    os.makedirs(path, exist_ok=True)
-    return path
+# Browser screenshot scratch store. The actual class + retention logic
+# lives in ``infrastructure.vision.ScreenshotStore`` so the same tier
+# semantics can be reused by desktop_tool (Phase 2) and activity_monitor
+# (Phase 3) — only the root directory differs per producer. We hold a
+# lazy module-level instance because ConfigManager is not always ready
+# at import time.
+#
+# Long-term keepers do NOT live here. If the agent wants to preserve a
+# capture beyond the task, it writes to its session directory (working
+# dir) instead — see ARCHITECTURE.md §1.6.
+_browser_store_instance: Optional[Any] = None
 
 
-def _vision_supported() -> bool:
-    """Return True when the active LLM accepts image inputs.
-
-    Drives whether action='screenshot' is exposed in the parameter schema
-    and whether dispatch accepts the action at runtime. If False, the
-    LLM never sees screenshots as a tool option — the bytes-on-disk
-    output is useless when the model cannot read images, and exposing
-    the action just burns turns the way the 2026-05-23 APT Auto run did
-    (6 screenshot calls, none consumed by the model).
-
-    Source of truth is ``browser.vision_enabled`` in handq_config.yaml.
-    Future work: derive automatically from the active model's stated
-    capabilities once LLMService exposes a ``supports_vision`` flag.
-    """
-    try:
+def _browser_store():
+    global _browser_store_instance
+    if _browser_store_instance is None:
         from ..infrastructure.config_manager import ConfigManager
-        cm = ConfigManager()
-        cfg = cm.get_section("browser") or {}
-        return bool(cfg.get("vision_enabled", False))
-    except Exception:
-        # Conservative default — if we cannot read config, assume no vision.
-        return False
+        from ..infrastructure.vision import ScreenshotStore
+        try:
+            cfg = ConfigManager().get_section("screenshots") or {}
+        except Exception:
+            cfg = {}
+        _browser_store_instance = ScreenshotStore(
+            root=os.path.join(user_browser_profile_dir(), "screenshots"),
+            config_section=cfg,
+        )
+    return _browser_store_instance
+
+
+def _default_screenshot_dir() -> str:
+    """Backward-compat shim — returns the ``task`` subdir of the browser
+    store. Most call sites should call ``_browser_store().subdir(cat)``
+    directly with an explicit category."""
+    return _browser_store().subdir("task")
 
 
 # Recognised Playwright selector engine prefixes. We only validate CSS
@@ -449,6 +452,23 @@ async def flush_browser_pool() -> int:
                        component="BrowserTool")
     logger.info(f"browser flush: {sess.mode} session closed",
                 component="BrowserTool")
+    # Screenshot housekeeping at the session boundary.
+    #   ephemeral/  : nuked unconditionally — vision_query work files
+    #                 should never cross sessions.
+    #   task/       : aged sweep using screenshots.task.retain_after_task_days
+    #                 (defaults to 1). Keeps a short replay window.
+    try:
+        swept = _browser_store().session_close_sweep()
+        if swept.get("ephemeral") or swept.get("task"):
+            logger.info(
+                f"screenshots flush: purged "
+                f"{swept.get('ephemeral', 0)} ephemeral, "
+                f"{swept.get('task', 0)} aged-task file(s)",
+                component="BrowserTool",
+            )
+    except Exception as exc:
+        logger.warning(f"screenshots flush failed: {exc}",
+                       component="BrowserTool")
     return 1
 
 
@@ -494,6 +514,8 @@ class BrowserTool(BaseTool):
                     "type",
                     "wait_for",
                     "screenshot",
+                    "vision_query",
+                    "video_context",
                     "request_user_login",
                     "new_tab",
                     "close_tab",
@@ -599,10 +621,11 @@ class BrowserTool(BaseTool):
             "path": {
                 "type": "string",
                 "description": (
-                    "[screenshot] Output file path. Absolute paths used as-is; "
-                    "relative paths are resolved under the default screenshots "
-                    "directory. Defaults to a timestamped PNG under "
-                    "%USERPROFILE%\\HandQ\\browser_profile\\screenshots\\."
+                    "[screenshot] Output file path. Absolute paths used as-is "
+                    "(use this to write a long-term keeper into the session "
+                    "working directory). Relative paths are resolved under "
+                    "the auto-cleaned task tier — files there are removed "
+                    "shortly after the task completes."
                 ),
             },
             "full_page": {
@@ -666,6 +689,64 @@ class BrowserTool(BaseTool):
                     "Default: load (full page)."
                 ),
             },
+            "question": {
+                "type": "string",
+                "description": (
+                    "[vision_query] Natural-language instruction telling the "
+                    "vision model what to look at or extract. Be concrete: "
+                    "'What does the chart show?' / 'Where is the Sign In "
+                    "button? Reply with pixel coordinates.' / 'Is there a "
+                    "captcha on this page?' Pair with output_schema when you "
+                    "need a JSON answer instead of free text."
+                ),
+            },
+            "output_schema": {
+                "type": "object",
+                "description": (
+                    "[vision_query] Optional JSON Schema the vision model's "
+                    "reply must conform to. When set, the gateway is asked "
+                    "for a JSON object; the parsed JSON is returned in "
+                    "parsed_json alongside the raw answer text. Useful for "
+                    "coordinate or yes/no queries — leave omitted for prose."
+                ),
+            },
+            "max_image_dim": {
+                "type": "integer",
+                "description": (
+                    "[vision_query] Long-edge resize cap before sending to "
+                    "the model. Default from config (vision.max_image_dim, "
+                    "typically 1024). Lower = faster but loses small text; "
+                    "higher = more detail but more tokens."
+                ),
+            },
+            "max_cues": {
+                "type": "integer",
+                "description": (
+                    "[video_context] Maximum subtitle / caption cues to "
+                    "return. Default 500 — fits a ~30-minute video. Set "
+                    "higher for long lectures, lower if you only need the "
+                    "intro. Cues beyond the limit are dropped and "
+                    "captions_truncated=true is reported."
+                ),
+            },
+            "seek_to_s": {
+                "type": "number",
+                "description": (
+                    "[video_context] Optional: jump the video to this "
+                    "second BEFORE reading state. Use for 'what's at "
+                    "minute 2:30?' — pair with pause=true and the "
+                    "subsequent screenshot will land on that frame."
+                ),
+            },
+            "pause": {
+                "type": "boolean",
+                "description": (
+                    "[video_context] If true, pause playback before "
+                    "reading state. Default false. Useful when you want "
+                    "to follow up with screenshot+vision_query on a "
+                    "specific frame without it advancing."
+                ),
+            },
         },
         "required": ["action"],
         "additionalProperties": False,
@@ -692,12 +773,6 @@ class BrowserTool(BaseTool):
         if not action:
             return self._error(params, start, "browser tool requires 'action'.")
 
-        # Dispatch table is built per-call so vision-gated actions can be
-        # toggled at runtime by flipping browser.vision_enabled — no
-        # process restart required. When vision is off, 'screenshot' is
-        # absent from both the schema (LLM never sees it) and the dispatch
-        # (any stale-prompt call falls through to the standard
-        # "Unknown action" error below).
         dispatch: Dict[str, Any] = {
             "launch_browser":     self._action_launch_browser,
             "attach_browser":     self._action_attach_browser,
@@ -708,12 +783,13 @@ class BrowserTool(BaseTool):
             "click":              self._action_click,
             "type":               self._action_type,
             "wait_for":           self._action_wait_for,
+            "screenshot":         self._action_screenshot,
+            "vision_query":       self._action_vision_query,
+            "video_context":      self._action_video_context,
             "request_user_login": self._action_request_user_login,
             "new_tab":            self._action_new_tab,
             "close_tab":          self._action_close_tab,
         }
-        if _vision_supported():
-            dispatch["screenshot"] = self._action_screenshot
         handler = dispatch.get(action)
         if handler is None:
             return self._error(
@@ -2115,17 +2191,23 @@ class BrowserTool(BaseTool):
         selector: Optional[str] = kwargs.get("selector")
 
         # Resolve output path. Absolute paths used as-is; relative or empty
-        # paths fall back to the persistent screenshots dir with a
-        # timestamped filename. Always ensure parent dir exists.
+        # paths fall back to the 'task' tier (auto-cleaned at session
+        # close per screenshots.task.retain_after_task_days). For
+        # long-term keepers the agent should write into its session
+        # working_directory directly via an absolute path — see
+        # ARCHITECTURE.md §1.6.
+        store = _browser_store()
         if path_arg and os.path.isabs(path_arg):
             out_path = path_arg
+            wrote_to_store = False
         else:
-            base_dir = _default_screenshot_dir()
+            base_dir = store.subdir("task")
             if path_arg:
                 out_path = os.path.join(base_dir, path_arg)
             else:
                 ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
                 out_path = os.path.join(base_dir, f"screenshot-{ts}.png")
+            wrote_to_store = True
         os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
 
         try:
@@ -2151,6 +2233,11 @@ class BrowserTool(BaseTool):
         except OSError:
             size = 0
 
+        # Apply retention only when the file landed in the store.
+        # Absolute-path writes are caller-managed.
+        if wrote_to_store:
+            store.enforce_retention("task")
+
         return ToolResult(
             success=True,
             output={
@@ -2160,6 +2247,449 @@ class BrowserTool(BaseTool):
                 "url":       page.url,
                 "bytes":     size,
             },
+            tool_name=self.name,
+            tool_parameters=params,
+            execution_time=time.time() - start,
+        )
+
+    # ── vision_query (Phase 1, shipped) ───────────────────────────────────────
+    #
+    # Asks a vision LLM about the visible page. Routes through
+    # ``infrastructure.vision`` (the ``client.py`` submodule) which talks
+    # to the QGenie gateway
+    # (azure::gpt-5.4-mini); endpoint / api_key / model live in
+    # ``handq_config.yaml`` under the ``vision:`` section.
+    #
+    # Why a separate action instead of "screenshot with vision=true":
+    #   • Decouples cost: vision_query owns the per-call LLM spend; the
+    #     plain screenshot stays free (just disk I/O).
+    #   • Decouples context: vision_query returns a TEXT answer, so the
+    #     image bytes never enter the main agent's context window. The
+    #     small vision LLM eats the image, distills it to a string, and
+    #     the main agent sees only the answer. This protects the main
+    #     agent's KV-cache from per-screenshot churn.
+    #   • Decouples model: vision_query pins to a dedicated multimodal
+    #     model without forcing the main agent's planner / executor to
+    #     be vision-capable.
+    #
+    # Misuse guardrail lives at the prompt layer (tool_registry.py
+    # browser usage_guide → "VISION_QUERY DECISION RULE"), not as a
+    # numeric quota — the agent already has anti-loop machinery
+    # (_failed_approach_signature, observation compaction) that
+    # subsumes a per-step counter.
+
+    async def _action_vision_query(
+        self, params: Dict[str, Any], start: float, **kwargs: Any,
+    ) -> ToolResult:
+        """Ask a vision LLM about the visible browser page.
+
+        The agent sends a natural-language question; the tool screenshots the
+        viewport (or a selector subtree), downscales the image, ships it to a
+        small multimodal model, and returns a TEXT answer. The image itself
+        never enters the main agent's context — only the distilled answer.
+
+        Primary use cases:
+          * Reading content rendered inside ``<canvas>`` (charts, games,
+            whiteboards, PDF.js pages) where DOM extract returns nothing.
+          * Image-heavy pages (Pinterest, social feeds) where text content
+            is sparse and the meaning lives in the visuals.
+          * Layout queries the agent cannot answer from extract alone:
+            "where is the Sign In button?", "is this row highlighted?".
+          * Captcha / verification page detection (cannot SOLVE — only
+            recognise that the page has one and bail out to
+            request_user_login).
+
+        Parameters (proposed schema)
+        ----------------------------
+        question : str  (required)
+            Natural-language query. Tell the vision model what to look for.
+            Examples:
+              - "What does this chart show? Give me the trend in one sentence."
+              - "Where is the 'Sign in with Google' button? Reply with a
+                 CSS selector if possible, otherwise viewport coordinates."
+              - "Is there a captcha on this page? Yes/no plus reason."
+
+        tab_id : str  (optional, default = first tab)
+            Which tab to capture. Same semantics as the other actions.
+
+        selector : str  (optional)
+            Restrict the screenshot to a sub-element. When omitted, the
+            full viewport is used (or the full scrollable page if
+            full_page=true). Selector takes precedence over full_page.
+
+        full_page : bool  (optional, default false)
+            Capture the entire scrollable page rather than just the
+            viewport. Costs more tokens. Ignored when selector is set.
+
+        max_image_dim : int  (optional, default 1024)
+            Resize the long edge to this many pixels before sending.
+            Below 768 most details are lost; above 1568 hits Claude's
+            scale-down behaviour without paying off in detail. 1024 is
+            the sweet spot for most "what is on this page" queries.
+
+        timeout_ms : int  (optional, default 30000)
+            Deadline for the whole pipeline (screenshot + LLM call).
+            The vision model is the slow part — 10–20 s typical.
+
+        output_schema : dict  (optional)
+            JSON Schema the vision model must conform to. When set, the
+            model's reply is parsed as JSON; on parse failure the call
+            returns success=False with a clear error. Without this, the
+            answer is free text. Recommended pattern for action queries:
+              {"type": "object", "properties":
+                 {"found": {"type": "boolean"},
+                  "selector": {"type": "string"},
+                  "coords": {"type": "array", "items": {"type": "number"},
+                             "minItems": 2, "maxItems": 2},
+                  "description": {"type": "string"}},
+               "required": ["found", "description"]}
+
+        Returns (proposed)
+        ------------------
+        On success::
+
+            {
+              "answer":         <str | dict>   # free text or parsed JSON
+              "screenshot":     <abs path>     # archived for traceability
+              "image_dims":     [w, h]         # post-resize, pre-send
+              "tokens_input":   int            # billing visibility
+              "tokens_output":  int
+              "model":          str            # which vision model answered
+              "url":            str            # page url at capture time
+            }
+
+        On failure::
+
+            {success: False, error: <one-line reason>}
+
+        Failure modes to surface:
+          - playwright unavailable (tool itself disabled)
+          - no vision-capable LLMService configured in handq_config.yaml
+          - per-step quota exceeded (RuntimeAgent enforces; tool reports)
+          - screenshot capture timeout
+          - vision LLM call timeout / rate-limit / 4xx
+          - output_schema given but reply did not parse / validate
+
+        Implementation outline
+        ----------------------
+        1. Resolve tab + take screenshot to a temp PNG (re-use
+           ``_action_screenshot`` infra; do not duplicate path logic).
+        2. Open with PIL, resize to max_image_dim long-edge (preserve
+           aspect ratio), re-encode as PNG (or JPEG quality 80 for size).
+        3. Base64-encode and build a single user-turn message:
+              [
+                {"type": "image",
+                 "source": {"type": "base64", "media_type": "image/png",
+                            "data": <b64>}},
+                {"type": "text", "text": <prompt + output_schema hint>}
+              ]
+        4. ``call_with_fallback(self._vision_services, dict(messages=...))``
+           — services list plumbed through from FlowController.
+        5. If output_schema given, ``json_repair.parse(content)`` + jsonschema
+           validate; on failure return success=False with the raw content.
+        6. Return the structured result above.
+
+        Cost reference (Anthropic, 2026-05 prices)
+        ------------------------------------------
+        Claude 4.5 Haiku multimodal: ~1500 input tokens for a 1024×768
+        image + prompt overhead, ~100 output tokens for a one-line answer.
+        Per call ≈ $0.001 with Haiku, ≈ $0.005 with Sonnet. A typical
+        agent run consumes 1-3 vision_query calls. Misuse prevention
+        is handled at the prompt layer (see VISION_QUERY DECISION RULE
+        in tool_registry.py), not via a numeric per-step quota.
+        """
+        # ── Resolve config + question / tab / capture region ─────────────────
+        from ..infrastructure.config_manager import ConfigManager
+        from ..infrastructure.vision import get_vision_client
+        try:
+            cm = ConfigManager()
+        except Exception as exc:
+            return self._error(params, start, f"vision_query: config load failed: {exc}")
+
+        question: str = (kwargs.get("question") or "").strip()
+        if not question:
+            return self._error(
+                params, start,
+                "vision_query requires 'question' — a natural-language "
+                "instruction telling the model what to look for.",
+            )
+        sess = _session
+        if sess is None:
+            return self._error(params, start, "No browser session. Call action='launch_browser' first.")
+        page = self._resolve_tab(sess, kwargs.get("tab_id"))
+        if page is None:
+            return self._error(params, start, f"Unknown tab_id: {kwargs.get('tab_id')!r}")
+
+        selector: Optional[str] = kwargs.get("selector")
+        full_page = bool(kwargs.get("full_page", False))
+        timeout_ms = int(kwargs.get("timeout_ms") or _DEFAULT_ACTION_TIMEOUT_MS)
+        max_image_dim = kwargs.get("max_image_dim")  # may be None → use config default
+
+        # ── Capture screenshot to a stable path ──────────────────────────────
+        # vision_query work files always land in the ephemeral tier so a
+        # high-frequency task (e.g. iterating on what's on a chart) cannot
+        # blow up disk usage — the store's enforce_retention runs LRU + age
+        # cleanup right after the write.
+        store = _browser_store()
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
+        out_path = os.path.join(store.subdir("ephemeral"), f"vision-{ts}.png")
+        try:
+            if selector:
+                await page.locator(selector).first.screenshot(path=out_path, timeout=timeout_ms)
+            else:
+                await page.screenshot(path=out_path, full_page=full_page, timeout=timeout_ms)
+        except _PlaywrightTimeoutError as exc:
+            return self._error(
+                params, start,
+                f"vision_query: screenshot not ready within {timeout_ms} ms: {exc}",
+            )
+        except Exception as exc:
+            return self._error(params, start, f"vision_query: screenshot failed: {exc}")
+        store.enforce_retention("ephemeral")
+
+        # ── Send to vision model ─────────────────────────────────────────────
+        try:
+            client = get_vision_client(cm)
+        except Exception as exc:
+            return self._error(params, start, f"vision_query: vision client unavailable: {exc}")
+        # Per-call max_image_dim override is supported by VisionClient via
+        # constructor; we apply it by temporarily overriding the instance
+        # attribute since we share one singleton across calls. This keeps
+        # the API simple — most calls just use the config default.
+        prev_max_dim: Optional[int] = None
+        if isinstance(max_image_dim, int) and max_image_dim > 0:
+            prev_max_dim = client.max_image_dim
+            client.max_image_dim = max_image_dim
+
+        output_schema = kwargs.get("output_schema") if isinstance(kwargs.get("output_schema"), dict) else None
+        try:
+            result = await client.query(
+                out_path, question,
+                output_schema=output_schema,
+                max_tokens=int(kwargs.get("max_tokens") or 600),
+            )
+        finally:
+            if prev_max_dim is not None:
+                client.max_image_dim = prev_max_dim
+
+        if not result.ok:
+            return self._error(params, start, f"vision_query: {result.error}")
+
+        return ToolResult(
+            success=True,
+            output={
+                "answer":        result.answer,
+                "parsed_json":   result.parsed_json,
+                "screenshot":    out_path,
+                "image_dims":    list(result.image_dims),
+                "elapsed_ms":    result.elapsed_ms,
+                "tokens_input":  result.tokens_input,
+                "tokens_output": result.tokens_output,
+                "model":         result.model,
+                "url":           page.url,
+            },
+            tool_name=self.name,
+            tool_parameters=params,
+            execution_time=time.time() - start,
+        )
+
+    # ── video_context (Phase 1.5) ────────────────────────────────────────────
+    #
+    # Pulls TEXT context for the active <video> on the page: title,
+    # description, duration, and (most importantly) caption / subtitle
+    # text via the HTML5 textTracks API. This lets the agent answer
+    # "what is this video about" / "is there a part about X" / "watch
+    # this section before clicking next" WITHOUT calling vision_query
+    # at any frame rate. Single-keyframe vision_query is still fine for
+    # "what does the slide at 2:30 LOOK like" — pair it with seek_to_s
+    # + pause=true here, then call screenshot + vision_query.
+    #
+    # Why a focused action instead of a generic page.evaluate:
+    #   • Whitelisted JS — we read DOM/textTracks fields, never execute
+    #     arbitrary author code from the LLM.
+    #   • Bounded payload — caption arrays are capped at max_cues so a
+    #     2-hour podcast does not flood the agent's context.
+    #   • Site-aware fallbacks — YouTube/Bilibili keep their custom UI
+    #     captions outside textTracks; the helper checks the visible
+    #     caption container as a last-resort signal.
+
+    _VIDEO_SEEK_PAUSE_JS: str = """({selector, seek, pause}) => {
+  const v = selector ? document.querySelector(selector)
+                     : [...document.querySelectorAll('video')]
+                       .find(el => el.getClientRects().length > 0);
+  if (!v) return {ok: false, reason: 'no video element found'};
+  try {
+    if (typeof seek === 'number' && isFinite(seek)) v.currentTime = seek;
+    if (pause) v.pause();
+    return {ok: true, currentTime: v.currentTime, paused: v.paused};
+  } catch (exc) {
+    return {ok: false, reason: String(exc)};
+  }
+}"""
+
+    _VIDEO_CONTEXT_JS: str = """async ({selector, max_cues}) => {
+  const fallbacks = [];
+  const v = selector ? document.querySelector(selector)
+                     : [...document.querySelectorAll('video')]
+                       .find(el => el.getClientRects().length > 0);
+  if (!v) return {error: 'no visible <video> element found on this page'};
+
+  // textTracks populate asynchronously after the player loads — cues
+  // can be empty for the first ~500-1500ms even when subtitles will
+  // eventually arrive. Poll up to 1.5s before giving up so we don't
+  // falsely report "no_text_tracks" on a still-initialising player.
+  const pickActive = () => {
+    let a = [...v.textTracks].find(t => t.mode === 'showing');
+    if (!a) a = [...v.textTracks].find(t => t.cues && t.cues.length > 0);
+    return a;
+  };
+  let waitedMs = 0;
+  let active = pickActive();
+  const deadline = Date.now() + 1500;
+  while ((!active || !active.cues || active.cues.length === 0) && Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, 100));
+    active = pickActive();
+    waitedMs = Math.min(1500, Date.now() - (deadline - 1500));
+  }
+
+  const tracks = [...v.textTracks].map(t => ({
+    kind: t.kind || '',
+    language: t.language || '',
+    label: t.label || '',
+    mode: t.mode || '',
+    cues_count: t.cues ? t.cues.length : 0,
+  }));
+
+  if (!active) fallbacks.push('no_text_tracks');
+
+  const captions = [];
+  let truncated = false;
+  if (active && active.cues) {
+    const total = active.cues.length;
+    const limit = Math.max(1, Math.min(total, max_cues || 500));
+    for (let i = 0; i < limit; i++) {
+      const c = active.cues[i];
+      const text = ((c.text || '') + '').replace(/\\s+/g, ' ').trim();
+      if (text) captions.push({t: c.startTime, text});
+    }
+    truncated = total > limit;
+  }
+
+  // Site-specific custom-UI caption containers (YouTube / Bilibili / generic).
+  let visibleCaption = '';
+  const visualSelectors = [
+    '.ytp-caption-segment',
+    '.bilibili-player-subtitle-panel-text',
+    '.bpx-player-subtitle-panel-text',
+    '[class*="subtitle"][class*="text"]',
+    '[class*="caption"][class*="text"]',
+  ];
+  for (const sel of visualSelectors) {
+    const els = [...document.querySelectorAll(sel)];
+    const text = els.map(e => (e.innerText || '').trim()).filter(Boolean).join(' ').trim();
+    if (text) { visibleCaption = text; break; }
+  }
+  if (!visibleCaption && captions.length === 0) fallbacks.push('no_visible_caption');
+
+  // Page metadata.
+  const meta = (n) => {
+    const el = document.querySelector(`meta[property="og:${n}"]`)
+            || document.querySelector(`meta[name="${n}"]`);
+    return el ? (el.getAttribute('content') || '') : '';
+  };
+  const title = (document.title || '').trim() || meta('title');
+  const description = meta('description');
+
+  return {
+    url: location.href,
+    page: {title, description},
+    video: {
+      selector: selector || 'video',
+      src: v.currentSrc || v.src || '',
+      duration_s: isFinite(v.duration) ? v.duration : 0,
+      current_time_s: v.currentTime || 0,
+      paused: !!v.paused,
+      ended: !!v.ended,
+      tracks,
+      captions,
+      captions_truncated: truncated,
+    },
+    visible_caption: visibleCaption,
+    fallbacks_used: fallbacks,
+    waited_for_cues_ms: waitedMs,
+  };
+}"""
+
+    async def _action_video_context(
+        self, params: Dict[str, Any], start: float, **kwargs: Any,
+    ) -> ToolResult:
+        """Read text context for the active <video> on the page.
+
+        Returns title, description, duration, current playback time,
+        track listing, and a capped list of caption cues.  Use this
+        BEFORE reaching for vision_query when the question is "what is
+        this video about" / "is there a section about X" / "have I
+        finished section N" — it's faster, more accurate, and consumes
+        no vision tokens.
+
+        See ``_VIDEO_CONTEXT_JS`` for the exact fields returned.
+        """
+        sess = _session
+        if sess is None:
+            return self._error(params, start, "No browser session. Call action='launch_browser' first.")
+        page = self._resolve_tab(sess, kwargs.get("tab_id"))
+        if page is None:
+            return self._error(params, start, f"Unknown tab_id: {kwargs.get('tab_id')!r}")
+
+        selector: Optional[str] = kwargs.get("selector")
+        try:
+            max_cues = int(kwargs.get("max_cues") or 500)
+        except (TypeError, ValueError):
+            max_cues = 500
+        max_cues = max(1, min(max_cues, 5000))   # hard ceiling
+
+        seek_to_s = kwargs.get("seek_to_s")
+        pause = bool(kwargs.get("pause", False))
+
+        # Optional seek + pause before reading state — used when the
+        # caller wants a specific frame for a follow-up screenshot.
+        seek_result: Optional[Dict[str, Any]] = None
+        if seek_to_s is not None or pause:
+            try:
+                seek_arg: Dict[str, Any] = {
+                    "selector": selector,
+                    "seek": float(seek_to_s) if seek_to_s is not None else None,
+                    "pause": pause,
+                }
+                seek_result = await page.evaluate(self._VIDEO_SEEK_PAUSE_JS, seek_arg)
+                # Tiny settle window so currentTime stabilises before
+                # the main read; 150 ms covers HTML5 native players.
+                await asyncio.sleep(0.15)
+            except Exception as exc:
+                self.logger.warning(
+                    f"video_context: seek/pause failed (continuing): {exc}",
+                    component="BrowserTool",
+                )
+
+        try:
+            data = await page.evaluate(
+                self._VIDEO_CONTEXT_JS,
+                {"selector": selector, "max_cues": max_cues},
+            )
+        except Exception as exc:
+            return self._error(params, start, f"video_context: page.evaluate failed: {exc}")
+
+        if not isinstance(data, dict) or data.get("error"):
+            return self._error(
+                params, start,
+                f"video_context: {data.get('error') if isinstance(data, dict) else 'no data returned'}",
+            )
+
+        if seek_result is not None:
+            data["seek_result"] = seek_result
+        return ToolResult(
+            success=True,
+            output=data,
             tool_name=self.name,
             tool_parameters=params,
             execution_time=time.time() - start,
@@ -2543,37 +3073,3 @@ class BrowserTool(BaseTool):
             tool_name=self.name, tool_parameters=params,
             execution_time=time.time() - start,
         )
-
-
-# ── Capability-gated schema mutation ─────────────────────────────────────────
-# tool_registry reads ``BrowserTool.parameter_schema`` once at registration
-# time (see tool_registry.py:1111) and caches it on the registry metadata.
-# We therefore mutate the class-level dict here, at module import — by the
-# time tool_registry calls ``register_browser_tool`` the screenshot action
-# has already been pruned for vision-less LLMs. Doing this at import keeps
-# the gate purely declarative: no per-call branches, no chance of the LLM
-# seeing the action because of a stale schema cache.
-
-def _gate_schema_for_capabilities() -> None:
-    """Drop ``screenshot`` from the schema when no vision-capable LLM exists.
-
-    The schema is mutated in place; no other action's parameters depend on
-    'path' or 'full_page', so we also remove those properties to avoid
-    confusing the LLM with parameter help for an action it cannot call.
-    Idempotent — safe to call multiple times.
-    """
-    if _vision_supported():
-        return
-    schema = BrowserTool.parameter_schema
-    props = schema.get("properties") or {}
-    actions_prop = props.get("action") or {}
-    enum_list = actions_prop.get("enum")
-    if isinstance(enum_list, list) and "screenshot" in enum_list:
-        actions_prop["enum"] = [a for a in enum_list if a != "screenshot"]
-    # 'path' and 'full_page' are screenshot-only — drop the docs so the
-    # LLM doesn't see help text for parameters it can never use.
-    props.pop("path", None)
-    props.pop("full_page", None)
-
-
-_gate_schema_for_capabilities()
