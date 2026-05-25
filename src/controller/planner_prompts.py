@@ -500,6 +500,7 @@ _PLANNER_TOOL_SELECTION_WINDOWS = """\
 | `session` | Persistent subprocess satisfying ONE of: (1) state must persist across commands (cwd / env / REPL / adb shell context) — (2) watch streaming output AND inject commands concurrently — (3) tty-bound device (serial console, picocom, minicom) — (4) user explicitly asked to "watch" / "observe" / 看着 the process live | Name which scenario (1-4) in `planner_reasoning` |
 | `browser` | Web automation: visit URL, fill form, click links, extract page content, login flows | Step text references a URL or web action |
 | `desktop` | Native Windows app automation: Notepad, Excel, File Explorer, Settings, Task Manager, Office apps | Step text references a native app or screen-level action |
+| `coding` | **Hint-only marker** — step **writes or modifies source code files** (creates new files, edits existing logic, generates a component, fixes a bug). Pure read/grep/review steps with no writes do NOT need it. Stackable with the tools above (e.g. UI feature = `["coding", "browser"]`) | Step's primary deliverable is a `.py` / `.ts` / `.tsx` / `.js` / `.jsx` / `.go` / `.rs` / `.java` / `.kt` / `.c` / `.cpp` / `.cs` / `.rb` / `.swift` / `.bat` / `.ps1` / `.sh` / `.bash` file — NOT a `.md` / `.json` / `.yaml` / `.toml` config file and NOT a read-only review |
 
 **Routing rules** (apply in order; first match wins):
 
@@ -510,25 +511,31 @@ _PLANNER_TOOL_SELECTION_WINDOWS = """\
 5. Remote interactive matching scenario (1-4)               → `tools_required: ["session"]` + set `ssh_target`
 6. Web page interaction                                     → `tools_required: ["browser"]`
 7. Native Windows app interaction                           → `tools_required: ["desktop"]`
+8. Step writes / creates / modifies source code files       → ADD `"coding"` to tools_required
+   (stackable: `["coding"]`, `["coding", "browser"]` for UI feature, `["coding", "ssh"]` for remote build)
 
 **Anti-patterns**:
   ❌ `["ssh"]` for `ssh host 'echo hi'`        — single command, use shell with `ssh host 'cmd'`
   ❌ `["session"]` without naming scenario (1-4) in `planner_reasoning`
   ❌ `["browser"]` for "extract data from a JSON URL"  — that's `shell` + `curl` + `read`
   ❌ `["desktop"]` for clicking on a web page  — that's `["browser"]`
+  ❌ `["coding"]` for editing `.md` / `.json` / `.yaml` / config files  — those are not source code
+  ❌ `["coding"]` for a read-only exploration / grep / review step with no file writes
+  ❌ Forgetting `"coding"` on a step that writes source code  — the agent loses scope discipline, comment rules, and run-the-build verification guidance
   ❌ Empty `[]` for a step that clearly needs ssh/session/browser/desktop — under-declaration costs a replan
 """
 
 _PLANNER_TOOL_SELECTION_LINUX = """\
   read · write · edit · glob · grep · shell · notebook_edit
 
-**Platform: Linux.** Only one on-demand tool exists.
+**Platform: Linux.** Two on-demand markers exist.
 
 **On-demand tools**:
 
 | Tool | Activate when | Decision signal |
 |---|---|---|
 | `ssh` | Any remote work — long batch, OR remote interaction at any duration | Set `ssh_target` too |
+| `coding` | **Hint-only marker** — step **writes or modifies source code files** (creates new files, edits existing logic, generates a component, fixes a bug). Pure read/grep/review steps with no writes do NOT need it. Stackable with `ssh` for remote builds | Step's primary deliverable is a `.py` / `.ts` / `.tsx` / `.js` / `.jsx` / `.go` / `.rs` / `.java` / `.kt` / `.c` / `.cpp` / `.cs` / `.rb` / `.swift` / `.bat` / `.ps1` / `.sh` / `.bash` file — NOT a `.md` / `.json` / `.yaml` / `.toml` config file and NOT a read-only review |
 
 **Routing rules** (apply in order; first match wins):
 
@@ -536,6 +543,8 @@ _PLANNER_TOOL_SELECTION_LINUX = """\
 2. Local interactive (REPL, adb shell, monitoring stream)    → `tools_required: []`  (decompose into `bash -c '...'` chains, `screen -dmS`, `tee` patterns, `tmux send-keys`)
 3. Remote one-shot (single command, capture stdout)          → `tools_required: []`  (use shell with `ssh host 'cmd'`)
 4. Remote long batch (≥1 minute, want job tracking)          → `tools_required: ["ssh"]` + set `ssh_target`
+5. Step writes / creates / modifies source code files        → ADD `"coding"` to tools_required
+   (stackable: `["coding"]`, `["coding", "ssh"]` for remote build/test)
 
 **Linux interactive decomposition** (when a step appears to need a persistent
 subprocess — state/streaming/tty/watch — decompose into shell idioms):
@@ -546,6 +555,9 @@ subprocess — state/streaming/tty/watch — decompose into shell idioms):
 
 **Anti-patterns**:
   ❌ `["ssh"]` for `ssh host 'echo hi'` — single command, use shell with `ssh host 'cmd'`
+  ❌ `["coding"]` for editing `.md` / `.json` / `.yaml` / config files  — those are not source code
+  ❌ `["coding"]` for a read-only exploration / grep / review step with no file writes
+  ❌ Forgetting `"coding"` on a step that writes source code  — the agent loses scope discipline, comment rules, and run-the-build verification guidance
   ❌ Empty `[]` for a step that clearly needs ssh — under-declaration costs a replan
 """
 

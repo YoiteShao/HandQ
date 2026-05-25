@@ -796,6 +796,17 @@ class FlowController:
                 component="FlowController",
             )
 
+        # Coding-mode hint provider (cross-platform, no transitive deps).
+        # Activated when planner declares "coding" in tools_required.
+        try:
+            from ..infrastructure.coding_setup import CodingContextProvider
+            self.register_step_context_provider(CodingContextProvider())
+        except ImportError as _coding_exc:
+            self.logger.debug(
+                f"CodingContextProvider not registered: {_coding_exc}",
+                component="FlowController",
+            )
+
         if not _is_windows:
             self.logger.info(
                 "Linux platform: skipping Browser/Desktop/Session provider registration",
