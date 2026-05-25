@@ -62,10 +62,12 @@ import re
 import subprocess
 import sys
 import time
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
+from urllib.parse import urlparse
 
 from .base_tool import BaseTool, ToolResult
 from ..infrastructure.browser_paths import user_browser_profile_dir
@@ -255,6 +257,160 @@ class BrowserSession:
 
 _session: Optional[BrowserSession] = None
 _session_lock = asyncio.Lock()
+
+
+# ── Public helpers for cross-tool reuse ──────────────────────────────────────
+# web_search_tool reuses the live Playwright session to do same-origin
+# REST calls (cookies + SSO already in place via the user's profile). These
+# helpers are the public contract; downstream tools must NOT import _session
+# / _session_lock directly so the singleton can be refactored later without
+# breaking callers.
+
+def is_browser_available() -> bool:
+    """True iff Playwright is importable. Used by setup providers to fail
+    fast with an actionable install hint instead of a deep stacktrace."""
+    return _PLAYWRIGHT_AVAILABLE
+
+
+@asynccontextmanager
+async def acquire_browser_lock() -> AsyncIterator["BrowserSession"]:
+    """Yield the live ``BrowserSession`` while holding the global session lock.
+
+    Raises ``RuntimeError`` if no session is launched — caller must invoke
+    ``browser.launch_browser`` first. Lock is global to the process; all
+    actions across agents and steps queue on it.
+    """
+    async with _session_lock:
+        if _session is None:
+            raise RuntimeError(
+                "browser session is not launched. Call "
+                "browser.launch_browser before reusing the browser session."
+            )
+        yield _session
+
+
+# Cap on the body returned by evaluate_fetch — mirrors _EXTRACT_MAX_CHARS so
+# the LLM context budget stays predictable across browser primitives.
+_FETCH_BODY_MAX_CHARS = 100_000
+
+
+async def evaluate_fetch(
+    session: "BrowserSession",
+    *,
+    url: str,
+    method: str = "GET",
+    headers: Optional[Dict[str, str]] = None,
+    body: Optional[str] = None,
+    same_origin: bool = True,
+    timeout_ms: int = 30_000,
+    max_body_chars: int = _FETCH_BODY_MAX_CHARS,
+) -> Dict[str, Any]:
+    """Run ``fetch()`` from a page in the live browser, returning the response.
+
+    Same-origin mode (default): a tab is navigated to the target's origin
+    first if no open tab is already there, so the browser sends cookies
+    (SameSite=Strict / Lax SSO cookies require the page origin to match
+    the request origin). Set ``same_origin=False`` to fire from whatever
+    tab happens to be in front; cross-origin fetches require the server
+    to expose CORS headers and are rare for internal APIs.
+
+    Caller MUST already hold ``_session_lock`` (use ``acquire_browser_lock``).
+
+    Returns ``{status, headers, body, url, truncated}``. On JS-side error
+    (network failure, abort, malformed URL): ``{status: 0, error: ..., ...}``.
+    """
+    parsed = urlparse(url)
+    if not parsed.scheme or not parsed.netloc:
+        raise ValueError(
+            f"evaluate_fetch: url must include scheme and host, got {url!r}"
+        )
+    target_origin = f"{parsed.scheme}://{parsed.netloc}"
+
+    tab_id = session.first_tab_id()
+    if tab_id is None:
+        page = await session.context.new_page()
+        tab_id = session.mint_tab_id()
+        session.tabs[tab_id] = page
+    else:
+        page = session.tabs[tab_id]
+
+    if same_origin:
+        current_url = page.url or ""
+        cur_parsed = urlparse(current_url)
+        cur_origin = (
+            f"{cur_parsed.scheme}://{cur_parsed.netloc}"
+            if cur_parsed.scheme and cur_parsed.netloc
+            else ""
+        )
+        if cur_origin != target_origin:
+            try:
+                await page.goto(
+                    target_origin,
+                    wait_until="domcontentloaded",
+                    timeout=timeout_ms,
+                )
+            except Exception:
+                # Origin landing page may 403 or redirect to SSO — the
+                # follow-up fetch may still succeed if the target API is
+                # public on that host. We let the caller surface the
+                # eventual fetch status.
+                pass
+
+    js = """
+        async ({url, method, headers, body, timeoutMs}) => {
+            const ctrl = new AbortController();
+            const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+            try {
+                const init = {method, credentials: 'include', signal: ctrl.signal};
+                if (headers && Object.keys(headers).length) init.headers = headers;
+                if (body !== null && body !== undefined) init.body = body;
+                const r = await fetch(url, init);
+                const text = await r.text();
+                const hdrs = {};
+                r.headers.forEach((v, k) => { hdrs[k] = v; });
+                return {status: r.status, statusText: r.statusText,
+                        url: r.url, headers: hdrs, body: text};
+            } catch (err) {
+                return {error: (err && (err.message || String(err))) || 'fetch failed',
+                        name: (err && err.name) || 'Error'};
+            } finally {
+                clearTimeout(timer);
+            }
+        }
+    """
+    raw = await page.evaluate(
+        js,
+        {
+            "url": url,
+            "method": method.upper(),
+            "headers": dict(headers) if headers else {},
+            "body": body,
+            "timeoutMs": int(timeout_ms),
+        },
+    )
+    if "error" in raw:
+        return {
+            "status": 0,
+            "headers": {},
+            "body": "",
+            "url": url,
+            "truncated": False,
+            "error": raw["error"],
+            "error_name": raw.get("name", "Error"),
+        }
+
+    text = raw.get("body") or ""
+    truncated = False
+    if len(text) > max_body_chars:
+        text = text[:max_body_chars]
+        truncated = True
+    return {
+        "status": int(raw.get("status") or 0),
+        "headers": raw.get("headers") or {},
+        "body": text,
+        "url": raw.get("url") or url,
+        "truncated": truncated,
+    }
 
 
 # ── Phase 5b: attach auto-setup helpers ──────────────────────────────────────
@@ -516,6 +672,7 @@ class BrowserTool(BaseTool):
                     "screenshot",
                     "vision_query",
                     "video_context",
+                    "fetch_json",
                     "request_user_login",
                     "new_tab",
                     "close_tab",
@@ -525,7 +682,10 @@ class BrowserTool(BaseTool):
                     "browser.attach_enabled in handq_config.yaml — the action "
                     "fails with an actionable error when the switch is off. "
                     "Prefer 'snapshot' over repeated 'extract' probes when you "
-                    "need to discover what is interactable on a page."
+                    "need to discover what is interactable on a page. Use "
+                    "'fetch_json' to call a REST API as the logged-in user "
+                    "(cookies + SSO are reused) without leaving the DOM in "
+                    "an unexpected state."
                 ),
             },
             "tab_id": {
@@ -747,6 +907,49 @@ class BrowserTool(BaseTool):
                     "specific frame without it advancing."
                 ),
             },
+            "method": {
+                "type": "string",
+                "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"],
+                "description": (
+                    "[fetch_json] HTTP method. Default GET. Most internal "
+                    "search APIs are GET; POST is occasionally needed for "
+                    "Atlassian's CQL endpoint when the query is too long "
+                    "for a URL parameter."
+                ),
+            },
+            "headers": {
+                "type": "object",
+                "description": (
+                    "[fetch_json] Optional request headers as a flat "
+                    "{name: value} object. Common useful headers: "
+                    "{'Accept': 'application/json'} for REST endpoints, "
+                    "{'X-Atlassian-Token': 'no-check'} for Jira DC POSTs. "
+                    "Cookies are NOT a header here — they are added "
+                    "automatically because the request runs in the page "
+                    "context with credentials: 'include'."
+                ),
+            },
+            "body": {
+                "type": "string",
+                "description": (
+                    "[fetch_json] Optional request body string. Caller is "
+                    "responsible for serialisation (e.g. json.dumps) and "
+                    "for setting a matching Content-Type header. Ignored "
+                    "for GET / HEAD."
+                ),
+            },
+            "same_origin": {
+                "type": "boolean",
+                "description": (
+                    "[fetch_json] When true (default), the tool ensures "
+                    "an open tab is on the URL's origin before firing the "
+                    "fetch — this is required for SSO cookies to be sent "
+                    "(SameSite=Strict / Lax). Set false to fire from "
+                    "whatever tab is in front; only useful when the API "
+                    "exposes CORS for cross-origin reads, which is rare "
+                    "on internal Qualcomm endpoints."
+                ),
+            },
         },
         "required": ["action"],
         "additionalProperties": False,
@@ -786,6 +989,7 @@ class BrowserTool(BaseTool):
             "screenshot":         self._action_screenshot,
             "vision_query":       self._action_vision_query,
             "video_context":      self._action_video_context,
+            "fetch_json":         self._action_fetch_json,
             "request_user_login": self._action_request_user_login,
             "new_tab":            self._action_new_tab,
             "close_tab":          self._action_close_tab,
@@ -2692,6 +2896,102 @@ class BrowserTool(BaseTool):
             output=data,
             tool_name=self.name,
             tool_parameters=params,
+            execution_time=time.time() - start,
+        )
+
+    # ── fetch_json ────────────────────────────────────────────────────────────
+
+    async def _action_fetch_json(
+        self, params: Dict[str, Any], start: float, **kwargs: Any,
+    ) -> ToolResult:
+        """Run an authenticated ``fetch()`` from inside the browser.
+
+        Use this to call internal REST APIs without leaving the DOM in an
+        unexpected state — cookies and SSO tokens from the persistent
+        profile are reused automatically. ``same_origin=True`` (default)
+        navigates a tab to the URL's origin first so SameSite-restricted
+        auth cookies are sent.
+
+        The tool runs inside the global ``_session_lock`` (acquired by
+        ``execute``), so direct callers reusing ``acquire_browser_lock``
+        must not call this method.
+        """
+        global _session
+
+        url = (kwargs.get("url") or "").strip()
+        if not url:
+            return self._error(
+                params, start,
+                "fetch_json requires 'url' (absolute, with scheme).",
+            )
+        if _session is None:
+            return self._error(
+                params, start,
+                "fetch_json: no browser session. "
+                "Call action='launch_browser' first.",
+            )
+
+        method = (kwargs.get("method") or "GET").upper()
+        headers = kwargs.get("headers") or {}
+        body = kwargs.get("body")
+        same_origin = bool(kwargs.get("same_origin", True))
+        timeout_ms = int(kwargs.get("timeout_ms") or _DEFAULT_NAV_TIMEOUT_MS)
+
+        if not isinstance(headers, dict):
+            return self._error(
+                params, start,
+                f"fetch_json: 'headers' must be a flat object, got {type(headers).__name__}.",
+            )
+
+        try:
+            result = await evaluate_fetch(
+                _session,
+                url=url,
+                method=method,
+                headers=headers,
+                body=body,
+                same_origin=same_origin,
+                timeout_ms=timeout_ms,
+            )
+        except ValueError as exc:
+            return self._error(params, start, f"fetch_json: {exc}")
+        except Exception as exc:
+            self.logger.error(
+                f"fetch_json url={url!r} raised: {exc}",
+                component="BrowserTool", exc_info=True,
+            )
+            return self._error(params, start, f"fetch_json failed: {exc}")
+
+        _session.last_used = time.time()
+
+        # JS-side error (network failure, timeout, malformed URL inside fetch).
+        if result.get("error"):
+            return ToolResult(
+                success=False,
+                output=None,
+                tool_name=self.name,
+                tool_parameters=params,
+                error=(
+                    f"fetch_json transport error ({result.get('error_name', 'Error')}): "
+                    f"{result['error']}"
+                ),
+                execution_time=time.time() - start,
+            )
+
+        status = int(result.get("status") or 0)
+        ok = 200 <= status < 400
+        return ToolResult(
+            success=ok,
+            output={
+                "status": status,
+                "url": result.get("url") or url,
+                "headers": result.get("headers") or {},
+                "body": result.get("body") or "",
+                "truncated": bool(result.get("truncated")),
+            },
+            tool_name=self.name,
+            tool_parameters=params,
+            error=None if ok else f"HTTP {status}",
             execution_time=time.time() - start,
         )
 

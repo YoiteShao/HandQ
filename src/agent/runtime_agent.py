@@ -1050,11 +1050,12 @@ class RuntimeAgent:
         # Note: desktop is handled by the task-scoped block above and is
         # intentionally absent here.
         tool_switch_map = {
-            "write":   "tool_write",
-            "edit":    "tool_edit",
-            "bash":    "tool_bash",
-            "shell":   "tool_shell",
-            "browser": "tool_browser",
+            "write":      "tool_write",
+            "edit":       "tool_edit",
+            "bash":       "tool_bash",
+            "shell":      "tool_shell",
+            "browser":    "tool_browser",
+            "web_search": "tool_web_search",
         }
         if tool_name in tool_switch_map:
             switch_name = tool_switch_map[tool_name]

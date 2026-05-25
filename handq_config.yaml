@@ -59,6 +59,11 @@ interaction_switches:
       because input actions affect any focused application, not just the agent's own
       browser. Sensitive windows (password managers, banking) are always refused regardless
       of this switch.
+  tool_web_search:
+    auto_approve: true
+    description: Internal web search (Confluence / Jira / SharePoint / orbit) via
+      the authenticated browser session. Read-only — returns title/url/snippet
+      lists. Cookies and SSO are reused from the persistent browser profile.
   high_risk:
     auto_approve: true
     description: Control high-risk operation auto-execution
@@ -132,6 +137,28 @@ desktop:
   sensitive_window_patterns:
   - (?i)bitwarden|1password|keepass|lastpass|dashlane
   - (?i)bank|wallet|crypto|trading
+web_search:
+  default_limit: 10
+  max_limit: 25
+  snippet_max_chars: 300
+  sources:
+    confluence:
+      enabled: true
+      base_url: https://qualcomm-confluence.atlassian.net
+      api_path: /wiki/rest/api/search
+    jira:
+      enabled: true
+      base_url: https://jira-dc.qualcomm.com
+      api_path: /jira/rest/api/2/search
+    sharepoint:
+      enabled: true
+      base_url: https://qualcomm.sharepoint.com
+      api_path: /_api/search/query
+    orbit:
+      enabled: true
+      base_url: https://orbit
+      search_url_template: 'https://orbit/search?query={q}&pagesize=10'
+      result_selector: 'a[href*="/CR/"]'
 ocr:
   engine: rapidocr
   lang: ch

@@ -15,6 +15,7 @@ from .grep_tool import GrepTool
 from .notebook_edit_tool import NotebookEditTool
 from .browser_tool import BrowserTool
 from .desktop_tool import DesktopTool
+from .web_search_tool import WebSearchTool
 
 _IS_WINDOWS = sys.platform == "win32"
 
@@ -72,6 +73,7 @@ class ToolRegistry:
     SESSION = "session"
     BROWSER = "browser"
     DESKTOP = "desktop"
+    WEB_SEARCH = "web_search"
 
     _tools: Dict[str, ToolMetadata] = {}
     _initialized = False
@@ -1512,6 +1514,81 @@ EXAMPLES
         user for guidance.""",
                 parameter_schema=DesktopTool.parameter_schema,
                 tool_class=DesktopTool,
+                on_demand=True,
+            )
+
+        # Register WEB_SEARCH tool. Windows-only — depends on browser_tool
+        # whose Playwright session is Windows-tested. on_demand=True so it
+        # only enters the LLM tool list when WebSearchContextProvider
+        # activates it (mirrors the browser/desktop pattern).
+        if _IS_WINDOWS:
+            cls._tools[cls.WEB_SEARCH] = ToolMetadata(
+                name=cls.WEB_SEARCH,
+                description=(
+                    "Search across Qualcomm internal sources "
+                    "(Confluence Cloud, Jira DC, SharePoint Online, orbit) "
+                    "via the authenticated browser session. Cookies + SSO "
+                    "are reused from the persistent browser profile so the "
+                    "user logs in once per source and HandQ inherits the "
+                    "cookie thereafter. Returns a list of normalised "
+                    "(title, url, snippet, source, last_modified) hits — "
+                    "use browser.navigate + extract to read full documents."
+                ),
+                usage_guide="""\
+WHEN TO USE
+  - Step text says "search Confluence/Jira/SharePoint/orbit/intranet for X"
+  - Step text says "find internal docs / wiki page / ticket about X"
+  - Anything that looks like cross-source enterprise search
+
+WHEN NOT TO USE
+  Public web search (Google / DuckDuckGo)        → browser navigate + extract
+  Already know the URL                            → browser navigate
+  Read a specific Confluence page / Jira ticket   → browser navigate + extract
+  Email / calendar lookup                         → email tool
+
+WORKFLOW
+  1. Ensure browser is launched. browser.launch_browser is idempotent — if
+     in doubt, call it before every web_search.
+  2. action='search', source='confluence' (Phase 2 only fully wires this),
+     query='free-text or CQL/JQL', limit=10. Default limit 10, hard cap 25
+     (clamped from web_search.max_limit in handq_config.yaml).
+  3. Hits arrive snippet-truncated to ~300 chars. The agent CHOOSES which
+     hit to dig into and calls browser.navigate to read the full document.
+     Auto-fetching full bodies here is forbidden — search is for ranking,
+     navigation is for reading.
+  4. LOGIN RECOVERY: if the result error reads
+     '<source> requires login (status=401|403|3xx)':
+       a. browser.navigate url='<source's base_url>'
+       b. browser.request_user_login reason='auth <source>',
+          success_url_pattern='<base_url>'
+       c. After user clicks Approve, retry the same search call.
+     Cookies persist across HandQ sessions, so this dance is at most once
+     per source until cookies expire on the server side.
+
+SOURCES (all four wired)
+  - confluence  : qualcomm-confluence.atlassian.net (Atlassian Cloud REST)
+                  Query supports CQL ('text ~ "..."', 'space=ENG AND ...')
+                  or plain text (auto-wrapped in CQL text~).
+  - jira        : jira-dc.qualcomm.com (Jira Data Center REST)
+                  Query supports JQL ('project = ANDR AND text ~ "..."')
+                  or plain text (auto-wrapped in JQL text~).
+  - sharepoint  : qualcomm.sharepoint.com (SharePoint Online Search REST)
+                  Plain free-text query — KQL keywords (filetype:pdf,
+                  author:"...") work too.
+  - orbit       : intranet portal (DOM-extract fallback — no JSON API).
+                  Tune web_search.sources.orbit.result_selector in
+                  handq_config.yaml when the portal markup shifts.
+
+EXAMPLES
+  GOOD: action='search', source='confluence', query='power management release notes'
+  GOOD: action='search', source='confluence', query='space=ANDROID AND text ~ "boot trace"', limit=20
+  BAD:  action='search', source='confluence', query='everything about X', limit=200
+        (hard cap 25)
+  BAD:  Use web_search to read a known URL → use browser.navigate
+  BAD:  Loop web_search to scrape 100 results → fetch via search once, then
+        navigate the top hits agent picks""",
+                parameter_schema=WebSearchTool.parameter_schema,
+                tool_class=WebSearchTool,
                 on_demand=True,
             )
 

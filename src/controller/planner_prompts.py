@@ -500,6 +500,7 @@ _PLANNER_TOOL_SELECTION_WINDOWS = """\
 | `session` | Persistent subprocess satisfying ONE of: (1) state must persist across commands (cwd / env / REPL / adb shell context) — (2) watch streaming output AND inject commands concurrently — (3) tty-bound device (serial console, picocom, minicom) — (4) user explicitly asked to "watch" / "observe" / 看着 the process live | Name which scenario (1-4) in `planner_reasoning` |
 | `browser` | Web automation: visit URL, fill form, click links, extract page content, login flows | Step text references a URL or web action |
 | `desktop` | Native Windows app automation: Notepad, Excel, File Explorer, Settings, Task Manager, Office apps | Step text references a native app or screen-level action |
+| `web_search` | Search Qualcomm internal sources (Confluence / Jira / SharePoint / orbit). Stackable with `browser` (browser must be launched). Cookies + SSO are reused from the persistent browser profile | Step text says "搜 / search / find" + an internal source name, or "查内网/wiki/Confluence/Jira" |
 | `coding` | **Hint-only marker** — step **writes or modifies source code files** (creates new files, edits existing logic, generates a component, fixes a bug). Pure read/grep/review steps with no writes do NOT need it. Stackable with the tools above (e.g. UI feature = `["coding", "browser"]`) | Step's primary deliverable is a `.py` / `.ts` / `.tsx` / `.js` / `.jsx` / `.go` / `.rs` / `.java` / `.kt` / `.c` / `.cpp` / `.cs` / `.rb` / `.swift` / `.bat` / `.ps1` / `.sh` / `.bash` file — NOT a `.md` / `.json` / `.yaml` / `.toml` config file and NOT a read-only review |
 
 **Routing rules** (apply in order; first match wins):
@@ -511,18 +512,21 @@ _PLANNER_TOOL_SELECTION_WINDOWS = """\
 5. Remote interactive matching scenario (1-4)               → `tools_required: ["session"]` + set `ssh_target`
 6. Web page interaction                                     → `tools_required: ["browser"]`
 7. Native Windows app interaction                           → `tools_required: ["desktop"]`
-8. Step writes / creates / modifies source code files       → ADD `"coding"` to tools_required
+8. Internal search across Confluence/Jira/SharePoint/orbit  → `tools_required: ["browser", "web_search"]`  (web_search reuses the browser session for SSO cookies)
+9. Step writes / creates / modifies source code files       → ADD `"coding"` to tools_required
    (stackable: `["coding"]`, `["coding", "browser"]` for UI feature, `["coding", "ssh"]` for remote build)
 
 **Anti-patterns**:
   ❌ `["ssh"]` for `ssh host 'echo hi'`        — single command, use shell with `ssh host 'cmd'`
   ❌ `["session"]` without naming scenario (1-4) in `planner_reasoning`
   ❌ `["browser"]` for "extract data from a JSON URL"  — that's `shell` + `curl` + `read`
+  ❌ `["browser"]` for "search Confluence/Jira/SharePoint"  — that's `web_search`; navigating + extracting search-result HTML wastes 5-10k tokens vs the clean JSON web_search returns
+  ❌ `["web_search"]` without `"browser"`  — web_search reuses the browser session and will fail with "no session"
   ❌ `["desktop"]` for clicking on a web page  — that's `["browser"]`
   ❌ `["coding"]` for editing `.md` / `.json` / `.yaml` / config files  — those are not source code
   ❌ `["coding"]` for a read-only exploration / grep / review step with no file writes
   ❌ Forgetting `"coding"` on a step that writes source code  — the agent loses scope discipline, comment rules, and run-the-build verification guidance
-  ❌ Empty `[]` for a step that clearly needs ssh/session/browser/desktop — under-declaration costs a replan
+  ❌ Empty `[]` for a step that clearly needs ssh/session/browser/desktop/web_search — under-declaration costs a replan
 """
 
 _PLANNER_TOOL_SELECTION_LINUX = """\
