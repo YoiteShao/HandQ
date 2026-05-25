@@ -1,39 +1,19 @@
 # -*- coding: utf-8 -*-
-"""BrowserContextProvider — activate the browser tool by step keywords.
+"""BrowserContextProvider — prepare browser profile when Planner declares it.
 
-Mirrors :class:`SSHContextProvider` but the model is simpler:
+Activation is purely Planner-driven: when "browser" appears in
+step.tools_required, FlowController invokes prepare() to verify playwright
+availability, ensure the persistent profile directory exists, and return
+the workflow hint. There is no keyword scan.
 
-* No per-target identity (browser is process-wide; one persistent profile
-  shared across all FlowController sessions in this process). Memory is
-  keyed by a constant ``"default"`` slot — Phase 5 may add attach-mode
-  probe slots beside it.
-* No credential prompting. Authentication is deferred to
-  ``request_user_login`` (Phase 3) when an actual login wall is hit.
-* No I/O in :meth:`matches`. Just a keyword/URL scan over the step text.
-
-Lifecycle wired into FlowController:
-
-1. Before every step, ``matches(step)`` runs.
-2. When True, ``prepare(step, im, memory)`` returns a hint string and
-   ``extra_tool_names()`` returns ``["browser"]`` so the runtime agent
-   gets the on-demand tool added to its LLM call.
-3. The hint is appended to ``effective_goal`` so the LLM sees
-   "Tool 'browser' is available, here is how to use it.".
-4. Memory caches a ``"prepared": True`` flag so subsequent steps in the
-   same task get a brief reminder instead of the full workflow guide
-   (mirrors SSH progressive disclosure).
-
-Windows-only: :func:`is_windows` from :mod:`browser_paths` gates the
-provider — on non-Windows hosts it never matches, so the browser tool
-remains hidden from the LLM (the tool itself is also not registered
-on non-Windows; this is belt-and-suspenders).
+Windows-only: the browser tool is registered Windows-only in ToolRegistry,
+and FlowController only registers this provider on Windows.
 """
 from __future__ import annotations
 
-import re
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Optional
 
-from .browser_paths import is_windows, user_browser_profile_dir
+from .browser_paths import user_browser_profile_dir
 from .logger import get_logger
 from .step_context_provider import StepContextProvider
 
@@ -41,26 +21,6 @@ if TYPE_CHECKING:
     from ..controller.interaction_manager import InteractionManager
     from .memory import Memory
     from ..models.plan import Step
-
-
-# Keyword set deliberately conservative to avoid false positives like
-# "open the file" / "click <button name in CLI tool>". A bare "click"
-# without context is too vague — we require pairs ("click link",
-# "click button") or domain-specific phrases ("登录" / "网站").
-_BROWSER_KEYWORDS = frozenset({
-    # English — multi-word phrases reduce false positives
-    "browser", "website", "webpage", "navigate to", "go to https",
-    "log in to", "login to", "click link", "click button",
-    # Single-word terms that strongly imply web context
-    "url",
-    # Chinese
-    "网页", "网站", "浏览器", "登录", "网址", "链接",
-    "打开网页", "打开网站",
-})
-
-# Strong signal: any URL in the step text. Matches https://example.com
-# but NOT a bare hostname so file paths like /tmp/example.com don't trip.
-_URL_RE = re.compile(r"https?://[^\s<>\"']+", re.IGNORECASE)
 
 
 def _build_full_hint(profile_dir: str, attach_enabled: bool) -> str:
@@ -118,43 +78,20 @@ def _build_brief_hint() -> str:
 
 
 class BrowserContextProvider(StepContextProvider):
-    """Activate the browser tool when a step looks like it needs web automation.
+    """Prepare the browser tool's persistent profile when the Planner declares it.
 
-    Attaches as a default StepContextProvider in :class:`FlowController` so
-    every step is screened. Cheap (keyword + regex scan); no I/O until
-    :meth:`prepare` is called.
+    No keyword scanning — activation is purely declaration-driven via
+    step.tools_required. Cheap setup (mkdir + memory cache lookup); first
+    invocation per task emits the full workflow hint, subsequent invocations
+    emit the brief reminder.
     """
 
     def __init__(self) -> None:
         self.logger = get_logger()
 
-    def matches(self, step: "Step") -> bool:
-        # Belt-and-suspenders: the tool itself is registered Windows-only,
-        # and so is this provider's activation. Non-Windows hosts never
-        # see browser actions — even if an external StepContextProvider
-        # registry tried to enable us.
-        if not is_windows():
-            return False
-
-        text = f"{step.goal} {step.description}".lower()
-        for kw in _BROWSER_KEYWORDS:
-            if kw in text:
-                self.logger.debug(
-                    f"BrowserContextProvider matched step {step.step_id!r} "
-                    f"via keyword: {kw!r}",
-                    component="BrowserContextProvider",
-                )
-                return True
-        if _URL_RE.search(text):
-            self.logger.debug(
-                f"BrowserContextProvider matched step {step.step_id!r} via URL pattern",
-                component="BrowserContextProvider",
-            )
-            return True
-        return False
-
-    def extra_tool_names(self) -> List[str]:
-        return ["browser"]
+    @property
+    def tool_name(self) -> str:
+        return "browser"
 
     async def prepare(
         self,
@@ -211,10 +148,8 @@ class BrowserContextProvider(StepContextProvider):
                 component="BrowserContextProvider",
             )
 
-        # Progressive disclosure mirrors SSH: full guide on first activation
-        # in this task, brief reminder thereafter. The brief reminder still
-        # tells the agent the tool exists and that prior cookies are alive,
-        # but skips the multi-line workflow it has already seen.
+        # Progressive disclosure: full guide on first activation in this task,
+        # brief reminder thereafter.
         cached = memory.get_browser_context("default")
         if cached and cached.get("prepared"):
             return _build_brief_hint()

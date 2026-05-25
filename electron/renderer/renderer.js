@@ -809,6 +809,57 @@
         closePopover();
     });
 
+    // ── Activity popover proportional resize (handle at bottom-left) ──────
+    (function initActivityResize() {
+        const handle = document.getElementById('activity-resize-handle');
+        if (!handle || !activityPopover) return;
+        let resizing = false, startX, startY, startW, startH, aspect;
+
+        handle.addEventListener('mousedown', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            resizing = true;
+            startX = e.clientX;
+            startY = e.clientY;
+            startW = activityPopover.offsetWidth;
+            startH = activityPopover.offsetHeight;
+            aspect = startW / startH;
+            document.body.style.userSelect = 'none';
+        });
+
+        document.addEventListener('mousemove', (e) => {
+            if (!resizing) return;
+            // Dragging bottom-left handle: left decreases X → width grows,
+            // down increases Y → height grows. Use the larger delta to drive
+            // proportional scaling.
+            const dx = startX - e.clientX; // positive = dragged left = bigger
+            const dy = e.clientY - startY; // positive = dragged down = bigger
+            const delta = Math.abs(dx) > Math.abs(dy) ? dx : dy * aspect / (startH / startW);
+            let newW = startW + delta;
+            let newH = newW / aspect;
+
+            // Clamp to minimum
+            if (newW < 320) { newW = 320; newH = newW / aspect; }
+            if (newH < 200) { newH = 200; newW = newH * aspect; }
+
+            // Clamp to app window size (can't exceed viewport)
+            const maxW = window.innerWidth - 28;
+            const maxH = window.innerHeight - 80;
+            if (newW > maxW) { newW = maxW; newH = newW / aspect; }
+            if (newH > maxH) { newH = maxH; newW = newH * aspect; }
+
+            activityPopover.style.width = Math.round(newW) + 'px';
+            activityPopover.style.maxHeight = Math.round(newH) + 'px';
+        });
+
+        document.addEventListener('mouseup', () => {
+            if (resizing) {
+                resizing = false;
+                document.body.style.userSelect = '';
+            }
+        });
+    })();
+
     function formatToolParams(params) {
         if (params === undefined || params === null) return '';
         if (typeof params === 'string') return params;
@@ -1238,6 +1289,351 @@
         }
     });
 
+    // ── Interactive Session Terminal Panel (xterm.js) ───────────────────────────
+    //
+    // Displays a real-time terminal for each interactive session. Uses xterm.js
+    // to render ANSI output, with tabs for multiple concurrent sessions.
+
+    const _sessionTerminals = new Map(); // session_id → {terminal, fitAddon, command, container, tab}
+    let _terminalPanelEl = null;
+    let _terminalHeaderEl = null;
+    let _terminalTabsEl = null;
+    let _terminalBodyEl = null;
+    let _activeSessionId = null;
+    let _terminalMinimized = false;
+
+    function ensureTerminalPanel() {
+        if (_terminalPanelEl) return;
+        _terminalPanelEl = document.createElement('div');
+        _terminalPanelEl.className = 'terminal-panel hidden';
+
+        // Header (draggable)
+        _terminalHeaderEl = document.createElement('div');
+        _terminalHeaderEl.className = 'terminal-panel-header';
+
+        _terminalTabsEl = document.createElement('div');
+        _terminalTabsEl.className = 'terminal-tabs';
+
+        const controls = document.createElement('div');
+        controls.className = 'terminal-panel-controls';
+
+        const btnMin = document.createElement('button');
+        btnMin.type = 'button';
+        btnMin.title = 'Minimize';
+        btnMin.textContent = '―';
+        btnMin.addEventListener('click', toggleTerminalMinimize);
+
+        const btnHide = document.createElement('button');
+        btnHide.type = 'button';
+        btnHide.className = 'terminal-btn-close';
+        btnHide.title = 'Close';
+        btnHide.textContent = '×';
+        btnHide.addEventListener('click', hideTerminalPanel);
+
+        controls.appendChild(btnMin);
+        controls.appendChild(btnHide);
+        _terminalHeaderEl.appendChild(_terminalTabsEl);
+        _terminalHeaderEl.appendChild(controls);
+
+        // Body
+        _terminalBodyEl = document.createElement('div');
+        _terminalBodyEl.className = 'terminal-panel-body';
+
+        // Resize handle
+        const resizeHandle = document.createElement('div');
+        resizeHandle.className = 'terminal-resize-handle';
+
+        _terminalPanelEl.appendChild(_terminalHeaderEl);
+        _terminalPanelEl.appendChild(_terminalBodyEl);
+        _terminalPanelEl.appendChild(resizeHandle);
+        document.body.appendChild(_terminalPanelEl);
+
+        // Re-fit active terminal on resize
+        const ro = new ResizeObserver(() => {
+            const entry = _sessionTerminals.get(_activeSessionId);
+            if (entry) requestAnimationFrame(() => entry.fitAddon.fit());
+        });
+        ro.observe(_terminalBodyEl);
+
+        // Drag-to-move via header
+        initPanelDrag(_terminalHeaderEl, _terminalPanelEl);
+        // Drag-to-resize via handle
+        initPanelResize(resizeHandle, _terminalPanelEl, _terminalBodyEl);
+    }
+
+    function createSessionTerminal(sessionId, command, description) {
+        ensureTerminalPanel();
+        _terminalPanelEl.classList.remove('hidden');
+        if (_terminalMinimized) {
+            _terminalMinimized = false;
+            _terminalPanelEl.classList.remove('minimized');
+        }
+
+        const container = document.createElement('div');
+        container.className = 'terminal-container';
+        container.dataset.session = sessionId;
+        _terminalBodyEl.appendChild(container);
+
+        const terminal = new window.XTermLib.Terminal({
+            fontSize: 15,
+            fontFamily: '"SF Mono", ui-monospace, Menlo, Monaco, "Cascadia Mono", Consolas, "Liberation Mono", monospace',
+            theme: {
+                background: '#1e1e2e',
+                foreground: '#cdd6f4',
+                cursor: '#89b4fa',
+                selectionBackground: '#45475a',
+                black: '#45475a',
+                red: '#f38ba8',
+                green: '#a6e3a1',
+                yellow: '#f9e2af',
+                blue: '#89b4fa',
+                magenta: '#cba6f7',
+                cyan: '#94e2d5',
+                white: '#bac2de',
+            },
+            scrollback: 5000,
+            convertEol: true,
+            cursorBlink: false,
+            cursorStyle: 'underline',
+            disableStdin: true,
+            allowProposedApi: true,
+        });
+        const fitAddon = new window.XTermLib.FitAddon();
+        terminal.loadAddon(fitAddon);
+        terminal.open(container);
+
+        // Tab button
+        const tab = document.createElement('button');
+        tab.type = 'button';
+        tab.className = 'terminal-tab';
+        tab.dataset.session = sessionId;
+        const dot = document.createElement('span');
+        dot.className = 'tab-dot';
+        tab.appendChild(dot);
+        const label = document.createTextNode(
+            truncate(description || command || sessionId, 20)
+        );
+        tab.appendChild(label);
+        const tabClose = document.createElement('span');
+        tabClose.className = 'tab-close';
+        tabClose.textContent = '×';
+        tabClose.addEventListener('click', (e) => {
+            e.stopPropagation();
+            removeSessionTerminal(sessionId);
+        });
+        tab.appendChild(tabClose);
+        tab.addEventListener('click', () => switchToSession(sessionId));
+        _terminalTabsEl.appendChild(tab);
+
+        _sessionTerminals.set(sessionId, {
+            terminal, fitAddon, command, container, tab,
+        });
+
+        switchToSession(sessionId);
+    }
+
+    function destroySessionTerminal(sessionId) {
+        removeSessionTerminal(sessionId);
+    }
+
+    function switchToSession(sessionId) {
+        _activeSessionId = sessionId;
+        for (const [id, entry] of _sessionTerminals) {
+            const isActive = id === sessionId;
+            entry.container.classList.toggle('active', isActive);
+            entry.tab.classList.toggle('active', isActive);
+        }
+        const entry = _sessionTerminals.get(sessionId);
+        if (entry) {
+            requestAnimationFrame(() => entry.fitAddon.fit());
+        }
+    }
+
+    function writeSessionData(sessionId, text) {
+        const entry = _sessionTerminals.get(sessionId);
+        if (entry) entry.terminal.write(text);
+    }
+
+    function writeSessionInput(sessionId, text) {
+        const entry = _sessionTerminals.get(sessionId);
+        if (!entry) return;
+        entry.terminal.write('\x1b[32m$ ' + text + '\x1b[0m\r\n');
+    }
+
+    function toggleTerminalMinimize() {
+        _terminalMinimized = !_terminalMinimized;
+        _terminalPanelEl.classList.toggle('minimized', _terminalMinimized);
+        if (_terminalMinimized) {
+            _terminalPanelEl._savedTop = _terminalPanelEl.style.top;
+            _terminalPanelEl._savedLeft = _terminalPanelEl.style.left;
+            _terminalPanelEl._savedWidth = _terminalPanelEl.style.width;
+            _terminalPanelEl._savedHeight = _terminalPanelEl.style.height;
+            _terminalPanelEl.style.top = 'auto';
+            _terminalPanelEl.style.bottom = '80px';
+            _terminalPanelEl.style.left = _terminalPanelEl._savedLeft || '16px';
+            _terminalPanelEl.style.right = 'auto';
+            _terminalPanelEl.style.width = '';
+            _terminalPanelEl.style.height = '';
+        } else {
+            _terminalPanelEl.style.bottom = 'auto';
+            _terminalPanelEl.style.top = _terminalPanelEl._savedTop || '52px';
+            _terminalPanelEl.style.left = _terminalPanelEl._savedLeft || '16px';
+            _terminalPanelEl.style.right = 'auto';
+            _terminalPanelEl.style.width = _terminalPanelEl._savedWidth || '';
+            _terminalPanelEl.style.height = _terminalPanelEl._savedHeight || '';
+            const entry = _sessionTerminals.get(_activeSessionId);
+            if (entry) requestAnimationFrame(() => entry.fitAddon.fit());
+        }
+    }
+
+    function hideTerminalPanel() {
+        if (_terminalPanelEl) _terminalPanelEl.classList.add('hidden');
+    }
+
+    function showTerminalPanel() {
+        if (_terminalPanelEl) {
+            _terminalPanelEl.classList.remove('hidden');
+            if (_terminalMinimized) {
+                _terminalMinimized = false;
+                _terminalPanelEl.classList.remove('minimized');
+            }
+            const entry = _sessionTerminals.get(_activeSessionId);
+            if (entry) requestAnimationFrame(() => entry.fitAddon.fit());
+        }
+    }
+
+    function updatePanelCloseVisibility() {
+        if (!_terminalPanelEl) return;
+        const hasAlive = [..._sessionTerminals.values()].some(
+            e => !e.tab.classList.contains('dead')
+        );
+        _terminalPanelEl.classList.toggle('has-alive', hasAlive);
+    }
+
+    function removeSessionTerminal(sessionId) {
+        const entry = _sessionTerminals.get(sessionId);
+        if (!entry) return;
+        entry.terminal.dispose();
+        entry.container.remove();
+        entry.tab.remove();
+        _sessionTerminals.delete(sessionId);
+        if (_activeSessionId === sessionId) {
+            const next = _sessionTerminals.keys().next().value || null;
+            if (next) {
+                switchToSession(next);
+            } else {
+                _activeSessionId = null;
+                _terminalPanelEl.classList.add('hidden');
+            }
+        }
+    }
+
+    // ── Drag to move (clamped to window boundaries) ─────────────────────────
+
+    function initPanelDrag(handle, panel) {
+        let dragging = false, startX, startY, origLeft, origTop;
+
+        function clampPosition(left, top) {
+            const w = panel.offsetWidth;
+            const h = panel.offsetHeight;
+            return {
+                left: Math.max(0, Math.min(left, window.innerWidth - w)),
+                top: Math.max(0, Math.min(top, window.innerHeight - h)),
+            };
+        }
+
+        handle.addEventListener('mousedown', (e) => {
+            if (e.target.closest('button') || e.target.closest('.tab-close')) return;
+            dragging = true;
+            startX = e.clientX;
+            startY = e.clientY;
+            const rect = panel.getBoundingClientRect();
+            origLeft = rect.left;
+            origTop = rect.top;
+            e.preventDefault();
+        });
+
+        document.addEventListener('mousemove', (e) => {
+            if (!dragging) return;
+            const dx = e.clientX - startX;
+            const dy = e.clientY - startY;
+            const clamped = clampPosition(origLeft + dx, origTop + dy);
+            panel.style.left = clamped.left + 'px';
+            panel.style.top = clamped.top + 'px';
+            panel.style.right = 'auto';
+            panel.style.bottom = 'auto';
+        });
+
+        document.addEventListener('mouseup', () => { dragging = false; });
+
+        window.addEventListener('resize', () => {
+            if (panel.classList.contains('hidden')) return;
+            const rect = panel.getBoundingClientRect();
+            const clamped = clampPosition(rect.left, rect.top);
+            panel.style.left = clamped.left + 'px';
+            panel.style.top = clamped.top + 'px';
+        });
+    }
+
+    // ── Drag to resize (clamped to window boundaries) ─────────────────────
+
+    function initPanelResize(handle, panel, body) {
+        let resizing = false, startX, startY, startW, startH;
+
+        handle.addEventListener('mousedown', (e) => {
+            resizing = true;
+            startX = e.clientX;
+            startY = e.clientY;
+            startW = panel.offsetWidth;
+            startH = panel.offsetHeight;
+            e.preventDefault();
+        });
+
+        document.addEventListener('mousemove', (e) => {
+            if (!resizing) return;
+            const rect = panel.getBoundingClientRect();
+            const maxW = window.innerWidth - rect.left;
+            const maxH = window.innerHeight - rect.top;
+            const newW = Math.max(360, Math.min(startW + (e.clientX - startX), maxW));
+            const newH = Math.max(200, Math.min(startH + (e.clientY - startY), maxH));
+            panel.style.width = newW + 'px';
+            panel.style.height = newH + 'px';
+        });
+
+        document.addEventListener('mouseup', () => {
+            if (resizing) {
+                resizing = false;
+                const entry = _sessionTerminals.get(_activeSessionId);
+                if (entry) requestAnimationFrame(() => entry.fitAddon.fit());
+            }
+        });
+    }
+
+    function handleSessionEvent(eventName, data) {
+        if (eventName === 'session_opened') {
+            createSessionTerminal(data.session_id, data.command, data.description);
+            pushActivity('⬡', 'Session opened', data.command);
+            updatePanelCloseVisibility();
+        } else if (eventName === 'session_data') {
+            writeSessionData(data.session_id, data.text || '');
+        } else if (eventName === 'session_input') {
+            writeSessionInput(data.session_id, data.text || '');
+        } else if (eventName === 'session_exec_done') {
+            // No-op: output already streamed via session_data
+        } else if (eventName === 'session_closed') {
+            const entry = _sessionTerminals.get(data.session_id);
+            if (entry) {
+                entry.tab.classList.add('dead');
+                entry.terminal.write(
+                    '\r\n\x1b[2m[session closed, exit=' +
+                    (data.exit_code ?? '?') + ']\x1b[0m\r\n'
+                );
+            }
+            pushActivity('⬡', 'Session closed', 'exit=' + (data.exit_code ?? '?'));
+            updatePanelCloseVisibility();
+        }
+    }
+
     handq.onStatus((evt) => {
         if (gateGen(evt)) return;
         if (!evt) return;
@@ -1376,6 +1772,8 @@
             recordEvent('receptionist idle');
             removeThinkingBubble();
             clearWorking();
+        } else if (evt.kind === 'session_event') {
+            handleSessionEvent(evt.event, evt.data || {});
         }
         if (!overlayStatus.classList.contains('hidden')) {
             refreshStatusPanel();

@@ -308,6 +308,9 @@ class RuntimeAgent:
             shell = self.tools.get("shell")
             if shell is not None:
                 shell.interrupt_event = interrupt_event  # type: ignore[attr-defined]
+            session = self.tools.get("session")
+            if session is not None:
+                session.interrupt_event = interrupt_event  # type: ignore[attr-defined]
         # Pre-build the tools list in OpenAI function-calling format once at init time.
         # Passed to every chat_stream() call so the model uses
         # native function-calling instead of JSON-in-content.
@@ -910,13 +913,17 @@ class RuntimeAgent:
                 # If no observation (group_size=0), nothing to append
 
         # ── [N] Next-action prompt — always last ──────────────────────────────
-        # The "batch independent tool calls" tail stays constant across turns so
-        # it remains a stable cache prefix; it costs ~20 tokens and acts as a
-        # persistent reinforcement of the parallel-first system-prompt section.
+        # Architectural anchor: HandQ rebuilds the message list each iteration,
+        # so the conversation must end with a user-role message that prompts the
+        # model to produce its next output. Names all three exits explicitly so
+        # the agent treats "complete" and "block" as first-class options rather
+        # than always producing more tool calls. Parallelism guidance stays
+        # narrow to the "continue" branch — the system prompt already covers it
+        # in detail. Constant text → cache-friendly across turns.
         next_action = (
-            "What is the next action? "
-            "Batch every independent tool call into this single response — "
-            "only serialize on real data dependencies."
+            "Decide your next move: continue (tool calls — batch independents), "
+            "complete (return completion JSON), "
+            "or block (return error JSON if genuinely stuck)."
         )
         if reminder:
             next_action = f"{reminder}\n\n{next_action}"
@@ -925,8 +932,8 @@ class RuntimeAgent:
         #
         # On the first iteration there are no observation pairs yet, so the
         # message list ends with the goal message [1] — a user message.
-        # Appending another user message ("What is the next action?") creates
-        # two back-to-back user messages with no assistant turn in between.
+        # Appending another user message (the anchor) creates two back-to-back
+        # user messages with no assistant turn in between.
         # When using function-calling, the last message after a tool result is
         # a "tool" role message, so we always append a fresh user message then.
         last_role = messages[-1]["role"]
@@ -1787,21 +1794,29 @@ class RuntimeAgent:
                 )
                 reminder = (_anti_repeat + "\n\n" + reminder) if reminder else _anti_repeat
 
-            # Parallelism nudge: when 3+ recent iterations have each used a single
-            # tool call, the agent is leaving easy parallelism on the table.
-            # The reminder fires once per 3-iteration window (resets after firing
-            # so it does not spam every turn).
+            # Parallelism check: when 3+ recent iterations have each used a single
+            # tool call, the agent MIGHT be leaving easy parallelism on the table —
+            # but it might also be in a genuine sequential flow where each call's
+            # input is the previous call's output. Phrased as a verification
+            # question rather than an assertion to avoid pushing the agent into
+            # over-batching dependent operations (which could cause race conditions
+            # on shared files or wrong-order writes). The reminder fires once per
+            # 3-iteration window (resets after firing so it does not spam every turn).
             if len(self._iteration_tool_counts) >= 3:
                 _recent = self._iteration_tool_counts[-3:]
                 if all(c == 1 for c in _recent):
                     _parallel_nudge = (
-                        "PARALLELISM NUDGE — the last 3 turns each issued only one tool call. "
-                        "Independent reads/greps/globs/checks must be batched in a single response — "
-                        "the runtime dispatches concurrent-safe tools in parallel and you save ~80% "
-                        "of wall-clock time. Before sending the next response, list the tool calls you "
-                        "are about to make and ask which of them are truly dependent on each other. "
-                        "Only the dependent ones serialize. For read-only shell commands set "
-                        "concurrent_safe=true so they batch with other reads."
+                        "PARALLELISM CHECK — the last 3 turns each issued one tool call. "
+                        "Before sending the next response, ask yourself: were those calls "
+                        "genuinely sequential (B's input is A's output), or could some have "
+                        "run in parallel? If the next turn has multiple INDEPENDENT operations "
+                        "(reads of unrelated files, greps for different patterns, existence "
+                        "checks of different commands), batch them in one response — the "
+                        "runtime dispatches concurrent-safe tools in parallel. If the next "
+                        "operations are genuinely dependent on each other, keep them "
+                        "sequential — do NOT force batching where there is a real data "
+                        "dependency or a shared write target. For read-only shell commands, "
+                        "set concurrent_safe=true so they batch with other reads."
                     )
                     reminder = (_parallel_nudge + "\n\n" + reminder) if reminder else _parallel_nudge
                     # Reset the tracker so the nudge does not fire on every subsequent turn.

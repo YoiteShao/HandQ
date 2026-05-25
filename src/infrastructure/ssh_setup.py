@@ -240,50 +240,31 @@ def _collect_default_key_files() -> list:
 
 
 def _build_context_hint(creds_file: str, auth_method: str, login_shell: str = "unknown") -> str:
-    auth_labels = {
-        "key":      "SSH key (passwordless)",
-        "keyring":  "OS keyring",
-        "password": "password (stored in OS keyring)",
-    }
-    auth_label = auth_labels.get(auth_method, auth_method)
+    """First-time hint: minimal — credentials path, auth method, remote shell.
 
-    # Shell-specific advisory — built as plain lines to avoid textwrap.dedent
-    # stripping too much whitespace when the shell_line is multi-line.
-    if login_shell == "unknown":
-        shell_lines = (
-            "Remote login shell: unknown "
-            "(run action='exec' with command='echo $SHELL' to check)"
-        )
-    elif login_shell != "bash" and login_shell != "powershell":
-        shell_lines = (
-            f"Remote login shell: {login_shell} (not bash)\n"
-            "  WARNING: Built-in SSH actions (exec_bg, job_status, safe_exit) use\n"
-            "  'bash -c' internally — they work correctly regardless of login shell.\n"
-            "  For action='exec' with your own commands, wrap them explicitly:\n"
-            f"  command='bash -c \"your_command_here\"'"
-        )
-    else:
-        shell_lines = f"Remote login shell: {login_shell}"
+    The full SSH workflow lives in the ssh tool's usage_guide (single source of
+    truth). We only inject what changes per host: the creds_file path, how we
+    authenticated, and a non-bash advisory when relevant.
+    """
+    auth_label = {
+        "key":      "key",
+        "keyring":  "keyring",
+        "password": "password (cached in keyring)",
+    }.get(auth_method, auth_method)
 
-    # First-time hint: include full usage guide so the agent knows the workflow.
-    return (
-        "[SSH Context — Credentials Ready]\n"
-        f"credentials_file: {creds_file}\n"
-        f"Auth method: {auth_label}\n"
-        f"{shell_lines}\n"
-        "\n"
-        "SSH tool workflow (shown once; subsequent steps show credentials path only):\n"
-        "  1. exec        — verify environment, run short commands (< 30s)\n"
-        "  2. run_script  — upload script and launch in background (preferred for long tasks)\n"
-        "  3. wait_done   — PREFERRED: single SSH connection, blocks until job finishes\n"
-        "                   set timeout= to expected job duration + buffer\n"
-        "     — OR —\n"
-        "     job_status  — poll every 30-60s when you need to interleave local work\n"
-        "                   (output is slim while running — log_tail omitted)\n"
-        "  4. tail_log / fetch_log — inspect output or debug errors\n"
-        "  5. safe_exit   — must be called when done; cleans up pid files\n"
-        f"Pass credentials_file=\"{creds_file}\" in all calls"
+    shell_note = f"shell={login_shell}" if login_shell != "unknown" else "shell=?"
+    hint = (
+        f"[SSH ready] credentials_file={creds_file} | auth={auth_label} | {shell_note}\n"
+        f"Pass credentials_file in every ssh tool call."
     )
+
+    if login_shell not in ("bash", "unknown", "powershell"):
+        hint += (
+            f"\nNOTE: remote shell is {login_shell}, not bash. For action='exec' "
+            f"with custom commands wrap as: command='bash -c \"...\"'"
+        )
+
+    return hint
 
 
 def _build_context_hint_brief(creds_file: str) -> str:
@@ -632,14 +613,8 @@ class SSHSetupManager:
 
 # ── SSHContextProvider ────────────────────────────────────────────────────────
 
-# Keywords that indicate a step requires SSH remote work.
-_SSH_KEYWORDS = frozenset({
-    "ssh", "remote", "远程", "服务器", "server",
-    "sftp", "scp", "nohup", "exec_bg", "run_script",
-})
-
-# Regex to extract hostname/IP from step text.
-# Matches: user@host, user@1.2.3.4, or bare IPs/hostnames after keywords.
+# Regex to extract hostname/IP from step text — used as fallback by
+# _extract_host_user when step.ssh_target is not explicitly set by the Planner.
 _HOST_RE = re.compile(
     r"(?:(\w[\w.-]*)@)?"                    # optional user@
     r"((?:\d{1,3}\.){3}\d{1,3}"            # IPv4
@@ -647,41 +622,32 @@ _HOST_RE = re.compile(
     r"|localhost)"
 )
 
-# Regex to extract username from "user@host" patterns.
+# Regex to extract username from "user@host" patterns (used for ssh_target parse).
 _USER_AT_RE = re.compile(r"(\w[\w.-]*)@([\w.-]+)")
 
 
 class SSHContextProvider(StepContextProvider):
     """
-    StepContextProvider implementation for SSH remote work.
+    StepContextProvider for SSH remote work.
 
-    Detects SSH-related steps by keyword scan, extracts hostname/username
-    from the step text, and calls SSHSetupManager to establish credentials.
+    Activation: Planner declares "ssh" in step.tools_required (and should
+    also set step.ssh_target so prepare() knows which host to authenticate
+    against). FlowController invokes prepare() based purely on the
+    declaration — there is no keyword safety net.
 
-    Results are cached in Memory so subsequent steps in the same task
-    reuse the same credentials without re-prompting.
+    Responsibility: establish SSH credentials (key/keyring/password) for
+    the target host BEFORE the agent runs, so the ssh tool's connection
+    pool can authenticate without prompting mid-execution. Per-hostname
+    cache in Memory ensures subsequent steps reuse the same credentials.
     """
 
     def __init__(self) -> None:
         self._manager = SSHSetupManager()
         self.logger = get_logger()
 
-    def matches(self, step: "Step") -> bool:
-        """Return True if the step text contains SSH-related keywords."""
-        text = f"{step.goal} {step.description}".lower()
-        matched = [kw for kw in _SSH_KEYWORDS if kw in text]
-        if matched:
-            self.logger.debug(
-                f"SSHContextProvider matched step {step.step_id!r} "
-                f"via keywords: {matched}",
-                component="SSHContextProvider",
-            )
-            return True
-        return False
-
-    def extra_tool_names(self) -> list:
-        """Activate the SSH tool whenever this provider matches."""
-        return ["ssh"]
+    @property
+    def tool_name(self) -> str:
+        return "ssh"
 
     async def prepare(
         self,

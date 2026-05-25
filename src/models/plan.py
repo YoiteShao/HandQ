@@ -50,6 +50,7 @@ class Step:
     risk_assessment: str = ""        # Planner's assessment of what could go wrong and the fallback strategy
     required_context_keys: List[str] = field(default_factory=list)  # step_id values of prior steps whose findings this step needs; empty = full isolation
     ssh_target: str = ""             # "user@hostname" — Planner fills when step requires SSH remote work; empty for local steps
+    tools_required: List[str] = field(default_factory=list)  # On-demand tool names to activate for this step (e.g. ["ssh"], ["session"]); merged with provider matches via UNION at runtime
 
     # ── Execution state ──────────────────────────────────────────────────────
     status: StepStatus = StepStatus.PENDING
@@ -82,7 +83,8 @@ class Step:
                      expected_outcomes: Optional[List[str]] = None,
                      risk_assessment: str = "",
                      required_context_keys: Optional[List[str]] = None,
-                     ssh_target: str = "") -> "Step":
+                     ssh_target: str = "",
+                     tools_required: Optional[List[str]] = None) -> "Step":
         """Create a step from planner output."""
         return cls(
             step_id=step_id,
@@ -96,6 +98,7 @@ class Step:
             risk_assessment=risk_assessment,
             required_context_keys=required_context_keys or [],
             ssh_target=ssh_target,
+            tools_required=tools_required or [],
         )
 
     @classmethod
@@ -233,6 +236,7 @@ class Step:
             "risk_assessment": self.risk_assessment,
             "required_context_keys": self.required_context_keys,
             "ssh_target": self.ssh_target,
+            "tools_required": self.tools_required,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "started_at": self.started_at.isoformat() if self.started_at else None,
             "completed_at": self.completed_at.isoformat() if self.completed_at else None,
@@ -296,6 +300,7 @@ class Plan:
                 risk_assessment=s.get("risk_assessment", ""),
                 required_context_keys=s.get("required_context_keys", []),
                 ssh_target=s.get("ssh_target", ""),
+                tools_required=s.get("tools_required", []),
             )
             for s in data.get("next_steps", [])
         ]

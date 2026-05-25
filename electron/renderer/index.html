@@ -6,6 +6,7 @@
           content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self';" />
     <title>HandQ</title>
     <link rel="stylesheet" href="styles.css" />
+    <link rel="stylesheet" href="vendor/xterm.css" />
 </head>
 <body>
     <div class="app">
@@ -129,6 +130,8 @@
                         title="Close">×</button>
             </header>
             <ul class="activity-feed" id="activity-feed"></ul>
+            <div class="activity-resize-handle" id="activity-resize-handle"
+                 title="Drag to resize"></div>
         </aside>
 
         <!-- ============================================================ -->
@@ -458,6 +461,7 @@
         </div>
     </div>
 
+    <script src="vendor/xterm.bundle.js"></script>
     <script src="renderer.js"></script>
 </body>
 </html>

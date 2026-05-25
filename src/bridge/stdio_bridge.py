@@ -367,6 +367,19 @@ class _StdioUI:
         _emit({"type": "status", "kind": "desktop_takeover_ended",
                "reason": str(reason)}, gen=self._generation)
 
+    # ── Interactive session events ─────────────────────────────────────────
+    #
+    # The session_tool emits lifecycle events (open/exec_done/close) through
+    # InteractionManager._ui_call → getattr(ui, "notify_session_event").
+    # The renderer uses these to render a live session monitor panel showing
+    # which sessions are active, their last command, and output previews.
+    def notify_session_event(self, event_name: str, data: Any = None) -> None:
+        _ui_logger.debug("notify_session_event: %s data=%s", event_name, _truncate(data))
+        _emit({"type": "status", "kind": "session_event",
+               "event": str(event_name),
+               "data": data if isinstance(data, dict) else {}},
+              gen=self._generation)
+
     # ── Confirmation dialogs (UI delegate path) ──────────────────────────────
     #
     # InteractionManager.request_*_confirmation() probes the UI delegate
@@ -1109,6 +1122,13 @@ class StdioBridge:
                 )
             except Exception:
                 logger.warning("new_session: browser pool flush failed", exc_info=True)
+            try:
+                from ..tools.session_tool import flush_session_pool as _flush_sessions
+                session_result = await _flush_sessions()
+                if session_result:
+                    logger.info("new_session: %s", session_result)
+            except Exception:
+                logger.warning("new_session: session pool flush failed", exc_info=True)
             try:
                 # Drop the desktop takeover memo so the next task starts
                 # unapproved. If the OLD task still had the overlay up,

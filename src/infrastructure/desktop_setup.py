@@ -1,35 +1,18 @@
 # -*- coding: utf-8 -*-
-"""DesktopContextProvider — activate the desktop tool by step keywords.
+"""DesktopContextProvider — emit desktop usage hint when Planner declares it.
 
-Mirrors :class:`BrowserContextProvider` (see :mod:`browser_setup`):
+Activation is purely Planner-driven: when "desktop" appears in
+step.tools_required, FlowController invokes prepare() to inject the
+workflow + tool-choice-hierarchy hint. There is no keyword scan — the
+desktop tool is the most disruptive in the kit (steals real mouse +
+keyboard) so we now require the Planner to make an explicit decision.
 
-* Cheap matching: keyword + regex scan over ``step.goal + step.description``.
-* No I/O in :meth:`matches`. Provider lookup happens before every step.
-* Progressive disclosure via :class:`Memory`: first activation in a task
-  emits the full workflow guide; subsequent steps get a brief reminder.
-* Windows-only — the desktop tool itself is registered Windows-only,
-  this provider's :meth:`matches` returns False on other platforms as a
-  belt-and-suspenders measure.
-
-The provider exists because :data:`DesktopTool.parameter_schema` is
-``on_demand=True`` — without an active provider the LLM never sees the
-tool. By gating activation on **explicit native-app cues** rather than
-making it always-on, we avoid the failure mode where the LLM reaches
-for desktop CUA on tasks that browser_tool / shell / read / write
-should handle (those are 5-10× faster and deterministic). See
-``docs/desktop_tool.md`` §11 for the takeover-indicator IPC contract
-that fires once the tool is actually used.
-
-Activation keywords are intentionally CONSERVATIVE — high precision
-matters more than recall here, because the desktop tool steals the
-user's actual mouse + keyboard. Adding more keywords later is cheap;
-firing on a false positive and confusing the agent is expensive.
+Windows-only: the desktop tool is registered Windows-only in ToolRegistry,
+and FlowController only registers this provider on Windows.
 """
 from __future__ import annotations
 
-import re
-import sys
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, Optional
 
 from .logger import get_logger
 from .step_context_provider import StepContextProvider
@@ -38,74 +21,6 @@ if TYPE_CHECKING:
     from ..controller.interaction_manager import InteractionManager
     from .memory import Memory
     from ..models.plan import Step
-
-
-# Strong-signal keywords. Pure native-app names + phrases that have no
-# meaningful browser interpretation. "settings" alone is too ambiguous
-# (could be website settings page) so we require "windows settings" /
-# "系统设置".
-_DESKTOP_KEYWORDS = frozenset({
-    # Native-only Windows apps (English)
-    "notepad", "calculator", "task manager", "control panel",
-    "file explorer", "device manager", "registry editor",
-    "command prompt", "powershell window",
-    "windows settings", "windows explorer",
-
-    # Microsoft Office / 365 — desktop apps. The browser does have
-    # office.com but when the user says "OneNote / Excel / Word /
-    # PowerPoint / Outlook" without "online" or a URL, they mean the
-    # native client. Same for Teams desktop and the M365 Copilot app.
-    "onenote", "outlook", "powerpoint", "ms word", "ms excel",
-    "microsoft word", "microsoft excel", "microsoft powerpoint",
-    "microsoft outlook", "microsoft onenote", "microsoft teams",
-    "ms teams", "teams desktop", "m365 copilot", "copilot app",
-
-    # Other common third-party desktop apps
-    "notepad++", "vscode", "vs code", "visual studio",
-    "windows store", "microsoft store",
-
-    # Phrases that strongly imply desktop, not browser / not a generic word
-    "on the desktop", "click on screen", "click on desktop",
-    "type on screen", "drag the file to", "on the taskbar",
-    "system tray", "minimise the window", "minimize the window",
-    "maximise the window", "maximize the window",
-    "screenshot the screen", "screenshot the desktop",
-    "native app", "desktop app", "desktop application",
-    "windows app", "uwp app", "win32 app",
-
-    # Native-only Windows apps (Chinese)
-    "记事本", "计算器", "画图", "任务管理器", "控制面板",
-    "文件管理器", "文件资源管理器", "设备管理器",
-    "注册表编辑器", "Windows 设置", "Windows 应用",
-
-    # Office / 365 (Chinese)
-    "邮件应用", "邮件客户端", "便签",
-
-    # Chinese phrases — desktop-specific
-    "桌面上", "在桌面", "任务栏", "系统托盘", "最小化窗口",
-    "最大化窗口", "桌面截图", "桌面应用", "本地应用",
-    "本地的", "桌面应用程序", "桌面客户端", "本地客户端",
-    "原生应用", "Windows 应用程序", "GUI 自动化", "GUI自动化",
-
-    # Internal tool
-    "QUTS", "PCAT", "ALPACA", "QXDM"
-})
-
-
-# "open / launch / run / 打开 / 启动 / 运行 + native app" pattern. The
-# native-app whitelist is the same set as _DESKTOP_KEYWORDS' first block
-# plus a few common shorthands (notepad without a verb is already in
-# the keyword set).
-_OPEN_NATIVE_RE = re.compile(
-    r"(?:open|launch|run|start|打开|启动|运行|使用)\s*"
-    r"(?:本地的?|本机的?|local\s+|native\s+)?"
-    r"(?:notepad|calculator|excel|word|powerpoint|outlook|onenote|"
-    r"explorer|paint|cmd|powershell|teams|copilot|"
-    r"file\s*manager|control\s*panel|task\s*manager|"
-    r"记事本|计算器|画图|任务管理器|控制面板|"
-    r"文件管理器|文件资源管理器|设备管理器)",
-    re.IGNORECASE,
-)
 
 
 def _build_full_hint() -> str:
@@ -193,44 +108,20 @@ def _build_brief_hint() -> str:
 
 
 class DesktopContextProvider(StepContextProvider):
-    """Activate the desktop tool when a step explicitly references native
-    Windows apps or screen-level actions.
+    """Inject the desktop usage hint when the Planner declares it.
 
-    Cheap (one substring scan + one regex scan over the step text) and
-    matches conservatively: the desktop tool is the most powerful and
-    most disruptive tool in the kit, so we'd rather miss an activation
-    and fall back to specialised tools than reach for it on every
-    "click" / "open" mention.
+    No keyword scanning — activation is purely declaration-driven. Required
+    transitive deps (pyautogui / mss / pywin32 / rapidocr) are bundled in
+    both dev and packaged builds; missing deps surface their own pip-install
+    hint at the call site, mirroring how every other tool handles them.
     """
 
     def __init__(self) -> None:
         self.logger = get_logger()
 
-    def matches(self, step: "Step") -> bool:
-        # Belt-and-suspenders: the tool itself is registered Windows-only.
-        if sys.platform != "win32":
-            return False
-
-        text = f"{step.goal} {step.description}".lower()
-        for kw in _DESKTOP_KEYWORDS:
-            if kw.lower() in text:
-                self.logger.debug(
-                    f"DesktopContextProvider matched step {step.step_id!r} "
-                    f"via keyword: {kw!r}",
-                    component="DesktopContextProvider",
-                )
-                return True
-        if _OPEN_NATIVE_RE.search(text):
-            self.logger.debug(
-                f"DesktopContextProvider matched step {step.step_id!r} "
-                "via 'open/launch/打开 + native-app' pattern",
-                component="DesktopContextProvider",
-            )
-            return True
-        return False
-
-    def extra_tool_names(self) -> List[str]:
-        return ["desktop"]
+    @property
+    def tool_name(self) -> str:
+        return "desktop"
 
     async def prepare(
         self,
@@ -238,14 +129,8 @@ class DesktopContextProvider(StepContextProvider):
         interaction_manager: "InteractionManager",
         memory: "Memory",
     ) -> Optional[str]:
-        # Dependencies (pyautogui / mss / pywin32 / rapidocr) are
-        # bundled in both dev (requirements.txt) and packaged builds
-        # (Nuitka --include-package-data), so we don't probe at
-        # prepare-time. If something IS missing, the relevant action
-        # surfaces its own "pip install X" hint at the call site —
-        # matches how every other tool handles missing transitive deps.
-
-        # Progressive disclosure mirrors browser provider exactly.
+        # Progressive disclosure: full guide on first activation in this task,
+        # brief reminder thereafter.
         cached = memory.get_desktop_context("default")
         if cached and cached.get("prepared"):
             return _build_brief_hint()

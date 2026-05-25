@@ -69,6 +69,7 @@ class ToolRegistry:
     GREP = "grep"
     NOTEBOOK_EDIT = "notebook_edit"
     SSH  = "ssh"
+    SESSION = "session"
     BROWSER = "browser"
     DESKTOP = "desktop"
 
@@ -360,212 +361,155 @@ Examples:
         )
         if _IS_WINDOWS:
             _shell_usage_guide = """\
-Platform: Windows. Default shell: PowerShell (pwsh 7+ / powershell.exe).
-Use the 'shell' parameter to select: "powershell" (default), "cmd", or "bash" (Git Bash).
+Platform: Windows. Default shell: PowerShell 7+ (pwsh / powershell.exe).
+Override: shell="cmd" (legacy batch), shell="bash" (Git Bash if installed).
 
-Working Directory: Each command runs in the agent's project directory by default.
-Use 'cd subdir && cmd' within a single command for subdirectory operations.
-Shell state (variables, functions) does NOT persist between calls — each call runs
-in a fresh process.
+Each call runs in a fresh process at the project root. Shell state (vars,
+functions) does NOT persist between calls — chain with ';' if you need cd.
 
-When to Use:
-  - Run programs, scripts, tests, or build commands
-  - Search for patterns, check system state, verify results
-  - Process text, install packages or manage dependencies
-  - Long-running tasks: use run_in_background=true
+WHEN TO USE
+  - Run programs, scripts, tests, builds
+  - Quick state checks (Get-ChildItem, Test-Path, Get-Process)
+  - Long-running tasks → run_in_background=true, returns task_id
 
-When NOT to Use:
-  - Reading file contents — use read instead (cleaner, no shell escaping issues)
-  - Interactive commands that will hang (see Forbidden Commands below)
+WHEN NOT TO USE — use the listed alternative instead
+  Read file contents          → 'read' tool (no escaping, no truncation issues)
+  Find files by name          → 'glob' tool
+  Search file contents        → 'grep' tool
+  Edit a file                 → 'edit' / 'write' tool
+  Interactive (Read-Host, Get-Credential, $Host.UI.PromptForChoice, pause,
+    git rebase -i, vi, nano)  → these hang in non-interactive mode
 
-Forbidden Commands (will hang — tool runs non-interactively):
-  - Read-Host, Get-Credential, Out-GridView, $Host.UI.PromptForChoice, pause
-  - git rebase -i, git add -i, or any command that opens an interactive editor
-  - Destructive cmdlets without -Confirm:$false may prompt and hang
+PYTHON IS YOUR POWER TOOL — prefer it over chained PowerShell pipelines for
+JSON/YAML/CSV processing, conditionals, loops, error handling, anything
+beyond 2-3 piped commands. Easier to debug than PS object pipelines.
+  e.g.  python -c "import json; d=json.load(open('a.json')); print(d['x'][0])"
 
-PowerShell Syntax (default):
-  • List files: Get-ChildItem (aliases: ls, dir)
-  • Find files: Get-ChildItem -Recurse -Filter *.ext
-  • Search text: Select-String -Pattern "x" -Path *.py (or -Recurse)
-  • Check path: Test-Path "path"
-  • Remove file: Remove-Item "path"
-  • Remove dir: Remove-Item -Recurse -Force -Confirm:$false "path"
-  • Print file: Get-Content "path"
-  • Current dir: Get-Location (alias: pwd)
-  • Move/rename: Move-Item
-  • Copy: Copy-Item
-  • Env vars: read with $env:NAME, set with $env:NAME = "value"
-  • Path separator: \\ (forward slashes also work)
-  • Null device: $null (NOT /dev/null)
-  • Python: python (NOT python3)
-  • Command chaining: cmd1 && cmd2 (stop on fail), cmd1; cmd2 (always both)
-  • String interpolation: "Hello $name" or "Value: $($obj.Property)"
-  • Pipeline: passes objects, not text — use Select-Object, Where-Object, ForEach-Object
-  • Ternary: $condition ? $true_val : $false_val
-  • Null-coalescing: $var ?? "default"
-  • Null-conditional: $obj?.Property
+POWERSHELL 7+ ESSENTIALS
+  Pipeline    | passes objects (not text) — use Select-Object/Where-Object
+  Variables   | $var = "x";  $env:NAME for env vars (NOT bash's $VAR)
+  Strings     | "Hello $name", "Value: $($obj.Prop)"
+  Null        | $null  (NOT /dev/null);  ?? coalesce, ?. null-conditional
+  Chain       | cmd1 && cmd2  (stop on fail)  /  cmd1; cmd2  (always both)
+  Heredoc     | @'..'@ literal, @"..."@ interpolated. Closing '@ AT COL 0
+  Escape      | backtick (`), NOT backslash
+  Confirm     | destructive cmdlets need -Confirm:$false to avoid prompt hang
+  Registry    | HKLM:\\SOFTWARE\\... (PSDrive, NOT raw HKEY_LOCAL_MACHINE\\)
 
-Destructive Cmdlet Safety:
-  Destructive cmdlets (Remove-Item, Stop-Process, Clear-Content) may prompt for
-  confirmation. Add -Confirm:$false when you intend the action to proceed.
-  Use -Force for read-only or hidden items.
+UNIX → POWERSHELL (top conversions; infer the rest)
+  head -N file        → Get-Content file -TotalCount N
+  tail -N file        → Get-Content file -Tail N
+  rm -rf dir          → Remove-Item -Recurse -Force dir
+  mkdir -p dir        → New-Item -ItemType Directory -Force dir
+  which cmd           → (Get-Command cmd).Source
+  2>/dev/null         → 2>$null
+  VAR=x cmd           → $env:VAR='x'; cmd
+  if [ -f x ]         → if (Test-Path x) { ... }
+  `cmd` (backtick)    → $(cmd)
 
-Multiline Strings (Here-Strings):
-  Use single-quoted here-strings for literal content (no variable expansion):
-    git commit -m @'
-    Commit message here.
-    Second line with $literal dollar signs.
-    '@
-  CRITICAL: Closing '@ MUST be at column 0 (no leading whitespace) on its own line.
-  Use @"..."@ (double-quoted) only when you need variable expansion.
+BACKGROUND EXECUTION
+  run_in_background=true            → returns task_id; no timeout limit
+  task_id="bg_X"                    → query status & captured output
+  task_id="bg_X", command="kill"    → terminate task tree
 
-Stop-Parsing Token:
-  For arguments containing -, @, or other PowerShell operators:
-    git log --% --format=%H
+OUTPUT
+  - Truncated at 30,000 chars (10k head + 5k tail). Filter aggressively.
+  - Background tasks capped at 30,000 bytes per stream.
+  - Filter via | Select-Object -First N, | Select-String PATTERN.
 
-Registry Access:
-  Use PSDrive prefixes (NOT raw paths):
-  ✓ Get-ItemProperty HKLM:\\SOFTWARE\\...
-  ✓ Get-ItemProperty HKCU:\\...
-  ✗ HKEY_LOCAL_MACHINE\\... (will fail)
+SCOPE GUARD
+  Search commands (grep, find, rg, Get-ChildItem -Recurse) MUST target '.'
+  or a subdirectory. Searching drive root or %USERPROFILE% hangs on large
+  trees → tool will warn but allow.
 
-Exit Code Handling:
-  -ErrorAction SilentlyContinue suppresses error output but the tool still reports
-  exit 1. For truly non-fatal errors, wrap in try-catch:
-    try { Cmdlet ... -ErrorAction Stop } catch { }
+ESCALATION (planner-activated, do not request manually)
+  - Long-running remote batch (submit script → poll/wait → fetch logs)
+    → 'ssh' tool activates when the step targets a remote host
+  - Persistent subprocess where EXACTLY ONE of these holds:
+      (a) state must survive across commands (cwd, env, REPL, adb shell context)
+      (b) watch streaming output AND inject commands concurrently
+      (c) tty-bound device (serial console, minicom)
+      (d) user explicitly asked to watch the process live
+    → 'session' tool activates when the planner detects the pattern
+  - Web automation: visit URL, fill form, click, extract page, login flows
+    → 'browser' tool activates when the step references a URL or web action
+  - Native Windows app automation: Notepad, Excel, File Explorer, Settings,
+    Task Manager, Office apps, third-party desktop software
+    → 'desktop' tool activates when the step targets a native app or
+       screen-level interaction
+  If a step matches one of the above but the corresponding tool is not in
+  your list, the planner under-declared `tools_required`. Stop calling
+  shell on the wrong path — set the completion `error` field with a one-
+  line note ("step needs <tool_name>: <why>") and omit `tool_name`. The
+  planner will re-classify on the next observe_and_plan() round and
+  re-issue the step with the right tool. This costs one iteration; far
+  cheaper than thrashing on shell trying to fake the missing capability.
 
-Unix → PowerShell Equivalents (Do NOT use Unix commands without shell="bash"):
-  head -N file         → Get-Content file -TotalCount N
-  tail -N file         → Get-Content file -Tail N
-  head (piped)         → | Select-Object -First N
-  tail (piped)         → | Select-Object -Last N
-  which cmd            → (Get-Command cmd).Source
-  touch path           → if (-not (Test-Path path)) { New-Item -ItemType File path }
-  wc -l file           → (Get-Content file | Measure-Object -Line).Lines
-  mkdir -p dir         → New-Item -ItemType Directory -Force dir
-  rm -rf dir           → Remove-Item -Recurse -Force dir
-  ln -s target link    → New-Item -ItemType SymbolicLink -Path link -Target target
-  2>/dev/null          → 2>$null
-  VAR=x cmd            → $env:VAR = 'x'; cmd
-  if [ -f x ]          → if (Test-Path x) { ... }
-  for x in *           → foreach ($x in ...) { ... }
-  `cmd` (backtick)     → $(cmd)
-  chmod/chown          → icacls (Windows ACL model)
-
-cmd.exe alternative (use shell="cmd"):
-  • List: dir /s /b
-  • Search: findstr /s /i "pattern" *.py
-  • Chaining: cmd1 && cmd2
-  • Env vars: %VAR%
-
-Background Execution:
-  Set run_in_background=true for long-running commands (tests, builds, servers).
-  Returns a task_id immediately. You will be notified when it completes.
-  No timeout limit for background tasks (foreground: 600s max).
-  Use task_id="..." to query status.
-  Use task_id="...", command="kill" to terminate.
-
-Output Handling:
-  - Output is truncated at 30,000 characters (head 10k + tail 5k + notice)
-  - Background tasks: output capped at 30,000 bytes per task
-  - Use Select-String or Select-Object -First N to filter proactively
-
-Git Security:
-  NEVER use --no-verify to skip hooks or --no-gpg-sign to bypass signing
-  unless explicitly requested. If a hook fails, investigate the underlying issue.
-
-Strategy:
-  - Always use non-interactive flags: --yes, -y, --no-input, -Confirm:$false
-  - Check exit codes: zero = success; non-zero = failure
-  - Limit output: pipe to Select-Object -First N or Select-String to filter
-  - For long-running commands, use run_in_background=true
-  - Context budget: large outputs consume context. Filter aggressively.
-
-Python as a power tool (PREFERRED for complex operations):
-  Python is available and should be your first choice when:
-  - Processing structured data (JSON, YAML, CSV, XML)
-  - Complex text manipulation across multiple files
-  - Any logic requiring conditionals, loops, or error handling
-  - Anything that would require more than 2 piped commands
-
-Examples:
-  GOOD: Get-ChildItem -Recurse -Filter *.py | Select-String 'pattern'
-  GOOD: python -m pytest tests/test_core.py -x -q
-  GOOD: {"command": "npm test", "run_in_background": true, "description": "Running tests"}
+EXAMPLES
+  GOOD: Get-ChildItem -Recurse -Filter *.py | Select-String 'def main'
+  GOOD: python -m pytest tests/ -x -q
+  GOOD: python -c "import json; d=json.load(open('a.json')); ..."
+  GOOD: {"command": "npm test", "run_in_background": true}
+  GOOD: {"command": "Get-ChildItem", "concurrent_safe": true}
   GOOD: {"task_id": "bg_1"} — check background task status
   GOOD: {"task_id": "bg_1", "command": "kill"} — kill background task
-  BAD:  grep -rn "pattern" src/   — Unix command, will fail on PowerShell
-  BAD:  find . -name "*.py"       — Unix; use Get-ChildItem -Recurse
-  BAD:  Read-Host "prompt"        — will hang (non-interactive)"""
+  BAD:  cat large_file.log         → use 'read' or Select-String
+  BAD:  Read-Host "prompt"         → hangs (non-interactive)
+  BAD:  grep -rn "x" src/          → wrong shell, use Select-String
+  BAD:  awk + sed + grep chain     → write Python instead"""
         else:
             _shell_usage_guide = """\
-Platform: Linux/macOS. Default shell: /bin/sh.
-Use the 'shell' parameter to select: "sh" (default), "bash", "zsh".
+Platform: Linux/macOS. Default shell: /bin/sh. Override with shell="bash"/"zsh".
 
-Working Directory: Each command runs in the agent's project directory by default.
-Use 'cd subdir && cmd' within a single command for subdirectory operations.
-Shell state (variables, functions) does NOT persist between calls — each call runs
-in a fresh process.
+Each call runs in a fresh process at the project root. Shell state (vars,
+functions) does NOT persist between calls — chain with '&&' if you need cd.
 
-When to Use:
-  - Run programs, scripts, tests, or build commands
-  - Search for patterns: grep, find, rg (ripgrep)
-  - Check system state: ls, ps, df, env, which
-  - Verify results: run tests, check syntax, list outputs
-  - Process text: awk, sed, sort, uniq, wc
-  - Long-running tasks: use run_in_background=true
+WHEN TO USE
+  - Run programs, scripts, tests, builds
+  - Quick state checks (ls, ps, df, env, which)
+  - Long-running tasks → run_in_background=true, returns task_id
 
-When NOT to Use:
-  - Reading file contents — use read instead (cleaner, no shell escaping issues)
-  - Interactive commands: git rebase -i, git add -i, editors (vi, nano)
-  - Commands that prompt for input without a --yes/-y flag
+WHEN NOT TO USE — use the listed alternative instead
+  Read file contents          → 'read' tool (no escaping, no truncation issues)
+  Find files by name          → 'glob' tool
+  Search file contents        → 'grep' tool
+  Edit a file                 → 'edit' / 'write' tool
+  Interactive (vi, nano, git rebase -i, prompts without --yes) → they hang
 
-Background Execution:
-  Set run_in_background=true for long-running commands (tests, builds, servers).
-  Returns a task_id immediately. You will be notified when it completes.
-  No timeout limit for background tasks (foreground: 600s max).
-  Use task_id="..." to query status.
-  Use task_id="...", command="kill" to terminate.
+PYTHON IS YOUR POWER TOOL — prefer it over chained sed/awk/grep/cut when the
+task needs JSON/YAML/CSV processing, conditionals, loops, error handling,
+or more than 2-3 piped commands. Easier to debug, easier to extend.
+  e.g.  python -c "import json; d=json.load(open('a.json')); print(d['x'][0])"
 
-Output Handling:
-  - Output is truncated at 30,000 characters (head 10k + tail 5k + notice)
-  - Background tasks: output capped at 30,000 bytes per task
-  - Use head/tail/grep to filter proactively
+BACKGROUND EXECUTION
+  run_in_background=true            → returns task_id; no timeout limit
+  task_id="bg_X"                    → query status & captured output
+  task_id="bg_X", command="kill"    → terminate task tree
 
-Scope Warning:
-  Search commands (grep, find, rg) must target the working directory or subdirectories.
-  Searching / or ~ can hang on large directory trees — always scope to '.' or a subdir.
+OUTPUT
+  - Truncated at 30,000 chars (10k head + 5k tail). Filter aggressively.
+  - Background tasks capped at 30,000 bytes per stream.
+  - Filter via | head -N, | tail -N, | grep PATTERN.
 
-Git Security:
-  NEVER use --no-verify to skip hooks or --no-gpg-sign to bypass signing
-  unless explicitly requested. If a hook fails, investigate the underlying issue.
+SCOPE GUARD
+  Search commands (grep, find, rg) MUST target '.' or a subdirectory.
+  Searching / or ~ hangs on large directory trees → tool will warn but allow.
 
-Strategy:
-  - Always use non-interactive flags: --yes, -y, --no-input, --force, -f,
-    DEBIAN_FRONTEND=noninteractive
-  - Check exit codes: zero = success; non-zero = failure
-  - Limit output: command | head -100, command | tail -50, command | grep ERROR
-  - For long-running commands, use run_in_background=true
-  - Chain commands with && to stop on first failure
-  - Context budget: large outputs consume context. Filter aggressively.
+ESCALATION (planner-activated, do not request manually)
+  Long-running remote batch (submit script → poll/wait → fetch logs)
+  → 'ssh' tool activates when the step targets a remote host
 
-Python as a power tool (PREFERRED for complex operations):
-  Python is available and should be your first choice when:
-  - Processing structured data (JSON, YAML, CSV, XML)
-  - Complex text manipulation across multiple files
-  - Any logic requiring conditionals, loops, or error handling
-  - Anything that would require more than 2-3 piped shell commands
-
-Examples:
+EXAMPLES
   GOOD: grep -rn "def process_batch" src/ | head -20
-  GOOD: python -m pytest tests/test_core.py -x -q 2>&1 | tail -30
-  GOOD: find . -name "*.py" -newer requirements.txt | head -20
-  GOOD: {"command": "npm test", "run_in_background": true, "description": "Running tests"}
+  GOOD: python -m pytest tests/ -x -q 2>&1 | tail -30
+  GOOD: python -c "import json; d=json.load(open('a.json')); ..."
+  GOOD: {"command": "npm test", "run_in_background": true}
+  GOOD: {"command": "ls", "concurrent_safe": true}
   GOOD: {"task_id": "bg_1"} — check background task status
   GOOD: {"task_id": "bg_1", "command": "kill"} — kill background task
-  BAD:  cat large_file.log  — use read or grep instead
-  BAD:  git rebase -i HEAD~3  — interactive, will hang
-  BAD:  Running a command that hangs waiting for user input"""
+  BAD:  cat large_file.log                 → use 'read' or grep -n
+  BAD:  find . -name "*.py" | xargs sed -i → write Python instead
+  BAD:  git rebase -i HEAD~3               → interactive, hangs"""
 
         cls._tools[cls.SHELL] = ToolMetadata(
             name=cls.SHELL,
@@ -919,6 +863,69 @@ Examples:
         )
 
         # Register SSH tool (on_demand=True: only activated when a StepContextProvider requests it)
+        # Build the usage_guide as a string variable so we can drop the
+        # session advisory line on Linux (session is Windows-only registered).
+        _ssh_usage_guide = """\
+SECURITY: Pass credentials_file (a local YAML/JSON path written by ssh_setup)
+— NEVER hostname/username/password directly. Only the path passes through
+LLM context.
+
+WHEN TO USE
+  Long-running remote batch jobs. You submit, the job survives disconnect,
+  you poll/wait/fetch logs. NO interactive UI streaming.
+
+WHEN NOT TO USE — use the listed alternative instead
+  Local command                                   → 'shell' tool
+  Single short remote cmd (no log/job tracking)   → 'shell' with: ssh host 'cmd'
+  Need live UI streaming of remote output         → 'session' tool: open(command='ssh user@host')   (-tt auto-prepended)
+
+WORKFLOW (the recommended pattern — 5 steps)
+  1. exec        Verify env, run < 30s commands. Returns 'login_shell' field.
+  2. run_script  PREFERRED: upload script + launch as nohup background.
+                 The job survives ssh disconnect.
+  3. wait_done   PREFERRED over polling: single SSH connection blocks until
+                 the job finishes. Set timeout = expected duration + buffer.
+                   — OR —
+     job_status  Poll every 30-60s when interleaving local work.
+                 NOTE: log_tail is OMITTED while status="running"; use tail_log
+                 to peek at running output.
+  4. tail_log    Inspect output on success.
+     fetch_log   Page through large logs to debug failures (start_line/end_line).
+  5. safe_exit   ALWAYS call when done — kills tracked jobs, removes pid files.
+
+ACTIONS (full param schemas in tool definition):
+  exec | exec_bg | job_status | wait_done | tail_log | fetch_log
+  write_file | run_script | safe_exit
+
+CONNECTION MANAGEMENT (transparent)
+  All actions to one host share a single TCP connection (pool). First action
+  pays the handshake; subsequent actions reuse it for free. Auto-reconnects
+  on transport death with exponential backoff. Keepalive every 30s prevents
+  NAT/firewall from dropping the idle pool.
+
+SHELL COMPATIBILITY
+  Built-in actions (exec_bg, job_status, safe_exit) wrap commands in 'bash -c'
+  regardless of remote login shell. For action='exec' on non-bash hosts:
+    command='bash -c "your_command"'
+
+EXAMPLES
+  GOOD: ssh(exec, command="uname -a")                   (probe first)
+  GOOD: ssh(run_script, script_content="...8h job...")  (long batch)
+        → ssh(wait_done, timeout=30000)                 (single conn, blocks)
+        → ssh(tail_log)                                 (read result)
+        → ssh(safe_exit)                                (cleanup)
+  BAD:  ssh(exec, command="...8h job...")               → use run_script
+  BAD:  Loop ssh(job_status) every 5s                   → use wait_done"""
+
+        if not _IS_WINDOWS:
+            # Drop the session advisory: session tool is not registered on Linux.
+            # Linux users needing live remote streaming should use shell with
+            # `ssh -tt host 'cmd | tee /tmp/log'` and poll the log via task_id.
+            _ssh_usage_guide = _ssh_usage_guide.replace(
+                "  Need live UI streaming of remote output         → 'session' tool: open(command='ssh user@host')   (-tt auto-prepended)\n",
+                ""
+            )
+
         cls._tools[cls.SSH] = ToolMetadata(
             name=cls.SSH,
             description=(
@@ -927,103 +934,155 @@ Examples:
                 "SECURITY: hostname, username, password, and key_path are read from a local "
                 "credentials file at runtime; only the file path is passed through the LLM."
             ),
-            usage_guide="""\
-SECURITY: Pass credentials_file (a local YAML/JSON path) — never hostname/username/password directly.
-Credentials file format:
-  hostname: 192.168.1.100
-  username: user
-  key_path: ~/.ssh/id_rsa      # optional; tried before password
-  password: secret             # optional; used when key auth fails
-  keyring_service: myapp       # RECOMMENDED on shared machines: fetch password from OS keyring
-                               # (Windows Credential Manager / Linux Secret Service / macOS Keychain)
-                               # Store once: python handq_keyring.py set myapp user
-                               # Password never written to any file on disk.
-
-Login shell detection:
-  The first action='exec' call returns a 'login_shell' field ("bash"/"tcsh"/"zsh"/"sh"/"unknown").
-  A 'shell_warning' field is added when the shell is not bash.
-  Built-in actions (exec_bg, job_status, safe_exit) wrap ALL commands in 'bash -c' internally
-  and work correctly regardless of login shell.
-  For action='exec' with your own commands on a non-bash host, wrap them:
-    command='bash -c "your_command_here"'
-
-Actions:
-  exec        Run a short command; return stdout/stderr/exit_code/login_shell.
-              Required: credentials_file, command.
-              Optional: workdir, timeout (30).
-
-  exec_bg     Launch a long-running command as nohup background process.
-              Required: credentials_file, command.
-              Optional: job_id, log_path, pid_file, workdir, timeout (30).
-              Returns: job_id, pid, pid_file, log_path, exit_file.
-              Returns success=False with actionable error if PID capture fails.
-
-  job_status  Poll a background job (call this externally on an interval).
-              Required: credentials_file, pid_file, log_path.
-              Optional: exit_file, tail_lines (50), timeout (15).
-              Returns: status ("running"|"done"|"unknown"), exit_code,
-                       total_lines, log_tail (only when done), error_summary (only when done+nonzero).
-              POLLING RULES:
-                • When status="running" the output has NO log_tail field — it is
-                  omitted to keep polling calls slim.  Do NOT try to read log_tail
-                  from a RUNNING result; wait until status="done".
-                • Recommended poll interval: 30–900 s depending on expected job
-                  duration.  Polling faster than 30 s wastes context with no benefit.
-                • PREFER wait_done over job_status for long tasks — it uses a
-                  single SSH connection instead of one per poll.
-
-  wait_done   PREFERRED for long tasks: block inside a SINGLE SSH connection
-              until the background job finishes, then return the result.
-              Eliminates repeated job_status polling (each poll = new connection).
-              The remote host runs a sleep loop; Python waits for it to return.
-              SSH keepalive packets prevent NAT/firewall from dropping the idle
-              connection during the wait.
-              Required: credentials_file, pid_file, log_path.
-              Optional: exit_file, timeout (300), poll_interval (5), tail_lines (50).
-              Returns: status ("done"|"timeout"), exit_code, log_tail,
-                       total_lines, error_summary, waited_seconds.
-              USE THIS instead of job_status when you don't need to do other work
-              while the remote job runs.  Fall back to job_status only when you
-              need to interleave local work with remote polling.
-
-  tail_log    Read the last N lines of a remote log file.
-              Required: credentials_file, log_path.
-              Optional: lines (100), pattern (grep -E filter), timeout (15).
-
-  fetch_log   Page through a large log file by line range.
-              Required: credentials_file, log_path.
-              Optional: start_line (1), end_line (start+199), timeout (15).
-              USE THIS to debug failures in large logs.
-
-  write_file  Upload inline string content to a remote path via SFTP.
-              Required: credentials_file, remote_path, content.
-
-  run_script  HIGH-LEVEL: write_file → chmod +x → exec_bg in one call.
-              Required: credentials_file, script_content.
-              Optional: script_name, job_id, workdir, timeout_hint_seconds.
-              Returns: job_id, pid, pid_file, log_path, exit_file, script_remote_path.
-              USE THIS for long-running remote scripts.
-
-  safe_exit   Kill all nohup jobs tracked under ~/handq_jobs/ and remove pid files.
-              Required: credentials_file. Optional: timeout (15).
-              ALWAYS call this when done.
-
-Recommended workflow for long-running remote scripts:
-  1. ssh(exec)            — verify workdir and environment; check login_shell field
-  2. ssh(run_script)      — upload and launch the script as nohup background
-  3. ssh(wait_done)       — PREFERRED: single connection, blocks until job finishes
-                            (set timeout to expected job duration + buffer)
-     — OR —
-     ssh(job_status)      — poll externally every 30–60 s until status != "running"
-                            (use when you need to interleave local work during the wait)
-  4. ssh(tail_log)        — inspect output on success, or
-     ssh(fetch_log)       — page through large logs to debug failures
-  5. ssh(safe_exit)       — clean up all jobs
-  6. write report to local file""",
+            usage_guide=_ssh_usage_guide,
             parameter_schema=StatelessSSHTool().parameter_schema,
             tool_class=StatelessSSHTool,
             on_demand=True,
         )
+
+        # Register SESSION tool — interactive subprocess sessions (adb shell,
+        # Python REPL, telnet, etc.). Windows-only: the irreplaceable scenarios
+        # (adb dev, serial console, watch-and-inject) are Windows-centric;
+        # Linux equivalents (tmux, expect, screen) are mature enough that
+        # shell + ssh suffice. on_demand=True: activated by
+        # SessionContextProvider when the planner detects the pattern.
+        if _IS_WINDOWS:
+            from .session_tool import InteractiveSessionTool
+            _session_usage_guide = """\
+WHEN TO USE — exactly ONE of (1)-(4) must hold; STATE WHICH IN REASONING:
+  (1) State persistence across commands.
+      Subsequent commands depend on accumulated process state that a fresh
+      shell call would lose: cwd, env vars, REPL bindings, adb shell context,
+      open file handles. shell spawns a new process per call → state lost.
+      e.g.  open('adb shell') → exec('cd /data/local/tmp') → exec('ls') → exec('cat foo')
+
+  (2) Watch streaming output AND inject commands concurrently.
+      You read a continuous stream while sending input based on what you see.
+      shell run_in_background lets you watch OR write — not both.
+      e.g.  open('adb logcat') → read(timeout=5) → write('am force-stop X') → read
+
+  (3) Tty-bound device interaction.
+      Serial console, picocom, minicom — programs that genuinely require a
+      pty and refuse to work with a piped stdin.
+      e.g.  open('picocom -b 115200 /dev/ttyUSB0', prompt_pattern='> $')
+
+  (4) User explicitly asked to watch / observe / 看着 / monitor live.
+      The UI streams session output in real time; only session can do this.
+      Trigger words: "看着", "演示", "watch", "observe", "monitor live".
+
+WHEN NOT TO USE
+  Anything not matching (1)-(4) → use shell or ssh. If you cannot name which
+  scenario applies in your reasoning, you are using the wrong tool. Default
+  to shell.
+    Single command, even if remote     → shell with: ssh host 'cmd'
+    Known multi-cmd sequence           → shell with: 'cmd1 && cmd2'
+    Long-running ssh batch job         → ssh tool: run_script + wait_done
+    Single ssh exec for stdout         → shell with: ssh host 'cmd'
+
+ACTIONS (parameter details in schema):
+  open    spawn subprocess; returns session_id; pass alias= to reuse a live one
+  exec    send command, wait for completion (delimiter auto-injected for
+          shells; prompt_pattern matched for REPLs)
+  write   send raw stdin without waiting (use for y/n prompts, ^C, password)
+  read    drain buffered output (timeout=N waits up to N seconds for new data)
+  list    list active sessions
+  close   kill the subprocess tree
+
+NOTES
+  - Maximum 4 concurrent sessions; auto-killed on task completion.
+  - SSH commands: 'ssh -tt' is auto-prepended for remote pty allocation.
+    Credentials must be pre-established by ssh_setup (key auth or keyring) —
+    no password injection happens here.
+  - For streaming processes (logcat, tail -f), use write + read instead of exec.
+
+EXAMPLES
+  GOOD scenario (1): open('adb shell') → exec('cd /data') → exec('ls') → close
+  GOOD scenario (2): open('adb logcat') → read(timeout=5) → write('q\\n')
+  GOOD scenario (3): open('picocom -b 115200 /dev/ttyUSB0', prompt_pattern='> $')
+  GOOD scenario (4): user said "watch it live" → open('ssh -tt user@host')
+  BAD:  open('adb shell') → exec('ls /data') → close
+        ↑ single command, no state reuse → shell with: adb shell ls /data
+  BAD:  open('ssh host') → exec('long_script.sh') → block waiting
+        ↑ batch job → ssh tool: run_script + wait_done (survives disconnect)
+"""
+            cls._tools[cls.SESSION] = ToolMetadata(
+                name=cls.SESSION,
+                description=(
+                    "Interactive session tool — spawn and control long-lived subprocesses "
+                    "(adb shell, Python REPL, serial console, etc.) across multiple tool "
+                    "calls. UI streams stdout in real time. Use ONLY when shell+ssh cannot "
+                    "express the scenario; see WHEN TO USE for the 4 irreplaceable cases."
+                ),
+                usage_guide=_session_usage_guide,
+                parameter_schema={
+                    "type": "object",
+                    "properties": {
+                        "action": {
+                            "type": "string",
+                            "enum": ["open", "exec", "write", "read", "list", "close"],
+                            "description": "Session action to perform.",
+                        },
+                        "session_id": {
+                            "type": "string",
+                            "description": "[exec/write/read/close] Session ID returned by open.",
+                        },
+                        "command": {
+                            "type": "string",
+                            "description": (
+                                "[open] Program to launch (e.g., 'adb shell', 'python -i'). "
+                                "[exec] Command to send to stdin and wait for completion."
+                            ),
+                        },
+                        "alias": {
+                            "type": "string",
+                            "description": (
+                                "[open] If a live session with this alias exists, reuse it "
+                                "instead of spawning a new one. Useful for re-entering an "
+                                "existing adb/REPL session across planner steps."
+                            ),
+                        },
+                        "input": {
+                            "type": "string",
+                            "description": "[write] Raw text sent to stdin without waiting.",
+                        },
+                        "description": {
+                            "type": "string",
+                            "description": "[open] Human-readable label for the session.",
+                        },
+                        "prompt_pattern": {
+                            "type": "string",
+                            "description": (
+                                "[open] Regex matching the REPL's prompt "
+                                "(e.g., '^>>> ' for Python). Used by 'exec' to detect "
+                                "completion. Not needed for shells (delimiter auto-injected)."
+                            ),
+                        },
+                        "cwd": {
+                            "type": "string",
+                            "description": "[open] Working directory for the subprocess.",
+                        },
+                        "timeout": {
+                            "type": "number",
+                            "description": (
+                                "[exec] Max seconds to wait for completion (default 30). "
+                                "[read] Seconds to wait for new data (default 0 = immediate)."
+                            ),
+                        },
+                        "append_newline": {
+                            "type": "boolean",
+                            "description": "[write] Append newline after input (default true).",
+                        },
+                        "merge_stderr": {
+                            "type": "boolean",
+                            "description": "[open] Merge stderr into stdout (default true).",
+                        },
+                    },
+                    "required": ["action"],
+                    "additionalProperties": False,
+                },
+                tool_class=InteractiveSessionTool,
+                on_demand=True,
+            )
 
         # Register BROWSER tool. Windows-only — Playwright + Edge channel
         # gating is tested only on Win11. on_demand=True so it only enters
@@ -1530,6 +1589,8 @@ EXAMPLES
                 instances[name] = ShellTool(venv_path=venv_path)
             elif name == cls.SSH:
                 instances[name] = StatelessSSHTool()
+            elif name == cls.SESSION:
+                instances[name] = metadata.create_instance()
             else:
                 instances[name] = metadata.create_instance()
         return instances

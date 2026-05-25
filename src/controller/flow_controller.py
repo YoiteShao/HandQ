@@ -777,21 +777,36 @@ class FlowController:
         return step
 
     def _register_default_providers(self) -> None:
-        """Register built-in StepContextProviders (SSH, browser, etc.)."""
+        """Register built-in StepContextProviders.
+
+        Browser, Desktop, and Session providers are Windows-only — they are
+        not registered on Linux, so the Linux planner never sees their tools
+        nor receives any hint mentioning them. SSH provider is registered on
+        both platforms.
+        """
+        import sys as _sys
+        _is_windows = _sys.platform == "win32"
+
         try:
             from ..infrastructure.ssh_setup import SSHContextProvider
             self.register_step_context_provider(SSHContextProvider())
         except ImportError:
-            # paramiko / keyring not installed — SSH provider unavailable.
             self.logger.debug(
                 "SSHContextProvider not registered (paramiko or keyring missing)",
                 component="FlowController",
             )
+
+        if not _is_windows:
+            self.logger.info(
+                "Linux platform: skipping Browser/Desktop/Session provider registration",
+                component="FlowController",
+            )
+            return
+
         try:
             from ..infrastructure.browser_setup import BrowserContextProvider
             self.register_step_context_provider(BrowserContextProvider())
         except ImportError:
-            # browser_paths or other transitive deps missing — silently skip.
             self.logger.debug(
                 "BrowserContextProvider not registered (transitive deps missing)",
                 component="FlowController",
@@ -800,12 +815,20 @@ class FlowController:
             from ..infrastructure.desktop_setup import DesktopContextProvider
             self.register_step_context_provider(DesktopContextProvider())
         except ImportError:
-            # desktop_tool transitive deps (pyautogui / mss / pywin32) may
-            # be missing on a slim install. The provider itself does its
-            # own dep check at prepare-time and emits an UNAVAILABLE hint;
-            # this except is just for the import-line itself.
             self.logger.debug(
                 "DesktopContextProvider not registered (transitive deps missing)",
+                component="FlowController",
+            )
+        try:
+            from ..infrastructure.session_setup import SessionContextProvider
+            self.register_step_context_provider(SessionContextProvider())
+            self.logger.info(
+                f"SessionContextProvider registered (total providers: {len(self._step_context_providers)})",
+                component="FlowController",
+            )
+        except Exception as _session_exc:
+            self.logger.warning(
+                f"SessionContextProvider not registered: {type(_session_exc).__name__}: {_session_exc}",
                 component="FlowController",
             )
 
@@ -2249,14 +2272,17 @@ class FlowController:
             # prepare() is idempotent: calling it again for the same hostname
             # returns the brief hint without re-prompting or re-connecting.
             for _preflight_step in chunk:
+                _pf_required = getattr(_preflight_step, "tools_required", None) or []
                 for _provider in self._step_context_providers:
+                    _pf_tool = getattr(_provider, "tool_name", None)
+                    if not _pf_tool or _pf_tool not in _pf_required:
+                        continue
                     try:
-                        if _provider.matches(_preflight_step):
-                            await _provider.prepare(
-                                _preflight_step,
-                                self.interaction_manager,
-                                self.memory,
-                            )
+                        await _provider.prepare(
+                            _preflight_step,
+                            self.interaction_manager,
+                            self.memory,
+                        )
                     except Exception as _pf_exc:
                         self.logger.warning(
                             f"SSH pre-flight failed for step "
@@ -2457,28 +2483,48 @@ class FlowController:
             )
 
         # ── Step context providers ─────────────────────────────────────────────
-        # Each registered provider may append a hint to effective_goal.
-        # Providers run sequentially; errors are logged but do not abort the step
-        # unless the provider explicitly raises (e.g. SSHSetupError).
-        extra_tool_names: List[str] = []
+        # Tool activation policy: Planner's step.tools_required is the SINGLE
+        # source of truth. Each registered provider serves exactly one tool
+        # (provider.tool_name). When that name appears in step.tools_required,
+        # the provider's prepare() runs to set up resources (credentials,
+        # profile dirs, etc.) and inject a hint into effective_goal.
+        #
+        # No keyword safety net: if the Planner under-declares, the agent
+        # fails for lack of a tool, returns an error JSON, and the next
+        # observe_and_plan() round corrects tools_required. This costs one
+        # wasted iteration; it preserves agent focus and avoids context
+        # inflation from keyword false-positives.
+        extra_tool_names: List[str] = list(getattr(step, "tools_required", []) or [])
+        self.logger.info(
+            f"Step {step.step_id!r}: planner declared tools_required={extra_tool_names}; "
+            f"{len(self._step_context_providers)} providers registered",
+            component="FlowController",
+        )
         for provider in self._step_context_providers:
-            try:
-                if provider.matches(step):
+            provider_tool = getattr(provider, "tool_name", None)
+            if provider_tool and provider_tool in extra_tool_names:
+                try:
                     hint = await provider.prepare(step, self.interaction_manager, self.memory)
                     if hint:
                         effective_goal = f"{effective_goal}\n\n{hint}"
-                    extra_tool_names.extend(provider.extra_tool_names())
-            except Exception as provider_exc:
-                self.logger.warning(
-                    f"StepContextProvider {provider.__class__.__name__} failed: {provider_exc}",
-                    component="FlowController",
-                )
-                # Surface the error in the goal so the agent can report it.
-                effective_goal = (
-                    f"{effective_goal}\n\n"
-                    f"[Context Setup Warning]\n"
-                    f"{provider.__class__.__name__} failed: {provider_exc}"
-                )
+                except Exception as provider_exc:
+                    self.logger.warning(
+                        f"StepContextProvider {provider.__class__.__name__} "
+                        f"failed for tool '{provider_tool}': {provider_exc}",
+                        component="FlowController",
+                    )
+                    # Surface the error in the goal so the agent can report it.
+                    effective_goal = (
+                        f"{effective_goal}\n\n"
+                        f"[Context Setup Warning]\n"
+                        f"{provider.__class__.__name__} failed: {provider_exc}"
+                    )
+
+        if extra_tool_names:
+            self.logger.info(
+                f"Extra tools activated for step {step.step_id!r}: {extra_tool_names}",
+                component="FlowController",
+            )
 
         agent = RuntimeAgent(
             llm_services=self._agent_services,
@@ -2698,6 +2744,7 @@ class FlowController:
         from ..tools.browser_tool import flush_browser_pool
         from ..tools.desktop_tool import flush_desktop_store
         from ..infrastructure.vision import flush_vision_client
+        from ..tools.session_tool import flush_session_pool
 
         # Order matters slightly: browser uses the vision client (for
         # vision_query); flush browser first so its in-flight calls
@@ -2707,6 +2754,7 @@ class FlowController:
             ("browser pool",       flush_browser_pool),
             ("vision LLM client",  flush_vision_client),
             ("desktop screenshot store", flush_desktop_store),
+            ("interactive sessions", flush_session_pool),
         ]
         for label, fn in cleanups:
             try:

@@ -363,6 +363,34 @@ while leaving a stale `error_summary` from a previous failed attempt.  The patte
   3. Clear ALL stale intermediate fields (error_summary, tmp_pid, partial_artifacts, …)
   4. Write the entire updated record atomically
 
+**URL discipline**:
+Do NOT generate or guess URLs. A URL is only acceptable when ONE of these holds:
+  - The URL was provided by the user, the task description, or a config file you read
+  - The URL is a well-known canonical address you are highly confident about
+    (e.g. https://github.com, https://pypi.org, https://docs.python.org)
+  - You found the URL via a tool call (read a file, ran a command that printed it,
+    grep'd it from source, fetched it via shell)
+If a URL is needed and none of the above applies, surface this as a gap in
+key_findings rather than fabricating a plausible-looking URL. Hallucinated URLs
+send users to wrong, unreachable, or malicious addresses.
+
+---
+
+## Narration Discipline
+
+Between tool calls, keep narration text to ≤25 words — one short sentence stating
+what you just learned or what you're about to do. Don't narrate internal
+deliberation; the tool calls and their results speak for themselves. Users see
+the diff and the observation history.
+
+The completion JSON's `outcome` and `key_findings` fields are where detail goes —
+that's where you have a budget for thoroughness. Narration text outside those
+fields should be sparse. State results and decisions directly.
+
+Match responses to the situation: a single targeted action gets one short
+sentence; a discovery sweep can warrant two. Don't add headers or sections to
+inter-turn narration.
+
 ---
 
 ## Context Window Awareness
