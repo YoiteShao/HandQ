@@ -227,6 +227,7 @@ class FlowController:
         # Register additional providers via register_step_context_provider().
         self._step_context_providers: List[StepContextProvider] = []
         self._register_default_providers()
+        self._update_planner_tool_table()
 
         self.logger.info(
             f"FlowController initialized. working_directory:{self.working_directory}, "
@@ -817,7 +818,13 @@ class FlowController:
 
         try:
             from ..infrastructure.browser_setup import BrowserContextProvider
-            self.register_step_context_provider(BrowserContextProvider())
+            if self.config_manager.is_tool_enabled("browser"):
+                self.register_step_context_provider(BrowserContextProvider())
+            else:
+                self.logger.info(
+                    "BrowserContextProvider not registered: tool_browser disabled in interaction_switches",
+                    component="FlowController",
+                )
         except ImportError:
             self.logger.debug(
                 "BrowserContextProvider not registered (transitive deps missing)",
@@ -825,7 +832,13 @@ class FlowController:
             )
         try:
             from ..infrastructure.web_search_setup import WebSearchContextProvider
-            self.register_step_context_provider(WebSearchContextProvider())
+            if self.config_manager.is_tool_enabled("web_search"):
+                self.register_step_context_provider(WebSearchContextProvider())
+            else:
+                self.logger.info(
+                    "WebSearchContextProvider not registered: tool_web_search disabled in interaction_switches",
+                    component="FlowController",
+                )
         except ImportError:
             self.logger.debug(
                 "WebSearchContextProvider not registered (transitive deps missing)",
@@ -833,7 +846,13 @@ class FlowController:
             )
         try:
             from ..infrastructure.email_setup import EmailContextProvider
-            self.register_step_context_provider(EmailContextProvider())
+            if self.config_manager.is_tool_enabled("email"):
+                self.register_step_context_provider(EmailContextProvider())
+            else:
+                self.logger.info(
+                    "EmailContextProvider not registered: tool_email disabled in interaction_switches",
+                    component="FlowController",
+                )
         except ImportError:
             self.logger.debug(
                 "EmailContextProvider not registered (pywin32 missing)",
@@ -841,10 +860,30 @@ class FlowController:
             )
         try:
             from ..infrastructure.desktop_setup import DesktopContextProvider
-            self.register_step_context_provider(DesktopContextProvider())
+            if self.config_manager.is_tool_enabled("desktop"):
+                self.register_step_context_provider(DesktopContextProvider())
+            else:
+                self.logger.info(
+                    "DesktopContextProvider not registered: tool_desktop disabled in interaction_switches",
+                    component="FlowController",
+                )
         except ImportError:
             self.logger.debug(
                 "DesktopContextProvider not registered (transitive deps missing)",
+                component="FlowController",
+            )
+        try:
+            from ..infrastructure.ask_human_setup import AskHumanContextProvider
+            if self.config_manager.is_tool_enabled("ask_human"):
+                self.register_step_context_provider(AskHumanContextProvider())
+            else:
+                self.logger.info(
+                    "AskHumanContextProvider not registered: tool_ask_human disabled in interaction_switches",
+                    component="FlowController",
+                )
+        except ImportError:
+            self.logger.debug(
+                "AskHumanContextProvider not registered (import failed)",
                 component="FlowController",
             )
         try:
@@ -865,6 +904,48 @@ class FlowController:
 
 
 
+
+    def _update_planner_tool_table(self) -> None:
+        """Build all dynamic planner sections from registered providers and push to Planner.
+
+        Called once after _register_default_providers() so the planner's system
+        prompt only mentions tools that are both enabled and importable.
+        """
+        table_rows: List[str] = []
+        routing_rules: List[str] = []
+        antipatterns: List[str] = []
+
+        for provider in self._step_context_providers:
+            row = provider.planner_description()
+            if row:
+                table_rows.append(f"| {row} |\n")
+            rule = provider.planner_routing_rule()
+            if rule:
+                routing_rules.append(rule)
+            for ap in provider.planner_antipatterns():
+                antipatterns.append(ap)
+
+        # Number routing rules starting at 6 (after the 5 static ssh/session rules).
+        numbered_rules = "".join(
+            f"{6 + i}. {rule:<52}\n"
+            for i, rule in enumerate(routing_rules)
+        )
+        coding_rule_num = 6 + len(routing_rules)
+
+        formatted_antipatterns = "".join(
+            f"  ❌ {ap}\n" for ap in antipatterns
+        )
+
+        self.planner._on_demand_tools_table   = "".join(table_rows)
+        self.planner._on_demand_routing_rules = numbered_rules
+        self.planner._on_demand_antipatterns  = formatted_antipatterns
+        self.planner._coding_rule_num         = coding_rule_num
+
+        tool_names = [p.tool_name for p in self._step_context_providers if p.planner_description()]
+        self.logger.info(
+            f"Planner tool table updated: {len(table_rows)} dynamic tool(s) — {tool_names}",
+            component="FlowController",
+        )
 
     def _make_evaluate_callback(self, goal: str) -> Callable[[str], Awaitable]:
         """
@@ -2547,6 +2628,28 @@ class FlowController:
             f"{len(self._step_context_providers)} providers registered",
             component="FlowController",
         )
+        # Defense-in-depth: silently drop any tool the user has disabled via
+        # interaction switches. Provider registration is already gated in
+        # _register_default_providers, so when a tool is disabled neither the
+        # provider nor the tool itself reaches the agent. The planner's static
+        # prompt may still mention the tool — if it declares one anyway, we
+        # strip it here. We DO NOT inject a hint into effective_goal: the
+        # agent will simply not have access to the tool, the call (if any)
+        # will fail with a normal "tool not available" error, and the planner
+        # will replan on the next round. Adding a [Tool Disabled] hint just
+        # bloats context for what is already a self-correcting path.
+        disabled_tools: List[str] = [
+            t for t in extra_tool_names
+            if not self.config_manager.is_tool_enabled(t)
+        ]
+        if disabled_tools:
+            for t in disabled_tools:
+                extra_tool_names.remove(t)
+            self.logger.info(
+                f"Step {step.step_id!r}: stripped disabled tools "
+                f"{disabled_tools} from extra_tool_names",
+                component="FlowController",
+            )
         for provider in self._step_context_providers:
             provider_tool = getattr(provider, "tool_name", None)
             if provider_tool and provider_tool in extra_tool_names:
@@ -2870,9 +2973,6 @@ class FlowController:
 
         if m.total_duration_seconds > 0.0:
             rows.append(("Total duration", f"{m.total_duration_seconds:.1f}s"))
-            rows.append(("Avg task duration", f"{m.avg_duration_seconds:.1f}s"))
-            rows.append(("Min task duration", f"{m.min_duration_seconds:.1f}s"))
-            rows.append(("Max task duration", f"{m.max_duration_seconds:.1f}s"))
 
         if m.step_confidence_avg > 0.0:
             rows.append(("Avg confidence", f"{m.step_confidence_avg:.2f}"))
@@ -2901,43 +3001,37 @@ class FlowController:
         if m.failed_approach_reuse_rate > 0.0:
             rows.append(("Failed-approach avoidance", f"{avoidance_pct:.1f}%"))
 
-        # Build the Markdown table
-        # md_lines = [
-        #     "",
-        #     "---",
-        #     "📊 **Session Metrics** (Cumulative)",
-        #     "",
-        #     "| Metric | Value |",
-        #     "|---|---|",
-        # ]
-        # for label, value in rows:
-        #     md_lines.append(f"| {label} | {value} |")
+        # Build the Markdown block and send to the UI conversation pane.
+        if rows:
+            md_lines = [
+                "",
+                "---",
+                "📊 **Session Metrics** (Cumulative)",
+                "",
+                "| Metric | Value |",
+                "|---|---|",
+            ]
+            for label, value in rows:
+                md_lines.append(f"| {label} | {value} |")
 
-        # # Append goals list if there are multiple (single-task runs are obvious)
-        # if m.goals and len(m.goals) > 1:
-        #     md_lines.append("")
-        #     md_lines.append("**Goals:**")
-        #     for i, goal in enumerate(m.goals, 1):
-        #         truncated = goal[:100] + ("…" if len(goal) > 100 else "")
-        #         md_lines.append(f"{i}. {truncated}")
+            if m.goals and len(m.goals) > 1:
+                md_lines.append("")
+                md_lines.append("**Goals:**")
+                for i, goal in enumerate(m.goals, 1):
+                    truncated = goal[:100] + ("…" if len(goal) > 100 else "")
+                    md_lines.append(f"{i}. {truncated}")
 
-        # # Append non-empty replan trigger messages (skip blank confidence-triggered ones)
-        # meaningful_triggers = [msg for msg in m.replan_trigger_messages if msg.strip()]
-        # if meaningful_triggers:
-        #     md_lines.append("")
-        #     md_lines.append("**Replan triggers:**")
-        #     for i, msg in enumerate(meaningful_triggers, 1):
-        #         truncated = msg[:100] + ("…" if len(msg) > 100 else "")
-        #         md_lines.append(f"{i}. {truncated}")
+            meaningful_triggers = [msg for msg in m.replan_trigger_messages if msg.strip()]
+            if meaningful_triggers:
+                md_lines.append("")
+                md_lines.append("**Replan triggers:**")
+                for i, msg in enumerate(meaningful_triggers, 1):
+                    truncated = msg[:100] + ("…" if len(msg) > 100 else "")
+                    md_lines.append(f"{i}. {truncated}")
 
-        # md_lines.append("")
-        # markdown_block = "\n".join(md_lines)
-        # self.interaction_manager.display_message(markdown_block)
-
-        # ── Output via interaction manager (UI mode) AND stdout (CLI mode) ────
-        # display_message() renders Markdown in the TUI; it is a no-op in CLI.
-        # The plain-text print() ensures CLI users also see the summary.
-        
+            md_lines.append("")
+            markdown_block = "\n".join(md_lines)
+            self.interaction_manager.notify_metrics_report(markdown_block)
 
         # Plain-text stdout fallback for CLI / non-UI mode
         avoidance_pct = m.failed_approach_reuse_rate * 100.0
@@ -2946,9 +3040,6 @@ class FlowController:
         ]
         if m.total_duration_seconds > 0.0:
             plain_lines.append(f"  Total duration:     {m.total_duration_seconds:.1f}s")
-            plain_lines.append(f"  Avg task duration:  {m.avg_duration_seconds:.1f}s")
-            plain_lines.append(f"  Min task duration:  {m.min_duration_seconds:.1f}s")
-            plain_lines.append(f"  Max task duration:  {m.max_duration_seconds:.1f}s")
         if m.step_confidence_avg > 0.0:
             plain_lines.append(f"  Avg confidence:     {m.step_confidence_avg:.2f}")
         if m.avg_iterations_per_step > 0.0:

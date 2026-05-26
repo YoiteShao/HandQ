@@ -93,6 +93,25 @@ class BrowserContextProvider(StepContextProvider):
     def tool_name(self) -> str:
         return "browser"
 
+    def planner_description(self) -> str:
+        return (
+            "`browser` | "
+            "Web automation: visit URL, fill form, click links, extract page content, login flows. "
+            "Off-screen Chromium; cookies persist. "
+            "Routing: `[\"browser\"]`; add `\"web_search\"` when searching internal sources. | "
+            "Step text references a URL or web action"
+        )
+
+    def planner_routing_rule(self) -> str:
+        return "Web page interaction → `tools_required: [\"browser\"]`"
+
+    def planner_antipatterns(self) -> list:
+        return [
+            '`["browser"]` for "extract data from a JSON URL" — that\'s `shell` + `curl` + `read`',
+            '`["browser"]` for "search Confluence/Jira/SharePoint" — that\'s `web_search`; '
+            "navigating + extracting search-result HTML wastes 5-10k tokens vs the clean JSON web_search returns",
+        ]
+
     async def prepare(
         self,
         step: "Step",

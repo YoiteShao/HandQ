@@ -564,6 +564,10 @@ class InteractionManager:
         """
         self._ui_call("show_task_completed", summary)
 
+    def notify_metrics_report(self, markdown: str) -> None:
+        """Send a Markdown-formatted metrics report to the UI conversation pane."""
+        self._ui_call("show_metrics_report", markdown)
+
     def notify_desktop_takeover_started(self, reason: str) -> None:
         """Tell the UI the agent has started driving the user's mouse / keyboard.
 
@@ -775,6 +779,63 @@ class InteractionManager:
                 return _getpass.getpass("  Password: ")
             except (EOFError, KeyboardInterrupt):
                 return ""
+
+    def request_user_text(self, prompt: str) -> str:
+        """
+        Request a single free-text reply from the user (e.g. an answer to an
+        agent's clarifying question via the ``ask_human`` tool).
+
+        Differs from ``request_secret_input`` in two ways:
+          - The renderer is told to show a non-masked text input.
+          - The fallback path prints the prompt without password framing.
+
+        Like ``request_secret_input``, this method is BLOCKING — call it from
+        a thread (e.g. via ``run_in_executor``) so the asyncio loop is not
+        stalled while the user reads and replies.
+
+        Returns the raw string entered by the user (may be empty if the user
+        dismissed the modal without typing).
+        """
+        if self._ui is not None:
+            fn = getattr(self._ui, "request_user_text", None)
+            if fn is not None:
+                self.logger.debug(
+                    "request_user_text: delegating to UI delegate",
+                    component="InteractionManager",
+                )
+                try:
+                    return fn(prompt)
+                except Exception as exc:
+                    self.logger.debug(
+                        f"UI request_user_text raised: {exc}",
+                        component="InteractionManager",
+                    )
+            # Fallback: surface the prompt and block on the confirmation queue.
+            self.logger.warning(
+                f"request_user_text: UI has no request_user_text — "
+                f"blocking on confirmation queue. Prompt: {prompt[:80]}",
+                component="InteractionManager",
+            )
+            print(
+                f"\n[HandQ] AGENT QUESTION — respond in the UI:\n{prompt}",
+                file=sys.stderr, flush=True,
+            )
+            self.display_message(prompt)
+            with self._confirmation_active_lock:
+                self._confirmation_active = True
+            try:
+                return self._confirmation_queue.get()
+            finally:
+                with self._confirmation_active_lock:
+                    self._confirmation_active = False
+        else:
+            # CLI path: print prompt, read a single line.
+            print(f"\n[HandQ] {prompt}", flush=True)
+            try:
+                reply = input("  Your answer: ")
+            except (EOFError, KeyboardInterrupt):
+                return ""
+            return reply
 
     def request_risk_confirmation(
         self, decision: Decision, risk_description: str

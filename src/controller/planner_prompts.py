@@ -491,7 +491,7 @@ bloat and decision-paralysis from over-listing.
 _PLANNER_TOOL_SELECTION_WINDOWS = """\
   read · write · edit · glob · grep · shell · notebook_edit
 
-**Platform: Windows.** Four on-demand tools available.
+**Platform: Windows.**
 
 **On-demand tools** (LIST ONLY when this step concretely needs them):
 
@@ -499,11 +499,10 @@ _PLANNER_TOOL_SELECTION_WINDOWS = """\
 |---|---|---|
 | `ssh` | Long-running remote batch job (≥1 minute, you'll poll/wait/fetch logs) | Set `ssh_target` too |
 | `session` | Persistent subprocess satisfying ONE of: (1) state must persist across commands (cwd / env / REPL / adb shell context) — (2) watch streaming output AND inject commands concurrently — (3) tty-bound device (serial console, picocom, minicom) — (4) user explicitly asked to "watch" / "observe" / 看着 the process live | Name which scenario (1-4) in `planner_reasoning` |
-| `browser` | Web automation: visit URL, fill form, click links, extract page content, login flows | Step text references a URL or web action |
-| `desktop` | Native Windows app automation: Notepad, Excel, File Explorer, Settings, Task Manager, Office apps | Step text references a native app or screen-level action |
-| `web_search` | Search Qualcomm internal sources (Confluence / Jira / SharePoint / orbit). Stackable with `browser` (browser must be launched). Cookies + SSO are reused from the persistent browser profile | Step text says "搜 / search / find" + an internal source name, or "查内网/wiki/Confluence/Jira" |
-| `email` | Read / search local Outlook mail via COM (list folders, messages, read full body, search, download attachment). Reuses the user's MAPI profile — no extra auth. | Step text says "邮件 / inbox / 收件箱 / outlook / mail / 谁发我 / 翻邮箱 / 查邮件" |
-| `coding` | **Hint-only marker** — step **writes or modifies source code files** (creates new files, edits existing logic, generates a component, fixes a bug). Pure read/grep/review steps with no writes do NOT need it. Stackable with the tools above (e.g. UI feature = `["coding", "browser"]`) | Step's primary deliverable is a `.py` / `.ts` / `.tsx` / `.js` / `.jsx` / `.go` / `.rs` / `.java` / `.kt` / `.c` / `.cpp` / `.cs` / `.rb` / `.swift` / `.bat` / `.ps1` / `.sh` / `.bash` file — NOT a `.md` / `.json` / `.yaml` / `.toml` config file and NOT a read-only review |
+{on_demand_tools_table}| `coding` | **Hint-only marker** — step **writes or modifies source code files** (creates new files, edits existing logic, generates a component, fixes a bug). Pure read/grep/review steps with no writes do NOT need it. Stackable with the tools above (e.g. UI feature = `["coding", "browser"]`) | Step's primary deliverable is a `.py` / `.ts` / `.tsx` / `.js` / `.jsx` / `.go` / `.rs` / `.java` / `.kt` / `.c` / `.cpp` / `.cs` / `.rb` / `.swift` / `.bat` / `.ps1` / `.sh` / `.bash` file — NOT a `.md` / `.json` / `.yaml` / `.toml` config file and NOT a read-only review |
+
+> **The table above is the authoritative tool list for this session.**
+> Tools not shown are not available — do not declare them in `tools_required`.
 
 **Routing rules** (apply in order; first match wins):
 
@@ -512,27 +511,17 @@ _PLANNER_TOOL_SELECTION_WINDOWS = """\
 3. Remote long batch (≥1 minute, want job tracking)         → `tools_required: ["ssh"]` + set `ssh_target`
 4. Local interactive matching scenario (1-4)                → `tools_required: ["session"]`
 5. Remote interactive matching scenario (1-4)               → `tools_required: ["session"]` + set `ssh_target`
-6. Web page interaction                                     → `tools_required: ["browser"]`
-7. Native Windows app interaction                           → `tools_required: ["desktop"]`
-8. Internal search across Confluence/Jira/SharePoint/orbit  → `tools_required: ["browser", "web_search"]`  (web_search reuses the browser session for SSO cookies)
-9. Read / search local Outlook email                        → `tools_required: ["email"]`
-10. Step writes / creates / modifies source code files      → ADD `"coding"` to tools_required
+{on_demand_routing_rules}{coding_rule_num}. Step writes / creates / modifies source code files      → ADD `"coding"` to tools_required
    (stackable: `["coding"]`, `["coding", "browser"]` for UI feature, `["coding", "ssh"]` for remote build)
 
 **Anti-patterns**:
   ❌ `["ssh"]` for `ssh host 'echo hi'`        — single command, use shell with `ssh host 'cmd'`
   ❌ `["session"]` without naming scenario (1-4) in `planner_reasoning`
-  ❌ `["browser"]` for "extract data from a JSON URL"  — that's `shell` + `curl` + `read`
-  ❌ `["browser"]` for "search Confluence/Jira/SharePoint"  — that's `web_search`; navigating + extracting search-result HTML wastes 5-10k tokens vs the clean JSON web_search returns
-  ❌ `["web_search"]` without `"browser"`  — web_search reuses the browser session and will fail with "no session"
-  ❌ `["desktop"]` for clicking on a web page  — that's `["browser"]`
-  ❌ `["browser"]` to read mail through OWA when Outlook is installed  — that's `["email"]`; OWA loses the MAPI shortcut and burns 5-10k tokens on page rendering
-  ❌ `["email"]` for sending mail  — write path not yet wired; composer + send come later
   ❌ `["coding"]` for editing `.md` / `.json` / `.yaml` / config files  — those are not source code
   ❌ `["coding"]` for a read-only exploration / grep / review step with no file writes
   ❌ Forgetting `"coding"` on a step that writes source code  — the agent loses scope discipline, comment rules, and run-the-build verification guidance
-  ❌ Empty `[]` for a step that clearly needs ssh/session/browser/desktop/web_search — under-declaration costs a replan
-"""
+  ❌ Empty `[]` for a step that clearly needs ssh/session — under-declaration costs a replan
+{on_demand_antipatterns}"""
 
 _PLANNER_TOOL_SELECTION_LINUX = """\
   read · write · edit · glob · grep · shell · notebook_edit
@@ -570,9 +559,39 @@ subprocess — state/streaming/tty/watch — decompose into shell idioms):
   ❌ Empty `[]` for a step that clearly needs ssh — under-declaration costs a replan
 """
 
-PLANNER_SYSTEM_PROMPT = _PLANNER_COMMON_HEAD + (
-    _PLANNER_TOOL_SELECTION_WINDOWS if _IS_WINDOWS else _PLANNER_TOOL_SELECTION_LINUX
-)
+def build_planner_system_prompt(
+    on_demand_tools_table: str = "",
+    on_demand_routing_rules: str = "",
+    on_demand_antipatterns: str = "",
+    coding_rule_num: int = 6,
+) -> str:
+    """Return the planner system prompt with all dynamic sections filled in.
+
+    Args:
+        on_demand_tools_table: Pipe-delimited table rows from enabled providers
+            (one per line ending with ``\\n``).
+        on_demand_routing_rules: Numbered routing-rule lines (6, 7, …) from
+            enabled providers (one per line ending with ``\\n``).
+        on_demand_antipatterns: ``❌ …`` anti-pattern lines from enabled
+            providers (one per line ending with ``\\n``).
+        coding_rule_num: Sequential number for the static coding routing rule;
+            equals 6 + number_of_dynamic_routing_rules.
+    """
+    if _IS_WINDOWS:
+        tool_selection = _PLANNER_TOOL_SELECTION_WINDOWS.format(
+            on_demand_tools_table=on_demand_tools_table,
+            on_demand_routing_rules=on_demand_routing_rules,
+            on_demand_antipatterns=on_demand_antipatterns,
+            coding_rule_num=coding_rule_num,
+        )
+    else:
+        tool_selection = _PLANNER_TOOL_SELECTION_LINUX
+    return _PLANNER_COMMON_HEAD + tool_selection
+
+
+# Base prompt with all dynamic sections empty (backward compat).
+# Callers should use build_planner_system_prompt() for the live prompt.
+PLANNER_SYSTEM_PROMPT = build_planner_system_prompt()
 
 OBSERVE_AND_PLAN_TEMPLATE = """Decide the next action based on current state.
 

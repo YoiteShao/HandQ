@@ -137,3 +137,41 @@ class ConfigManager:
         if not result and switch_name == "tool_shell":
             result = switches.get("tool_bash", {}).get("auto_approve", False)
         return result
+
+    # Map of context-provider tool name → interaction-switch key.
+    # Tools NOT in this map (write/edit/bash/shell/high_risk/session/ssh/coding)
+    # are always considered enabled — their availability is not user-toggleable.
+    _TOOL_ENABLE_SWITCH = {
+        "browser":    "tool_browser",
+        "desktop":    "tool_desktop",
+        "email":      "tool_email",
+        "web_search": "tool_web_search",
+        "ask_human":  "tool_ask_human",
+    }
+
+    def is_tool_enabled(self, tool_name: str) -> bool:
+        """
+        Check whether a ContextProvider-registered tool is enabled.
+
+        Only the five tools in ``_TOOL_ENABLE_SWITCH`` carry a user-facing
+        enable/disable toggle; everything else is always enabled.
+
+        Backward-compat: if the switch entry is missing the ``enabled`` key
+        entirely (older user configs), default to True so existing setups
+        keep working.
+
+        Args:
+            tool_name: Tool name as declared in the planner's ``tools_required``.
+
+        Returns:
+            True when the tool is available to the agent; False when the user
+            has disabled it via the interaction switch.
+        """
+        switch_name = self._TOOL_ENABLE_SWITCH.get(tool_name)
+        if switch_name is None:
+            return True
+        switches = self.get_interaction_switches_config()
+        switch_entry = switches.get(switch_name, {})
+        # Missing key → treat as enabled (back-compat for older configs that
+        # only carry auto_approve).
+        return bool(switch_entry.get("enabled", True))

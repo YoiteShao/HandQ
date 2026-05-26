@@ -125,6 +125,25 @@ class EmailContextProvider(StepContextProvider):
     def tool_name(self) -> str:
         return "email"
 
+    def planner_description(self) -> str:
+        return (
+            "`email` | "
+            "Read / search local Outlook mail via COM (list folders, messages, read full body, "
+            "search by keyword/sender/date, download attachment). Reuses the user's MAPI profile — "
+            "no extra auth. Routing: `[\"email\"]`. | "
+            "Step says 邮件 / inbox / 收件箱 / outlook / mail / 谁发我 / 翻邮箱 / 查邮件"
+        )
+
+    def planner_routing_rule(self) -> str:
+        return "Read / search local Outlook email → `tools_required: [\"email\"]`"
+
+    def planner_antipatterns(self) -> list:
+        return [
+            '`["browser"]` to read mail through OWA when Outlook is installed — '
+            "that's `[\"email\"]`; OWA loses the MAPI shortcut and burns 5-10k tokens on page rendering",
+            '`["email"]` for sending mail — write path not yet wired; composer + send come later',
+        ]
+
     async def prepare(
         self,
         step: "Step",

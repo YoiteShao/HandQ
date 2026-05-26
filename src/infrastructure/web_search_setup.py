@@ -81,6 +81,28 @@ class WebSearchContextProvider(StepContextProvider):
     def tool_name(self) -> str:
         return "web_search"
 
+    def planner_description(self) -> str:
+        return (
+            "`web_search` | "
+            "Search Qualcomm internal sources (Confluence / Jira / SharePoint / orbit). "
+            "Requires browser session — always pair with `\"browser\"` in tools_required. "
+            "Routing: `[\"browser\", \"web_search\"]`. | "
+            "Step says 搜 / search / find + internal source name, or 查内网/wiki/Confluence/Jira"
+        )
+
+    def planner_routing_rule(self) -> str:
+        return (
+            "Internal search across Confluence/Jira/SharePoint/orbit → "
+            "`tools_required: [\"browser\", \"web_search\"]`  "
+            "(web_search reuses the browser session for SSO cookies)"
+        )
+
+    def planner_antipatterns(self) -> list:
+        return [
+            '`["web_search"]` without `"browser"` — web_search reuses the browser session '
+            'and will fail with "no session"',
+        ]
+
     async def prepare(
         self,
         step: "Step",

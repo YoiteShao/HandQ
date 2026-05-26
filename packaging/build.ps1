@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Build HandQ: Python bridge (Nuitka / Python 3.14) + Electron frontend (electron-builder).
 
@@ -56,7 +56,7 @@
 #>
 [CmdletBinding()]
 param(
-    [string]$Python       = 'py -3.14',
+    [string]$Python       = 'py -3.12',
     [int]   $Jobs         = 0,
     [switch]$Clean,
     [switch]$BridgeOnly,
@@ -115,7 +115,7 @@ Write-Host @"
 # ─────────────────────────────────────────────────────────────────────────────
 Step 'Pre-flight checks'
 
-# Split $Python into cmd + possible args (e.g. "py -3.14")
+# Split $Python into cmd + possible args (e.g. "py -3.12")
 $pyParts = $Python -split ' ', 2
 $pyCmd   = $pyParts[0]
 $pyArgs  = if ($pyParts.Count -gt 1) { $pyParts[1] } else { '' }
@@ -137,9 +137,10 @@ Ok "Python: $pyVer"
 
 if (-not $ElectronOnly) {
     # Nuitka check
-    $nuitkaVer = & $pyCmd ($pyArgs.Split(' ') + @('-m', 'nuitka', '--version')) 2>&1 |
-                 Select-Object -First 1
-    if ($LASTEXITCODE -ne 0) {
+    $nuitkaOut = & $pyCmd ($pyArgs.Split(' ') + @('-m', 'nuitka', '--version')) 2>&1
+    $nuitkaExit = $LASTEXITCODE
+    $nuitkaVer = $nuitkaOut | Select-Object -First 1
+    if ($nuitkaExit -ne 0) {
         Fail "Nuitka not found for $Python. Install with: $Python -m pip install nuitka"
     }
     Ok "Nuitka: $nuitkaVer"
@@ -369,7 +370,10 @@ if (-not $ElectronOnly) {
     Push-Location $REPO_ROOT
     try {
         Write-Host "`n  [Nuitka] compiling bridge_main.py — first build ~10-20 min, incremental ~2 min" -ForegroundColor DarkGray
-        & $pyCmd ($pyArgs ? $pyArgs.Split(' ') : @()) $nuitkaArgs 'bridge_main.py'
+        # Build the python invocation argv. We avoid the PS7-only ternary
+        # operator here so the script also runs under Windows PowerShell 5.1.
+        $pyArgsArray = if ($pyArgs) { $pyArgs.Split(' ') } else { @() }
+        & $pyCmd $pyArgsArray $nuitkaArgs 'bridge_main.py'
         if ($LASTEXITCODE -ne 0) { Fail 'Nuitka compilation failed' }
     }
     finally {

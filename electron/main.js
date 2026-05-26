@@ -364,6 +364,9 @@ function notifyConfirmationNeeded(evt) {
     if (kind === 'secret_input') {
         title = '🔑 HandQ — input required';
         body  = String((evt && evt.prompt) || 'Enter a value to continue.');
+    } else if (kind === 'ask_human') {
+        title = '❓ HandQ — agent question';
+        body  = String((evt && evt.prompt) || 'The agent has a question for you.');
     } else if (kind === 'risk_confirmation') {
         title = '⚠️ HandQ — high-risk operation';
         body  = String((evt && evt.description) || 'Agent wants to run a high-risk command.');
@@ -513,7 +516,8 @@ function spawnBridge() {
         if (evtType === 'status' && evt && (
             evt.kind === 'risk_confirmation' ||
             evt.kind === 'tool_confirmation' ||
-            evt.kind === 'secret_input'
+            evt.kind === 'secret_input' ||
+            evt.kind === 'ask_human'
         )) {
             try { notifyConfirmationNeeded(evt); }
             catch (err) {

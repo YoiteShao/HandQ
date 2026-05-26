@@ -227,6 +227,23 @@ html, body {
     border-top-left-radius: 16px;
 }
 
+.bubble.step {
+    align-self: center;
+    max-width: 88%;
+    padding: 3px 12px;
+    font-size: 12px;
+    line-height: 1.4;
+    background: rgba(255, 255, 255, 0.28);
+    border-color: rgba(0, 0, 0, 0.07);
+    border-radius: 20px;
+    backdrop-filter: blur(20px) saturate(160%);
+    -webkit-backdrop-filter: blur(20px) saturate(160%);
+    color: var(--fg-mute);
+    text-align: center;
+    word-break: break-word;
+    box-shadow: none;
+}
+
 .bubble.error {
     align-self: stretch;
     max-width: 100%;
@@ -1159,6 +1176,46 @@ html, body {
 }
 .settings-form label.checkbox-row > span        { grid-column: 2; }
 .settings-form label.checkbox-row > .help-text  { grid-column: 2; margin-top: 2px; }
+
+/* ── Tool groups ───────────────────────────────────────────────────────
+ * Each registered tool gets a small bordered card containing the tool
+ * name and its switches. Sub-rows are indented so the user can tell at
+ * a glance which switches belong to which tool. When Enable is off, the
+ * Auto-approve row is hidden (see renderer.js applyEnableVisibility).
+ */
+.settings-form .tool-group {
+    margin: 0 0 14px;
+    padding: 10px 12px 6px;
+    border: 1px solid var(--hairline);
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.30);
+}
+.settings-form .tool-group-name {
+    font-weight: 600;
+    color: var(--fg);
+    margin-bottom: 8px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.settings-form .tool-group-badge {
+    font-size: 11px;
+    font-weight: 500;
+    padding: 1px 6px;
+    border-radius: 8px;
+    background: rgba(10, 132, 255, 0.15);
+    color: var(--tint-strong);
+}
+.settings-form label.checkbox-row.tool-sub {
+    margin-left: 18px;
+    margin-bottom: 8px;
+}
+.settings-form label.checkbox-row.tool-sub:last-child {
+    margin-bottom: 4px;
+}
+.settings-form .tool-group label.checkbox-row.tool-sub.is-hidden {
+    display: none;
+}
 
 .settings-actions {
     display: flex;

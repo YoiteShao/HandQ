@@ -72,3 +72,35 @@ class StepContextProvider(ABC):
                        proceed. FlowController surfaces the error to the
                        agent's effective_goal so the agent can report it.
         """
+
+    def planner_description(self) -> str:
+        """Return a Markdown table row for the planner's tool-selection table.
+
+        Format (pipe-delimited, no leading/trailing pipes):
+            ``\\`tool_name\\` | Activate-when description | Decision signal``
+
+        Return an empty string to exclude this tool from the planner table
+        (e.g. tools whose description is already in the static table).
+        The default implementation returns an empty string.
+        """
+        return ""
+
+    def planner_routing_rule(self) -> str:
+        """Return the routing-rule line for this tool (no number prefix).
+
+        Example: ``"Web page interaction → tools_required: ['browser']"``
+
+        Return an empty string to skip. Numbered sequentially by
+        FlowController starting at 6 (after the static ssh/session rules).
+        """
+        return ""
+
+    def planner_antipatterns(self) -> list:
+        """Return a list of anti-pattern strings for this tool.
+
+        Each string should be the full line WITHOUT the leading ❌ —
+        FlowController prepends ``  ❌ `` when building the section.
+
+        Return an empty list to skip.
+        """
+        return []

@@ -330,114 +330,190 @@
                         </label>
                     </fieldset>
 
-                    <!-- ============================== Auto-approve ============================== -->
+                    <!-- ============================== Interaction Switches ============================== -->
                     <fieldset>
-                        <legend>Auto-approve</legend>
+                        <legend>Interaction Switches</legend>
 
                         <p class="help-text fieldset-intro">
-                            For each switch: <strong>checked</strong> = run
-                            immediately without asking; <strong>unchecked</strong>
-                            = show a confirmation dialog first. Paths inside the
-                            working directory are always auto-approved for
-                            write/edit regardless of these switches.
+                            <strong>Enable</strong> controls whether the tool exists at
+                            all — when off, the tool is hidden from the agent.
+                            <strong>Auto-approve</strong> controls whether calls run
+                            silently — checked = run without asking; unchecked = confirm
+                            first. Tools without an Enable switch are always available.
+                            Paths inside the working directory are always auto-approved
+                            for write/edit regardless of these switches.
                         </p>
 
-                        <label class="checkbox-row">
-                            <input type="checkbox" id="cfg-sw-tool-write" />
-                            <span>Auto-approve write tool</span>
-                            <small class="help-text">
-                                When unchecked, ask before the write tool
-                                creates or overwrites a file outside the
-                                working directory.
-                            </small>
-                        </label>
+                        <div class="tool-group">
+                            <div class="tool-group-name">Write tool</div>
+                            <label class="checkbox-row tool-sub">
+                                <input type="checkbox" id="cfg-sw-tool-write" />
+                                <span>Auto-approve</span>
+                                <small class="help-text">
+                                    When unchecked, ask before the write tool
+                                    creates or overwrites a file outside the
+                                    working directory.
+                                </small>
+                            </label>
+                        </div>
 
-                        <label class="checkbox-row">
-                            <input type="checkbox" id="cfg-sw-tool-edit" />
-                            <span>Auto-approve edit tool</span>
-                            <small class="help-text">
-                                When unchecked, ask before the edit tool
-                                modifies an existing file outside the working
-                                directory.
-                            </small>
-                        </label>
+                        <div class="tool-group">
+                            <div class="tool-group-name">Edit tool</div>
+                            <label class="checkbox-row tool-sub">
+                                <input type="checkbox" id="cfg-sw-tool-edit" />
+                                <span>Auto-approve</span>
+                                <small class="help-text">
+                                    When unchecked, ask before the edit tool
+                                    modifies an existing file outside the working
+                                    directory.
+                                </small>
+                            </label>
+                        </div>
 
-                        <label class="checkbox-row">
-                            <input type="checkbox" id="cfg-sw-tool-bash" />
-                            <span>Auto-approve bash tool</span>
-                            <small class="help-text">
-                                When unchecked, ask before any bash command
-                                runs. The high-risk switch below is checked
-                                first and takes priority.
-                            </small>
-                        </label>
+                        <div class="tool-group">
+                            <div class="tool-group-name">Bash tool</div>
+                            <label class="checkbox-row tool-sub">
+                                <input type="checkbox" id="cfg-sw-tool-bash" />
+                                <span>Auto-approve</span>
+                                <small class="help-text">
+                                    When unchecked, ask before any bash command
+                                    runs. The high-risk switch below is checked
+                                    first and takes priority.
+                                </small>
+                            </label>
+                        </div>
 
-                        <label class="checkbox-row">
-                            <input type="checkbox" id="cfg-sw-tool-browser" />
-                            <span>Auto-approve browser tool</span>
-                            <small class="help-text">
-                                When unchecked, ask before each browser action
-                                (navigate, click, type, extract, screenshot, …).
-                                The browser launches off-screen with a separate
-                                profile so it does not disturb your main Chrome.
-                                attach_browser (taking over your running Chrome)
-                                is gated separately by the high-risk switch and
-                                always asks regardless of this setting.
-                            </small>
-                        </label>
+                        <div class="tool-group" data-tool="browser">
+                            <div class="tool-group-name">Browser tool</div>
+                            <label class="checkbox-row tool-sub" data-row="enable">
+                                <input type="checkbox" id="cfg-sw-tool-browser-enabled" />
+                                <span>Enable</span>
+                                <small class="help-text">
+                                    When unchecked, the agent cannot open a
+                                    browser at all — useful when you want to
+                                    forbid web automation for a session.
+                                </small>
+                            </label>
+                            <label class="checkbox-row tool-sub" data-row="auto">
+                                <input type="checkbox" id="cfg-sw-tool-browser-auto" />
+                                <span>Auto-approve</span>
+                                <small class="help-text">
+                                    When unchecked, ask before each browser action
+                                    (navigate, click, type, extract, screenshot, …).
+                                    The browser launches off-screen with a separate
+                                    profile so it does not disturb your main Chrome.
+                                    attach_browser (taking over your running Chrome)
+                                    is gated separately by the high-risk switch and
+                                    always asks regardless of this setting.
+                                </small>
+                            </label>
+                        </div>
 
-                        <label class="checkbox-row">
-                            <input type="checkbox" id="cfg-sw-tool-desktop" />
-                            <span>Auto-approve desktop tool</span>
-                            <small class="help-text">
-                                When unchecked, the agent asks once per task
-                                before driving your real mouse / keyboard
-                                (click_at, type_text, drag, scroll, hotkey,
-                                key_press); a single approval covers every
-                                desktop action until the task ends. Press
-                                <code>Ctrl+Shift+C</code> anytime to revoke.
-                                Read-only actions (screenshot, list_windows,
-                                find_element) are not gated. Sensitive windows
-                                (password managers, banking) are always
-                                refused regardless of this switch. Off by
-                                default — desktop input affects whatever app
-                                is focused, not just HandQ's own browser.
-                            </small>
-                        </label>
+                        <div class="tool-group" data-tool="desktop">
+                            <div class="tool-group-name">Desktop tool</div>
+                            <label class="checkbox-row tool-sub" data-row="enable">
+                                <input type="checkbox" id="cfg-sw-tool-desktop-enabled" />
+                                <span>Enable</span>
+                                <small class="help-text">
+                                    When unchecked, the agent cannot drive your
+                                    mouse / keyboard / take screenshots at all.
+                                </small>
+                            </label>
+                            <label class="checkbox-row tool-sub" data-row="auto">
+                                <input type="checkbox" id="cfg-sw-tool-desktop-auto" />
+                                <span>Auto-approve</span>
+                                <small class="help-text">
+                                    When unchecked, the agent asks once per task
+                                    before driving your real mouse / keyboard
+                                    (click_at, type_text, drag, scroll, hotkey,
+                                    key_press); a single approval covers every
+                                    desktop action until the task ends. Press
+                                    <code>Ctrl+Shift+C</code> anytime to revoke.
+                                    Read-only actions (screenshot, list_windows,
+                                    find_element) are not gated. Sensitive
+                                    windows (password managers, banking) are
+                                    always refused regardless of this switch.
+                                    Off by default — desktop input affects
+                                    whatever app is focused, not just HandQ's
+                                    own browser.
+                                </small>
+                            </label>
+                        </div>
 
-                        <label class="checkbox-row">
-                            <input type="checkbox" id="cfg-sw-tool-web-search" />
-                            <span>Auto-approve web search tool</span>
-                            <small class="help-text">
-                                When unchecked, ask before each internal web
-                                search (Confluence / Jira / SharePoint / orbit).
-                                Read-only — returns titles, URLs, and snippets.
-                                Uses the authenticated browser session.
-                            </small>
-                        </label>
+                        <div class="tool-group" data-tool="web_search">
+                            <div class="tool-group-name">Web search tool</div>
+                            <label class="checkbox-row tool-sub" data-row="enable">
+                                <input type="checkbox" id="cfg-sw-tool-web-search-enabled" />
+                                <span>Enable</span>
+                                <small class="help-text">
+                                    When unchecked, the agent cannot search
+                                    Confluence / Jira / SharePoint / orbit at
+                                    all.
+                                </small>
+                            </label>
+                            <label class="checkbox-row tool-sub" data-row="auto">
+                                <input type="checkbox" id="cfg-sw-tool-web-search-auto" />
+                                <span>Auto-approve</span>
+                                <small class="help-text">
+                                    When unchecked, ask before each internal web
+                                    search. Read-only — returns titles, URLs,
+                                    and snippets. Uses the authenticated browser
+                                    session.
+                                </small>
+                            </label>
+                        </div>
 
-                        <label class="checkbox-row">
-                            <input type="checkbox" id="cfg-sw-tool-email" />
-                            <span>Auto-approve email tool</span>
-                            <small class="help-text">
-                                When unchecked, ask before reading email via
-                                local Outlook COM. Read actions are low-risk.
-                                Write actions (compose / send) will always go
-                                through the high-risk gate regardless of this
-                                switch.
-                            </small>
-                        </label>
+                        <div class="tool-group" data-tool="email">
+                            <div class="tool-group-name">Email tool</div>
+                            <label class="checkbox-row tool-sub" data-row="enable">
+                                <input type="checkbox" id="cfg-sw-tool-email-enabled" />
+                                <span>Enable</span>
+                                <small class="help-text">
+                                    When unchecked, the agent cannot read your
+                                    Outlook mail at all.
+                                </small>
+                            </label>
+                            <label class="checkbox-row tool-sub" data-row="auto">
+                                <input type="checkbox" id="cfg-sw-tool-email-auto" />
+                                <span>Auto-approve</span>
+                                <small class="help-text">
+                                    When unchecked, ask before reading email via
+                                    local Outlook COM. Read actions are
+                                    low-risk. Write actions (compose / send)
+                                    will always go through the high-risk gate
+                                    regardless of this switch.
+                                </small>
+                            </label>
+                        </div>
 
-                        <label class="checkbox-row">
-                            <input type="checkbox" id="cfg-sw-high-risk" />
-                            <span>Auto-approve high-risk commands</span>
-                            <small class="help-text">
-                                When unchecked, ask before any high-risk bash
-                                command (rm, kill, shutdown, DROP TABLE,
-                                git push --force, …). Strongly recommended:
-                                leave unchecked.
-                            </small>
-                        </label>
+                        <div class="tool-group" data-tool="ask_human">
+                            <div class="tool-group-name">Ask Human tool</div>
+                            <label class="checkbox-row tool-sub" data-row="enable">
+                                <input type="checkbox" id="cfg-sw-tool-ask-human-enabled" />
+                                <span>Enable</span>
+                                <small class="help-text">
+                                    When checked, the agent can pop a modal
+                                    asking you for clarification when it
+                                    genuinely needs more information. Off by
+                                    default — most tasks should be solved from
+                                    context, not by prompting.
+                                </small>
+                            </label>
+                        </div>
+
+                        <div class="tool-group">
+                            <div class="tool-group-name">High-risk commands</div>
+                            <label class="checkbox-row tool-sub">
+                                <input type="checkbox" id="cfg-sw-high-risk" />
+                                <span>Auto-approve</span>
+                                <small class="help-text">
+                                    When unchecked, ask before any high-risk
+                                    bash command (rm, kill, shutdown, DROP
+                                    TABLE, git push --force, …). Strongly
+                                    recommended: leave unchecked.
+                                </small>
+                            </label>
+                        </div>
                     </fieldset>
 
                     <!-- ============================== Email ============================== -->

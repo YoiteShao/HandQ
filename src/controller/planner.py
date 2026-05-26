@@ -30,6 +30,7 @@ from ..infrastructure.gep_template import validate_instantiated_steps
 from ..models.plan import Plan, Step, StepStatus
 from .planner_prompts import (
     PLANNER_SYSTEM_PROMPT,
+    build_planner_system_prompt,
     OBSERVE_AND_PLAN_TEMPLATE,
     ACCEPTANCE_SYNTHESIS_SYSTEM_PROMPT,
     ACCEPTANCE_SYNTHESIS_TEMPLATE,
@@ -195,6 +196,12 @@ class Planner:
         self.last_input_tokens: int = 0
         self.detail_window: int = 4  # steps shown in full detail by _build_completed_summary
         self._gep_template = gep_template
+        # Dynamic tool table — set by FlowController after provider registration.
+        # Each row is a pipe-delimited Markdown table line from provider.planner_description().
+        self._on_demand_tools_table: str = ""
+        self._on_demand_routing_rules: str = ""
+        self._on_demand_antipatterns: str = ""
+        self._coding_rule_num: int = 6
         self.logger.info("Planner initialized successfully", component="Planner")
 
         # ── Context compression state ─────────────────────────────────────────
@@ -758,7 +765,12 @@ class Planner:
             # discard the proven lookahead on confidence-driven or stagnation replans.
             user_instruction_block = "\n" + GEP_REPLAN_CONSTRAINT
 
-        system_prompt_content = PLANNER_SYSTEM_PROMPT
+        system_prompt_content = build_planner_system_prompt(
+            on_demand_tools_table=self._on_demand_tools_table,
+            on_demand_routing_rules=self._on_demand_routing_rules,
+            on_demand_antipatterns=self._on_demand_antipatterns,
+            coding_rule_num=self._coding_rule_num,
+        )
         gep_template_section = self._build_gep_template_section()
 
         # Build directory section dynamically. When working_directory is None

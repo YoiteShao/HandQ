@@ -238,10 +238,15 @@
     const cfgSwToolWrite = document.getElementById('cfg-sw-tool-write');
     const cfgSwToolEdit  = document.getElementById('cfg-sw-tool-edit');
     const cfgSwToolBash  = document.getElementById('cfg-sw-tool-bash');
-    const cfgSwToolBrowser = document.getElementById('cfg-sw-tool-browser');
-    const cfgSwToolDesktop = document.getElementById('cfg-sw-tool-desktop');
-    const cfgSwToolWebSearch = document.getElementById('cfg-sw-tool-web-search');
-    const cfgSwToolEmail = document.getElementById('cfg-sw-tool-email');
+    const cfgSwToolBrowserEnabled = document.getElementById('cfg-sw-tool-browser-enabled');
+    const cfgSwToolBrowserAuto    = document.getElementById('cfg-sw-tool-browser-auto');
+    const cfgSwToolDesktopEnabled = document.getElementById('cfg-sw-tool-desktop-enabled');
+    const cfgSwToolDesktopAuto    = document.getElementById('cfg-sw-tool-desktop-auto');
+    const cfgSwToolWebSearchEnabled = document.getElementById('cfg-sw-tool-web-search-enabled');
+    const cfgSwToolWebSearchAuto    = document.getElementById('cfg-sw-tool-web-search-auto');
+    const cfgSwToolEmailEnabled = document.getElementById('cfg-sw-tool-email-enabled');
+    const cfgSwToolEmailAuto    = document.getElementById('cfg-sw-tool-email-auto');
+    const cfgSwToolAskHumanEnabled = document.getElementById('cfg-sw-tool-ask-human-enabled');
     const cfgSwHighRisk  = document.getElementById('cfg-sw-high-risk');
     const cfgEmailFolderBlacklist = document.getElementById('cfg-email-folder-blacklist');
 
@@ -249,6 +254,43 @@
     const cfgHotkey = document.getElementById('cfg-hotkey');
 
     let originalConfig = null;
+
+    // ── Enable → Auto-approve visibility ──────────────────────────────
+    // For tools that have both an Enable and an Auto-approve switch, the
+    // Auto-approve row is meaningless when Enable is off. Hide it in that
+    // case so the Settings panel stays uncluttered.
+    const _enableAutoPairs = [
+        // [enable checkbox, tool-group data-tool key]
+        ['browser',    'cfg-sw-tool-browser-enabled',    'cfg-sw-tool-browser-auto'],
+        ['desktop',    'cfg-sw-tool-desktop-enabled',    'cfg-sw-tool-desktop-auto'],
+        ['web_search', 'cfg-sw-tool-web-search-enabled', 'cfg-sw-tool-web-search-auto'],
+        ['email',      'cfg-sw-tool-email-enabled',      'cfg-sw-tool-email-auto'],
+        ['ask_human',  'cfg-sw-tool-ask-human-enabled',  null],
+    ];
+
+    function applyEnableVisibility() {
+        for (const [, enableId, autoId] of _enableAutoPairs) {
+            if (!autoId) continue;
+            const enableEl = document.getElementById(enableId);
+            const autoEl   = document.getElementById(autoId);
+            if (!enableEl || !autoEl) continue;
+            const autoRow = autoEl.closest('label.checkbox-row');
+            if (!autoRow) continue;
+            if (enableEl.checked) {
+                autoRow.classList.remove('is-hidden');
+            } else {
+                autoRow.classList.add('is-hidden');
+            }
+        }
+    }
+
+    // Re-evaluate visibility whenever an Enable checkbox flips.
+    for (const [, enableId] of _enableAutoPairs) {
+        const enableEl = document.getElementById(enableId);
+        if (enableEl) {
+            enableEl.addEventListener('change', applyEnableVisibility);
+        }
+    }
 
     // Settings loading overlay (created lazily on first settings open)
     let settingsLoadingEl = null;
@@ -1126,6 +1168,16 @@
         scrollToBottom();
     }
 
+    function addStepBubble(icon, desc) {
+        const bubble = el('div', 'bubble step');
+        const body = el('div', 'bubble-body');
+        const time = new Date().toLocaleTimeString([], { hour12: false });
+        body.textContent = time + '  ' + (icon ? icon + ' ' : '') + (desc || '');
+        bubble.appendChild(body);
+        conversation.appendChild(bubble);
+        scrollToBottom();
+    }
+
     function addErrorBubble(message, where) {
         const bubble = el('div', 'bubble error');
         const prefix = where ? '[' + where + '] ' : '';
@@ -1208,11 +1260,26 @@
             renderDecisionSummary(null);
             confirmSecretWrap.classList.remove('hidden');
             confirmSecretIn.value = '';
+            try { confirmSecretIn.type = 'password'; } catch (_) { /* ignore */ }
             confirmGuidanceEl.classList.add('hidden');
             confirmGuidanceEl.value = '';
             confirmRejectBtn.classList.add('hidden');
             confirmGuidBtn.classList.add('hidden');
             confirmSubmitBtn.textContent = 'Submit';
+        } else if (evt.kind === 'ask_human') {
+            confirmTitle.textContent = 'Question from agent';
+            confirmDescEl.textContent = String(evt.prompt || 'The agent has a question:');
+            renderDecisionSummary(null);
+            confirmSecretWrap.classList.remove('hidden');
+            confirmSecretIn.value = '';
+            // Non-masked input — the user is typing a clarifying answer,
+            // not a secret. Reset to password before the next secret_input.
+            try { confirmSecretIn.type = 'text'; } catch (_) { /* ignore */ }
+            confirmGuidanceEl.classList.add('hidden');
+            confirmGuidanceEl.value = '';
+            confirmRejectBtn.classList.add('hidden');
+            confirmGuidBtn.classList.add('hidden');
+            confirmSubmitBtn.textContent = 'Send';
         } else {
             // risk_confirmation or tool_confirmation
             const isRisk = evt.kind === 'risk_confirmation';
@@ -1253,9 +1320,9 @@
         }
 
         openOverlay(overlayConfirm);
-        // Focus management: passwords get the input; risk gates need an
-        // explicit click on Approve so we don't auto-focus the primary.
-        if (evt.kind === 'secret_input') {
+        // Focus management: passwords / ask_human get the input; risk gates
+        // need an explicit click on Approve so we don't auto-focus the primary.
+        if (evt.kind === 'secret_input' || evt.kind === 'ask_human') {
             try { confirmSecretIn.focus(); } catch (_) { /* ignore */ }
         }
     }
@@ -1656,7 +1723,8 @@
 
         if (evt.kind === 'risk_confirmation' ||
             evt.kind === 'tool_confirmation' ||
-            evt.kind === 'secret_input') {
+            evt.kind === 'secret_input' ||
+            evt.kind === 'ask_human') {
             // Show the confirmation modal and stop further dispatch — these
             // envelopes are not informational status updates.
             recordEvent('confirmation requested: ' + evt.kind +
@@ -1693,16 +1761,20 @@
             recordEvent(text);
             setPill(text);
         } else if (evt.kind === 'step_started') {
+            const stepId = String(evt.step_id || args[0] || '');
             const desc = String(evt.desc || args[1] || '');
             session.currentStep = desc;
             recordEvent('step started: ' + desc);
             pushActivity('▶', 'Step started', desc);
             setWorking('▶ ' + truncate(desc, 120));
+            addStepBubble('▶', desc);
         } else if (evt.kind === 'step_completed') {
+            const stepId = String(evt.step_id || args[0] || '');
             const desc = String(evt.desc || args[1] || '');
             recordEvent('step completed: ' + desc);
             pushActivity('✓', 'Step completed', desc);
             setPill('✓ ' + truncate(desc, 120));
+            addStepBubble('✓', desc);
         } else if (evt.kind === 'step_confidence') {
             const conf = parseFloat(args[0]);
             if (!Number.isNaN(conf)) {
@@ -1755,6 +1827,8 @@
             // lock, and we want the entry to land in the popover regardless.
             pushActivity('🏁', 'Task completed', summary);
             markCompleted(summary);
+        } else if (evt.kind === 'metrics_report') {
+            addAssistantTextBubble(evt.text || '');
         } else if (evt.kind === 'bridge_exit') {
             session.state = 'bridge exited';
             recordEvent('bridge exited');
@@ -2039,7 +2113,7 @@
     // accidentally cancel an SSH credential prompt mid-typing.
 
     confirmSubmitBtn.addEventListener('click', () => {
-        if (activePromptKind === 'secret_input') {
+        if (activePromptKind === 'secret_input' || activePromptKind === 'ask_human') {
             sendConfirmationAnswer(confirmSecretIn.value || '');
         } else if (!confirmGuidanceEl.classList.contains('hidden')) {
             // Guidance mode active — submit the guidance text
@@ -2074,9 +2148,9 @@
         }
     });
 
-    // Pressing Enter in the secret input submits.
+    // Pressing Enter in the secret/ask_human input submits.
     confirmSecretIn.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter' && activePromptKind === 'secret_input') {
+        if (e.key === 'Enter' && (activePromptKind === 'secret_input' || activePromptKind === 'ask_human')) {
             e.preventDefault();
             sendConfirmationAnswer(confirmSecretIn.value || '');
         }
@@ -2359,21 +2433,36 @@
                 ? '' : String(sessCfg.step_verification_threshold);
         cfgSessionVenvPath.value = sessCfg.venv_path || '';
 
-        function readSwitch(name) {
+        // readSwitch reads either `auto_approve` or `enabled` from a
+        // switch entry. `enabled` defaults to true when missing (back-compat
+        // with older configs that only carry `auto_approve`).
+        function readSwitch(name, field) {
             const v = switches[name];
-            if (v && typeof v === 'object' && 'auto_approve' in v) {
-                return Boolean(v.auto_approve);
+            if (!v || typeof v !== 'object') {
+                return field === 'enabled' ? true : false;
             }
-            return false;
+            if (field === 'enabled') {
+                return ('enabled' in v) ? Boolean(v.enabled) : true;
+            }
+            return ('auto_approve' in v) ? Boolean(v.auto_approve) : false;
         }
-        cfgSwToolWrite.checked = readSwitch('tool_write');
-        cfgSwToolEdit.checked  = readSwitch('tool_edit');
-        cfgSwToolBash.checked  = readSwitch('tool_bash');
-        cfgSwToolBrowser.checked = readSwitch('tool_browser');
-        cfgSwToolDesktop.checked = readSwitch('tool_desktop');
-        cfgSwToolWebSearch.checked = readSwitch('tool_web_search');
-        cfgSwToolEmail.checked = readSwitch('tool_email');
-        cfgSwHighRisk.checked  = readSwitch('high_risk');
+        cfgSwToolWrite.checked = readSwitch('tool_write', 'auto_approve');
+        cfgSwToolEdit.checked  = readSwitch('tool_edit',  'auto_approve');
+        cfgSwToolBash.checked  = readSwitch('tool_bash',  'auto_approve');
+        cfgSwToolBrowserEnabled.checked = readSwitch('tool_browser', 'enabled');
+        cfgSwToolBrowserAuto.checked    = readSwitch('tool_browser', 'auto_approve');
+        cfgSwToolDesktopEnabled.checked = readSwitch('tool_desktop', 'enabled');
+        cfgSwToolDesktopAuto.checked    = readSwitch('tool_desktop', 'auto_approve');
+        cfgSwToolWebSearchEnabled.checked = readSwitch('tool_web_search', 'enabled');
+        cfgSwToolWebSearchAuto.checked    = readSwitch('tool_web_search', 'auto_approve');
+        cfgSwToolEmailEnabled.checked = readSwitch('tool_email', 'enabled');
+        cfgSwToolEmailAuto.checked    = readSwitch('tool_email', 'auto_approve');
+        cfgSwToolAskHumanEnabled.checked = readSwitch('tool_ask_human', 'enabled');
+        cfgSwHighRisk.checked  = readSwitch('high_risk', 'auto_approve');
+
+        // Reflect each Enable state in the visibility of the matching
+        // Auto-approve row. Disabled tool → no Auto-approve switch needed.
+        applyEnableVisibility();
 
         const blacklist = emailCfg.folder_blacklist;
         cfgEmailFolderBlacklist.value = Array.isArray(blacklist)
@@ -2428,20 +2517,25 @@
         if (cfgSessionVenvPath.value) sess.venv_path = cfgSessionVenvPath.value;
         else delete sess.venv_path;
 
-        function writeSwitch(name, checked) {
+        function writeSwitch(name, field, checked) {
             if (!switches[name] || typeof switches[name] !== 'object') {
                 switches[name] = {};
             }
-            switches[name].auto_approve = Boolean(checked);
+            switches[name][field] = Boolean(checked);
         }
-        writeSwitch('tool_write', cfgSwToolWrite.checked);
-        writeSwitch('tool_edit',  cfgSwToolEdit.checked);
-        writeSwitch('tool_bash',  cfgSwToolBash.checked);
-        writeSwitch('tool_browser', cfgSwToolBrowser.checked);
-        writeSwitch('tool_desktop', cfgSwToolDesktop.checked);
-        writeSwitch('tool_web_search', cfgSwToolWebSearch.checked);
-        writeSwitch('tool_email', cfgSwToolEmail.checked);
-        writeSwitch('high_risk',  cfgSwHighRisk.checked);
+        writeSwitch('tool_write', 'auto_approve', cfgSwToolWrite.checked);
+        writeSwitch('tool_edit',  'auto_approve', cfgSwToolEdit.checked);
+        writeSwitch('tool_bash',  'auto_approve', cfgSwToolBash.checked);
+        writeSwitch('tool_browser', 'enabled',      cfgSwToolBrowserEnabled.checked);
+        writeSwitch('tool_browser', 'auto_approve', cfgSwToolBrowserAuto.checked);
+        writeSwitch('tool_desktop', 'enabled',      cfgSwToolDesktopEnabled.checked);
+        writeSwitch('tool_desktop', 'auto_approve', cfgSwToolDesktopAuto.checked);
+        writeSwitch('tool_web_search', 'enabled',      cfgSwToolWebSearchEnabled.checked);
+        writeSwitch('tool_web_search', 'auto_approve', cfgSwToolWebSearchAuto.checked);
+        writeSwitch('tool_email', 'enabled',      cfgSwToolEmailEnabled.checked);
+        writeSwitch('tool_email', 'auto_approve', cfgSwToolEmailAuto.checked);
+        writeSwitch('tool_ask_human', 'enabled',      cfgSwToolAskHumanEnabled.checked);
+        writeSwitch('high_risk',  'auto_approve', cfgSwHighRisk.checked);
 
         const rawBlacklist = cfgEmailFolderBlacklist.value;
         emailCfg.folder_blacklist = rawBlacklist

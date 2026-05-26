@@ -17,6 +17,7 @@ from .browser_tool import BrowserTool
 from .desktop_tool import DesktopTool
 from .web_search_tool import WebSearchTool
 from .email_tool import EmailTool
+from .ask_human_tool import AskHumanTool
 
 _IS_WINDOWS = sys.platform == "win32"
 
@@ -76,6 +77,7 @@ class ToolRegistry:
     DESKTOP = "desktop"
     WEB_SEARCH = "web_search"
     EMAIL = "email"
+    ASK_HUMAN = "ask_human"
 
     _tools: Dict[str, ToolMetadata] = {}
     _initialized = False
@@ -1643,6 +1645,74 @@ EXAMPLES
   BAD:  include_full_body=true on 50 messages — context overflow""",
                 parameter_schema=EmailTool.parameter_schema,
                 tool_class=EmailTool,
+                on_demand=True,
+            )
+
+        # Register ASK_HUMAN tool. Windows-only — relies on the GUI bridge to
+        # render the modal and capture the reply. Linux/CLI runtimes use the
+        # IM's stderr+stdin fallback, but the official surface is the Electron
+        # UI. on_demand=True so it only enters the LLM tool list when
+        # AskHumanContextProvider activates it (mirrors browser/desktop
+        # pattern). Toggleable via the tool_ask_human interaction switch.
+        if _IS_WINDOWS:
+            cls._tools[cls.ASK_HUMAN] = ToolMetadata(
+                name=cls.ASK_HUMAN,
+                description=(
+                    "Ask the user a single clarifying question via a modal "
+                    "dialog and return their text reply. Use ONLY when the "
+                    "task literally cannot proceed without information you "
+                    "cannot derive from context — see usage_guide for the "
+                    "restraint contract."
+                ),
+                usage_guide="""\
+RESTRAINT CONTRACT (read before EVERY call)
+
+WHEN TO USE
+  - The task literally cannot proceed without information you (a) do not
+    have, AND (b) cannot derive by reading the project, asking the planner
+    via your reasoning, or making a sensible default choice that is easy
+    to revert.
+  - Examples that legitimately need ask_human:
+      • The user said "deploy it" but never specified the target
+        environment, and you cannot infer it from the repo.
+      • The user said "send the email to the team" but the team's address
+        is not in any artifact you can read.
+      • A destructive operation needs a final go-ahead and there is no
+        captured prior consent in this session.
+
+WHEN NOT TO USE
+  - To CONFIRM a choice the user already made — they made it; honour it.
+  - To SECOND-GUESS your own plan — pick a sensible default and proceed;
+    they can correct you afterwards.
+  - To surface intermediate decisions you can make yourself (file names,
+    function names, formatting choices, library choices, etc.).
+  - To pick between cosmetic options ("which colour?", "which heading?").
+  - To re-ask after the user dismissed the dialog — they declined; pick
+    a default and continue.
+
+PHRASING RULES
+  - Pass exactly the literal sentence the user will read.
+  - One short sentence. Answerable in one short sentence.
+  - No "I need to ask…", no chain-of-thought, no options list, no
+    multi-part questions.
+  - Never include speculation, justification, or your reasoning — they
+    interrupt the user too.
+
+OUTPUT
+  On success: ToolResult.output = the user's text reply (string).
+  On user dismiss / empty reply: ToolResult.success=False with an error
+  asking you to proceed with a default. DO NOT loop or re-ask.
+
+EXAMPLES
+  GOOD: {"question": "Which environment should I deploy to: staging or prod?"}
+  GOOD: {"question": "What's the team's distribution address for the report?"}
+  BAD:  {"question": "Should I name this file foo.py or bar.py?"}        ← decide yourself
+  BAD:  {"question": "I'm going to add error handling, OK?"}              ← do it
+  BAD:  {"question": "Let me know if you want me to continue."}           ← never
+  BAD:  {"question": "The repo has X and Y. Should I use X or Y? Also,
+                       what colour should the header be?"}                ← multi-part""",
+                parameter_schema=AskHumanTool.parameter_schema,
+                tool_class=AskHumanTool,
                 on_demand=True,
             )
 

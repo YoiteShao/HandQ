@@ -123,6 +123,24 @@ class DesktopContextProvider(StepContextProvider):
     def tool_name(self) -> str:
         return "desktop"
 
+    def planner_description(self) -> str:
+        return (
+            "`desktop` | "
+            "Native Windows app automation: Notepad, Excel, File Explorer, Settings, Task Manager, "
+            "Office apps, third-party desktop software. Drives real mouse / keyboard. "
+            "❌ Do NOT use for web pages — use `browser` instead. "
+            "Routing: `[\"desktop\"]`. | "
+            "Step references a native app or screen-level action outside the browser"
+        )
+
+    def planner_routing_rule(self) -> str:
+        return "Native Windows app interaction → `tools_required: [\"desktop\"]`"
+
+    def planner_antipatterns(self) -> list:
+        return [
+            '`["desktop"]` for clicking on a web page — that\'s `["browser"]`',
+        ]
+
     async def prepare(
         self,
         step: "Step",
