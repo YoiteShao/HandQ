@@ -1081,21 +1081,39 @@ class Planner:
         completed_steps: List[Step],
     ) -> str:
         """
-        First-pass epistemic pre-pass — runs only on the initial planning call
-        (completed_steps empty).
+        Builds the epistemic_preamble block for OBSERVE_AND_PLAN_TEMPLATE.
 
-        Scans the goal text for noun phrases that name external-world entities
-        (file paths, API names, table names, env vars, etc.) and lists them as
-        ASSUMED claims to remind the LLM to schedule observation steps before
-        acting on them.
+        Initial call (completed_steps empty):
+          Scans goal text for external-world entity references and lists them
+          as ASSUMED claims, reminding the LLM to schedule observation steps
+          before acting on them.
 
-        On subsequent calls (completed_steps non-empty) the LLM already has the
-        full completed_summary to reason about confirmed vs unconfirmed state, so
-        this function returns "" and defers to that richer source of truth.
+        Post-exploration (completed_steps non-empty, recent findings exist):
+          Injects a concretization requirement reminding the planner to rewrite
+          subsequent step goals using concrete values confirmed by tool output.
+          Only fires for early steps (≤ 6) to avoid noise in later replans.
 
         This is injected into OBSERVE_AND_PLAN_TEMPLATE as {epistemic_preamble}.
         """
         if completed_steps:
+            # Fire exactly once: after the first step completes (the exploration step).
+            # That is the single most important moment to force goal concretization —
+            # the planner just received real findings and should rewrite subsequent
+            # step goals from abstract to concrete. After step 1 the system prompt's
+            # "Goal grounding" rule carries it forward; no need to repeat in the prompt.
+            if len(completed_steps) == 1 and (
+                completed_steps[0].key_findings or completed_steps[0].factual_outcome
+            ):
+                return (
+                    "\n[Goal Grounding Requirement]\n"
+                    "The first step has completed with observed findings (see [Completed Work] "
+                    "and [Accumulated Task Findings] above). "
+                    "REQUIREMENT: every next_steps[i].goal MUST now use concrete values "
+                    "confirmed by that output — actual file paths, exact function names, "
+                    "confirmed command syntax. Abstract goals ('fix the bug', 'read "
+                    "relevant files') are not acceptable when the concrete target is "
+                    "now known from observations.\n"
+                )
             return ""
 
         import re

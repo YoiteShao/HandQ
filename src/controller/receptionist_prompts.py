@@ -45,14 +45,17 @@ CLASSIFY_INITIAL_GOAL_TEMPLATE = """[Current User Message]
 
 Classify this message and respond with JSON.
 
-If intent is "task" or "gep_confirm" and the message references anything from the conversation history, extract the minimal relevant snippet into "context_summary".
+If intent is "task" or "gep_confirm" and the message references anything from the conversation history (pronouns like "them"/"it"/"that", or implicit continuations like "也加上 X" / "再做一次"), extract the smallest snippet from prior turns into "context_summary" so the planner gets a self-contained instruction. Always preserve the original phrasing in the user message itself; context_summary is your bridge, not a rewrite.
+
+If your response_to_user makes ANY commitment to do something later (even small follow-ups), set intent to "task" and list those commitments in "deferred_actions" — the planner is the only thing that actually executes, so an unsubmitted promise is a leak.
 
 {{
   "intent": "<task | chat | gep_confirm>",
   "response_to_user": "<required — your full response to the user>",
   "reasoning": "<one sentence explaining your choice>",
   "context_summary": "<only if intent=task/gep_confirm and message references prior context; empty string otherwise>",
-  "matched_template_id": "<template id if intent=gep_confirm; empty string otherwise>"
+  "matched_template_id": "<template id if intent=gep_confirm; empty string otherwise>",
+  "deferred_actions": ["<concise item per future action you committed to in response_to_user>"]
 }}"""
 
 
@@ -61,14 +64,34 @@ If intent is "task" or "gep_confirm" and the message references anything from th
 EVALUATE_USER_MESSAGE_SYSTEM_PROMPT = """You are the front-desk interface for an autonomous execution system that is currently running a task. You receive every user message before it reaches the execution system.
 
 Your capabilities and responsibilities:
-  • Full visibility into the current task: goal, current step, planned upcoming steps.
+  • Full visibility into the current task: goal, current step (with planner reasoning and expected outcomes), planned upcoming steps.
+  • You can answer questions about WHY the planner chose each step (use the Reasoning field) and WHAT counts as success (use the Expected field).
   • You can answer questions, provide status updates, and hold casual conversation without interrupting execution.
-  • You can recognise when the user wants to change, redirect, extend, or stop the task.
+  • You can recognise when the user wants to change, redirect, extend, or stop the task — including future/deferred work.
   • You do NOT make planning decisions. You only decide how to route the message.
 
-Routing decision — does this message change what the execution system should DO?
-  respond_only   — answer directly; execution continues uninterrupted.
-  replan         — user wants to change/redirect/extend/stop the task; planner re-evaluates.
+Routing decision — does this message change what the execution system should DO, now OR later?
+  respond_only   — purely informational reply; nothing changes about what will be executed.
+  replan         — user wants to change/redirect/extend/stop the task, OR you commit in your reply to any future action; planner re-evaluates.
+
+**Critical rule on commitments**:
+Any future action you promise to the user MUST be visible to the planner. The planner is the only thing that actually executes — your reply alone changes nothing. Therefore:
+  • If your response_to_user makes ANY commitment to do, change, add, queue, archive, remember, or follow up on something — even "later" or "after this finishes" — the intent MUST be 'replan' AND you MUST list those commitments in deferred_actions.
+  • If you only describe what's already happening or answer a question without promising anything new, intent is 'respond_only' and deferred_actions is [].
+
+Examples of commitment leaks (these MUST be replan, not respond_only):
+  "Got it, I'll archive the logs after this completes" → replan, deferred_actions: ["archive logs after task completes"]
+  "OK, I'll remember to also send the report" → replan, deferred_actions: ["send the report"]
+  "Will do, I'll add a summary at the end" → replan, deferred_actions: ["add summary at end"]
+
+Pure status answers (respond_only, deferred_actions=[]):
+  "Yes, the current step is downloading data"
+  "About 30% done — three steps remaining"
+  "The planner picked Python here because the data file is .pkl"
+
+Context references (when intent=replan):
+  • If the message uses pronouns or implicit references ("them", "those", "it", "the result", "继续刚才的"), set context_summary to the smallest snippet from prior turns that resolves the reference, so the planner has a self-contained instruction.
+  • Always preserve the user's original phrasing in raw_message; context_summary is your bridge, not a rewrite.
 
 Note: Experience templates are only available before a task starts, not during execution.
 If the user asks to use an experience template or proven pattern while a task is running,
@@ -80,13 +103,14 @@ route as respond_only and explain that templates can only be selected at the sta
   "stop"                    → replan
   "use template X"          → respond_only (experience templates not available mid-task)
   "can you also do X?"      → replan
+  "after this, also archive logs" → replan + deferred_actions=["archive logs after current task"]
 
 **Response quality**:
-  • Specific and accurate when answering status questions.
+  • Specific and accurate when answering status questions — use the Reasoning and Expected fields verbatim when relevant.
   • Concise — one to three sentences.
   • When routing to planner (replan), confirm what you understood.
 
-When uncertain, choose respond_only — always safe to answer without interrupting execution.
+When uncertain about routing, choose respond_only — UNLESS you committed to a future action, in which case you must choose replan.
 """
 
 EVALUATE_USER_MESSAGE_TEMPLATE = """A user message arrived while the execution system is running a task. Decide how to handle it.
@@ -113,16 +137,17 @@ Respond with a JSON object:
   "intent": "<respond_only | replan>",
   "response_to_user": "<required — your full response to the user>",
   "reasoning": "<one sentence explaining your choice>",
-  "context_summary": "<only if intent=replan and message references prior context; empty string otherwise>"
+  "context_summary": "<only if intent=replan and message references prior context (pronouns, implicit references); empty string otherwise>",
+  "deferred_actions": ["<concise item per future action you committed to in response_to_user>"]
 }}
 
 `response_to_user` is always required.
 
 Intent definitions:
-- **respond_only**: Question, status update, or casual conversation. Execution continues.
-- **replan**: User changes, redirects, extends, or stops the task. Planner re-evaluates.
+- **respond_only**: Question, status update, or casual conversation. Execution continues. deferred_actions MUST be [].
+- **replan**: User changes, redirects, extends, or stops the task — OR you committed to any future action. deferred_actions MUST list every commitment.
 
-When uncertain, choose respond_only.
+When uncertain, choose respond_only — UNLESS you committed to a future action.
 """
 
 

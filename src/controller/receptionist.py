@@ -80,6 +80,10 @@ class UserMessageEvaluation:
                           when there is no prior conversation context to add.
     gep_suggested       — True when the LLM matched a GEP template to the request.
     matched_template_id — template id when intent=GEP_CONFIRM; empty string otherwise.
+    deferred_actions    — concise items the receptionist committed to in
+                          response_to_user. Non-empty list forces intent=REPLAN
+                          so the planner sees every promised future action;
+                          empty list means the reply made no commitments.
     """
     intent: UserMessageIntent
     response_to_user: str          # always required
@@ -87,6 +91,7 @@ class UserMessageEvaluation:
     context_for_planner: str = ""  # enriched message forwarded to Planner
     gep_suggested: bool = False
     matched_template_id: str = ""
+    deferred_actions: List[str] = field(default_factory=list)
 
 
 # ── Intent string → enum mapping ──────────────────────────────────────────────
@@ -168,6 +173,7 @@ class Receptionist:
         self,
         llm_services: List[LLMService],
         shell_history_path: Optional[str] = None,
+        long_term_memory_path: Optional[str] = None,
         initial_task_context: Optional[str] = None,
     ):
         if not llm_services:
@@ -175,6 +181,7 @@ class Receptionist:
         self._services: List[LLMService] = list(llm_services)
 
         self.shell_history_path: Optional[str] = shell_history_path
+        self.long_term_memory_path: Optional[str] = long_term_memory_path
         self.logger = get_logger()
 
         # FR-3: session-scoped full conversation history.
@@ -194,32 +201,46 @@ class Receptionist:
 
     # ── Conversation context helper ───────────────────────────────────────────
 
-    def _format_conversation_history(self, max_turns: int = 30) -> str:
+    def _format_conversation_history(self) -> str:
         """
-        Format the last max_turns entries of conversation_history as a
-        readable string for injection into the LLM prompt.
+        Format conversation_history as a readable string for prompt injection.
 
-        Excludes the current turn (last 2 entries: user + assistant).
-        Returns "(none)" when there is no prior history.
+        Excludes the current turn (last 2 entries: user + assistant). Returns
+        the full prior history without truncation: a sliding window would
+        invalidate the prefix every time it shifts and break KV-cache for the
+        rest of the prompt. The message processor commits one turn per request,
+        so the prior history is append-only across consecutive calls — perfect
+        for cache reuse. Compress older turns (planner-style) only when token
+        cost actually warrants it.
         """
         prior = self.conversation_history[:-2] if len(self.conversation_history) >= 2 else []
         if not prior:
             return "(none)"
-        recent = prior[-(max_turns):]
         lines = []
-        for turn in recent:
+        for turn in prior:
             role = "User" if turn["role"] == "user" else "Assistant"
             lines.append(f"{role}: {turn['content']}")
         return "\n".join(lines)
 
     @staticmethod
-    def _build_context_for_planner(raw_message: str, context_summary: str) -> str:
-        if not context_summary:
+    def _build_context_for_planner(
+        raw_message: str,
+        context_summary: str,
+        deferred_actions: Optional[List[str]] = None,
+    ) -> str:
+        deferred_actions = deferred_actions or []
+        if not context_summary and not deferred_actions:
             return raw_message
-        return (
-            f"[Context from prior conversation]\n{context_summary}\n\n"
-            f"[Current request]\n{raw_message}"
-        )
+        parts: List[str] = []
+        if context_summary:
+            parts.append(f"[Context from prior conversation]\n{context_summary}")
+        if deferred_actions:
+            parts.append(
+                "[Deferred actions promised to user]\n"
+                + "\n".join(f"  - {a}" for a in deferred_actions)
+            )
+        parts.append(f"[Current request]\n{raw_message}")
+        return "\n\n".join(parts)
 
     # ── Shell history helper ──────────────────────────────────────────────────
 
@@ -238,11 +259,41 @@ class Receptionist:
             )
             return "[Shell History]\nCurrent console command history is empty or unreadable\n"
 
+    # ── Long-term memory helper ───────────────────────────────────────────────
+
+    def _read_long_term_memory(self) -> str:
+        """
+        Read the persistent long-term memory file (skills, accumulated user
+        preferences, cross-session notes).  Returns "" when no path is
+        configured or the file does not exist — silent absence by design,
+        unlike shell history which surfaces a placeholder.
+
+        The block lands first in the prompt (most-static slot) so it can
+        share the KV-cache prefix across every receptionist call, even as
+        the conversation history grows.
+        """
+        if not self.long_term_memory_path:
+            return ""
+        try:
+            content = Path(self.long_term_memory_path).read_text(encoding="utf-8").strip()
+            if not content:
+                return ""
+            return "[Long-Term Memory]\n" + content + "\n"
+        except FileNotFoundError:
+            return ""
+        except Exception as exc:
+            self.logger.debug(
+                f"Could not read long-term memory from {self.long_term_memory_path!r}: {exc}",
+                component="Receptionist",
+            )
+            return ""
+
     # ── Context message builder ───────────────────────────────────────────────
 
     def _build_context_messages(
         self,
         *,
+        include_long_term_memory: bool = True,
         include_shell_history: bool = True,
         include_conversation_history: bool = True,
         include_templates: bool = True,
@@ -253,11 +304,21 @@ class Receptionist:
         Each non-empty context block is sent as a standalone user message
         immediately acknowledged by a brief assistant reply, keeping the
         final user turn (the actual request) clean.
+
+        Order (most-static → most-volatile) for KV cache hit rate:
+          1. long-term memory  — survives across sessions, rarely edited.
+          2. templates          — changes only when a GEP template is saved.
+          3. conversation       — append-only within a session (no truncation,
+                                  so the prefix stays stable).
+          4. shell history      — sliding window (Linux only).
         """
         extra: List[Dict[str, str]] = []
 
-        # Order: static first → append-only next → sliding window last
-        # This maximizes KV cache hit rate across consecutive calls.
+        if include_long_term_memory:
+            ltm = self._read_long_term_memory()
+            if ltm:
+                extra.append({"role": "user",      "content": ltm})
+                extra.append({"role": "assistant", "content": "Noted."})
 
         if include_templates:
             templates = _build_templates_section()
@@ -355,12 +416,25 @@ class Receptionist:
         Resolves the intent string via _INTENT_MAP (handles "task"/"chat" aliases
         and direct enum values), appends the assistant turn to conversation_history,
         and enriches context_for_planner for REPLAN/GEP_CONFIRM intents.
+
+        Commitment-leak guard: if the LLM populates deferred_actions but leaves
+        intent as RESPOND_ONLY (or chat), the intent is force-upgraded to REPLAN
+        and the deferred actions are embedded into context_for_planner. This
+        means even when the LLM mis-routes the intent, any explicit promise of
+        future work still reaches the planner.
         """
         intent_str = parsed.get("intent", default_intent.value)
         response = parsed.get("response_to_user") or ""
         reasoning = parsed.get("reasoning", "")
         context_summary = parsed.get("context_summary", "") or ""
         matched_template_id = parsed.get("matched_template_id", "") or ""
+
+        deferred_raw = parsed.get("deferred_actions") or []
+        if not isinstance(deferred_raw, list):
+            deferred_raw = [deferred_raw]
+        deferred_actions: List[str] = [
+            str(a).strip() for a in deferred_raw if str(a).strip()
+        ]
 
         # Resolve intent: map lookup covers aliases; fallback tries direct enum value.
         lower = intent_str.lower()
@@ -376,17 +450,28 @@ class Receptionist:
                 )
                 intent = default_intent
 
+        # Commitment-leak guard: deferred_actions present but routed as
+        # RESPOND_ONLY → force REPLAN so the planner sees the promised work.
+        if deferred_actions and intent == UserMessageIntent.RESPOND_ONLY:
+            self.logger.warning(
+                f"Receptionist returned respond_only with deferred_actions={deferred_actions} "
+                f"— forcing intent=replan to avoid commitment leak",
+                component="Receptionist",
+            )
+            intent = UserMessageIntent.REPLAN
+
         if not response:
             response = self._default_response(intent, raw_message)
 
         # FR-3: record assistant turn
         self.conversation_history.append({"role": "assistant", "content": response})
 
-        context_for_planner = (
-            self._build_context_for_planner(raw_message, context_summary)
-            if intent in (UserMessageIntent.REPLAN, UserMessageIntent.GEP_CONFIRM)
-            else raw_message
-        )
+        if intent in (UserMessageIntent.REPLAN, UserMessageIntent.GEP_CONFIRM):
+            context_for_planner = self._build_context_for_planner(
+                raw_message, context_summary, deferred_actions
+            )
+        else:
+            context_for_planner = raw_message
 
         return UserMessageEvaluation(
             intent=intent,
@@ -395,6 +480,7 @@ class Receptionist:
             context_for_planner=context_for_planner,
             gep_suggested=(intent == UserMessageIntent.GEP_CONFIRM),
             matched_template_id=matched_template_id,
+            deferred_actions=deferred_actions,
         )
 
     # ── Initial goal classification ───────────────────────────────────────────

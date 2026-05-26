@@ -18,9 +18,10 @@ they need to A/B against PaddleOCR / WinRT / LLM vision.
 
 Configuration in ``handq_config.yaml`` (optional — defaults work)::
 
-    ocr:
-      engine: rapidocr            # only one option today
-      lang: ch                    # ch covers Chinese + English
+    vision:
+      ocr:
+        engine: rapidocr   # only one option today
+        lang: ch           # ch covers Chinese + English
 """
 from __future__ import annotations
 
@@ -154,7 +155,7 @@ _local_ocr: Optional[LocalOCR] = None
 def get_local_ocr(config_manager: Any = None) -> LocalOCR:
     """Return the process-wide :class:`LocalOCR` singleton.
 
-    Builds it on first call from the optional ``ocr:`` section of
+    Builds it on first call from the optional ``vision.ocr:`` subsection of
     ``handq_config.yaml``.  Defaults are sensible (lang='ch') so most
     deployments need no config block at all.
     """
@@ -164,7 +165,8 @@ def get_local_ocr(config_manager: Any = None) -> LocalOCR:
     lang = "ch"
     if config_manager is not None:
         try:
-            section = config_manager.get_section("ocr") or {}
+            vision_section = config_manager.get_section("vision") or {}
+            section = vision_section.get("ocr") or {}
             lang = str(section.get("lang", "ch")).strip() or "ch"
         except Exception:
             pass

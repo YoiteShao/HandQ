@@ -1,6 +1,6 @@
-version: '3.0'
+version: '4.0'
 llm:
-  API_KEY: ff6bb18f-4a84-401d-9989-f6997487abe5
+  API_KEY: ''
   models:
   - anthropic::claude-4-7-opus
   - anthropic::claude-4-6-opus:1M
@@ -122,12 +122,13 @@ high_risk_commands:
   - rm *.tmp
   - rm -rf __pycache__
 vision:
-  endpoint: https://qgenie-api.qualcomm.com/v1
-  api_key: ff6bb18f-4a84-401d-9989-f6997487abe5
   model: azure::gpt-5.4-mini
   timeout: 120
   verify_ssl: false
   max_image_dim: 1024
+  ocr:
+    engine: rapidocr
+    lang: ch
 screenshots:
   ephemeral:
     max_files: 30
@@ -164,9 +165,6 @@ web_search:
       base_url: https://orbit
       search_url_template: 'https://orbit/search?query={q}&pagesize=10'
       result_selector: 'a[href*="/CR/"]'
-ocr:
-  engine: rapidocr
-  lang: ch
 email:
   body_preview_chars: 500
   attachment_sandbox: '%USERPROFILE%\HandQ\email_attachments'

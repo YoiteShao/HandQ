@@ -331,6 +331,11 @@ class _StdioUI:
         _emit({"type": "status", "kind": "task_completed",
                "summary": text}, gen=self._generation)
 
+    def show_metrics_report(self, markdown: str) -> None:
+        _ui_logger.debug("show_metrics_report: %s", _truncate(markdown))
+        _emit({"type": "status", "kind": "metrics_report", "text": str(markdown)},
+              gen=self._generation)
+
     def show_receptionist_thinking(self) -> None:
         _ui_logger.debug("show_receptionist_thinking")
         _emit({"type": "status", "kind": "receptionist_thinking_on"},
@@ -528,6 +533,18 @@ class _StdioUI:
         prompt_id = f"secret-{int(time.time() * 1000)}"
         payload = {"prompt": str(prompt)}
         return self._await_user_response("secret_input", payload, prompt_id)
+
+    def request_user_text(self, prompt: str) -> str:
+        """Free-text input (ask_human tool — agent's clarifying question).
+
+        Same plumbing as request_secret_input, but the renderer shows a
+        non-masked text input and an "agent question" framing. Returns the
+        raw string entered by the user (may be empty if they dismiss the
+        modal).
+        """
+        prompt_id = f"ask-{int(time.time() * 1000)}"
+        payload = {"prompt": str(prompt)}
+        return self._await_user_response("ask_human", payload, prompt_id)
 
 
 # ---------------------------------------------------------------------------
@@ -815,6 +832,28 @@ class StdioBridge:
         # session.
         session_dir = _allocate_session_dir(goal)
 
+        # Initialise the HandQ engine logger now that we know the session dir
+        # and can read log_level from config.  Must happen before FlowController
+        # construction so every get_logger() call in src/ picks up the right
+        # level and file handler.
+        from ..infrastructure.logger import initialize_logger, LogLevel as _LogLevel
+        _log_level_str = sess_cfg.get("log_level", "INFO") or "INFO"
+        try:
+            initialize_logger(
+                name="HandQ",
+                level=_LogLevel[_log_level_str.upper()],
+                log_file=f"handq_{time.strftime('%Y%m%d_%H%M%S')}.log",
+                log_dir=str(session_dir),
+            )
+            logger.info(
+                "_ensure_flow: HandQ engine logger initialised; level=%s log_dir=%s",
+                _log_level_str.upper(), session_dir,
+            )
+        except Exception:
+            logger.exception(
+                "_ensure_flow: initialize_logger failed (continuing with default)"
+            )
+
         api_key = llm_cfg.get("API_KEY") or ""
         max_tokens = int(llm_cfg.get("max_tokens", 4096))
         roles = resolve_role_models(llm_cfg)
@@ -870,6 +909,21 @@ class StdioBridge:
 
         # Track every distinct service for shutdown.
         self._services = list(svc_map.values()) + planner_services
+
+        # Wire server-error notifications to the UI.  The closure captures
+        # `self` so it always reads the current _generation at call time —
+        # important because the same services are reused across sessions.
+        _bridge = self
+        def _on_llm_server_error(msg: str, retry_in: int, attempts_left: int) -> None:
+            _emit({
+                "type": "status",
+                "kind": "llm_server_error",
+                "message": msg,
+                "retry_in": retry_in,
+                "attempts_left": attempts_left,
+            }, gen=_bridge._generation)
+        for svc in self._services:
+            svc.on_server_error = _on_llm_server_error
 
         self._flow = FlowController(
             agent_llm_services=agent_services,

@@ -11,12 +11,16 @@ Configuration lives in ``handq_config.yaml`` under the ``vision:``
 section::
 
     vision:
-      endpoint: https://qgenie-api.qualcomm.com/v1
-      api_key: ff6bb18f-...
       model: azure::gpt-5.4-mini
       timeout: 120
       verify_ssl: false
       max_image_dim: 1024
+      ocr:
+        engine: rapidocr
+        lang: ch
+
+The endpoint is hardcoded to the QGenie gateway; the API key is shared
+with ``llm.API_KEY``.
 
 The client is a process-wide singleton fetched via
 :func:`get_vision_client`.  First call lazily builds the underlying
@@ -347,11 +351,15 @@ def _try_parse_json_object(text: str) -> Optional[Dict[str, Any]]:
 _client: Optional[VisionClient] = None
 
 
+_VISION_ENDPOINT = "https://qgenie-api.qualcomm.com/v1"
+
+
 def get_vision_client(config_manager: Any) -> VisionClient:
     """Return the process-wide :class:`VisionClient` singleton.
 
     Builds it on first call from the ``vision:`` section of
     ``handq_config.yaml`` via the supplied :class:`ConfigManager`.
+    The endpoint is hardcoded; the API key is shared with the LLM section.
     Subsequent calls return the same instance even if a different
     ConfigManager is passed — this matches the browser-pool pattern
     where a single user-data-dir lock means one process-wide handle.
@@ -368,11 +376,18 @@ def get_vision_client(config_manager: Any) -> VisionClient:
     if not section:
         raise RuntimeError(
             "vision_client: handq_config.yaml is missing the 'vision:' section. "
-            "Add it with endpoint / api_key / model fields. See plan §1.1."
+            "Add it with model field. See plan §1.1."
         )
+    try:
+        llm_section = config_manager.get_section("llm") or {}
+    except Exception as exc:
+        raise RuntimeError(
+            f"vision_client: cannot read 'llm:' section for API key: {exc}"
+        )
+    api_key = str(llm_section.get("API_KEY", "") or "").strip()
     _client = VisionClient(
-        endpoint=str(section.get("endpoint", "")).strip(),
-        api_key=str(section.get("api_key", "")).strip(),
+        endpoint=_VISION_ENDPOINT,
+        api_key=api_key,
         model=str(section.get("model", "")).strip(),
         timeout=float(section.get("timeout", 120.0)),
         verify_ssl=bool(section.get("verify_ssl", False)),

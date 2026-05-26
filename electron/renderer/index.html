@@ -406,6 +406,29 @@
                         </label>
 
                         <label class="checkbox-row">
+                            <input type="checkbox" id="cfg-sw-tool-web-search" />
+                            <span>Auto-approve web search tool</span>
+                            <small class="help-text">
+                                When unchecked, ask before each internal web
+                                search (Confluence / Jira / SharePoint / orbit).
+                                Read-only — returns titles, URLs, and snippets.
+                                Uses the authenticated browser session.
+                            </small>
+                        </label>
+
+                        <label class="checkbox-row">
+                            <input type="checkbox" id="cfg-sw-tool-email" />
+                            <span>Auto-approve email tool</span>
+                            <small class="help-text">
+                                When unchecked, ask before reading email via
+                                local Outlook COM. Read actions are low-risk.
+                                Write actions (compose / send) will always go
+                                through the high-risk gate regardless of this
+                                switch.
+                            </small>
+                        </label>
+
+                        <label class="checkbox-row">
                             <input type="checkbox" id="cfg-sw-high-risk" />
                             <span>Auto-approve high-risk commands</span>
                             <small class="help-text">
@@ -413,6 +436,22 @@
                                 command (rm, kill, shutdown, DROP TABLE,
                                 git push --force, …). Strongly recommended:
                                 leave unchecked.
+                            </small>
+                        </label>
+                    </fieldset>
+
+                    <!-- ============================== Email ============================== -->
+                    <fieldset>
+                        <legend>Email</legend>
+
+                        <label>
+                            <span>Folder Blacklist</span>
+                            <input type="text" id="cfg-email-folder-blacklist"
+                                   placeholder="Drafts, Junk Email, Deleted Items" />
+                            <small class="help-text">
+                                Comma-separated folder names that the email
+                                tool will never read. Case-insensitive.
+                                Leave empty to read all folders.
                             </small>
                         </label>
                     </fieldset>

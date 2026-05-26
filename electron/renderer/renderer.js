@@ -240,7 +240,10 @@
     const cfgSwToolBash  = document.getElementById('cfg-sw-tool-bash');
     const cfgSwToolBrowser = document.getElementById('cfg-sw-tool-browser');
     const cfgSwToolDesktop = document.getElementById('cfg-sw-tool-desktop');
+    const cfgSwToolWebSearch = document.getElementById('cfg-sw-tool-web-search');
+    const cfgSwToolEmail = document.getElementById('cfg-sw-tool-email');
     const cfgSwHighRisk  = document.getElementById('cfg-sw-high-risk');
+    const cfgEmailFolderBlacklist = document.getElementById('cfg-email-folder-blacklist');
 
     // Hotkey field
     const cfgHotkey = document.getElementById('cfg-hotkey');
@@ -822,7 +825,9 @@
             startX = e.clientX;
             startY = e.clientY;
             startW = activityPopover.offsetWidth;
-            startH = activityPopover.offsetHeight;
+            // Use max(offsetHeight, 200) to avoid an extreme aspect ratio when
+            // the feed has very few items and the natural height is tiny.
+            startH = Math.max(activityPopover.offsetHeight, 200);
             aspect = startW / startH;
             document.body.style.userSelect = 'none';
         });
@@ -834,7 +839,8 @@
             // proportional scaling.
             const dx = startX - e.clientX; // positive = dragged left = bigger
             const dy = e.clientY - startY; // positive = dragged down = bigger
-            const delta = Math.abs(dx) > Math.abs(dy) ? dx : dy * aspect / (startH / startW);
+            // dy converts to width-delta via aspect (width/height), not aspect^2.
+            const delta = Math.abs(dx) >= Math.abs(dy) ? dx : dy * aspect;
             let newW = startW + delta;
             let newH = newW / aspect;
 
@@ -849,7 +855,9 @@
             if (newH > maxH) { newH = maxH; newW = newH * aspect; }
 
             activityPopover.style.width = Math.round(newW) + 'px';
-            activityPopover.style.maxHeight = Math.round(newH) + 'px';
+            // Use style.height (not maxHeight) so shrinking actually reduces
+            // the rendered height regardless of content amount.
+            activityPopover.style.height = Math.round(newH) + 'px';
         });
 
         document.addEventListener('mouseup', () => {
@@ -1774,6 +1782,20 @@
             clearWorking();
         } else if (evt.kind === 'session_event') {
             handleSessionEvent(evt.event, evt.data || {});
+        } else if (evt.kind === 'llm_server_error') {
+            const retryIn = (typeof evt.retry_in === 'number' && evt.retry_in > 0)
+                ? ' — retrying in ' + evt.retry_in + 's'
+                : '';
+            const attLeft = (typeof evt.attempts_left === 'number' && evt.attempts_left > 0)
+                ? ' (' + evt.attempts_left + ' attempt' + (evt.attempts_left !== 1 ? 's' : '') + ' remaining)'
+                : '';
+            const errSummary = (evt.message || 'API server issue') + retryIn + attLeft;
+            addSystemBubble('⏳ ' + errSummary
+                + '\nThis is a temporary API server issue, not a HandQ problem.'
+                + ' Retrying automatically — please wait.');
+            recordEvent('API retry: ' + errSummary);
+            pushActivity('⏳', 'API retry', errSummary);
+            setPill('retrying…');
         }
         if (!overlayStatus.classList.contains('hidden')) {
             refreshStatusPanel();
@@ -2281,6 +2303,7 @@
         const llm      = cfg.llm || {};
         const sessCfg  = cfg.session || {};
         const switches = cfg.interaction_switches || {};
+        const emailCfg = cfg.email || {};
 
         cfgLlmApiKey.value =
             (llm.API_KEY === undefined || llm.API_KEY === null) ? '' : String(llm.API_KEY);
@@ -2348,7 +2371,14 @@
         cfgSwToolBash.checked  = readSwitch('tool_bash');
         cfgSwToolBrowser.checked = readSwitch('tool_browser');
         cfgSwToolDesktop.checked = readSwitch('tool_desktop');
+        cfgSwToolWebSearch.checked = readSwitch('tool_web_search');
+        cfgSwToolEmail.checked = readSwitch('tool_email');
         cfgSwHighRisk.checked  = readSwitch('high_risk');
+
+        const blacklist = emailCfg.folder_blacklist;
+        cfgEmailFolderBlacklist.value = Array.isArray(blacklist)
+            ? blacklist.join(', ')
+            : (typeof blacklist === 'string' ? blacklist : '');
     }
 
     function readFormToConfig() {
@@ -2360,6 +2390,7 @@
         const switches = out.interaction_switches
             && typeof out.interaction_switches === 'object'
                 ? out.interaction_switches : {};
+        const emailCfg = out.email && typeof out.email === 'object' ? out.email : {};
 
         if ('api_key_env' in llm) delete llm.api_key_env;
         if ('api_key' in llm) delete llm.api_key;
@@ -2408,11 +2439,19 @@
         writeSwitch('tool_bash',  cfgSwToolBash.checked);
         writeSwitch('tool_browser', cfgSwToolBrowser.checked);
         writeSwitch('tool_desktop', cfgSwToolDesktop.checked);
+        writeSwitch('tool_web_search', cfgSwToolWebSearch.checked);
+        writeSwitch('tool_email', cfgSwToolEmail.checked);
         writeSwitch('high_risk',  cfgSwHighRisk.checked);
+
+        const rawBlacklist = cfgEmailFolderBlacklist.value;
+        emailCfg.folder_blacklist = rawBlacklist
+            ? rawBlacklist.split(',').map((s) => s.trim()).filter(Boolean)
+            : [];
 
         out.llm = llm;
         out.session = sess;
         out.interaction_switches = switches;
+        out.email = emailCfg;
         return out;
     }
 

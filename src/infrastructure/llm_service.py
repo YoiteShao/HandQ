@@ -21,7 +21,7 @@ JSON parsing / repair lives in ``Plan.from_data()`` and
 import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, AsyncGenerator, Literal, Optional
+from typing import Any, AsyncGenerator, Callable, Literal, Optional
 import anthropic as _anthropic
 from .logger import get_logger
 from ..models.token_usage import TokenUsage
@@ -167,6 +167,10 @@ class LLMService(ABC):
         # (tokens_per_day / retry_after > 5min) is hit. call_with_fallback skips
         # exhausted services for the remainder of the session.
         self._exhausted: bool = False
+        # Optional callback invoked on transient server errors before each retry.
+        # Signature: on_server_error(user_message: str, retry_in_seconds: int, attempts_left: int)
+        # Set by the bridge to forward retry status to the frontend UI.
+        self.on_server_error: Optional[Callable[[str, int, int], None]] = None
 
     # ------------------------------------------------------------------
     # Abstract interface – must be implemented by every concrete adapter

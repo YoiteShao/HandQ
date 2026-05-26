@@ -397,6 +397,7 @@ The [Accumulated Task Findings] section contains structured knowledge extracted 
 - **Avoid redundant work**: if a finding already answers what a planned step would discover, skip that step
 - **Artifact continuity**: when a step produced a file that a subsequent step needs, include the exact artifact path in that step's goal
 - **Build on discoveries**: if a previous step revealed unexpected complexity or a new constraint, let that reshape your plan
+- **Goal grounding**: after any discovery or exploration step, rewrite the `goal` fields of subsequent action steps using concrete values confirmed by tool output (actual file paths, exact function names, line numbers, confirmed command syntax). Do not carry forward abstract goal text when the specific target is now known from findings.
 - **Failed approaches are permanent**: never re-plan a step that repeats a failed approach
 
 ## Expected Outcomes
@@ -596,7 +597,7 @@ Before deciding, reason through the following:
 
 0. **Epistemic inventory (do this before anything else)**: For every factual claim in the task description or prior context that an action step will depend on — file names, directory paths, API endpoints, column names, config keys, environment variables, service ports, code symbol names, etc. — tag it as OBSERVED (confirmed by tool output in this session) or ASSUMED (derived from natural language, not yet confirmed by a tool call). For every ASSUMED claim with non-trivial risk, derive an Observation Obligation and schedule it as a concrete step *before* the action step that depends on it. If all external-world claims are already OBSERVED (e.g. prior steps have confirmed them), state that explicitly and proceed. This question must be answered before questions 1–6 below.
 
-1. **Task progress**: What has been accomplished so far? What gaps remain between the current state and a complete, user-ready deliverable? If this is the initial plan (no completed steps), write a one-line plan preview in `planner_reasoning` so the user can see the full step sequence before execution begins.
+1. **Task progress**: What has been accomplished so far? What gaps remain between the current state and a complete, user-ready deliverable? If this is the initial plan (no completed steps), write a **complete, concrete plan preview** in `planner_reasoning`: `'Plan: N steps — 1. [step with specific target] → 2. → ... → N.'` Each step must name its actual target (file path, tool, endpoint, system) where known from the [Environment Snapshot] or goal text — vague descriptions like 'explore code' or 'fix bug' are not acceptable in the preview.
 
 2. **Last step quality** (set last_step_confidence based on this): Did the most recently completed step truly achieve its stated goal? Compare the step's `expected_outcomes` list against the agent's `outcome` and `key_findings` — these are your primary evaluation signals. The agent is required to report verifiable facts (exit codes, file sizes, command output excerpts), not subjective assessments. If the agent deviated from an expected outcome and explained why in `key_findings`, treat the explanation as execution feedback and update your understanding — a well-reasoned deviation is not a failure. Watch for partial success, false confidence, or results that technically satisfy the step description but miss the actual intent. Below {step_verification_threshold}: begin with a corrective step.
 
@@ -622,7 +623,7 @@ Output a JSON object with this structure:
             "step_id": "step_N",
             "description": "short label",
             "goal": "precise, verifiable goal — what the agent must accomplish and how success is measured",
-            "planner_reasoning": "why this step, why this granularity, and how it advances toward the final deliverable. IMPORTANT — on the very first plan (no completed steps yet): also include a full plan preview in this format: 'Plan: N steps — 1. [description] → 2. [description] → ... → N. [description]'.",
+            "planner_reasoning": "why this step, why this granularity, and how it advances toward the final deliverable. IMPORTANT — on the very first plan (no completed steps yet): include a COMPLETE, CONCRETE plan preview: 'Plan: N steps — 1. [specific target, not abstract description] → 2. → ... → N.' Use actual file paths, tool names, or system names from the [Environment Snapshot] or goal text. Example: '1. Read src/auth/login.py → 2. Fix validate_token() expiry check → 3. Run py_compile to verify'. Vague previews like '1. Explore → 2. Fix → 3. Test' are not acceptable.",
             "step_supplement": "",
             "parallel_group": "",
             "is_aggregation": false,

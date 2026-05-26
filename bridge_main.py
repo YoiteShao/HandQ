@@ -92,6 +92,42 @@ def _resolve_config_path() -> str:
     return os.path.join(_INSTALL_DIR, "handq_config.yaml")
 
 
+def _ensure_user_config_present() -> None:
+    """First-run: copy the shipped default to %USERPROFILE%\\HandQ\\.
+
+    Frozen-only: in dev mode the install dir IS the repo root, so a
+    copy here would create a parallel user file that silently shadows
+    the dev's repo-side edits (priority 2 beats priority 3 in
+    _resolve_config_path). Skipping the copy in dev keeps `python
+    bridge_main.py` reading the repo yaml directly. A dev who wants
+    packaged-style behaviour can `set HANDQ_CONFIG=...` (priority 1)
+    or hand-create the user copy.
+
+    Best-effort: failures (perms / disk / AV lock) are swallowed —
+    _resolve_config_path falls back to the install default and the
+    bridge still boots; we just won't have a writable user copy yet.
+    The boot logger is not yet configured at this point in the file,
+    so there's nowhere useful to log a copy failure.
+    """
+    is_frozen = getattr(sys, "frozen", False) or "__compiled__" in globals()
+    if not is_frozen:
+        return
+    user_root = _user_handq_root()
+    user_cfg = os.path.join(user_root, "handq_config.yaml")
+    if os.path.exists(user_cfg):
+        return
+    install_cfg = os.path.join(_INSTALL_DIR, "handq_config.yaml")
+    if not os.path.exists(install_cfg):
+        return
+    try:
+        os.makedirs(user_root, exist_ok=True)
+        import shutil
+        shutil.copy2(install_cfg, user_cfg)
+    except OSError:
+        pass
+
+
+_ensure_user_config_present()
 _HANDQ_CONFIG = _resolve_config_path()
 os.environ["HANDQ_CONFIG"] = _HANDQ_CONFIG
 

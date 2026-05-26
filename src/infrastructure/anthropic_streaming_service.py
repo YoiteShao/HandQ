@@ -683,6 +683,15 @@ class AnthropicStreamingService(LLMService):
                         f"retrying in {wait_time}s: {type(e).__name__}: {e}",
                         component="AnthropicStreamingService",
                     )
+                    if self.on_server_error is not None:
+                        try:
+                            self.on_server_error(
+                                self._user_friendly_error(e),
+                                wait_time,
+                                self.max_retries - attempt - 1,
+                            )
+                        except Exception:
+                            pass
                     await asyncio.sleep(wait_time)
                 else:
                     self.logger.error(
@@ -697,3 +706,16 @@ class AnthropicStreamingService(LLMService):
     async def close(self) -> None:
         """Close the underlying Anthropic client."""
         await self._client.close()
+
+    def _user_friendly_error(self, e: Exception) -> str:
+        """Return a short, user-friendly description of a server-side error."""
+        if isinstance(e, anthropic.APIStatusError):
+            status = getattr(e, 'status_code', None)
+            if status and 500 <= status < 600:
+                return f"API server error (HTTP {status})"
+            return f"API error (HTTP {status or '?'})"
+        if isinstance(e, anthropic.APITimeoutError):
+            return "API request timed out"
+        if isinstance(e, anthropic.APIConnectionError):
+            return "API connection failed"
+        return f"Temporary error ({type(e).__name__})"

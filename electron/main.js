@@ -14,7 +14,7 @@
 
 'use strict';
 
-const { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, globalShortcut } = require('electron');
+const { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, globalShortcut, Notification } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const { spawn } = require('child_process');
@@ -150,6 +150,7 @@ let mainWindow = null;
 let tray = null;
 let isQuitting = false;
 let pythonChild = null;
+let _trayFlashTimer = null;
 let stdoutReader = null;
 let isShuttingDown = false;
 
@@ -347,6 +348,50 @@ function sendToRenderer(evt) {
     }
 }
 
+// Show a system toast + flash the taskbar when a confirmation is needed and
+// the window is not in focus (hidden to tray or minimized). Clicking the
+// notification brings the window to the front.
+function notifyConfirmationNeeded(evt) {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    const windowNeedsAttention =
+        !mainWindow.isVisible() ||
+        mainWindow.isMinimized() ||
+        !mainWindow.isFocused();
+    if (!windowNeedsAttention) return;
+
+    const kind = evt && evt.kind;
+    let title, body;
+    if (kind === 'secret_input') {
+        title = '🔑 HandQ — input required';
+        body  = String((evt && evt.prompt) || 'Enter a value to continue.');
+    } else if (kind === 'risk_confirmation') {
+        title = '⚠️ HandQ — high-risk operation';
+        body  = String((evt && evt.description) || 'Agent wants to run a high-risk command.');
+    } else {
+        const tool = String((evt && evt.tool) || 'tool');
+        title = '🛠️ HandQ — approval needed';
+        body  = String((evt && evt.description) || ('Agent wants to use the ' + tool + ' tool.'));
+    }
+    // Truncate body so it fits in the OS notification area.
+    if (body.length > 120) body = body.slice(0, 117) + '…';
+
+    if (Notification.isSupported()) {
+        const note = new Notification({ title, body, silent: false });
+        note.on('click', () => {
+            if (!mainWindow || mainWindow.isDestroyed()) return;
+            if (mainWindow.isMinimized()) mainWindow.restore();
+            mainWindow.show();
+            mainWindow.focus();
+        });
+        note.show();
+        logLine('NOTIFY', 'toast shown', { kind, title });
+    }
+
+    // Flash the taskbar button / tray icon regardless of toast support.
+    try { mainWindow.flashFrame(true); } catch (_) { /* ignore */ }
+    startTrayFlash();
+}
+
 function writeToBridge(obj) {
     if (!pythonChild || !pythonChild.stdin || pythonChild.stdin.destroyed) {
         logLine('IPC-OUT', 'bridge stdin unavailable',
@@ -462,6 +507,20 @@ function spawnBridge() {
                 }
             }
         }
+        // Notify the user when a confirmation is needed and the window is
+        // hidden / minimized — a toast + taskbar flash so they don't miss it.
+        // Bridge emits {type:"status", kind:"risk_confirmation"|"tool_confirmation"|"secret_input"}.
+        if (evtType === 'status' && evt && (
+            evt.kind === 'risk_confirmation' ||
+            evt.kind === 'tool_confirmation' ||
+            evt.kind === 'secret_input'
+        )) {
+            try { notifyConfirmationNeeded(evt); }
+            catch (err) {
+                logLine('NOTIFY', 'notifyConfirmationNeeded threw',
+                        { err: err && err.message });
+            }
+        }
         sendToRenderer(evt);
     });
 
@@ -564,7 +623,37 @@ function buildHandqIconPng() {
         '..BBBBBBBBBBBB..',
     ];
     const TINT = [60, 124, 224, 255];   // Apple-ish blue
-    const FORE = [255, 255, 255, 255];  // white H
+    return _buildIconPng(zlib, SIZE, PATTERN, TINT);
+}
+
+// Alert variant: orange background with a white "!" for attention.
+function buildHandqAlertIconPng() {
+    const zlib = require('zlib');
+    const SIZE = 16;
+    const PATTERN = [
+        '..BBBBBBBBBBBB..',
+        '.BBBBBBBBBBBBBB.',
+        'BBBBBBBFFBBBBBBB',
+        'BBBBBBBFFBBBBBBB',
+        'BBBBBBBFFBBBBBBB',
+        'BBBBBBBFFBBBBBBB',
+        'BBBBBBBFFBBBBBBB',
+        'BBBBBBBFFBBBBBBB',
+        'BBBBBBBBBBBBBBBB',
+        'BBBBBBBBBBBBBBBB',
+        'BBBBBBBFFBBBBBBB',
+        'BBBBBBBFFBBBBBBB',
+        'BBBBBBBBBBBBBBBB',
+        'BBBBBBBBBBBBBBBB',
+        '.BBBBBBBBBBBBBB.',
+        '..BBBBBBBBBBBB..',
+    ];
+    const TINT = [220, 100, 20, 255];   // amber/orange
+    return _buildIconPng(zlib, SIZE, PATTERN, TINT);
+}
+
+function _buildIconPng(zlib, SIZE, PATTERN, TINT) {
+    const FORE = [255, 255, 255, 255];
     const TRANS = [0, 0, 0, 0];
 
     const rowBytes = SIZE * 4 + 1; // 1 filter byte per row + RGBA
@@ -619,6 +708,49 @@ function buildTrayIcon() {
         logLine('TRAY', 'PNG synthesis failed', { err: err && err.message });
     }
     return nativeImage.createEmpty();
+}
+
+// Lazily-built alert icon (orange "!"). Built once, reused for every flash.
+let _alertTrayIcon = null;
+function getAlertTrayIcon() {
+    if (_alertTrayIcon) return _alertTrayIcon;
+    try {
+        const png = buildHandqAlertIconPng();
+        const img = nativeImage.createFromBuffer(png);
+        if (img && !img.isEmpty()) { _alertTrayIcon = img; return img; }
+    } catch (err) {
+        logLine('TRAY', 'alert PNG synthesis failed', { err: err && err.message });
+    }
+    return nativeImage.createEmpty();
+}
+
+// Flash the tray icon between normal and alert states at ~600 ms intervals.
+// Stops automatically when the user focuses the window.
+function startTrayFlash() {
+    if (_trayFlashTimer) return; // already flashing
+    if (!tray) return;
+    let alertVisible = false;
+    const normalIcon = buildTrayIcon();
+    const alertIcon  = getAlertTrayIcon();
+    _trayFlashTimer = setInterval(() => {
+        if (!tray) { stopTrayFlash(); return; }
+        alertVisible = !alertVisible;
+        try {
+            tray.setImage(alertVisible ? alertIcon : normalIcon);
+        } catch (_) { /* ignore */ }
+    }, 600);
+    logLine('TRAY', 'flash started');
+}
+
+function stopTrayFlash() {
+    if (!_trayFlashTimer) return;
+    clearInterval(_trayFlashTimer);
+    _trayFlashTimer = null;
+    // Restore normal icon.
+    if (tray) {
+        try { tray.setImage(buildTrayIcon()); } catch (_) { /* ignore */ }
+    }
+    logLine('TRAY', 'flash stopped');
 }
 
 function ensureTray() {
@@ -721,9 +853,22 @@ function createWindow() {
         logLine('MAIN', 'main window closed');
         mainWindow = null;
     });
+
+    // Stop taskbar flash as soon as the user focuses the window.
+    mainWindow.on('focus', () => {
+        try { mainWindow.flashFrame(false); } catch (_) { /* ignore */ }
+        stopTrayFlash();
+    });
 }
 
 // --- single-instance lock --------------------------------------------------
+
+// Windows: set AppUserModelId so that native Toast notifications are
+// attributed to this app. Must be called before app.whenReady().
+if (process.platform === 'win32') {
+    app.setName('HandQ');
+    app.setAppUserModelId('com.handq.app');
+}
 
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {

@@ -154,6 +154,7 @@ class FlowController:
         self.receptionist = Receptionist(
             llm_services=receptionist_llm_services,
             shell_history_path=shell_context_path,
+            long_term_memory_path=None,
         )
 
         self.memory = Memory(self.storage_directory)
@@ -861,6 +862,10 @@ class FlowController:
 
 
 
+
+
+
+
     def _make_evaluate_callback(self, goal: str) -> Callable[[str], Awaitable]:
         """
         Return an async callback for InteractionManager's message processor.
@@ -879,18 +884,33 @@ class FlowController:
         """
         async def callback(msg: str):
             plan = self.current_plan
+
+            def _format_step_for_receptionist(s: Step) -> str:
+                """Pack description + goal + reasoning + expected outcomes.
+
+                Receptionist needs WHY (planner_reasoning) and SUCCESS CRITERIA
+                (expected_outcomes) so it can answer user questions about
+                decisions without guessing.
+                """
+                lines = [f"{s.description}: {s.goal}"]
+                reasoning = getattr(s, "planner_reasoning", "") or ""
+                expected = getattr(s, "expected_outcomes", None) or []
+                if reasoning:
+                    lines.append(f"  Reasoning: {reasoning}")
+                if expected:
+                    lines.append(f"  Expected: {'; '.join(expected)}")
+                return "\n".join(lines)
+
             # next_steps[0] is the first planned step — the best available
             # proxy for "what is currently executing" without needing to track
             # in_flight_batch separately.
-            # Include the full goal text so the Receptionist can accurately
-            # describe and classify what is happening, not just a short label.
             current_step_desc = (
-                f"{plan.next_steps[0].description}: {plan.next_steps[0].goal}"
+                _format_step_for_receptionist(plan.next_steps[0])
                 if plan and plan.next_steps
                 else None
             )
             next_step_descs = [
-                f"{s.description}: {s.goal}"
+                _format_step_for_receptionist(s)
                 for s in (plan.next_steps[1:] if plan and plan.next_steps else [])
             ]
 
