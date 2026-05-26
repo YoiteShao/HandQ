@@ -16,6 +16,7 @@ from .notebook_edit_tool import NotebookEditTool
 from .browser_tool import BrowserTool
 from .desktop_tool import DesktopTool
 from .web_search_tool import WebSearchTool
+from .email_tool import EmailTool
 
 _IS_WINDOWS = sys.platform == "win32"
 
@@ -74,6 +75,7 @@ class ToolRegistry:
     BROWSER = "browser"
     DESKTOP = "desktop"
     WEB_SEARCH = "web_search"
+    EMAIL = "email"
 
     _tools: Dict[str, ToolMetadata] = {}
     _initialized = False
@@ -1589,6 +1591,58 @@ EXAMPLES
         navigate the top hits agent picks""",
                 parameter_schema=WebSearchTool.parameter_schema,
                 tool_class=WebSearchTool,
+                on_demand=True,
+            )
+
+        # Register EMAIL tool. Windows-only — depends on pywin32 (win32com /
+        # pythoncom) and a local Outlook MAPI profile. on_demand=True so it
+        # only enters the LLM tool list when EmailContextProvider activates it.
+        if _IS_WINDOWS:
+            cls._tools[cls.EMAIL] = ToolMetadata(
+                name=cls.EMAIL,
+                description=(
+                    "Read Outlook email via local COM automation. "
+                    "Reuses the user's MAPI profile — no extra credentials. "
+                    "Actions: list_folders, list_messages, read_message, "
+                    "search, mark_read, mark_unread, download_attachment."
+                ),
+                usage_guide="""\
+WHEN TO USE
+  - Step says "read my email", "show inbox", "翻一下邮箱", "收件箱"
+  - User asks who sent them message X, summary of unread, find attachment
+
+WHEN NOT TO USE
+  Web mail (Gmail, OWA via browser)   → browser tool
+  IMAP/POP3 / Exchange EWS            → not supported here
+  Calendar / contacts / tasks         → not in scope
+
+WORKFLOW
+  1. action='list_folders'                               (see counts)
+  2. action='list_messages' folder='Inbox' [unread_only=true] [limit=20]
+       → entry_id + subject + sender + 500-char preview
+  3. action='read_message' entry_id='...' [include_full_body=true]
+       → full body only when needed (LLM context budget)
+  4. action='search' query='...' [folder='Inbox']
+  5. action='download_attachment' entry_id='...' attachment_name='file.pdf'
+       → sandboxed to %USERPROFILE%\\HandQ\\email_attachments\\
+
+KEY INVARIANTS
+  - body_preview always 500 chars; include_full_body=true for full text
+  - Outlook stays open — the tool never calls app.Quit()
+  - No write actions (compose_draft / send) in this phase
+  - output_dir outside sandbox → refused (path-traversal guard)
+
+EXAMPLES
+  GOOD: action='list_folders'
+  GOOD: action='list_messages', folder='Inbox', unread_only=true, limit=20
+  GOOD: action='read_message', entry_id='000000007FAB...', include_full_body=true
+  GOOD: action='search', query='qprof ddr', folder='Inbox', limit=10
+  GOOD: action='download_attachment', entry_id='...', attachment_name='spec.pdf'
+  BAD:  action='send' — not in this phase
+  BAD:  output_dir='C:\\Windows\\System32' — refused by sandbox guard
+  BAD:  include_full_body=true on 50 messages — context overflow""",
+                parameter_schema=EmailTool.parameter_schema,
+                tool_class=EmailTool,
                 on_demand=True,
             )
 

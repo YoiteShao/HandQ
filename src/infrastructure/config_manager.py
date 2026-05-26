@@ -2,6 +2,7 @@
 Configuration Manager — Unified YAML loader
 Loads and manages all system configuration from a single YAML file.
 """
+import os
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -11,7 +12,7 @@ import yaml
 class ConfigManager:
     """Configuration manager — loads all settings from handq_config.yaml."""
 
-    def __init__(self, config_path: str = "handq_config.yaml"):
+    def __init__(self, config_path: Optional[str] = None):
         """
         Initialize the configuration manager.
 
@@ -19,9 +20,19 @@ class ConfigManager:
         ConfigManager can be constructed before the process working directory
         has been set to the project root.
 
+        Path resolution when ``config_path`` is omitted (the common case for
+        tools that build their own ConfigManager): consume ``HANDQ_CONFIG``
+        from the environment — bridge_main.py resolves the absolute path on
+        boot and writes it there, per ARCHITECTURE.md §1. Fall back to the
+        cwd-relative ``handq_config.yaml`` only if the env var is unset (e.g.
+        unit tests that import ConfigManager standalone).
+
         Args:
-            config_path: Full path to the handq_config.yaml file.
+            config_path: Explicit path to handq_config.yaml. ``None`` defers
+                to ``HANDQ_CONFIG`` env, then to the cwd-relative default.
         """
+        if config_path is None:
+            config_path = os.environ.get("HANDQ_CONFIG") or "handq_config.yaml"
         self.config_path = Path(config_path)
         self._config: Dict[str, Any] = {}
         self._loaded: bool = False

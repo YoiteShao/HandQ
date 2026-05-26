@@ -165,7 +165,7 @@ class FlowController:
         self.interaction_manager = InteractionManager.get_instance()
         if getattr(self.interaction_manager, 'config_path', None) is None and config_path:
             self.interaction_manager.config_path = config_path
-        self.config_manager = ConfigManager(config_path if config_path else "./handq_config.yaml")
+        self.config_manager = ConfigManager(config_path)
         self.logger = get_logger()
 
         self.state = SystemState.IDLE
@@ -828,6 +828,14 @@ class FlowController:
         except ImportError:
             self.logger.debug(
                 "WebSearchContextProvider not registered (transitive deps missing)",
+                component="FlowController",
+            )
+        try:
+            from ..infrastructure.email_setup import EmailContextProvider
+            self.register_step_context_provider(EmailContextProvider())
+        except ImportError:
+            self.logger.debug(
+                "EmailContextProvider not registered (pywin32 missing)",
                 component="FlowController",
             )
         try:

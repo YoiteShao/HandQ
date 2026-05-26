@@ -79,6 +79,10 @@ class Memory:
         # providers don't collide on key="default" and can be cleared
         # independently.
         self._desktop_contexts: Dict[str, Dict[str, Any]] = {}
+        # Email provider progressive-disclosure cache. Same shape / purpose as
+        # _browser_contexts and _desktop_contexts but kept separate so all
+        # three providers can be cleared independently.
+        self._email_contexts: Dict[str, Dict[str, Any]] = {}
 
     def set_ssh_context(self, hostname: str, creds_file: str, hint: str) -> None:
         """
@@ -159,6 +163,20 @@ class Memory:
         full first-activation hint again."""
         self._desktop_contexts.clear()
 
+    # ── Email context ─────────────────────────────────────────────────────────
+    # Same shape / lifecycle as the browser-context methods above.
+
+    def set_email_context(self, key: str, value: Dict[str, Any]) -> None:
+        """Store email-related context (first-touch hint flag, etc.)."""
+        self._email_contexts[key] = dict(value)
+
+    def get_email_context(self, key: str) -> Optional[Dict[str, Any]]:
+        """Return the stored email context for *key*, or None."""
+        return self._email_contexts.get(key)
+
+    def clear_email_contexts(self) -> None:
+        """Drop every cached email context entry."""
+        self._email_contexts.clear()
 
     def add_step(self, step: Step) -> None:
         """Record a completed step and accumulate its structured findings.
@@ -561,5 +579,6 @@ class Memory:
         self._ssh_contexts.clear()
         self._browser_contexts.clear()
         self._desktop_contexts.clear()
+        self._email_contexts.clear()
 
 AgentMemory = Memory  # alias for backward-compatible imports

@@ -64,6 +64,11 @@ interaction_switches:
     description: Internal web search (Confluence / Jira / SharePoint / orbit) via
       the authenticated browser session. Read-only — returns title/url/snippet
       lists. Cookies and SSO are reused from the persistent browser profile.
+  tool_email:
+    auto_approve: true
+    description: Email read via local Outlook COM (win32com). Read actions are
+      low-risk. Write actions (compose_draft / send) — when added — will go
+      through the high_risk gate plus a recipient_domain_allowlist check.
   high_risk:
     auto_approve: true
     description: Control high-risk operation auto-execution
@@ -162,3 +167,7 @@ web_search:
 ocr:
   engine: rapidocr
   lang: ch
+email:
+  body_preview_chars: 500
+  attachment_sandbox: '%USERPROFILE%\HandQ\email_attachments'
+  folder_blacklist: []

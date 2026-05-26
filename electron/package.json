@@ -7,12 +7,49 @@
   "scripts": {
     "build:vendor": "node build-vendor.js",
     "prestart": "node build-vendor.js",
-    "start": "electron ."
+    "start": "electron .",
+    "dist": "electron-builder --win nsis --x64",
+    "dist:dir": "electron-builder --win dir --x64"
   },
   "devDependencies": {
     "@xterm/addon-fit": "^0.10.0",
     "@xterm/xterm": "^5.5.0",
     "electron": "^31.0.0",
+    "electron-builder": "^24.0.0",
     "esbuild": "^0.21.0"
+  },
+  "build": {
+    "appId": "com.handq.app",
+    "productName": "HandQ",
+    "copyright": "Copyright © 2026 HandQ",
+    "directories": {
+      "output": "../dist/installer"
+    },
+    "files": [
+      "**/*",
+      "!node_modules/**/*",
+      "!README.md"
+    ],
+    "extraFiles": [
+      {
+        "from": "../dist/.nuitka_cache/bridge_main.dist",
+        "to": ".",
+        "filter": ["**/*"]
+      }
+    ],
+    "win": {
+      "target": [
+        { "target": "nsis", "arch": ["x64"] },
+        { "target": "dir",  "arch": ["x64"] }
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "shortcutName": "HandQ",
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    }
   }
 }

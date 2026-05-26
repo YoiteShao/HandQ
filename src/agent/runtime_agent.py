@@ -1056,6 +1056,7 @@ class RuntimeAgent:
             "shell":      "tool_shell",
             "browser":    "tool_browser",
             "web_search": "tool_web_search",
+            "email":      "tool_email",
         }
         if tool_name in tool_switch_map:
             switch_name = tool_switch_map[tool_name]

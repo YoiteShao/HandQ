@@ -501,6 +501,7 @@ _PLANNER_TOOL_SELECTION_WINDOWS = """\
 | `browser` | Web automation: visit URL, fill form, click links, extract page content, login flows | Step text references a URL or web action |
 | `desktop` | Native Windows app automation: Notepad, Excel, File Explorer, Settings, Task Manager, Office apps | Step text references a native app or screen-level action |
 | `web_search` | Search Qualcomm internal sources (Confluence / Jira / SharePoint / orbit). Stackable with `browser` (browser must be launched). Cookies + SSO are reused from the persistent browser profile | Step text says "搜 / search / find" + an internal source name, or "查内网/wiki/Confluence/Jira" |
+| `email` | Read / search local Outlook mail via COM (list folders, messages, read full body, search, download attachment). Reuses the user's MAPI profile — no extra auth. | Step text says "邮件 / inbox / 收件箱 / outlook / mail / 谁发我 / 翻邮箱 / 查邮件" |
 | `coding` | **Hint-only marker** — step **writes or modifies source code files** (creates new files, edits existing logic, generates a component, fixes a bug). Pure read/grep/review steps with no writes do NOT need it. Stackable with the tools above (e.g. UI feature = `["coding", "browser"]`) | Step's primary deliverable is a `.py` / `.ts` / `.tsx` / `.js` / `.jsx` / `.go` / `.rs` / `.java` / `.kt` / `.c` / `.cpp` / `.cs` / `.rb` / `.swift` / `.bat` / `.ps1` / `.sh` / `.bash` file — NOT a `.md` / `.json` / `.yaml` / `.toml` config file and NOT a read-only review |
 
 **Routing rules** (apply in order; first match wins):
@@ -513,7 +514,8 @@ _PLANNER_TOOL_SELECTION_WINDOWS = """\
 6. Web page interaction                                     → `tools_required: ["browser"]`
 7. Native Windows app interaction                           → `tools_required: ["desktop"]`
 8. Internal search across Confluence/Jira/SharePoint/orbit  → `tools_required: ["browser", "web_search"]`  (web_search reuses the browser session for SSO cookies)
-9. Step writes / creates / modifies source code files       → ADD `"coding"` to tools_required
+9. Read / search local Outlook email                        → `tools_required: ["email"]`
+10. Step writes / creates / modifies source code files      → ADD `"coding"` to tools_required
    (stackable: `["coding"]`, `["coding", "browser"]` for UI feature, `["coding", "ssh"]` for remote build)
 
 **Anti-patterns**:
@@ -523,6 +525,8 @@ _PLANNER_TOOL_SELECTION_WINDOWS = """\
   ❌ `["browser"]` for "search Confluence/Jira/SharePoint"  — that's `web_search`; navigating + extracting search-result HTML wastes 5-10k tokens vs the clean JSON web_search returns
   ❌ `["web_search"]` without `"browser"`  — web_search reuses the browser session and will fail with "no session"
   ❌ `["desktop"]` for clicking on a web page  — that's `["browser"]`
+  ❌ `["browser"]` to read mail through OWA when Outlook is installed  — that's `["email"]`; OWA loses the MAPI shortcut and burns 5-10k tokens on page rendering
+  ❌ `["email"]` for sending mail  — write path not yet wired; composer + send come later
   ❌ `["coding"]` for editing `.md` / `.json` / `.yaml` / config files  — those are not source code
   ❌ `["coding"]` for a read-only exploration / grep / review step with no file writes
   ❌ Forgetting `"coding"` on a step that writes source code  — the agent loses scope discipline, comment rules, and run-the-build verification guidance
