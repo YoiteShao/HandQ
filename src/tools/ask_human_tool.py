@@ -30,6 +30,18 @@ Concurrency
 ``request_user_text`` is intentionally blocking — the user takes seconds to
 answer. ``execute()`` runs it on the asyncio default executor so the event
 loop is not stalled while we wait for the modal.
+
+Timeout
+-------
+``asyncio.wait_for()`` wraps the executor call with a hard ceiling of
+``_ASK_HUMAN_TIMEOUT_S`` seconds (default 300 s / 5 min).  When the timeout
+fires, the tool returns ``success=False`` with an explicit instruction to
+proceed with a sensible default — the task does not stall indefinitely.
+
+Note: ``run_in_executor`` threads cannot be cancelled mid-flight; the IM
+thread keeps running after the timeout but its eventual result is discarded.
+The UI dialog may remain visible briefly until the user dismisses it or the
+next IM call clears the confirmation queue.
 """
 from __future__ import annotations
 
@@ -39,6 +51,11 @@ from typing import Any
 from .base_tool import BaseTool, ToolResult
 from ..controller.interaction_manager import InteractionManager
 from ..infrastructure.logger import get_logger
+
+# Hard ceiling for blocking on user input.
+# Prevents a long-running unattended task from stalling indefinitely if the
+# agent calls ask_human while no one is watching.
+_ASK_HUMAN_TIMEOUT_S: int = 1800  # 30 minutes
 
 
 class AskHumanTool(BaseTool):
@@ -92,8 +109,24 @@ class AskHumanTool(BaseTool):
 
         loop = asyncio.get_running_loop()
         try:
-            answer = await loop.run_in_executor(
-                None, im.request_user_text, question.strip()
+            answer = await asyncio.wait_for(
+                loop.run_in_executor(None, im.request_user_text, question.strip()),
+                timeout=float(_ASK_HUMAN_TIMEOUT_S),
+            )
+        except asyncio.TimeoutError:
+            self.logger.warning(
+                f"ask_human timed out after {_ASK_HUMAN_TIMEOUT_S}s with no reply",
+                component="AskHumanTool",
+            )
+            return ToolResult(
+                success=False,
+                output=None,
+                tool_name=self.name,
+                tool_parameters=kwargs,
+                error=(
+                    f"No user response within {_ASK_HUMAN_TIMEOUT_S}s. "
+                    "Proceed with best available default — do not re-prompt."
+                ),
             )
         except Exception as exc:
             self.logger.warning(
@@ -126,3 +159,4 @@ class AskHumanTool(BaseTool):
                 "default; do not re-prompt."
             ),
         )
+

@@ -533,7 +533,7 @@ _PLANNER_TOOL_SELECTION_LINUX = """\
 | Tool | Activate when | Decision signal |
 |---|---|---|
 | `ssh` | Any remote work — long batch, OR remote interaction at any duration | Set `ssh_target` too |
-| `coding` | **Hint-only marker** — step **writes or modifies source code files** (creates new files, edits existing logic, generates a component, fixes a bug). Pure read/grep/review steps with no writes do NOT need it. Stackable with `ssh` for remote builds | Step's primary deliverable is a `.py` / `.ts` / `.tsx` / `.js` / `.jsx` / `.go` / `.rs` / `.java` / `.kt` / `.c` / `.cpp` / `.cs` / `.rb` / `.swift` / `.bat` / `.ps1` / `.sh` / `.bash` file — NOT a `.md` / `.json` / `.yaml` / `.toml` config file and NOT a read-only review |
+{on_demand_tools_table}| `coding` | **Hint-only marker** — step **writes or modifies source code files** (creates new files, edits existing logic, generates a component, fixes a bug). Pure read/grep/review steps with no writes do NOT need it. Stackable with `ssh` for remote builds | Step's primary deliverable is a `.py` / `.ts` / `.tsx` / `.js` / `.jsx` / `.go` / `.rs` / `.java` / `.kt` / `.c` / `.cpp` / `.cs` / `.rb` / `.swift` / `.bat` / `.ps1` / `.sh` / `.bash` file — NOT a `.md` / `.json` / `.yaml` / `.toml` config file and NOT a read-only review |
 
 **Routing rules** (apply in order; first match wins):
 
@@ -541,7 +541,7 @@ _PLANNER_TOOL_SELECTION_LINUX = """\
 2. Local interactive (REPL, adb shell, monitoring stream)    → `tools_required: []`  (decompose into `bash -c '...'` chains, `screen -dmS`, `tee` patterns, `tmux send-keys`)
 3. Remote one-shot (single command, capture stdout)          → `tools_required: []`  (use shell with `ssh host 'cmd'`)
 4. Remote long batch (≥1 minute, want job tracking)          → `tools_required: ["ssh"]` + set `ssh_target`
-5. Step writes / creates / modifies source code files        → ADD `"coding"` to tools_required
+{on_demand_routing_rules}{coding_rule_num}. Step writes / creates / modifies source code files        → ADD `"coding"` to tools_required
    (stackable: `["coding"]`, `["coding", "ssh"]` for remote build/test)
 
 **Linux interactive decomposition** (when a step appears to need a persistent
@@ -557,7 +557,7 @@ subprocess — state/streaming/tty/watch — decompose into shell idioms):
   ❌ `["coding"]` for a read-only exploration / grep / review step with no file writes
   ❌ Forgetting `"coding"` on a step that writes source code  — the agent loses scope discipline, comment rules, and run-the-build verification guidance
   ❌ Empty `[]` for a step that clearly needs ssh — under-declaration costs a replan
-"""
+{on_demand_antipatterns}"""
 
 def build_planner_system_prompt(
     on_demand_tools_table: str = "",
@@ -585,7 +585,12 @@ def build_planner_system_prompt(
             coding_rule_num=coding_rule_num,
         )
     else:
-        tool_selection = _PLANNER_TOOL_SELECTION_LINUX
+        tool_selection = _PLANNER_TOOL_SELECTION_LINUX.format(
+            on_demand_tools_table=on_demand_tools_table,
+            on_demand_routing_rules=on_demand_routing_rules,
+            on_demand_antipatterns=on_demand_antipatterns,
+            coding_rule_num=coding_rule_num,
+        )
     return _PLANNER_COMMON_HEAD + tool_selection
 
 
@@ -598,8 +603,7 @@ OBSERVE_AND_PLAN_TEMPLATE = """Decide the next action based on current state.
 [Original Goal]
 {goal}
 
-{directory_block}
-[Progress]
+{directory_block}{long_term_section}[Progress]
 Completed steps: {completed_count}
 {loop_warning}
 [Completed Work]

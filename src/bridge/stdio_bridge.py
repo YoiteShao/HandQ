@@ -838,16 +838,17 @@ class StdioBridge:
         # level and file handler.
         from ..infrastructure.logger import initialize_logger, LogLevel as _LogLevel
         _log_level_str = sess_cfg.get("log_level", "INFO") or "INFO"
+        _engine_log_dir = os.environ.get("HANDQ_LOG_DIR") or str(session_dir)
         try:
             initialize_logger(
                 name="HandQ",
                 level=_LogLevel[_log_level_str.upper()],
                 log_file=f"handq_{time.strftime('%Y%m%d_%H%M%S')}.log",
-                log_dir=str(session_dir),
+                log_dir=_engine_log_dir,
             )
             logger.info(
                 "_ensure_flow: HandQ engine logger initialised; level=%s log_dir=%s",
-                _log_level_str.upper(), session_dir,
+                _log_level_str.upper(), _engine_log_dir,
             )
         except Exception:
             logger.exception(
