@@ -154,7 +154,6 @@ class FlowController:
         self.receptionist = Receptionist(
             llm_services=receptionist_llm_services,
             shell_history_path=shell_context_path,
-            long_term_memory_path=None,
         )
 
         self.memory = Memory(self.storage_directory)
@@ -217,6 +216,17 @@ class FlowController:
         # Access is safe: _planner_loop reads it only when has_new_messages
         # is True, which happens between agent iterations (asyncio yield points).
         self._current_agent: Optional["RuntimeAgent"] = None
+
+        # ── Long-term memory snapshot ─────────────────────────────────────────
+        # Rendered once at the start of _planner_loop (after the goal is known)
+        # and reused across every observe_and_plan call within the same task.
+        # This keeps the planner system-prompt prefix stable so KV cache hits
+        # across replan cycles. Re-recalling per cycle would invalidate the
+        # prefix and waste ~25% of every planner call's input tokens. New LTM
+        # entries written by DreamWorker mid-task become visible on the next
+        # task start, not the next replan — that latency is acceptable
+        # because dream-worker writes are infrequent (60s batches).
+        self._long_term_context_snapshot: str = ""
 
         self.interaction_manager.set_status_callback(self._get_status_string)
 
@@ -818,13 +828,7 @@ class FlowController:
 
         try:
             from ..infrastructure.browser_setup import BrowserContextProvider
-            if self.config_manager.is_tool_enabled("browser"):
-                self.register_step_context_provider(BrowserContextProvider())
-            else:
-                self.logger.info(
-                    "BrowserContextProvider not registered: tool_browser disabled in interaction_switches",
-                    component="FlowController",
-                )
+            self.register_step_context_provider(BrowserContextProvider())
         except ImportError:
             self.logger.debug(
                 "BrowserContextProvider not registered (transitive deps missing)",
@@ -832,13 +836,7 @@ class FlowController:
             )
         try:
             from ..infrastructure.web_search_setup import WebSearchContextProvider
-            if self.config_manager.is_tool_enabled("web_search"):
-                self.register_step_context_provider(WebSearchContextProvider())
-            else:
-                self.logger.info(
-                    "WebSearchContextProvider not registered: tool_web_search disabled in interaction_switches",
-                    component="FlowController",
-                )
+            self.register_step_context_provider(WebSearchContextProvider())
         except ImportError:
             self.logger.debug(
                 "WebSearchContextProvider not registered (transitive deps missing)",
@@ -846,13 +844,7 @@ class FlowController:
             )
         try:
             from ..infrastructure.email_setup import EmailContextProvider
-            if self.config_manager.is_tool_enabled("email"):
-                self.register_step_context_provider(EmailContextProvider())
-            else:
-                self.logger.info(
-                    "EmailContextProvider not registered: tool_email disabled in interaction_switches",
-                    component="FlowController",
-                )
+            self.register_step_context_provider(EmailContextProvider())
         except ImportError:
             self.logger.debug(
                 "EmailContextProvider not registered (pywin32 missing)",
@@ -860,13 +852,7 @@ class FlowController:
             )
         try:
             from ..infrastructure.desktop_setup import DesktopContextProvider
-            if self.config_manager.is_tool_enabled("desktop"):
-                self.register_step_context_provider(DesktopContextProvider())
-            else:
-                self.logger.info(
-                    "DesktopContextProvider not registered: tool_desktop disabled in interaction_switches",
-                    component="FlowController",
-                )
+            self.register_step_context_provider(DesktopContextProvider())
         except ImportError:
             self.logger.debug(
                 "DesktopContextProvider not registered (transitive deps missing)",
@@ -874,13 +860,7 @@ class FlowController:
             )
         try:
             from ..infrastructure.ask_human_setup import AskHumanContextProvider
-            if self.config_manager.is_tool_enabled("ask_human"):
-                self.register_step_context_provider(AskHumanContextProvider())
-            else:
-                self.logger.info(
-                    "AskHumanContextProvider not registered: tool_ask_human disabled in interaction_switches",
-                    component="FlowController",
-                )
+            self.register_step_context_provider(AskHumanContextProvider())
         except ImportError:
             self.logger.debug(
                 "AskHumanContextProvider not registered (import failed)",
@@ -909,7 +889,7 @@ class FlowController:
         """Build all dynamic planner sections from registered providers and push to Planner.
 
         Called once after _register_default_providers() so the planner's system
-        prompt only mentions tools that are both enabled and importable.
+        prompt only mentions tools that are importable on this platform.
         """
         table_rows: List[str] = []
         routing_rules: List[str] = []
@@ -1407,6 +1387,22 @@ class FlowController:
             component="FlowController",
         )
 
+        # ── Long-term memory snapshot (once per task) ─────────────────────────
+        # Recall + render the cross-session context block based on the goal.
+        # Reused across every observe_and_plan call this task; never refreshed
+        # mid-task so the planner system-prompt prefix stays cache-stable.
+        try:
+            from ..infrastructure.long_term_memory import LongTermMemory
+            self._long_term_context_snapshot = await LongTermMemory.get().format_context_block(
+                query=goal, memory_k=5, knowledge_k=5,
+            )
+        except Exception:
+            self.logger.debug(
+                "long-term memory snapshot skipped (non-fatal)",
+                component="FlowController",
+            )
+            self._long_term_context_snapshot = ""
+
         # ── GEP timeout confirm ───────────────────────────────────────────────
         # If a template was matched on the initial message, wait up to
         # _GEP_CONFIRM_TIMEOUT seconds for the user to respond.
@@ -1718,6 +1714,9 @@ class FlowController:
                 # Proactively compress old findings before passing to planner.
                 await self.memory.compress_findings_async(self._planner_services)
 
+                # Reuse the per-task long-term context snapshot. See
+                # __init__ for why this is computed once per task rather
+                # than per planner cycle.
                 self.current_plan = await self.planner.observe_and_plan(
                     goal=goal,
                     completed_steps=completed_for_plan,
@@ -1726,6 +1725,7 @@ class FlowController:
                     accumulated_findings=self.memory.get_accumulated_findings_for_planner(
                         already_covered_count=self.memory.count_context_entries_in_last_n_steps(self.planner.detail_window)
                     ),
+                    long_term_context=self._long_term_context_snapshot,
                 )
                 # Compress early steps when context grows large; takes effect for the next call.
                 await self.planner.maybe_compress_steps(completed_for_plan)
@@ -1819,7 +1819,18 @@ class FlowController:
                         )
                         self._transition_state(SystemState.ERROR)
                         error_msg = f"Task aborted: {progress_status.abort_reason}"
-                        
+
+                        # Submit a failure-summary candidate so triage can
+                        # extract any reusable lessons (e.g. "approach X
+                        # doesn't work in environment Y"). Pass the abort
+                        # reason verbatim — it is the planner-authored
+                        # failure summary, not a verifier criticism.
+                        self._submit_session_complete_candidate(
+                            goal=goal,
+                            summary=(progress_status.abort_reason or "Task aborted by progress tracker"),
+                            success=False,
+                        )
+
                         # Display error and continue waiting for user input
                         self.interaction_manager.display_error(error_msg)
                         self.logger.info(
@@ -1885,6 +1896,20 @@ class FlowController:
                             f"({confidence:.2f} < "
                             f"{self.step_verification_threshold:.2f}) "
                             "and no recovery steps available."
+                        )
+
+                        # Submit a failure-summary candidate so triage can
+                        # extract reusable lessons. Pass a concise planner-
+                        # authored failure description, not the verifier's
+                        # confidence number alone.
+                        self._submit_session_complete_candidate(
+                            goal=goal,
+                            summary=(
+                                self.current_plan.completion_reason
+                                or self.current_plan.confidence_rationale
+                                or "Task failed: verification confidence below threshold and no recovery."
+                            ),
+                            success=False,
                         )
 
                         # Display error and continue waiting for user input
@@ -2018,6 +2043,15 @@ class FlowController:
                                 self.current_plan.completion_reason
                                 or "Task completed successfully"
                             )
+                            # Snapshot the pristine planner-authored summary
+                            # BEFORE we overlay the acceptance gap_summary so
+                            # the LTM candidate sees only what the planner
+                            # actually intended to deliver. The user-facing
+                            # `reason` keeps the gap line (it's actionable
+                            # context the user wants); LTM does not, because
+                            # gap_summary is the verifier criticising the
+                            # planner — not a durable user preference.
+                            pristine_reason = reason
                             # Surface non-PASS acceptance gap to the user so
                             # they can decide during review whether the gap
                             # warrants a follow-up.  Per anti-pattern #5 the
@@ -2045,6 +2079,13 @@ class FlowController:
                             # Write metrics_summary.json BEFORE notifying completion so
                             # the foreground process can read it when it detects state3.
                             self._report_metrics()
+                            # Fire-and-forget candidate submission so triage can
+                            # mine durable user preferences + reusable knowledge
+                            # from the just-finished task. Pass the pristine
+                            # planner summary, not the verify-overlay version.
+                            self._submit_session_complete_candidate(
+                                goal=goal, summary=pristine_reason, success=True,
+                            )
                             # Run end-of-task finaliser (user hook → internal
                             # resource flushes) BEFORE notifying the user so
                             # side-effects are flushed to disk before the user
@@ -2158,6 +2199,11 @@ class FlowController:
                         # Write metrics_summary.json BEFORE notifying completion so
                         # the foreground process can read it when it detects state3.
                         self._report_metrics()
+                        # Same fire-and-forget candidate path as the regular
+                        # completion site above — keep both branches in lock-step.
+                        self._submit_session_complete_candidate(
+                            goal=goal, summary=reason, success=True,
+                        )
                         # Run end-of-task finaliser (user hook → internal
                         # resource flushes) — same guarantee as the normal path.
                         await self._finalize_task()
@@ -2628,26 +2674,21 @@ class FlowController:
             f"{len(self._step_context_providers)} providers registered",
             component="FlowController",
         )
-        # Defense-in-depth: silently drop any tool the user has disabled via
-        # interaction switches. Provider registration is already gated in
-        # _register_default_providers, so when a tool is disabled neither the
-        # provider nor the tool itself reaches the agent. The planner's static
-        # prompt may still mention the tool — if it declares one anyway, we
-        # strip it here. We DO NOT inject a hint into effective_goal: the
-        # agent will simply not have access to the tool, the call (if any)
-        # will fail with a normal "tool not available" error, and the planner
-        # will replan on the next round. Adding a [Tool Disabled] hint just
-        # bloats context for what is already a self-correcting path.
-        disabled_tools: List[str] = [
-            t for t in extra_tool_names
-            if not self.config_manager.is_tool_enabled(t)
-        ]
-        if disabled_tools:
-            for t in disabled_tools:
-                extra_tool_names.remove(t)
-            self.logger.info(
-                f"Step {step.step_id!r}: stripped disabled tools "
-                f"{disabled_tools} from extra_tool_names",
+        # Warn when the planner declared a tool that has no registered provider —
+        # this indicates the planner prompt may be out of sync with the registered
+        # providers (e.g. a tool name from LLM training data on a platform where
+        # it is not available). The tools still pass through to RuntimeAgent, which
+        # surfaces a clean "unknown tool" error if the agent tries to call one.
+        _registered_tools = {
+            getattr(p, "tool_name", None)
+            for p in self._step_context_providers
+            if getattr(p, "tool_name", None)
+        }
+        _unregistered = [t for t in extra_tool_names if t not in _registered_tools]
+        if _unregistered:
+            self.logger.warning(
+                f"Step {step.step_id!r}: tools_required declares unregistered tools "
+                f"{_unregistered} — planner prompt may be out of sync with registered providers",
                 component="FlowController",
             )
         for provider in self._step_context_providers:
@@ -2814,6 +2855,51 @@ class FlowController:
 
     def get_state(self) -> SystemState:
         return self.state
+
+    def _submit_session_complete_candidate(
+        self, *, goal: str, summary: str, success: bool,
+    ) -> None:
+        """Fire-and-forget submission of a session-completion candidate.
+
+        Sends goal + final summary + last 10 step outcomes to the LongTermMemory
+        triage queue so the DreamWorker can mine durable user preferences and
+        reusable knowledge. Failures are swallowed — long-term memory must
+        never block or delay task completion.
+        """
+        try:
+            from ..infrastructure.long_term_memory import LongTermMemory
+            from ..infrastructure.long_term_memory.candidates import (
+                submit_session_complete,
+            )
+            ltm = LongTermMemory.get()
+        except Exception:
+            return
+        try:
+            recent_steps = self.memory.get_completed_steps()[-10:]
+        except Exception:
+            recent_steps = []
+        try:
+            asyncio.create_task(
+                submit_session_complete(
+                    ltm=ltm,
+                    session_dir=str(self.storage_directory),
+                    goal=goal,
+                    summary=summary,
+                    last_steps=recent_steps,
+                    success=success,
+                ),
+                name=f"ltm-submit-session-{self._current_plan_id or 'noid'}",
+            )
+        except RuntimeError:
+            self.logger.debug(
+                "submit_session_complete skipped (no running loop)",
+                component="FlowController",
+            )
+        except Exception:
+            self.logger.warning(
+                "submit_session_complete dispatch failed",
+                component="FlowController",
+            )
 
     async def _fire_task_complete_hook(self) -> None:
         """

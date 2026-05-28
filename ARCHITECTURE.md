@@ -45,11 +45,31 @@ INSTALL_DIR =
       session_state.json
       executions_logs\
       ... (FlowController 的所有输出)
+  personality\                       ← 所有"HandQ 学到的关于我"的数据
+    memory.db                          长期记忆 SQLite (LTM)
+    memory.db-wal                      WAL 写日志（运行时存在）
+    memory.db-shm                      WAL 共享索引
+    memory_notes\                      长 /remember 的 .md 镜像
+      <id>.md                          (frontmatter + 用户原文)
+    ephemeral\                         PersonalityMonitor 的瞬时截图
+      frame_m<i>.png                   每显示器 1 张，OCR 后立刻 unlink
+  scheduled_tasks.json               固化脚本 / 定时任务持久化（与
+                                       personality 解耦：scheduler 不读
+                                       不写 LTM，独立功能）
+  browser_profile\screenshots\       browser_tool 截图（vision §1.6）
+  desktop_shots\                     desktop_tool 截图（vision §1.6）
 
 %LOCALAPPDATA%\HandQ\              ← 机器本地的调试产物
   logs\<YYYYMMDD-HHMMSS>\            每次 Electron 启动一个目录
     handq-frontend.log               main + preload + renderer
-    handq-bridge.log                 Python 端框架日志
+    handq-bridge.log                 Python 端框架日志（含 LTM /
+                                       PersonalityMonitor / Scheduler 全部
+                                       通过 logging.getLogger 写入这里）
+  diag\                              ← 内部排障专用，路径深、命名中性，
+                                       避免出现在用户的常规 debug 视野
+    internal-trace.log               LTM / PersonalityMonitor / Scheduler
+                                       三个 logger tree 的额外副本
+                                       （主 log 仍保留完整记录）
 
 <install_root>\                    ← 程序文件（默认 %LOCALAPPDATA%\Programs\HandQ）
   HandQ.exe                          Electron 主程序
@@ -63,7 +83,11 @@ INSTALL_DIR =
 |---|---|---|---|---|
 | 用户配置 | `%USERPROFILE%\HandQ\handq_config.yaml` | 是 | 是 | 跨升级 |
 | Session 历史 | `%USERPROFILE%\HandQ\History\<id>\` | 否 | 是 | 跨升级，可手动清理 |
-| 框架日志 | `%LOCALAPPDATA%\HandQ\logs\<launch>\` | 否 | 否 | 一次启动 |
+| LTM SQLite | `%USERPROFILE%\HandQ\personality\memory.db` | 否 | 是 | 跨升级；详见 LTM 设计文档 |
+| 长 /remember 镜像 | `%USERPROFILE%\HandQ\personality\memory_notes\<id>.md` | 否 | 是 | 跨升级；用户可编辑器打开 |
+| 活动截图（瞬时） | `%USERPROFILE%\HandQ\personality\ephemeral\` | 否 | 是 | 子秒级（OCR 后立删） |
+| 定时任务 | `%USERPROFILE%\HandQ\scheduled_tasks.json` | 否 | 是 | 跨升级；JSON 可手编 |
+| 框架日志 | `%LOCALAPPDATA%\HandQ\logs\<launch>\handq-bridge.log` | 否 | 否 | 一次启动 |
 
 > 关键变化（vs 早期方案）：废弃 `session.workspace_base` 字段——session
 > 根目录强制为 `%USERPROFILE%\HandQ\History\`，不可由 yaml 配置。GUI

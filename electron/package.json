@@ -35,6 +35,11 @@
         "from": "../dist/.nuitka_cache/bridge_main.dist",
         "to": ".",
         "filter": ["**/*"]
+      },
+      {
+        "from": "../scripts",
+        "to": "scripts",
+        "filter": ["*.bat"]
       }
     ],
     "win": {

@@ -160,6 +160,10 @@ if _env_log_dir:
 else:
     _LOG_DIR = Path(_ROOT) / "logs" / datetime.now().strftime("%Y%m%d-%H%M%S")
 _LOG_DIR.mkdir(parents=True, exist_ok=True)
+# Write back so stdio_bridge (and any other src/ module) can find the launch
+# log dir without re-deriving it. Safe to overwrite: if Electron passed
+# HANDQ_LOG_DIR it equals _LOG_DIR; if not, we just set it for the first time.
+os.environ["HANDQ_LOG_DIR"] = str(_LOG_DIR)
 _LOG_FILE = _LOG_DIR / "handq-bridge.log"
 
 _LOG_FMT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
@@ -185,6 +189,53 @@ logging.basicConfig(
     handlers=[_stderr_handler, _file_handler],
 )
 
+# ---------------------------------------------------------------------------
+# Internal-trace log (LTM / activity / scheduler).
+#
+# Production debugging needs deep visibility into the long-term memory and
+# activity-monitor subsystems WITHOUT cluttering the main bridge log.
+# This handler attaches to specific logger trees and writes to a separate
+# file in a deliberately non-obvious location: it's NOT named with "ltm"
+# or "memory" or "activity", and the directory is "diag" (not "logs"),
+# so a casual user poking through %LOCALAPPDATA% won't immediately see
+# what's there. We're not hiding from a determined investigator — we're
+# just keeping the visible-debug-surface small.
+#
+# Rotation: 1 MB per file, 5 files; comfortably covers a multi-hour
+# session even at DEBUG verbosity.
+try:
+    _diag_dir_env = os.environ.get("HANDQ_DIAG_DIR")
+    if _diag_dir_env:
+        _DIAG_DIR = Path(_diag_dir_env)
+    else:
+        _local_appdata = os.environ.get("LOCALAPPDATA") or str(Path.home())
+        _DIAG_DIR = Path(_local_appdata) / "HandQ" / "diag"
+    _DIAG_DIR.mkdir(parents=True, exist_ok=True)
+    _DIAG_FILE = _DIAG_DIR / "internal-trace.log"
+    _diag_handler = RotatingFileHandler(
+        str(_DIAG_FILE),
+        maxBytes=1_000_000,
+        backupCount=5,
+        encoding="utf-8",
+    )
+    _diag_handler.setLevel(logging.DEBUG)
+    _diag_handler.setFormatter(_formatter)
+    # Attach to the LTM / activity / scheduler logger trees only —
+    # the main bridge logs stay in the main file. Logger propagation
+    # means the root handler (handq-bridge.log) ALSO gets these
+    # records, which is fine: the diag log is an extra copy, not a
+    # diversion.
+    for _name in ("handq.ltm", "handq.personality", "handq.scheduler"):
+        logging.getLogger(_name).addHandler(_diag_handler)
+    _boot_logger = logging.getLogger("handq.bridge.boot")
+    _boot_logger.info("internal-trace log: %s", _DIAG_FILE)
+except Exception:
+    # If we can't write the diag log (perms / disk full / AV) just
+    # carry on with the main log — diag is supplementary.
+    logging.getLogger("handq.bridge.boot").exception(
+        "could not initialise internal-trace log; main log only",
+    )
+
 _boot_logger = logging.getLogger("handq.bridge.boot")
 _boot_logger.info(
     "bridge boot: python=%s executable=%s",
@@ -208,17 +259,164 @@ _boot_logger.info(
     bool(getattr(sys, "frozen", False) or "__compiled__" in globals()),
     _HANDQ_CONFIG,
 )
+# Windows is the only supported production target. Non-Windows is allowed
+# for dev / test (LTM core is portable: pure Python + SQLite + httpx),
+# but the personality monitor (which wraps Win32 APIs through ctypes) will
+# refuse to start on other platforms — see PersonalityMonitor.start().
+if sys.platform != "win32":
+    _boot_logger.warning(
+        "non-Windows platform detected (%s); the bridge will boot but "
+        "PersonalityMonitor will refuse to start. Production target is "
+        "Windows only.", sys.platform,
+    )
 
 import asyncio  # noqa: E402
 from src.bridge import stdio_bridge  # noqa: E402
+from src.infrastructure.long_term_memory import LongTermMemory  # noqa: E402
+from src.infrastructure.personality import PersonalityMonitor  # noqa: E402
+from src.infrastructure.scheduler import Scheduler  # noqa: E402
 
 _boot_logger.info("import phase complete; src.bridge.stdio_bridge loaded")
+
+
+async def _run_with_long_term_memory() -> None:
+    """Initialise LongTermMemory + PersonalityMonitor + Scheduler before the
+    bridge starts and tear them down on exit. All three live for the
+    lifetime of the bridge process; a clean shutdown lets WAL flush, the
+    personality buffer drain, and the scheduler's JSON state reach disk.
+
+    The init failure path is non-fatal for each subsystem: a null LTM
+    instance keeps the bridge available even when the SQLite db is
+    locked / corrupted; a PersonalityMonitor that fails to enumerate
+    monitors simply does nothing; a scheduler with a corrupt store
+    file backs it up and starts fresh. The bridge stays up so the user
+    can fix or delete files under %USERPROFILE%\\HandQ\\ without
+    losing core flows.
+    """
+    user_root = Path(_user_handq_root())
+    # ── Personality data root ─────────────────────────────────────────
+    # Per ARCHITECTURE.md §1.5, every "what HandQ has learned about
+    # me" artifact lives under %USERPROFILE%\HandQ\personality\:
+    #   memory.db, memory_notes\, ephemeral\
+    # Created lazily on first boot. We are pre-release, so there is no
+    # legacy layout to migrate from.
+    from src.infrastructure.long_term_memory import _constants as _ltm_consts
+    personality_root = user_root / _ltm_consts.PERSONALITY_DATA_DIR
+    personality_root.mkdir(parents=True, exist_ok=True)
+    db_path = personality_root / "memory.db"
+
+    config_path = Path(_HANDQ_CONFIG)
+    ltm = await LongTermMemory.init(db_path=db_path, config_path=config_path)
+
+    # ── PersonalityMonitor ────────────────────────────────────────────────
+    # screenshot_root = personality_root; the monitor's ScreenshotStore
+    # writes to <root>\ephemeral\ (via subdir("ephemeral")) per the
+    # ARCHITECTURE.md §1.5 layout. Per-frame files are unlinked the
+    # moment OCR returns; this directory is therefore empty almost all
+    # the time.
+    personality = PersonalityMonitor(
+        ltm=ltm,
+        screenshot_root=str(personality_root),
+        config_path=config_path,
+    )
+    try:
+        await personality.start()
+    except Exception:
+        _boot_logger.exception(
+            "PersonalityMonitor.start failed; continuing without personality capture",
+        )
+
+    # ── Scheduler ─────────────────────────────────────────────────────────
+    sched_path = user_root / "scheduled_tasks.json"
+    # The dispatch closure is bound at scheduler-start time but the
+    # bridge instance only exists once StdioBridge.run() builds one.
+    # We therefore use a level of indirection: the bridge registers
+    # itself into a module-level slot inside stdio_bridge after
+    # construction. The scheduler's dispatch reads that slot.
+    async def _dispatch_via_bridge(task) -> bool:  # type: ignore[no-untyped-def]
+        return await stdio_bridge.dispatch_scheduled_task(task)
+
+    scheduler = Scheduler(store_path=sched_path, dispatch=_dispatch_via_bridge)
+    try:
+        await scheduler.start()
+    except Exception:
+        _boot_logger.exception("Scheduler.start failed; continuing without scheduler")
+
+    # Plug both services into the bridge module so its IPC handlers
+    # can call them. We assign before stdio_bridge.run() so the
+    # references are visible by the time the first IPC envelope
+    # arrives.
+    stdio_bridge.personality_monitor = personality   # type: ignore[attr-defined]
+    stdio_bridge.scheduler = scheduler         # type: ignore[attr-defined]
+
+    # ── Sync git post-commit hooks declared in personalization.git_hook_repos
+    # The user manages this list through the Settings UI (which writes
+    # the yaml) — on every bridge launch we walk the list and:
+    #   - install in any listed repo that doesn't already have OUR hook
+    #   - skip with warning for paths that don't exist or have a
+    #     non-HandQ hook
+    # Hooks the user wrote themselves (no marker) are never touched.
+    try:
+        from src.bridge.stdio_bridge import (
+            _install_post_commit_hook,
+        )
+        import yaml as _yaml
+        try:
+            with open(_HANDQ_CONFIG, "r", encoding="utf-8") as _f:
+                _user_cfg = _yaml.safe_load(_f) or {}
+        except Exception:
+            _user_cfg = {}
+        _personalization = _user_cfg.get("personalization") or {}
+        _declared_repos = _personalization.get("git_hook_repos") or []
+        if isinstance(_declared_repos, list):
+            _declared = set(
+                str(r).strip() for r in _declared_repos if str(r).strip()
+            )
+        else:
+            _declared = set()
+            _boot_logger.warning(
+                "personalization.git_hook_repos is not a list; ignoring",
+            )
+        for _repo in _declared:
+            try:
+                _result = _install_post_commit_hook(_repo)
+                if _result.get("ok"):
+                    _boot_logger.info(
+                        "git hook ensured at %s", _result.get("path"),
+                    )
+                else:
+                    _boot_logger.warning(
+                        "git hook install skipped for %s: %s",
+                        _repo, _result.get("error"),
+                    )
+            except Exception:
+                _boot_logger.exception(
+                    "git hook sync failed for %s", _repo,
+                )
+    except Exception:
+        _boot_logger.exception("git hook sync raised; continuing without sync")
+
+    try:
+        await stdio_bridge.run()
+    finally:
+        try:
+            await scheduler.shutdown()
+        except Exception:
+            _boot_logger.exception("Scheduler shutdown raised")
+        try:
+            await personality.shutdown()
+        except Exception:
+            _boot_logger.exception("PersonalityMonitor shutdown raised")
+        try:
+            await ltm.shutdown()
+        except Exception:
+            _boot_logger.exception("LongTermMemory shutdown raised")
 
 
 if __name__ == "__main__":
     _boot_logger.info("bridge entrypoint: starting asyncio loop")
     try:
-        asyncio.run(stdio_bridge.run())
+        asyncio.run(_run_with_long_term_memory())
     except (KeyboardInterrupt, SystemExit):
         _boot_logger.info("bridge interrupted by KeyboardInterrupt/SystemExit")
         raise

@@ -706,6 +706,7 @@ class Planner:
         current_lookahead: List[Step],
         user_message: Optional[str] = None,
         accumulated_findings: str = "",
+        long_term_context: str = "",
     ) -> Plan:
         """
         Single planning entry point.
@@ -714,6 +715,10 @@ class Planner:
         - user_message set → incorporates user instruction into decision
         - accumulated_findings set → planner has a global view of all key findings
           from all completed steps, not just the detail_window-limited summary.
+        - long_term_context → opaque pre-rendered XML block (from
+          ``LongTermMemory.format_context_block``). Empty string disables the
+          section. The planner does not know how the block is composed —
+          memory + knowledge structure stays inside LongTermMemory.
 
         When a user_message is present the Planner decides internally whether
         the message affects the current plan step (adjust lookahead only) or
@@ -794,6 +799,14 @@ class Planner:
                 "every artifact goes here, and relative paths resolve against it."
             )
 
+        # The long-term context is rendered upstream (LongTermMemory.format_
+        # context_block) so the Planner stays agnostic to memory vs knowledge
+        # structure. Empty string collapses the section entirely and keeps the
+        # prompt-prefix cache-stable when LTM has no signal to offer.
+        long_term_section = (
+            "\n" + long_term_context + "\n"
+        ) if long_term_context else ""
+
         messages = [
             {"role": "system", "content": system_prompt_content},
             {"role": "user", "content": OBSERVE_AND_PLAN_TEMPLATE.format(
@@ -803,6 +816,7 @@ class Planner:
                 epistemic_preamble=epistemic_preamble,
                 completed_summary=self._build_completed_summary(completed_steps, self.detail_window),
                 accumulated_findings_section=accumulated_findings_section,
+                long_term_section=long_term_section,
                 lookahead_summary=self._build_lookahead_summary(current_lookahead),
                 directory_block=directory_block,
                 directory_note=directory_note,

@@ -176,6 +176,7 @@
 
     // Shortcut bar
     const scSettings = document.getElementById('sc-settings');
+    const scScheduler = document.getElementById('sc-scheduler');
     const scStatus   = document.getElementById('sc-status');
     const scNew      = document.getElementById('sc-new');
 
@@ -238,59 +239,23 @@
     const cfgSwToolWrite = document.getElementById('cfg-sw-tool-write');
     const cfgSwToolEdit  = document.getElementById('cfg-sw-tool-edit');
     const cfgSwToolBash  = document.getElementById('cfg-sw-tool-bash');
-    const cfgSwToolBrowserEnabled = document.getElementById('cfg-sw-tool-browser-enabled');
     const cfgSwToolBrowserAuto    = document.getElementById('cfg-sw-tool-browser-auto');
-    const cfgSwToolDesktopEnabled = document.getElementById('cfg-sw-tool-desktop-enabled');
     const cfgSwToolDesktopAuto    = document.getElementById('cfg-sw-tool-desktop-auto');
-    const cfgSwToolWebSearchEnabled = document.getElementById('cfg-sw-tool-web-search-enabled');
     const cfgSwToolWebSearchAuto    = document.getElementById('cfg-sw-tool-web-search-auto');
-    const cfgSwToolEmailEnabled = document.getElementById('cfg-sw-tool-email-enabled');
     const cfgSwToolEmailAuto    = document.getElementById('cfg-sw-tool-email-auto');
-    const cfgSwToolAskHumanEnabled = document.getElementById('cfg-sw-tool-ask-human-enabled');
     const cfgSwHighRisk  = document.getElementById('cfg-sw-high-risk');
     const cfgEmailFolderBlacklist = document.getElementById('cfg-email-folder-blacklist');
+    // Personalization fields — surface for git-hook learning + privacy
+    // controls. yaml is the source of truth; bridge_main re-syncs hooks
+    // on every launch based on personalization.git_hook_repos.
+    const cfgPersEnabled = document.getElementById('cfg-pers-enabled');
+    const cfgPersExcludedApps = document.getElementById('cfg-pers-excluded-apps');
+    const cfgPersGitHookRepos = document.getElementById('cfg-pers-git-hook-repos');
 
     // Hotkey field
     const cfgHotkey = document.getElementById('cfg-hotkey');
 
     let originalConfig = null;
-
-    // ── Enable → Auto-approve visibility ──────────────────────────────
-    // For tools that have both an Enable and an Auto-approve switch, the
-    // Auto-approve row is meaningless when Enable is off. Hide it in that
-    // case so the Settings panel stays uncluttered.
-    const _enableAutoPairs = [
-        // [enable checkbox, tool-group data-tool key]
-        ['browser',    'cfg-sw-tool-browser-enabled',    'cfg-sw-tool-browser-auto'],
-        ['desktop',    'cfg-sw-tool-desktop-enabled',    'cfg-sw-tool-desktop-auto'],
-        ['web_search', 'cfg-sw-tool-web-search-enabled', 'cfg-sw-tool-web-search-auto'],
-        ['email',      'cfg-sw-tool-email-enabled',      'cfg-sw-tool-email-auto'],
-        ['ask_human',  'cfg-sw-tool-ask-human-enabled',  null],
-    ];
-
-    function applyEnableVisibility() {
-        for (const [, enableId, autoId] of _enableAutoPairs) {
-            if (!autoId) continue;
-            const enableEl = document.getElementById(enableId);
-            const autoEl   = document.getElementById(autoId);
-            if (!enableEl || !autoEl) continue;
-            const autoRow = autoEl.closest('label.checkbox-row');
-            if (!autoRow) continue;
-            if (enableEl.checked) {
-                autoRow.classList.remove('is-hidden');
-            } else {
-                autoRow.classList.add('is-hidden');
-            }
-        }
-    }
-
-    // Re-evaluate visibility whenever an Enable checkbox flips.
-    for (const [, enableId] of _enableAutoPairs) {
-        const enableEl = document.getElementById(enableId);
-        if (enableEl) {
-            enableEl.addEventListener('change', applyEnableVisibility);
-        }
-    }
 
     // Settings loading overlay (created lazily on first settings open)
     let settingsLoadingEl = null;
@@ -1939,6 +1904,37 @@
         const text = composerInput.value.trim();
         if (!text) return;
 
+        // Hidden admin command. Typing /memory in the composer opens
+        // the LTM admin overlay instead of dispatching to the bridge.
+        // Variants accepted: /memory, /memory/, /MEMORY, "  /memory  ".
+        // We swallow the input (no bubble, no flow trigger) and just
+        // toggle the panel — that way the admin surface stays hidden
+        // from anyone who doesn't already know the magic word.
+        if (/^\/memory\/?$/i.test(text)) {
+            composerInput.value = '';
+            composerExpandedInput.value = '';
+            if (window.adminPanel) {
+                if (window.adminPanel.isOpen()) window.adminPanel.close();
+                else window.adminPanel.open();
+            }
+            return;
+        }
+
+        // Sister command: /schedules opens the recurring-task manager.
+        // Functionally independent from /memory (the scheduler doesn't
+        // touch memory.db). Accepts both /schedules and /tasks as an
+        // alias since the feature is naturally called either thing
+        // depending on the user's mental model.
+        if (/^\/(schedules?|tasks?)\/?$/i.test(text)) {
+            composerInput.value = '';
+            composerExpandedInput.value = '';
+            if (window.schedulePanel) {
+                if (window.schedulePanel.isOpen()) window.schedulePanel.close();
+                else window.schedulePanel.open();
+            }
+            return;
+        }
+
         addUserBubble(text);
         composerInput.value = '';
         composerExpandedInput.value = '';
@@ -2169,6 +2165,18 @@
     scSettings.addEventListener('click', () => {
         openOverlay(overlaySettings);
         loadConfig();
+    });
+
+    // Scheduler shortcut: same toggle behaviour as the /schedules slash
+    // command — opens admin-panel.js's overlay if closed, closes it if
+    // already open. window.schedulePanel is set up in admin-panel.js.
+    scScheduler.addEventListener('click', () => {
+        if (!window.schedulePanel) return;
+        if (window.schedulePanel.isOpen()) {
+            window.schedulePanel.close();
+        } else {
+            window.schedulePanel.open();
+        }
     });
 
     scStatus.addEventListener('click', () => {
@@ -2449,25 +2457,26 @@
         cfgSwToolWrite.checked = readSwitch('tool_write', 'auto_approve');
         cfgSwToolEdit.checked  = readSwitch('tool_edit',  'auto_approve');
         cfgSwToolBash.checked  = readSwitch('tool_bash',  'auto_approve');
-        cfgSwToolBrowserEnabled.checked = readSwitch('tool_browser', 'enabled');
         cfgSwToolBrowserAuto.checked    = readSwitch('tool_browser', 'auto_approve');
-        cfgSwToolDesktopEnabled.checked = readSwitch('tool_desktop', 'enabled');
         cfgSwToolDesktopAuto.checked    = readSwitch('tool_desktop', 'auto_approve');
-        cfgSwToolWebSearchEnabled.checked = readSwitch('tool_web_search', 'enabled');
         cfgSwToolWebSearchAuto.checked    = readSwitch('tool_web_search', 'auto_approve');
-        cfgSwToolEmailEnabled.checked = readSwitch('tool_email', 'enabled');
         cfgSwToolEmailAuto.checked    = readSwitch('tool_email', 'auto_approve');
-        cfgSwToolAskHumanEnabled.checked = readSwitch('tool_ask_human', 'enabled');
         cfgSwHighRisk.checked  = readSwitch('high_risk', 'auto_approve');
-
-        // Reflect each Enable state in the visibility of the matching
-        // Auto-approve row. Disabled tool → no Auto-approve switch needed.
-        applyEnableVisibility();
 
         const blacklist = emailCfg.folder_blacklist;
         cfgEmailFolderBlacklist.value = Array.isArray(blacklist)
             ? blacklist.join(', ')
             : (typeof blacklist === 'string' ? blacklist : '');
+
+        // ── Personalization fields ────────────────────────────────
+        const persCfg = cfg.personalization || {};
+        cfgPersEnabled.checked = persCfg.enabled !== false;  // default true
+        cfgPersExcludedApps.value = Array.isArray(persCfg.excluded_apps)
+            ? persCfg.excluded_apps.join('\n')
+            : '';
+        cfgPersGitHookRepos.value = Array.isArray(persCfg.git_hook_repos)
+            ? persCfg.git_hook_repos.join('\n')
+            : '';
     }
 
     function readFormToConfig() {
@@ -2526,21 +2535,29 @@
         writeSwitch('tool_write', 'auto_approve', cfgSwToolWrite.checked);
         writeSwitch('tool_edit',  'auto_approve', cfgSwToolEdit.checked);
         writeSwitch('tool_bash',  'auto_approve', cfgSwToolBash.checked);
-        writeSwitch('tool_browser', 'enabled',      cfgSwToolBrowserEnabled.checked);
         writeSwitch('tool_browser', 'auto_approve', cfgSwToolBrowserAuto.checked);
-        writeSwitch('tool_desktop', 'enabled',      cfgSwToolDesktopEnabled.checked);
         writeSwitch('tool_desktop', 'auto_approve', cfgSwToolDesktopAuto.checked);
-        writeSwitch('tool_web_search', 'enabled',      cfgSwToolWebSearchEnabled.checked);
         writeSwitch('tool_web_search', 'auto_approve', cfgSwToolWebSearchAuto.checked);
-        writeSwitch('tool_email', 'enabled',      cfgSwToolEmailEnabled.checked);
         writeSwitch('tool_email', 'auto_approve', cfgSwToolEmailAuto.checked);
-        writeSwitch('tool_ask_human', 'enabled',      cfgSwToolAskHumanEnabled.checked);
         writeSwitch('high_risk',  'auto_approve', cfgSwHighRisk.checked);
 
         const rawBlacklist = cfgEmailFolderBlacklist.value;
         emailCfg.folder_blacklist = rawBlacklist
             ? rawBlacklist.split(',').map((s) => s.trim()).filter(Boolean)
             : [];
+
+        // ── Personalization fields ────────────────────────────────
+        // Roundtrip the textarea contents into yaml lists. Empty
+        // lines and pure whitespace lines are dropped so a stray
+        // blank doesn't show up in the saved file.
+        const persCfg = (out.personalization && typeof out.personalization === 'object')
+            ? out.personalization : {};
+        persCfg.enabled = !!cfgPersEnabled.checked;
+        persCfg.excluded_apps = (cfgPersExcludedApps.value || '')
+            .split('\n').map((s) => s.trim()).filter(Boolean);
+        persCfg.git_hook_repos = (cfgPersGitHookRepos.value || '')
+            .split('\n').map((s) => s.trim()).filter(Boolean);
+        out.personalization = persCfg;
 
         out.llm = llm;
         out.session = sess;

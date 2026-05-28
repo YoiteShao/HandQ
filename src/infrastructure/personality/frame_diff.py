@@ -1,0 +1,124 @@
+"""Cheap perceptual hash + text-similarity helpers.
+
+The activity service uses these BEFORE OCR (image hash) and AFTER OCR
+(text Jaccard) to decide whether the current capture is novel enough
+to be worth pushing into LTM. Both are deliberately simple:
+
+- Image hash: 16x16 grayscale → mean threshold → 256-bit fingerprint.
+  Hamming distance gives a coarse "are these the same screen" signal.
+  False positives (two visually similar but logically different
+  screens) are accepted because the text-similarity stage catches them.
+
+- Text Jaccard: shingled token set ratio. Cheap, language-agnostic, and
+  resilient to small UI chrome differences (clock minute changing,
+  scrollbar position).
+"""
+from __future__ import annotations
+
+import logging
+from typing import Optional, Set, Tuple
+
+_logger = logging.getLogger("handq.activity.diff")
+
+
+# ── Perceptual hash ────────────────────────────────────────────────────────
+
+
+def perceptual_hash(image_path: str, *, downsample_px: int = 16) -> Optional[int]:
+    """Return a 256-bit dHash-style fingerprint as a Python int, or None.
+
+    Implementation: load with Pillow, convert to grayscale, resize to
+    ``downsample_px x downsample_px``, compute the mean pixel value,
+    then bit-pack ``pixel >= mean`` for each cell.
+
+    Why mean threshold rather than dHash row-difference: mean tolerates
+    one bright element appearing without flipping the entire fingerprint
+    (e.g. a notification balloon). For our "is this the same idle screen?"
+    use case, that's the right tradeoff.
+    """
+    try:
+        from PIL import Image
+    except Exception:
+        return None
+    try:
+        with Image.open(image_path) as im:
+            small = im.convert("L").resize(
+                (downsample_px, downsample_px), Image.NEAREST,
+            )
+            data = list(small.getdata())
+    except Exception:
+        _logger.debug("perceptual_hash open failed for %s", image_path,
+                      exc_info=True)
+        return None
+    if not data:
+        return None
+    mean = sum(data) / len(data)
+    bits = 0
+    for i, v in enumerate(data):
+        if v >= mean:
+            bits |= (1 << i)
+    return bits
+
+
+def hamming(a: int, b: int) -> int:
+    """Bit count of (a XOR b) — the number of differing pixels."""
+    return bin(a ^ b).count("1")
+
+
+# ── Text shingling ─────────────────────────────────────────────────────────
+
+
+def _shingle(text: str, *, n: int = 3) -> Set[str]:
+    """Word-level n-gram set. Whitespace-tokenised, case-folded.
+
+    For OCR'd UI text this works well because most screens have several
+    distinctive multi-word phrases (window titles, menu items, error
+    messages). 3-grams cover phrasing variations like "File > Open"
+    vs "File Open" while still being discriminative.
+    """
+    tokens = text.lower().split()
+    if len(tokens) < n:
+        # Fall back to single tokens so very short OCR texts still get a
+        # comparable set (Jaccard on identical short text is 1.0, which
+        # is what we want — same screen).
+        return set(tokens)
+    return {" ".join(tokens[i:i + n]) for i in range(len(tokens) - n + 1)}
+
+
+def text_jaccard(a: str, b: str, *, n: int = 3) -> float:
+    """Jaccard similarity in [0, 1]. 1.0 means identical shingle set."""
+    if not a and not b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    sa, sb = _shingle(a, n=n), _shingle(b, n=n)
+    if not sa or not sb:
+        return 0.0
+    inter = len(sa & sb)
+    union = len(sa | sb)
+    return inter / union if union else 0.0
+
+
+def excerpt(text: str, max_chars: int) -> str:
+    """Trim *text* to *max_chars*, preserving a leading whitespace marker
+    when truncated. Caller is responsible for sanitising newlines.
+    """
+    if not text:
+        return ""
+    text = text.strip()
+    if len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip() + "…"
+
+
+def short_signature(image_path: str) -> Tuple[Optional[int], Optional[float]]:
+    """Return (perceptual_hash, file_size_bytes) for diagnostics. Either
+    field may be None on failure; caller decides whether to proceed.
+    """
+    import os
+    h = perceptual_hash(image_path)
+    try:
+        sz = float(os.path.getsize(image_path))
+    except OSError:
+        sz = None
+    return h, sz

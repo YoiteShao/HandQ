@@ -263,38 +263,24 @@ if (-not $ElectronOnly) {
         "--include-data-files=$REPO_ROOT\handq_config.example.yaml=handq_config.yaml",
 
         # ── Size reduction: trim unused sub-packages of large deps ────────────
-        # anthropic: skip the deprecated pre-v1 compat layer
-        '--nofollow-import-to=anthropic._legacy_response',
-        # anthropic: client.beta.* surface (token counting, file API, etc.) is
-        # never used — we only call client.messages.stream(...).
-        '--nofollow-import-to=anthropic.resources.beta',
-        # openai: we call only AsyncOpenAI — skip CLI tooling and optional extras
+        # Rules here only if the module is a genuinely separate entry-point that
+        # the SDK core never imports itself. Fine-grained resource-level exclusions
+        # (openai.resources.*, anthropic.resources.*) are NOT safe: the SDK's
+        # _client.py imports all resource sub-packages at class-definition time,
+        # so any one of them being missing causes an ImportError at startup.
+        #
+        # openai.cli  — standalone CLI script, never imported by the SDK core.
         '--nofollow-import-to=openai.cli',
+        # openai._extras — all guarded with try/except ImportError in the SDK.
         '--nofollow-import-to=openai._extras',
-        # openai: we use only AsyncOpenAI().chat.completions.create(...) for
-        # the QGenie vision gateway (vision/llm.py:264). Every other resource
-        # subpackage is dead weight. If the packaged build raises ImportError
-        # mentioning one of these, peel that line out and rebuild — the list
-        # is intentionally one-per-line so removal is clean.
-        '--nofollow-import-to=openai.resources.audio',
-        '--nofollow-import-to=openai.resources.images',
-        '--nofollow-import-to=openai.resources.files',
-        '--nofollow-import-to=openai.resources.fine_tuning',
-        '--nofollow-import-to=openai.resources.embeddings',
-        '--nofollow-import-to=openai.resources.moderations',
-        '--nofollow-import-to=openai.resources.batches',
-        '--nofollow-import-to=openai.resources.uploads',
-        '--nofollow-import-to=openai.resources.evals',
-        '--nofollow-import-to=openai.resources.containers',
-        '--nofollow-import-to=openai.resources.responses',
-        '--nofollow-import-to=openai.resources.beta',
-        '--nofollow-import-to=openai.resources.fine_tunes',
-        '--nofollow-import-to=openai.resources.vector_stores',
-        # playwright: only async_api is used; the sync wrapper is a significant
-        # chunk of compiled code we don't need
+        # playwright: async_api and sync_api are independent; we only use async.
         '--nofollow-import-to=playwright.sync_api',
 
         # ── Exclude dev / test / profiling tooling ────────────────────────────
+        # src.ui contains dev-only TUI helpers (status_tui.py uses rich).
+        # Nothing in the prod code path imports src.ui; excluding it keeps rich
+        # out of the bundle and avoids any import-follow issues.
+        '--nofollow-import-to=src.ui',
         '--nofollow-import-to=pytest',
         '--nofollow-import-to=_pytest',
         '--nofollow-import-to=tests',
@@ -341,7 +327,7 @@ if (-not $ElectronOnly) {
         '--nofollow-import-to=email.contentmanager',
         '--nofollow-import-to=email.headerregistry',
         '--nofollow-import-to=mailbox',
-        '--nofollow-import-to=mimetypes',
+        # mimetypes must NOT be excluded — httpx._multipart imports it at runtime.
         '--nofollow-import-to=uu',
         '--nofollow-import-to=quopri',
 

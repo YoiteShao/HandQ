@@ -1,9 +1,16 @@
-"""Dataclasses + enums for the long-term memory system."""
+"""Dataclasses + enums for the long-term memory system.
+
+Also hosts the small data-shapes used by the activity monitor and the
+scheduler subsystems. Both of those write into LTM (as candidates), so
+their lifetime is bounded by LTM's; co-locating their model layer here
+keeps the surface area small and avoids a parallel ``schema.py`` set.
+"""
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 
 class CandidateStatus(str, Enum):
@@ -14,6 +21,34 @@ class CandidateStatus(str, Enum):
     ACCEPTED_BOTH = "accepted_both"
     REJECTED = "rejected"
     FAILED = "failed"
+
+
+class CandidateSource(str, Enum):
+    """Origin of a memory_candidates row.
+
+    The triage prompt and the dream worker's defensive guards both branch on
+    this value, so we keep it as an enum rather than free-form strings:
+
+    - ``SESSION_COMPLETE``  : a task ended successfully. Mine durable user
+      preferences (memory) and reusable team/project conventions (knowledge).
+    - ``SESSION_FAILED``    : a task ended in failure (planner gave up, or
+      progress tracker aborted). Knowledge ONLY; memory is hard-blocked
+      because user actions on a failed run are not consent.
+    - ``RECEPTIONIST_TURN`` : per-message capture from receptionist eval.
+      Most user messages are skipped by triage; explicit preferences pass.
+    - ``MANUAL_REMEMBER``   : explicit ``/remember <text>`` command. P4.
+      Higher trust than ambient sources; bias toward action='create'.
+    - ``POST_COMMIT``       : git post-commit hook (P4). Captures project
+      conventions from commit msg + diff stat.
+    - ``ACTIVITY_OBSERVER`` : background activity capture (P5+, not on
+      HandQ's roadmap currently — listed for forward compatibility).
+    """
+    SESSION_COMPLETE = "session_complete"
+    SESSION_FAILED = "session_failed"
+    RECEPTIONIST_TURN = "receptionist_turn"
+    MANUAL_REMEMBER = "manual_remember"
+    POST_COMMIT = "post_commit"
+    ACTIVITY_OBSERVER = "activity_observer"
 
 
 class MemoryDimension(str, Enum):
@@ -30,9 +65,42 @@ class KnowledgeCategory(str, Enum):
 
 
 class EntryKind(str, Enum):
+    """Discriminator used in embedding_cache.chunk_kind, recall pipeline,
+    and archive routing. The enum's values are the canonical strings —
+    do NOT introduce parallel KIND_* constants elsewhere.
+    """
     MEMORY = "memory"
     KNOWLEDGE = "knowledge"
     PROCEDURE = "procedure"  # P6 — not implemented in v1
+
+
+class VerdictAction(str, Enum):
+    """The triage LLM's decision per track.
+
+    Mirrors the prompt schema in :mod:`prompts`: each track (memory /
+    knowledge) reports one of these three actions independently.
+
+    - ``CREATE`` : insert a new entry. ``content`` is the body.
+    - ``UPDATE`` : merge into an existing entry referenced by *_update_id.
+                   ``content`` is the COMPLETE merged body, not a diff.
+    - ``SKIP``   : no new signal. ``worth_*`` must be False.
+    """
+    CREATE = "create"
+    UPDATE = "update"
+    SKIP = "skip"
+
+
+class ArchiveReason(str, Enum):
+    """Why an entry was soft-deleted (memory_files.archived_reason or
+    knowledge_files.archived_reason). Centralised here so the dream-worker
+    cleanup paths (auto_dedup, superseded) and the user-driven path
+    (user_request) all draw from the same vocabulary.
+    """
+    USER_REQUEST = "user_request"      # explicit user delete
+    AUTO_DEDUP = "auto_dedup"          # merge scanner found a duplicate
+    SUPERSEDED = "superseded"          # newer version replaced this one
+    CORRUPTED = "corrupted"            # data integrity check failed
+    SENSITIVE = "sensitive"            # post-hoc PII detection
 
 
 @dataclass
@@ -84,16 +152,173 @@ class TriageVerdict:
     worth_memory: bool = False
     worth_knowledge: bool = False
 
-    memory_action: str = "skip"                # 'create' | 'update' | 'skip'
+    # Action strings come from VerdictAction (kept as str for JSON-friendliness;
+    # the parser in prompts.py validates them against the enum).
+    memory_action: str = VerdictAction.SKIP.value     # 'create' | 'update' | 'skip'
     memory_dimension: Optional[MemoryDimension] = None
     memory_summary: str = ""
     memory_content: str = ""
     memory_update_id: Optional[str] = None
 
-    knowledge_action: str = "skip"
+    knowledge_action: str = VerdictAction.SKIP.value
     knowledge_category: Optional[KnowledgeCategory] = None
     knowledge_summary: str = ""
     knowledge_content: str = ""
     knowledge_update_id: Optional[str] = None
 
     reason: str = ""
+
+
+# ── Activity monitor models ─────────────────────────────────────────────────
+
+
+class MonitorTier(str, Enum):
+    """Per-monitor sampling tier — drives capture cadence.
+
+    The ActivityMonitor's adaptive loop owns one ``MonitorTier`` per physical
+    display. Promotion is immediate (any input event near the monitor or
+    visible content change → HOT). Demotion is delayed by
+    ``ACTIVITY_TIER_DEMOTE_GRACE_SEC`` so a single read-and-think pause
+    doesn't ping-pong back to WARM.
+    """
+    HOT = "hot"
+    WARM = "warm"
+    COLD = "cold"
+    DORMANT = "dormant"
+
+
+@dataclass
+class MonitorInfo:
+    """Static-ish description of a physical display.
+
+    The monitor enumerator builds these once (or once per topology change).
+    ``index`` is a stable ordinal across the session — we stamp candidates
+    with it so the dream worker can correlate samples to a specific
+    physical display. ``primary`` is True for the OS-designated primary;
+    handy for the UI when surfacing "main monitor" status.
+    """
+    index: int
+    bbox: Tuple[int, int, int, int]   # (left, top, right, bottom) in virtual-screen px
+    primary: bool = False
+    label: str = ""                    # e.g. "Display 1 (1920x1080, primary)"
+
+
+@dataclass
+class ActivitySample:
+    """One accepted observation of a monitor at a point in time.
+
+    Buffered in-memory by the ActivityMonitor service until either
+    ``ACTIVITY_BUFFER_FLUSH_AFTER_N`` accumulate or the per-monitor flush
+    deadline elapses. On flush, the buffer is rendered into a single
+    ACTIVITY_OBSERVER candidate.
+
+    We deliberately do NOT keep the screenshot bytes here — by the time a
+    sample exists, the source PNG has been unlinked. The OCR text excerpt
+    is the only durable artefact.
+    """
+    monitor_index: int
+    timestamp: int
+    foreground_window: str = ""        # window title at capture time, may be ""
+    foreground_app: str = ""           # process name, may be ""
+    text_excerpt: str = ""             # OCR-derived, capped to OCR_EXCERPT_MAX_CHARS
+    tier: MonitorTier = MonitorTier.HOT
+    novelty: float = 1.0               # 0..1; how different from previous accepted sample
+    sample_kind: str = "activity"     # "activity" | "daily_summary"
+
+
+# ── Scheduler models ────────────────────────────────────────────────────────
+
+
+class SchedulerTaskStatus(str, Enum):
+    """Last-known terminal state of a scheduled task fire."""
+    IDLE = "idle"               # never fired or last firing succeeded
+    RUNNING = "running"         # currently in flight
+    OK = "ok"                   # last fire completed without raising
+    FAILED = "failed"           # last fire raised; ``last_error`` populated
+    PENDING = "pending"         # firing time hit, bridge busy; next_run_at unchanged, retried on idle wakeup
+    CANCELLED = "cancelled"     # user clicked New Session while a scheduled fire was in flight
+
+
+@dataclass
+class ScheduledTask:
+    """One persistent scheduled task — pinned prompt + cadence.
+
+    Persisted to ``%USERPROFILE%\\HandQ\\scheduled_tasks.json`` as a plain
+    JSON array via :class:`scheduler.store.ScheduleStore`. Field
+    descriptions:
+
+    - ``id``        : opaque uuid string; immutable.
+    - ``name``      : human-readable label shown in the UI.
+    - ``prompt``    : the goal text injected into FlowController exactly as
+                      a user-typed request would be.
+    - ``schedule``  : grammar string parsed by ``scheduler.schedule``:
+                          - "every 30 seconds" / "every 5 minutes" / "every 2 hours"
+                          - "daily 09:30" / "daily 09:30:15"
+                          - "weekly mon 09:30"
+    - ``enabled``   : flag; if False the task is skipped without bumping
+                      run-counters.
+    - ``last_run_at``        : unix seconds — fire-START time of the most
+                      recent fire; 0 if never.
+    - ``next_run_at``        : unix seconds — when the next fire is due.
+                      Pinned at fire-START by ``mark_running`` to enable
+                      no-skip catch-up of missed triggers.
+    - ``run_count``          : monotonic count of fires.
+    - ``failure_count``      : consecutive failures since the last success;
+                      auto-disable kicks in at SCHEDULER_MAX_FAILURES_BEFORE_DISABLE.
+    - ``last_status`` / ``last_error`` : populated post-fire for the UI.
+    - ``created_at`` / ``updated_at``  : audit timestamps. Not used by
+                      the runtime; kept for human inspection of the JSON
+                      file.
+    """
+    id: str
+    name: str
+    prompt: str
+    schedule: str
+    enabled: bool = True
+    last_run_at: int = 0
+    next_run_at: int = 0
+    run_count: int = 0
+    failure_count: int = 0
+    last_status: SchedulerTaskStatus = SchedulerTaskStatus.IDLE
+    last_error: str = ""
+    created_at: int = field(default_factory=lambda: int(time.time()))
+    updated_at: int = field(default_factory=lambda: int(time.time()))
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "prompt": self.prompt,
+            "schedule": self.schedule,
+            "enabled": self.enabled,
+            "last_run_at": self.last_run_at,
+            "next_run_at": self.next_run_at,
+            "run_count": self.run_count,
+            "failure_count": self.failure_count,
+            "last_status": self.last_status.value,
+            "last_error": self.last_error,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+
+    @classmethod
+    def from_dict(cls, d: Dict[str, Any]) -> "ScheduledTask":
+        try:
+            status = SchedulerTaskStatus(d.get("last_status") or "idle")
+        except ValueError:
+            status = SchedulerTaskStatus.IDLE
+        return cls(
+            id=str(d["id"]),
+            name=str(d.get("name") or ""),
+            prompt=str(d.get("prompt") or ""),
+            schedule=str(d.get("schedule") or ""),
+            enabled=bool(d.get("enabled", True)),
+            last_run_at=int(d.get("last_run_at") or 0),
+            next_run_at=int(d.get("next_run_at") or 0),
+            run_count=int(d.get("run_count") or 0),
+            failure_count=int(d.get("failure_count") or 0),
+            last_status=status,
+            last_error=str(d.get("last_error") or ""),
+            created_at=int(d.get("created_at") or int(time.time())),
+            updated_at=int(d.get("updated_at") or int(time.time())),
+        )

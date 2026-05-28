@@ -1802,3 +1802,384 @@ code {
     animation: ai-pulse 1.6s ease-out infinite;
 }
 
+
+
+/* ============================================================ */
+/* LTM Admin overlay — opened via /memory in the composer.      */
+/* Hidden from normal users; powerful operations live here.     */
+/* ============================================================ */
+
+.admin-card {
+    width: min(900px, 94vw);
+    max-height: 84vh;
+    display: flex;
+    flex-direction: column;
+}
+
+.admin-tabs {
+    display: flex;
+    gap: 4px;
+    padding: 0 16px;
+    border-bottom: 1px solid var(--bd, #333);
+    flex-wrap: wrap;
+}
+
+.admin-tab {
+    background: transparent;
+    border: none;
+    padding: 8px 14px;
+    cursor: pointer;
+    color: inherit;
+    font-size: 13px;
+    border-bottom: 2px solid transparent;
+}
+.admin-tab:hover { background: rgba(255, 255, 255, 0.04); }
+.admin-tab.active { border-bottom-color: var(--accent, #4a90e2); font-weight: 600; }
+
+.admin-toast {
+    margin: 8px 16px;
+    padding: 8px 12px;
+    border-radius: 4px;
+    font-size: 12px;
+    background: rgba(74, 144, 226, 0.15);
+    border: 1px solid var(--accent, #4a90e2);
+}
+.admin-toast.error {
+    background: rgba(232, 64, 64, 0.15);
+    border-color: #e84040;
+}
+
+.admin-body {
+    flex: 1;
+    overflow-y: auto;
+    padding: 16px;
+}
+
+.admin-pane.hidden { display: none; }
+
+.admin-pane-header {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+    margin-bottom: 12px;
+    flex-wrap: wrap;
+}
+.admin-pane-header > select,
+.admin-pane-header > input,
+.admin-pane-header > button {
+    padding: 4px 10px;
+    font-size: 12px;
+}
+
+.admin-count {
+    margin-left: auto;
+    font-size: 11px;
+    opacity: 0.6;
+}
+
+.admin-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+}
+
+.admin-list li {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 8px;
+    padding: 10px 12px;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 4px;
+    margin-bottom: 6px;
+    background: rgba(255, 255, 255, 0.02);
+}
+
+.admin-entry-summary {
+    font-weight: 600;
+    margin: 0 0 4px 0;
+    word-break: break-word;
+}
+
+.admin-entry-meta {
+    font-size: 11px;
+    opacity: 0.6;
+    margin: 0 0 6px 0;
+}
+
+.admin-entry-content {
+    font-family: var(--mono, Consolas, monospace);
+    font-size: 11px;
+    white-space: pre-wrap;
+    word-break: break-word;
+    margin: 0;
+    max-height: 120px;
+    overflow-y: auto;
+    background: rgba(0, 0, 0, 0.2);
+    padding: 6px 8px;
+    border-radius: 3px;
+}
+
+.admin-entry-actions {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    align-items: flex-end;
+}
+
+.admin-entry-actions button {
+    padding: 4px 8px;
+    font-size: 11px;
+}
+
+.admin-stats-output {
+    font-family: var(--mono, Consolas, monospace);
+    font-size: 11px;
+    background: rgba(0, 0, 0, 0.3);
+    padding: 12px;
+    border-radius: 4px;
+    max-height: 60vh;
+    overflow-y: auto;
+    white-space: pre-wrap;
+}
+
+.admin-form {
+    margin-top: 16px;
+    padding: 12px;
+    background: rgba(255, 255, 255, 0.03);
+    border-radius: 6px;
+}
+
+.admin-form h4 { margin: 0 0 12px 0; font-size: 14px; }
+
+.admin-form label {
+    display: block;
+    margin-bottom: 10px;
+}
+.admin-form label > span { display: block; margin-bottom: 4px; font-size: 12px; }
+.admin-form input,
+.admin-form textarea {
+    width: 100%;
+    padding: 6px 10px;
+    font-size: 12px;
+    box-sizing: border-box;
+}
+
+.admin-form-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 12px;
+}
+
+.admin-tool-block {
+    padding: 14px;
+    margin-bottom: 14px;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 6px;
+}
+.admin-tool-block h4 { margin: 0 0 8px 0; }
+.admin-tool-block textarea {
+    width: 100%;
+    box-sizing: border-box;
+    font-size: 12px;
+    padding: 6px 10px;
+    margin: 8px 0;
+}
+.admin-tool-block label > span { display: block; margin-bottom: 4px; font-size: 12px; }
+.admin-tool-block input {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 6px 10px;
+    font-size: 12px;
+}
+
+/* ===== Scheduler panel — list + detail + create FAB ===== */
+/* Visual language matches the Settings overlay: light glass, rounded
+   corners, hairline borders, .settings-actions buttons reused. */
+
+.sched-card {
+    width: min(720px, 94vw);
+    max-height: 86vh;
+    display: flex;
+    flex-direction: column;
+}
+.sched-body {
+    display: flex;
+    flex-direction: column;
+    flex: 1 1 auto;
+    min-height: 0;
+    padding: 18px 22px 22px 22px;
+    gap: 12px;
+}
+
+/* ── List header: [+ Create task] [Delete] sit above the list ─── */
+.sched-list-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.sched-list-header button {
+    padding: 6px 14px;
+    font-size: 12px;
+    border: 1px solid var(--hairline);
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.55);
+    color: var(--fg);
+    cursor: pointer;
+    font-family: var(--sans);
+    transition: background 120ms ease, transform 80ms ease;
+}
+.sched-list-header button:hover:not(:disabled) {
+    background: rgba(255, 255, 255, 0.78);
+}
+.sched-list-header button:active:not(:disabled) {
+    transform: translateY(1px);
+}
+.sched-list-header button:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+}
+
+/* ── Top: task list ──────────────────────────────────────────── */
+.sched-list {
+    list-style: none;
+    margin: 0;
+    padding: 6px;
+    overflow-y: auto;
+    flex: 0 1 38%;
+    min-height: 80px;
+    border: 1px solid var(--hairline);
+    border-radius: 10px;
+    background: rgba(255, 255, 255, 0.35);
+}
+.sched-list-item {
+    padding: 9px 12px;
+    border-radius: 8px;
+    cursor: pointer;
+    margin-bottom: 4px;
+    border: 1px solid transparent;
+    transition: background 100ms ease, border-color 100ms ease;
+}
+.sched-list-item:hover {
+    background: rgba(255, 255, 255, 0.55);
+}
+.sched-list-item.selected {
+    background: rgba(10, 132, 255, 0.08);
+    border-color: rgba(10, 132, 255, 0.30);
+}
+.sched-list-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    font-size: 13px;
+}
+.sched-list-name {
+    font-weight: 600;
+    flex: 0 0 auto;
+    color: var(--fg);
+}
+.sched-list-schedule {
+    flex: 1 1 auto;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--fg-mute);
+}
+.sched-list-status {
+    flex: 0 0 auto;
+    font-size: 11px;
+    font-weight: 500;
+}
+
+/* ── Bottom: detail of selected task ─────────────────────────── */
+.sched-detail-pane {
+    flex: 1 1 62%;
+    min-height: 0;
+    overflow-y: auto;
+    border: 1px solid var(--hairline);
+    border-radius: 10px;
+    padding: 16px 18px;
+    background: rgba(255, 255, 255, 0.35);
+}
+.sched-detail-empty {
+    padding: 24px 12px;
+    text-align: center;
+}
+.sched-detail h4 {
+    margin: 0 0 14px 0;
+    font-size: 15px;
+    font-weight: 600;
+}
+.sched-detail-fields {
+    display: grid;
+    grid-template-columns: 96px 1fr;
+    gap: 6px 14px;
+    margin: 0 0 14px 0;
+    font-size: 12px;
+}
+.sched-detail-fields dt {
+    color: var(--fg-mute);
+    font-weight: 500;
+}
+.sched-detail-fields dd {
+    margin: 0;
+    color: var(--fg);
+}
+.sched-detail-prompt {
+    margin: 0;
+    padding: 10px 12px;
+    background: rgba(15, 20, 30, 0.05);
+    border: 1px solid var(--hairline);
+    border-radius: 8px;
+    font-family: var(--mono);
+    font-size: 11px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    max-height: 160px;
+    overflow-y: auto;
+    color: var(--fg);
+}
+
+/* Detail action row reuses .settings-actions for button styling. */
+.sched-detail-actions {
+    margin-top: 12px;
+    padding-top: 0;
+}
+
+/* Danger button — sits on the same .settings-actions visual base. */
+button.danger {
+    background: rgba(255, 90, 90, 0.10);
+    border-color: rgba(255, 90, 90, 0.45);
+    color: rgba(200, 40, 40, 0.92);
+}
+button.danger:hover:not(:disabled) {
+    background: rgba(255, 90, 90, 0.18);
+}
+
+/* ── Create modal — reuses .settings-card and .settings-form ──── */
+.sched-form-modal {
+    width: min(520px, 94vw);
+}
+.sched-form-modal .settings-form {
+    padding: 18px 22px 22px 22px;
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+#overlay-sched-form { z-index: 1500; }
+
+/* Toast inside the schedules panel — same look as settings-toast. */
+.settings-toast {
+    margin: 0 22px;
+    padding: 8px 14px;
+    border-radius: 8px;
+    background: rgba(10, 132, 255, 0.10);
+    border: 1px solid rgba(10, 132, 255, 0.30);
+    font-size: 12px;
+}
+.settings-toast.error {
+    background: rgba(255, 90, 90, 0.10);
+    border-color: rgba(255, 90, 90, 0.45);
+    color: rgba(200, 40, 40, 0.92);
+}
+.settings-toast.hidden { display: none; }

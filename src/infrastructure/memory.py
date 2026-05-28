@@ -1,8 +1,12 @@
 """
-Memory System - Agent memory (conversation history, context, workspace state).
+Memory System - Per-session step accumulator + cross-step knowledge.
+
+This is the in-process, session-scoped store the FlowController hands to
+Planner/RuntimeAgent so successive steps can see prior step outcomes,
+artifacts, and failed approaches. Cross-session, durable memory lives in
+``src.infrastructure.long_term_memory`` instead — the two layers do not
+share state.
 """
-from dataclasses import dataclass, field
-from datetime import datetime
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 from pathlib import Path
 
@@ -13,19 +17,11 @@ from .llm_pool import call_with_fallback
 if TYPE_CHECKING:
     from .llm_service import LLMService
 
-@dataclass
-class Message:
-    """Conversation message."""
-    role: str  # system, user, assistant
-    content: str
-    timestamp: datetime = field(default_factory=datetime.now)
-
 
 class Memory:
     """Agent memory store (global, per-session)."""
 
     def __init__(self, working_directory: str = "."):
-        self.conversation_history: List[Message] = []
         self.completed_steps: List[Step] = []
         self.working_directory = str(Path(working_directory).absolute())
         self.modified_files: List[str] = []
@@ -553,23 +549,7 @@ class Memory:
         if file_path not in self.modified_files:
             self.modified_files.append(file_path)
 
-    def get_recent_messages(self, n: int = 10) -> List[Message]:
-        return self.conversation_history[-n:]
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "conversation_history": [
-                {"role": m.role, "content": m.content,
-                 "timestamp": m.timestamp.isoformat()}
-                for m in self.conversation_history
-            ],
-            "completed_steps": [s.to_dict() for s in self.completed_steps],
-            "working_directory": self.working_directory,
-            "modified_files": self.modified_files,
-        }
-
     def clear(self) -> None:
-        self.conversation_history.clear()
         self.completed_steps.clear()
         self.modified_files.clear()
         self._step_context_entries.clear()

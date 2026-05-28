@@ -91,6 +91,191 @@ DEFAULT_CONFIG_PATH = "./handq_config.yaml"
 
 
 # ---------------------------------------------------------------------------
+# Cross-module slots populated by bridge_main.py.
+#
+# ``personality_monitor`` and ``scheduler`` are constructed BEFORE the
+# StdioBridge runs (bridge_main wires them up) and assigned here so the
+# IPC handlers can reach them without StdioBridge holding direct refs.
+# ``_active_bridge`` is set by StdioBridge.__init__ so the scheduler's
+# dispatch closure can reach the live bridge instance.
+#
+# Keeping these at module level (instead of stuffing into StdioBridge)
+# means bridge_main can wire them BEFORE the bridge instance is born and
+# avoids a chicken-and-egg with the scheduler dispatch callback.
+# ---------------------------------------------------------------------------
+
+personality_monitor: Optional[Any] = None      # type: ignore[assignment]
+scheduler: Optional[Any] = None             # type: ignore[assignment]
+_active_bridge: Optional["StdioBridge"] = None
+
+
+async def dispatch_scheduled_task(task) -> bool:  # type: ignore[no-untyped-def]
+    """Bridge-side entry point for the scheduler.
+
+    The scheduler holds a reference to this function; when a task fires,
+    it calls in here. We:
+
+    1. Refuse if the bridge isn't ready yet (boot still in progress).
+    2. Refuse if the bridge is currently running another flow session
+       — SCHEDULER_BUSY_POLICY = "skip" applies (see scheduler docs).
+    3. Otherwise emit a ``scheduled_task_started`` status envelope so
+       the UI can show "scheduled task X firing", then route a synthetic
+       ``request`` envelope through the same dispatcher path that
+       a manually-typed request takes.
+
+    Returns True iff the bridge accepted the task. The scheduler
+    interprets False as "bumped, try again later".
+    """
+    if _active_bridge is None:
+        logger.info("scheduler dispatch refused: bridge not ready")
+        return False
+    return await _active_bridge.accept_scheduled_task(task)
+
+
+def _entry_to_dict(entry) -> Dict[str, Any]:  # type: ignore[no-untyped-def]
+    """Render an LTM ``Entry`` as a JSON-friendly dict for IPC.
+
+    The renderer only needs enough to render a list view + open a
+    detail pane — id (for archive), summary, content (full chunk text),
+    facet (dim/category), source, dates, and version. We exclude raw
+    Chunk objects since they're a per-storage detail and the joined
+    content text is sufficient for display.
+    """
+    return {
+        "id": entry.id,
+        "kind": entry.kind.value if entry.kind else "",
+        "summary": entry.summary,
+        "content": entry.content,
+        "dimension": entry.dimension.value if entry.dimension else None,
+        "category": entry.category.value if entry.category else None,
+        "source": entry.source,
+        "source_ref": entry.source_ref,
+        "version": entry.version,
+        "archived": entry.archived,
+        "archived_reason": entry.archived_reason,
+        "created_at": entry.created_at,
+        "updated_at": entry.updated_at,
+        "score": entry.score,
+    }
+
+
+# ── Git post-commit hook installer helpers ─────────────────────────────────
+#
+# Both helpers are sync (filesystem only, no asyncio) because the bridge
+# dispatches them via asyncio.to_thread. They're module-level so unit
+# tests / tooling can call them without spinning up a StdioBridge.
+#
+# Hook identity marker — used by uninstall to make sure we only delete
+# files we wrote, not user-customised post-commit hooks. The marker is
+# embedded in the hook script's docstring (HandQ git post-commit hook).
+
+_HOOK_MARKER = "HandQ git post-commit hook"
+
+
+def _hook_source_path() -> Path:
+    """Locate ``scripts/handq_post_commit.py`` shipped with this build.
+
+    Resolution order (mirrors bridge_main.py's INSTALL_DIR logic):
+      1. Frozen builds: alongside ``sys.executable``
+      2. Dev mode: ``<repo>/scripts/handq_post_commit.py``
+    """
+    if getattr(sys, "frozen", False) or "__compiled__" in globals():
+        install_dir = Path(os.path.dirname(os.path.abspath(sys.executable)))
+        # Frozen builds may ship the script in either ``scripts/`` or
+        # the install root, depending on packaging — try both.
+        for candidate in (
+            install_dir / "scripts" / "handq_post_commit.py",
+            install_dir / "handq_post_commit.py",
+        ):
+            if candidate.exists():
+                return candidate
+    # Dev / fallback: from this file walk up to the repo root.
+    here = Path(__file__).resolve()
+    for parent in here.parents:
+        candidate = parent / "scripts" / "handq_post_commit.py"
+        if candidate.exists():
+            return candidate
+    raise FileNotFoundError("handq_post_commit.py not found in install / repo")
+
+
+def _install_post_commit_hook(repo_path: str) -> Dict[str, Any]:
+    """Copy the bundled hook script into ``<repo>/.git/hooks/post-commit``.
+
+    Returns ``{ok, path?, error?}``. We REFUSE to overwrite a hook the
+    user wrote themselves — if a post-commit already exists and doesn't
+    contain our marker, we bail with an error and let the user resolve
+    the conflict manually.
+    """
+    repo = Path(repo_path).expanduser().resolve()
+    git_dir = repo / ".git"
+    if not git_dir.is_dir():
+        return {"ok": False, "error": f"not a git repo: {repo}"}
+    hooks_dir = git_dir / "hooks"
+    hooks_dir.mkdir(parents=True, exist_ok=True)
+    target = hooks_dir / "post-commit"
+
+    # Conflict detection: if the file exists and doesn't carry our
+    # marker, the user has their own hook there. Don't clobber it.
+    if target.exists():
+        try:
+            head = target.read_text(encoding="utf-8", errors="replace")[:2000]
+        except Exception:
+            head = ""
+        if _HOOK_MARKER not in head:
+            return {
+                "ok": False,
+                "error": (
+                    f"existing post-commit hook at {target} is not ours; "
+                    "remove or rename it before installing"
+                ),
+            }
+
+    src = _hook_source_path()
+    # The hook needs a shebang to be runnable on POSIX; on Windows git
+    # invokes Python via the file extension association or via the
+    # shebang+sh shim (Git for Windows). Either way the file content
+    # is a Python script.
+    script_body = src.read_text(encoding="utf-8")
+    if not script_body.lstrip().startswith("#!"):
+        script_body = "#!/usr/bin/env python\n" + script_body
+    target.write_text(script_body, encoding="utf-8")
+    # chmod +x — git refuses to run hooks without the bit on POSIX.
+    if sys.platform != "win32":
+        try:
+            mode = target.stat().st_mode
+            target.chmod(mode | 0o755)
+        except OSError:
+            logger.warning("could not chmod %s", target, exc_info=True)
+    logger.info("installed post-commit hook at %s", target)
+    return {"ok": True, "path": str(target)}
+
+
+def _uninstall_post_commit_hook(repo_path: str) -> Dict[str, Any]:
+    """Delete the hook IF and only if it carries our marker.
+
+    Refuses to delete an unrelated post-commit hook (the user's own).
+    """
+    repo = Path(repo_path).expanduser().resolve()
+    target = repo / ".git" / "hooks" / "post-commit"
+    if not target.exists():
+        return {"ok": True, "removed": False, "note": "no hook to remove"}
+    try:
+        head = target.read_text(encoding="utf-8", errors="replace")[:2000]
+    except Exception:
+        head = ""
+    if _HOOK_MARKER not in head:
+        return {
+            "ok": False,
+            "error": "post-commit hook is not ours; refusing to delete",
+        }
+    try:
+        target.unlink()
+    except OSError as exc:
+        return {"ok": False, "error": str(exc)}
+    return {"ok": True, "removed": True}
+
+
+# ---------------------------------------------------------------------------
 # Per-user roots
 # ---------------------------------------------------------------------------
 #
@@ -364,11 +549,26 @@ class _StdioUI:
     # was the bug pre-2026-05.
     def notify_desktop_takeover_started(self, reason: str = "input_action") -> None:
         _ui_logger.debug("notify_desktop_takeover_started: reason=%s", reason)
+        # Pause the activity monitor while the desktop tool is driving
+        # the screen — capture during takeover would (a) interleave with
+        # the agent's own mouse / keyboard events, polluting OCR samples,
+        # and (b) potentially capture content the user already approved
+        # to share with a specific tool but not with LTM.
+        try:
+            if personality_monitor is not None:
+                personality_monitor.pause()
+        except Exception:
+            _ui_logger.exception("personality_monitor.pause failed")
         _emit({"type": "status", "kind": "desktop_takeover_started",
                "reason": str(reason)}, gen=self._generation)
 
     def notify_desktop_takeover_ended(self, reason: str = "task_ended") -> None:
         _ui_logger.debug("notify_desktop_takeover_ended: reason=%s", reason)
+        try:
+            if personality_monitor is not None:
+                personality_monitor.resume()
+        except Exception:
+            _ui_logger.exception("personality_monitor.resume failed")
         _emit({"type": "status", "kind": "desktop_takeover_ended",
                "reason": str(reason)}, gen=self._generation)
 
@@ -565,6 +765,23 @@ class StdioBridge:
         self._flow_task: Optional[asyncio.Task] = None
         self._services: List[AnthropicStreamingService] = []
 
+        # When a scheduled task triggered this flow, stash the id so
+        # _run_flow_session can call scheduler.notify_task_finished
+        # in its finally-block. Cleared as soon as the notify lands.
+        self._pending_scheduled_task_id: Optional[str] = None
+
+        # ── Scheduled-task lifecycle markers ────────────────────────────
+        # _scheduled_running_id: set when a scheduled flow_task is in
+        # flight. Read by _do_new_session (to detect user-new abort) and
+        # by _after_flow_done (to know whether to notify the scheduler).
+        # Cleared inside _after_flow_done.
+        # _cancelled_scheduled_ids: ids that the user-new-abort path
+        # already wrote CANCELLED for. _after_flow_done checks this
+        # set so it doesn't overwrite CANCELLED with FAILED when the
+        # done-callback fires after the cancellation.
+        self._scheduled_running_id: Optional[str] = None
+        self._cancelled_scheduled_ids: set[str] = set()
+
         # Session generation. Bumped by _do_new_session before the new
         # singleton is constructed, so a fresh _StdioUI with the new
         # generation drives the new flow while the OLD _StdioUI (still
@@ -589,6 +806,10 @@ class StdioBridge:
 
         logger.info("StdioBridge initialised; config_path=%s gen=%d",
                     self.config_path, self._generation)
+        # Publish self for module-level helpers (dispatch_scheduled_task).
+        # See module docstring on the cross-module slots.
+        global _active_bridge
+        _active_bridge = self
 
     # ------------------------------------------------------------------
     # Reader thread
@@ -718,6 +939,127 @@ class StdioBridge:
                       gen=self._generation)
             return
 
+        if msg_type == "ltm_stats":
+            # Read-only diagnostic: per-source candidate acceptance / rejection
+            # counts, totals, and DreamWorker queue depth. Lets the renderer
+            # (or a CLI debug command) show whether the triage bar is
+            # well-calibrated without exposing the raw memory tables.
+            try:
+                from src.infrastructure.long_term_memory import LongTermMemory
+                stats = await LongTermMemory.get().triage_stats()
+                _emit({
+                    "type": "final", "id": msg_id, "result": stats,
+                }, gen=self._generation)
+            except Exception as exc:
+                logger.exception("ltm_stats failed")
+                _emit({"type": "error", "id": msg_id, "where": "bridge",
+                       "message": f"ltm_stats failed: {exc}", "fatal": False},
+                      gen=self._generation)
+            return
+
+        # ── LTM review / archive (user trust surface) ───────────────────
+        # ``ltm_stats`` answers "how is triage performing"; the trio below
+        # answers "what is HandQ remembering about me, and can I drop a
+        # specific entry". We deliberately do NOT expose inline editing —
+        # entries' content is the triage prompt's contract; allowing the
+        # user to edit prose directly would let secret strings or persona
+        # instructions slip past every guard. To "fix" an entry the user
+        # archives it; the next session will re-emit a candidate and
+        # triage decides afresh.
+        if msg_type in ("ltm_list_memory", "ltm_list_knowledge", "ltm_archive"):
+            try:
+                from src.infrastructure.long_term_memory import (
+                    LongTermMemory, MemoryDimension, KnowledgeCategory,
+                    EntryKind,
+                )
+                ltm = LongTermMemory.get()
+                if msg_type == "ltm_list_memory":
+                    dim_raw = msg.get("dimension")
+                    dim = MemoryDimension(dim_raw) if dim_raw else None
+                    limit = int(msg.get("limit") or 50)
+                    entries = await ltm.list_active_memory(
+                        dimension=dim, limit=limit,
+                    )
+                    result = {"entries": [_entry_to_dict(e) for e in entries]}
+                elif msg_type == "ltm_list_knowledge":
+                    cat_raw = msg.get("category")
+                    cat = KnowledgeCategory(cat_raw) if cat_raw else None
+                    limit = int(msg.get("limit") or 50)
+                    entries = await ltm.list_active_knowledge(
+                        category=cat, limit=limit,
+                    )
+                    result = {"entries": [_entry_to_dict(e) for e in entries]}
+                else:  # ltm_archive
+                    eid = str(msg.get("id") or "")
+                    kind_raw = str(msg.get("kind") or "")
+                    if not eid or not kind_raw:
+                        raise ValueError("ltm_archive: id and kind required")
+                    kind = EntryKind(kind_raw)
+                    reason = str(msg.get("reason") or "user_request")
+                    await ltm.archive(entry_id=eid, kind=kind, reason=reason)
+                    result = {"ok": True}
+                _emit({"type": "final", "id": msg_id, "result": result},
+                      gen=self._generation)
+            except Exception as exc:
+                logger.exception("%s failed", msg_type)
+                _emit({"type": "error", "id": msg_id, "where": "bridge",
+                       "message": f"{msg_type} failed: {exc}",
+                       "fatal": False}, gen=self._generation)
+            return
+
+        # ── Activity Monitor IPC ───────────────────────────────────────
+        if msg_type in ("personality_status", "personality_pause", "personality_resume"):
+            try:
+                if personality_monitor is None:
+                    raise RuntimeError("activity monitor not initialised")
+                if msg_type == "personality_pause":
+                    personality_monitor.pause()
+                elif msg_type == "personality_resume":
+                    personality_monitor.resume()
+                snap = personality_monitor.snapshot_status()
+                _emit({"type": "final", "id": msg_id, "result": snap},
+                      gen=self._generation)
+            except Exception as exc:
+                logger.exception("%s failed", msg_type)
+                _emit({"type": "error", "id": msg_id, "where": "bridge",
+                       "message": f"{msg_type} failed: {exc}",
+                       "fatal": False}, gen=self._generation)
+            return
+
+        # ── Scheduler / Cron IPC ───────────────────────────────────────
+        if msg_type in (
+            "cron_list", "cron_create", "cron_update",
+            "cron_delete", "cron_set_enabled", "cron_run_now",
+            "cron_validate",
+        ):
+            try:
+                if scheduler is None:
+                    raise RuntimeError("scheduler not initialised")
+                result = await self._handle_cron(msg_type, msg)
+                _emit({"type": "final", "id": msg_id, "result": result},
+                      gen=self._generation)
+            except Exception as exc:
+                logger.exception("%s failed", msg_type)
+                _emit({"type": "error", "id": msg_id, "where": "bridge",
+                       "message": f"{msg_type} failed: {exc}",
+                       "fatal": False}, gen=self._generation)
+            return
+
+        # ── /remember + git post-commit hook install ────────────────────
+        if msg_type in (
+            "ltm_remember", "ltm_install_git_hook", "ltm_uninstall_git_hook",
+        ):
+            try:
+                result = await self._handle_ltm_aux(msg_type, msg)
+                _emit({"type": "final", "id": msg_id, "result": result},
+                      gen=self._generation)
+            except Exception as exc:
+                logger.exception("%s failed", msg_type)
+                _emit({"type": "error", "id": msg_id, "where": "bridge",
+                       "message": f"{msg_type} failed: {exc}",
+                       "fatal": False}, gen=self._generation)
+            return
+
         if msg_type == "config_set":
             try:
                 new_cfg = msg.get("config") or {}
@@ -730,6 +1072,15 @@ class StdioBridge:
                         self._flow.config_manager.reload_config()
                     except Exception:
                         logger.exception("config_set: reload_config failed (continuing)")
+                # Note: ``personalization`` (enabled / excluded_apps /
+                # git_hook_repos) takes effect on the NEXT bridge
+                # launch, not at runtime. Activity capture state is
+                # tightly coupled to startup-time monitor enumeration
+                # and OCR engine cold-start; restarting the bridge is
+                # the cleaner contract than wiring a runtime apply
+                # path that has its own subtle ordering bugs. The
+                # Settings UI surfaces this with a "restart to apply"
+                # hint when personalization fields change.
                 _emit({
                     "type": "final",
                     "id": msg_id,
@@ -752,6 +1103,12 @@ class StdioBridge:
                     self._flow_task = asyncio.create_task(
                         self._run_flow_session(msg_id)
                     )
+                    # External observer for schedule cleanup. Fires
+                    # AFTER the task has fully completed, so the cleanup
+                    # body (notify_task_finished + auto-new) runs in a
+                    # fresh asyncio task — never inside the flow task
+                    # itself, eliminating the finally-from-self deadlock.
+                    self._flow_task.add_done_callback(self._on_flow_task_done)
             except Exception as exc:
                 logger.exception("request failed")
                 _emit({"type": "error", "id": msg_id, "where": "bridge",
@@ -811,8 +1168,211 @@ class StdioBridge:
                "fatal": False}, gen=self._generation)
 
     # ------------------------------------------------------------------
-    # Flow lifecycle
+    # Cron / scheduler IPC
     # ------------------------------------------------------------------
+
+    async def _handle_cron(self, msg_type: str, msg: Dict[str, Any]) -> Dict[str, Any]:
+        """Route cron_* envelopes onto the scheduler.
+
+        We keep this here (not in scheduler/) because the IPC envelope
+        shape is bridge-specific. The scheduler exposes a clean Python
+        API; this method is the JSON / dict bridge layer.
+        """
+        from src.infrastructure.scheduler.schedule import ScheduleSyntaxError
+
+        if msg_type == "cron_list":
+            tasks = await scheduler.list_tasks()  # type: ignore[union-attr]
+            return {"tasks": tasks}
+
+        if msg_type == "cron_create":
+            try:
+                # The renderer only collects Name + Prompt; the schedule
+                # string is inferred by an LLM from the prompt content.
+                # If the caller (e.g. an old client / power user) supplies
+                # an explicit schedule, we honour it without inference.
+                schedule_str = (msg.get("schedule") or "").strip()
+                prompt_str = str(msg.get("prompt", ""))
+                if not schedule_str:
+                    from src.infrastructure.scheduler.inferer import infer_schedule
+                    # Single-use LLM service built from current config —
+                    # see inferer.py module docstring for rationale.
+                    config = self._load_config_dict()
+                    schedule_str = await infer_schedule(prompt_str, config)
+                t = await scheduler.create_task(  # type: ignore[union-attr]
+                    name=str(msg.get("name", "")),
+                    prompt=prompt_str,
+                    schedule=schedule_str,
+                )
+            except ScheduleSyntaxError as exc:
+                return {"ok": False, "error": str(exc)}
+            return {"ok": True, "task": t}
+
+        if msg_type == "cron_update":
+            tid = str(msg.get("id") or "")
+            if not tid:
+                return {"ok": False, "error": "missing id"}
+            try:
+                t = await scheduler.update_task(  # type: ignore[union-attr]
+                    tid,
+                    name=msg.get("name"),
+                    prompt=msg.get("prompt"),
+                    schedule=msg.get("schedule"),
+                )
+            except ScheduleSyntaxError as exc:
+                return {"ok": False, "error": str(exc)}
+            return {"ok": bool(t), "task": t}
+
+        if msg_type == "cron_delete":
+            tid = str(msg.get("id") or "")
+            ok = await scheduler.delete_task(tid)  # type: ignore[union-attr]
+            return {"ok": bool(ok)}
+
+        if msg_type == "cron_set_enabled":
+            tid = str(msg.get("id") or "")
+            t = await scheduler.set_enabled(  # type: ignore[union-attr]
+                tid, bool(msg.get("enabled", False)),
+            )
+            return {"ok": bool(t), "task": t}
+
+        if msg_type == "cron_run_now":
+            tid = str(msg.get("id") or "")
+            t = await scheduler.run_now(tid)  # type: ignore[union-attr]
+            return {"ok": bool(t), "task": t}
+
+        if msg_type == "cron_validate":
+            from src.infrastructure.scheduler import Scheduler as _S
+            try:
+                _S.validate_schedule(str(msg.get("schedule", "")))
+                return {"ok": True}
+            except ScheduleSyntaxError as exc:
+                return {"ok": False, "error": str(exc)}
+
+        return {"ok": False, "error": f"unknown cron op: {msg_type}"}
+
+    # ------------------------------------------------------------------
+    # /remember + git post-commit hook IPC
+    # ------------------------------------------------------------------
+
+    async def _handle_ltm_aux(self, msg_type: str, msg: Dict[str, Any]) -> Dict[str, Any]:
+        """Handle the auxiliary LTM IPC envelopes that don't fit the
+        list/archive/stats group:
+
+          - ``ltm_remember`` — explicit /remember command. Submits a
+            high-trust MANUAL_REMEMBER candidate.
+          - ``ltm_install_git_hook`` — copy
+            ``scripts/handq_post_commit.py`` into a target repo's
+            ``.git/hooks/post-commit`` (chmod +x on POSIX). Returns the
+            installed path on success.
+          - ``ltm_uninstall_git_hook`` — delete the hook file IF and
+            only if it's the one we installed (heuristic: head line
+            matches our shebang + module docstring marker).
+
+        These are bundled in one method because they all sit at the
+        same trust boundary (admin-grade operations on the user's
+        memory.db / git workspaces) and share error-handling.
+        """
+        if msg_type == "ltm_remember":
+            text = str(msg.get("text") or "").strip()
+            if not text:
+                return {"ok": False, "error": "text is required"}
+            try:
+                from src.infrastructure.long_term_memory import LongTermMemory
+                from src.infrastructure.long_term_memory.candidates import (
+                    submit_manual,
+                )
+                ltm = LongTermMemory.get()
+                ref = str(msg.get("ref") or "")
+                cid = await submit_manual(ltm=ltm, text=text, ref=ref)
+                return {"ok": bool(cid), "candidate_id": cid}
+            except Exception as exc:
+                return {"ok": False, "error": str(exc)}
+
+        if msg_type == "ltm_install_git_hook":
+            repo_path = str(msg.get("repo") or "").strip()
+            if not repo_path:
+                return {"ok": False, "error": "repo path required"}
+            return await asyncio.to_thread(
+                _install_post_commit_hook, repo_path,
+            )
+
+        if msg_type == "ltm_uninstall_git_hook":
+            repo_path = str(msg.get("repo") or "").strip()
+            if not repo_path:
+                return {"ok": False, "error": "repo path required"}
+            return await asyncio.to_thread(
+                _uninstall_post_commit_hook, repo_path,
+            )
+
+        return {"ok": False, "error": f"unknown op: {msg_type}"}
+
+    # ------------------------------------------------------------------
+    # Scheduler dispatch — bridge-side hook called from
+    # stdio_bridge.dispatch_scheduled_task().
+    # ------------------------------------------------------------------
+
+    async def accept_scheduled_task(self, task) -> bool:  # type: ignore[no-untyped-def]
+        """Decide whether to fire *task* now.
+
+        Returns True if the task is being dispatched, False if the
+        bridge declined (busy / shutdown). The scheduler reads the
+        return value to decide whether to bump the next-fire timestamp.
+        """
+        if self._shutdown_requested:
+            logger.info(
+                "scheduler dispatch refused: shutdown in progress task=%s",
+                task.id[:8],
+            )
+            return False
+        if self._flow_task is not None and not self._flow_task.done():
+            logger.info(
+                "scheduler dispatch refused: bridge busy task=%s "
+                "(scheduler will mark task PENDING)",
+                task.id[:8],
+            )
+            return False
+        # Publish a notification first so the renderer can show a
+        # "scheduled task firing" toast.
+        try:
+            _emit({
+                "type": "status", "kind": "scheduled_task_started",
+                "id": task.id, "name": task.name,
+                "schedule": task.schedule,
+                "prompt_preview": _truncate(task.prompt, 200),
+            }, gen=self._generation)
+        except Exception:
+            logger.exception("scheduler emit failed")
+
+        # Treat the firing exactly like an inbound `request` envelope.
+        # Stamp the message id with a marker the renderer can match
+        # against the scheduled_task_started toast.
+        msg_id = f"sched-{task.id}-{int(time.time())}"
+        synthetic = {
+            "type": "request",
+            "id": msg_id,
+            "goal": task.prompt,
+            "scheduled": True,
+            "scheduled_task_id": task.id,
+        }
+        try:
+            await self._handle(synthetic)
+        except Exception as exc:
+            logger.exception("scheduler synthetic _handle crashed")
+            try:
+                if scheduler is not None:
+                    await scheduler.notify_task_finished(
+                        task.id, ok=False, error=f"dispatch crashed: {exc}",
+                    )
+            except Exception:
+                logger.exception("scheduler notify_task_finished crashed")
+            return True  # already accepted; failure is recorded
+        # The actual flow runs asynchronously in self._flow_task. Its
+        # finally-block calls notify_task_finished; we attach that hook
+        # by stashing the task id on the bridge so _run_flow_session
+        # can pick it up.
+        self._pending_scheduled_task_id = task.id
+        return True
+
+
 
     def _ensure_flow(self, goal: str) -> None:
         if self._flow is not None:
@@ -953,19 +1513,124 @@ class StdioBridge:
         # generation — the renderer drops those, isolating the new
         # session's conversation from this orphan's tail.
         gen = self._generation
-        logger.info("flow session starting; id=%s gen=%d", msg_id, gen)
+        # Snapshot the scheduled-task id (if any). The eager-clear of
+        # _pending_scheduled_task_id keeps it as a one-tick handoff
+        # token; the long-lived marker is _scheduled_running_id, which
+        # is read by _after_flow_done after this coroutine exits.
+        sched_id = self._pending_scheduled_task_id
+        self._pending_scheduled_task_id = None
+        if sched_id is not None:
+            self._scheduled_running_id = sched_id
+        logger.info("flow session starting; id=%s gen=%d sched=%s",
+                    msg_id, gen, sched_id)
         try:
             result = await self._flow.start_idle_session()
             logger.info("flow session completed; id=%s gen=%d", msg_id, gen)
             _emit({"type": "final", "id": msg_id, "result": result}, gen=gen)
         except asyncio.CancelledError:
             logger.info("flow session cancelled; id=%s gen=%d", msg_id, gen)
+            # Re-raise so task.cancelled() reports True; _after_flow_done
+            # uses that to set ok=False/error="cancelled".
             raise
         except Exception as exc:
             logger.exception("flow session crashed; id=%s gen=%d", msg_id, gen)
             _emit({"type": "error", "id": msg_id, "where": "engine",
                    "message": f"start_idle_session failed: {exc}",
                    "fatal": True}, gen=gen)
+        # NOTE: schedule-related cleanup (notify_task_finished, auto-new,
+        # scheduler wakeup) is NOT done here. It runs in _after_flow_done
+        # via add_done_callback so it executes strictly after this task
+        # has fully completed — keeping the flow internals pure and
+        # making finally-from-self deadlocks unreachable.
+
+    # ------------------------------------------------------------------
+    # External post-flow observer — handles all schedule-related cleanup.
+    #
+    # The done-callback chain:
+    #   _flow_task finishes → asyncio fires _on_flow_task_done (sync) →
+    #   schedules _after_flow_done as a fresh asyncio.Task → that task
+    #   runs *outside* _flow_task (which is already done), so anything
+    #   it awaits — including _do_new_session's wait_for(_flow_task) —
+    #   short-circuits immediately. No deadlock path.
+    # ------------------------------------------------------------------
+
+    def _on_flow_task_done(self, task: "asyncio.Task[Any]") -> None:
+        """Sync done-callback. asyncio invokes this AFTER the task's
+        coroutine has fully returned, so we are firmly outside the
+        flow_task. Done-callbacks must not block the loop, so we just
+        schedule the actual work as a fresh task."""
+        try:
+            asyncio.create_task(
+                self._after_flow_done(task),
+                name="after-flow-done",
+            )
+        except Exception:
+            logger.exception("_on_flow_task_done failed to schedule cleanup")
+
+    async def _after_flow_done(self, task: "asyncio.Task[Any]") -> None:
+        """External cleanup that runs strictly after _flow_task is done.
+
+        Three responsibilities, all schedule-related:
+          1. Wake the scheduler so PENDING tasks get re-scanned now
+             that bridge is idle (applies to every flow, not only
+             scheduled ones — a user task finishing also unblocks
+             pending schedules).
+          2. Notify scheduler of the scheduled task's outcome.
+          3. Trigger auto-new so the next scheduled fire starts on a
+             clean _flow / IM / tool state.
+
+        Two early-exit paths short-circuit (2) + (3):
+          * sid is None — plain user task, scheduler is uninvolved.
+          * sid in _cancelled_scheduled_ids — the user-new path already
+            wrote CANCELLED and is itself running _do_new_session;
+            doing it again here would just bump the generation an
+            extra time and double-reset the IM.
+
+        The flow itself owns NONE of this — _run_flow_session stays
+        pure business logic.
+        """
+        sid = self._scheduled_running_id
+        self._scheduled_running_id = None
+
+        # (1) Wake scheduler — runs for every flow.
+        if scheduler is not None:
+            try:
+                scheduler._wakeup.set()
+            except Exception:
+                pass
+
+        if sid is None:
+            return  # plain user task
+
+        if sid in self._cancelled_scheduled_ids:
+            # User-new abort path: _do_new_session is already in flight
+            # on the caller side. CANCELLED is already written; auto-new
+            # is already happening. Just clear the marker and exit.
+            self._cancelled_scheduled_ids.discard(sid)
+            return
+
+        # (2) Real scheduled completion — notify outcome.
+        ok = (not task.cancelled()) and task.exception() is None
+        err = ""
+        if task.cancelled():
+            err = "cancelled"
+        elif task.exception() is not None:
+            err = str(task.exception())[:500]
+        if scheduler is not None:
+            try:
+                await scheduler.notify_task_finished(
+                    sid, ok=ok, error=err,
+                )
+            except Exception:
+                logger.exception("scheduler notify_task_finished failed")
+
+        # (3) Auto-new so the next scheduled fire starts clean. Runs in
+        # this fresh task; _flow_task.done() is True, so _do_new_session's
+        # wait_for(flow_task) returns immediately.
+        try:
+            await self._do_new_session(msg_id=None, _suppress_final=True)
+        except Exception:
+            logger.exception("auto-new after scheduled flow failed")
 
     # ------------------------------------------------------------------
     # New-session chain — equivalent to `handq new`. Designed for three
@@ -1001,7 +1666,32 @@ class StdioBridge:
     _NEW_SESSION_HARD_TIMEOUT  = 1.5    # after explicit cancel
     _NEW_SESSION_CLOSE_TIMEOUT = 2.0    # per-service httpx pool drain
 
-    async def _do_new_session(self, msg_id: Optional[str]) -> None:
+    async def _do_new_session(
+        self, msg_id: Optional[str], *, _suppress_final: bool = False,
+    ) -> None:
+        # User-initiated new during a scheduled fire: tell the scheduler
+        # the task was cancelled BEFORE we tear anything down. Marker
+        # added to _cancelled_scheduled_ids so _after_flow_done (which
+        # will fire when we cancel _flow_task below) skips its own
+        # notify_task_finished and doesn't overwrite CANCELLED → FAILED.
+        # We use count_as_failure=False because user-cancellations are
+        # not real task failures and shouldn't trip the auto-disable
+        # counter.
+        if (
+            self._scheduled_running_id is not None
+            and scheduler is not None
+        ):
+            sid = self._scheduled_running_id
+            try:
+                await scheduler.notify_task_finished(
+                    sid, ok=False,
+                    error="cancelled by user new_session",
+                    count_as_failure=False,
+                )
+                self._cancelled_scheduled_ids.add(sid)
+            except Exception:
+                logger.exception("scheduler cancel-notify failed")
+
         # Bump the generation BEFORE doing any cleanup, then construct a
         # fresh _StdioUI bound to the new gen. The OLD _StdioUI is NOT
         # mutated — it stays referenced by the OLD InteractionManager
@@ -1013,8 +1703,8 @@ class StdioBridge:
         self._generation = old_gen + 1
         new_gen = self._generation
         new_ui = _StdioUI(new_gen)
-        logger.info("new_session sequence begin; id=%s old_gen=%d new_gen=%d",
-                    msg_id, old_gen, new_gen)
+        logger.info("new_session sequence begin; id=%s old_gen=%d new_gen=%d suppress_final=%s",
+                    msg_id, old_gen, new_gen, _suppress_final)
         t0 = time.monotonic()
 
         # Snapshot + clear up-front. Any later in-flight `_emit` from
@@ -1203,11 +1893,12 @@ class StdioBridge:
             elapsed = (time.monotonic() - t0) * 1000.0
             logger.info("new_session sequence complete (%.2f ms; new_gen=%d)",
                         elapsed, new_gen)
-            _emit({"type": "final", "id": msg_id,
-                   "result": {"new_session": "ok",
-                              "generation": new_gen,
-                              "elapsed_ms": round(elapsed, 1)}},
-                  gen=new_gen)
+            if not _suppress_final:
+                _emit({"type": "final", "id": msg_id,
+                       "result": {"new_session": "ok",
+                                  "generation": new_gen,
+                                  "elapsed_ms": round(elapsed, 1)}},
+                      gen=new_gen)
 
     # ------------------------------------------------------------------
     # Shutdown chain (per backend_surface.md §1)

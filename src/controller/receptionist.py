@@ -19,7 +19,8 @@ GEP-aware intents (in addition to RESPOND_ONLY / REPLAN):
 Note: SAVE_SESSION and LIST_TEMPLATES are handled via CLI (handq --save / handq --list),
 not through the receptionist.
 """
-import json
+import asyncio
+import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -29,6 +30,8 @@ from ..infrastructure.gep_template import list_templates_summary
 from ..infrastructure.json_key_streamer import JsonKeyStreamer
 from ..infrastructure.llm_pool import call_with_fallback, call_with_fallback_stream
 from ..infrastructure.llm_service import LLMChatResult, LLMService
+from ..infrastructure.long_term_memory import LongTermMemory
+from ..infrastructure.long_term_memory.candidates import submit_user_turn
 from ..infrastructure.anthropic_streaming_service import StreamTextDeltaEvent, StreamDoneEvent
 from ..infrastructure.logger import get_logger
 from ..infrastructure.utils import try_parse_json
@@ -173,7 +176,6 @@ class Receptionist:
         self,
         llm_services: List[LLMService],
         shell_history_path: Optional[str] = None,
-        long_term_memory_path: Optional[str] = None,
         initial_task_context: Optional[str] = None,
     ):
         if not llm_services:
@@ -181,7 +183,6 @@ class Receptionist:
         self._services: List[LLMService] = list(llm_services)
 
         self.shell_history_path: Optional[str] = shell_history_path
-        self.long_term_memory_path: Optional[str] = long_term_memory_path
         self.logger = get_logger()
 
         # FR-3: session-scoped full conversation history.
@@ -261,38 +262,74 @@ class Receptionist:
 
     # ── Long-term memory helper ───────────────────────────────────────────────
 
-    def _read_long_term_memory(self) -> str:
-        """
-        Read the persistent long-term memory file (skills, accumulated user
-        preferences, cross-session notes).  Returns "" when no path is
-        configured or the file does not exist — silent absence by design,
-        unlike shell history which surfaces a placeholder.
+    async def _build_long_term_block(self, query: str) -> str:
+        """Recall memory + knowledge for *query* and format as one XML block.
 
-        The block lands first in the prompt (most-static slot) so it can
-        share the KV-cache prefix across every receptionist call, even as
-        the conversation history grows.
+        Thin wrapper around :meth:`LongTermMemory.format_context_block`.
+
+        Latency note: receptionist runs on the per-message hot path, so we
+        opt OUT of stage-3 LLM rerank (~3s) and rely on the BM25 + dense
+        + RRF fused order. Empirically that's enough precision for intent
+        classification — the receptionist's own LLM call already filters
+        out low-relevance noise. The 3s saved per message is far more
+        valuable than the marginal precision gain from rerank.
+
+        Falls back to "" on any error so receptionist replies are never
+        blocked by LTM problems.
         """
-        if not self.long_term_memory_path:
+        try:
+            ltm = LongTermMemory.get()
+        except Exception:
             return ""
         try:
-            content = Path(self.long_term_memory_path).read_text(encoding="utf-8").strip()
-            if not content:
-                return ""
-            return "[Long-Term Memory]\n" + content + "\n"
-        except FileNotFoundError:
-            return ""
-        except Exception as exc:
+            return await ltm.format_context_block(query=query, rerank=False)
+        except Exception:
             self.logger.debug(
-                f"Could not read long-term memory from {self.long_term_memory_path!r}: {exc}",
+                "LongTermMemory.format_context_block failed",
                 component="Receptionist",
             )
             return ""
 
+    def _submit_user_turn_candidate(
+        self, raw_message: str, current_goal: Optional[str] = None,
+    ) -> None:
+        """Fire-and-forget submission of the user's raw message as a triage
+        candidate. Failures are swallowed — long-term memory must never block
+        the user-facing reply path.
+        """
+        try:
+            ltm = LongTermMemory.get()
+        except Exception:
+            return
+        try:
+            asyncio.create_task(
+                submit_user_turn(
+                    ltm=ltm,
+                    msg_id=str(uuid.uuid4()),
+                    user_message=raw_message,
+                    current_goal=current_goal,
+                ),
+                name="ltm-submit-user-turn",
+            )
+        except RuntimeError:
+            # No running loop — extremely rare in receptionist context, but
+            # makes the helper safe to call from sync code paths.
+            self.logger.debug(
+                "submit_user_turn skipped (no running loop)",
+                component="Receptionist",
+            )
+        except Exception:
+            self.logger.debug(
+                "submit_user_turn dispatch failed",
+                component="Receptionist",
+            )
+
     # ── Context message builder ───────────────────────────────────────────────
 
-    def _build_context_messages(
+    async def _build_context_messages(
         self,
         *,
+        query_for_long_term: str = "",
         include_long_term_memory: bool = True,
         include_shell_history: bool = True,
         include_conversation_history: bool = True,
@@ -306,7 +343,7 @@ class Receptionist:
         final user turn (the actual request) clean.
 
         Order (most-static → most-volatile) for KV cache hit rate:
-          1. long-term memory  — survives across sessions, rarely edited.
+          1. long-term memory  — survives across sessions, recalled per query.
           2. templates          — changes only when a GEP template is saved.
           3. conversation       — append-only within a session (no truncation,
                                   so the prefix stays stable).
@@ -315,7 +352,7 @@ class Receptionist:
         extra: List[Dict[str, str]] = []
 
         if include_long_term_memory:
-            ltm = self._read_long_term_memory()
+            ltm = await self._build_long_term_block(query_for_long_term)
             if ltm:
                 extra.append({"role": "user",      "content": ltm})
                 extra.append({"role": "assistant", "content": "Noted."})
@@ -502,9 +539,13 @@ class Receptionist:
         # FR-3: record user turn
         self.conversation_history.append({"role": "user", "content": user_input})
 
+        # Submit a long-term-memory candidate so durable preferences in the
+        # initial goal are captured even if the user never sends a follow-up.
+        self._submit_user_turn_candidate(user_input)
+
         messages = [
             {"role": "system", "content": CLASSIFY_INITIAL_GOAL_SYSTEM_PROMPT},
-            *self._build_context_messages(),
+            *(await self._build_context_messages(query_for_long_term=user_input)),
             {"role": "user", "content": CLASSIFY_INITIAL_GOAL_TEMPLATE.format(user_input=user_input)},
         ]
 
@@ -567,6 +608,7 @@ class Receptionist:
         no-response case.
         """
         self.conversation_history.append({"role": "user", "content": user_input})
+        self._submit_user_turn_candidate(user_input)
 
         steps_section = (
             f"Steps:\n{guide_steps_summary}\n" if guide_steps_summary else ""
@@ -574,10 +616,11 @@ class Receptionist:
 
         messages = [
             {"role": "system", "content": GEP_CONFIRMATION_WINDOW_SYSTEM_PROMPT},
-            *self._build_context_messages(
+            *(await self._build_context_messages(
+                query_for_long_term=user_input,
                 include_shell_history=False,
                 include_templates=False,
-            ),
+            )),
             {
                 "role": "user",
                 "content": GEP_CONFIRMATION_WINDOW_TEMPLATE.format(
@@ -645,6 +688,7 @@ class Receptionist:
         """
         # FR-3: record user turn
         self.conversation_history.append({"role": "user", "content": message})
+        self._submit_user_turn_candidate(message, current_goal=goal)
 
         current_step = current_step_description or "(no step currently executing)"
         lookahead = (
@@ -678,7 +722,9 @@ class Receptionist:
 
         messages = [
             {"role": "system", "content": EVALUATE_USER_MESSAGE_SYSTEM_PROMPT},
-            *self._build_context_messages(include_templates=False),
+            *(await self._build_context_messages(
+                query_for_long_term=message, include_templates=False,
+            )),
             {"role": "user", "content": final_user_content},
         ]
 
