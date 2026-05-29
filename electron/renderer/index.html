@@ -16,6 +16,7 @@
         <!-- ============================================================ -->
         <header class="titlebar" id="titlebar">
             <div class="titlebar-drag">
+                <img class="titlebar-logo" src="../logo.png" alt="" aria-hidden="true" />
                 <span class="titlebar-brand">HandQ</span>
             </div>
             <div class="titlebar-controls" aria-label="Window controls">
@@ -89,10 +90,6 @@
                     <span class="sc-icon" aria-hidden="true">⏱</span>
                     <span class="sc-label">Scheduler</span>
                 </button>
-                <button class="shortcut-btn" id="sc-status" type="button">
-                    <span class="sc-icon" aria-hidden="true">◉</span>
-                    <span class="sc-label">Status</span>
-                </button>
                 <button class="shortcut-btn" id="sc-new" type="button">
                     <span class="sc-icon" aria-hidden="true">＋</span>
                     <span class="sc-label">New</span>
@@ -137,41 +134,6 @@
             <div class="activity-resize-handle" id="activity-resize-handle"
                  title="Drag to resize"></div>
         </aside>
-
-        <!-- ============================================================ -->
-        <!-- Status overlay                                                -->
-        <!-- ============================================================ -->
-        <div class="overlay hidden" id="overlay-status" aria-hidden="true">
-            <div class="overlay-card status-card">
-                <header class="overlay-header">
-                    <h2>Status</h2>
-                    <button type="button" class="overlay-close" id="status-close"
-                            aria-label="Close">×</button>
-                </header>
-                <div class="status-body" id="status-body">
-                    <div class="status-row">
-                        <span class="status-label">State</span>
-                        <span class="status-value" id="st-state">idle</span>
-                    </div>
-                    <div class="status-row">
-                        <span class="status-label">Progress</span>
-                        <span class="status-value" id="st-progress">—</span>
-                    </div>
-                    <div class="status-row">
-                        <span class="status-label">Current step</span>
-                        <span class="status-value" id="st-step">—</span>
-                    </div>
-                    <div class="status-row">
-                        <span class="status-label">Last update</span>
-                        <span class="status-value" id="st-last">—</span>
-                    </div>
-                    <div class="status-row status-row-multiline">
-                        <span class="status-label">Recent events</span>
-                        <pre class="status-events" id="st-events"></pre>
-                    </div>
-                </div>
-            </div>
-        </div>
 
         <!-- ============================================================ -->
         <!-- Settings overlay                                              -->
@@ -531,10 +493,11 @@
                                 For each path here, HandQ installs a tiny
                                 <code>post-commit</code> hook so each commit's
                                 message and file list become a learning
-                                signal. Removing a path stops new learning
-                                (existing entries stay; the hook itself can be
-                                cleaned up via the Memory admin Tools tab).
-                                Hooks you wrote yourself are never overwritten.
+                                signal. Add a path and Save → hook is
+                                installed. Remove a path and Save → hook is
+                                uninstalled (only if it carries our marker).
+                                Hooks you wrote yourself are never overwritten
+                                or deleted.
                             </small>
                         </label>
                     </fieldset>
@@ -655,25 +618,6 @@
                             <textarea id="admin-remember-text" rows="3"
                                       placeholder="e.g. Always use uv to create venvs (not conda)"></textarea>
                             <button type="button" id="admin-remember-btn" class="primary">Remember</button>
-                        </div>
-
-                        <div class="admin-tool-block">
-                            <h4>Git post-commit hook</h4>
-                            <p class="help-text">
-                                Install a hook in a target repo so each commit
-                                feeds a candidate into LTM. Safe to install in
-                                multiple repos. Refuses to overwrite a hook the
-                                user wrote themselves.
-                            </p>
-                            <label>
-                                <span>Repo path</span>
-                                <input type="text" id="admin-hook-path"
-                                       placeholder="C:\Code\HandQ" />
-                            </label>
-                            <div class="admin-form-actions">
-                                <button type="button" id="admin-hook-install" class="primary">Install</button>
-                                <button type="button" id="admin-hook-uninstall">Uninstall</button>
-                            </div>
                         </div>
                     </section>
                 </div>

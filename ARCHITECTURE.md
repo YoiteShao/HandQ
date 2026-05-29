@@ -35,17 +35,18 @@ INSTALL_DIR =
 
 ---
 
-## 1.5 三类数据，三个根（Windows）
+## 1.5 用户根目录布局（Windows）
 
 ```
-%USERPROFILE%\HandQ\               ← 用户拥有的数据
+%USERPROFILE%\HandQ\               ← 唯一用户根 — 所有 HandQ 写到磁盘的东西
   handq_config.yaml                  用户配置（小、可漫游）
-  History\                           会话历史（大、不漫游）
+  scheduled_tasks.json               定时任务持久化（与 personality 解耦）
+  History\                           会话历史（大、可手动清理）
     <YYYYMMDD-HHMMSS>-<slug>\        每个 `request` 一个目录
       session_state.json
       executions_logs\
       ... (FlowController 的所有输出)
-  personality\                       ← 所有"HandQ 学到的关于我"的数据
+  personality\                       ← "HandQ 学到的关于我"的所有数据
     memory.db                          长期记忆 SQLite (LTM)
     memory.db-wal                      WAL 写日志（运行时存在）
     memory.db-shm                      WAL 共享索引
@@ -53,28 +54,23 @@ INSTALL_DIR =
       <id>.md                          (frontmatter + 用户原文)
     ephemeral\                         PersonalityMonitor 的瞬时截图
       frame_m<i>.png                   每显示器 1 张，OCR 后立刻 unlink
-  scheduled_tasks.json               固化脚本 / 定时任务持久化（与
-                                       personality 解耦：scheduler 不读
-                                       不写 LTM，独立功能）
   browser_profile\screenshots\       browser_tool 截图（vision §1.6）
   desktop_shots\                     desktop_tool 截图（vision §1.6）
-
-%LOCALAPPDATA%\HandQ\              ← 机器本地的调试产物
-  logs\<YYYYMMDD-HHMMSS>\            每次 Electron 启动一个目录
-    handq-frontend.log               main + preload + renderer
-    handq-bridge.log                 Python 端框架日志（含 LTM /
-                                       PersonalityMonitor / Scheduler 全部
-                                       通过 logging.getLogger 写入这里）
-  diag\                              ← 内部排障专用，路径深、命名中性，
-                                       避免出现在用户的常规 debug 视野
-    internal-trace.log               LTM / PersonalityMonitor / Scheduler
-                                       三个 logger tree 的额外副本
-                                       （主 log 仍保留完整记录）
+  logs\                              ← 框架日志，每次启动一个目录
+    <YYYYMMDD-HHMMSS>\
+      handq-bridge.log                 Python 端框架日志（含 LTM /
+                                         PersonalityMonitor / Scheduler 全部
+                                         通过 logging.getLogger 写入这里）
+      handq-frontend.log               Electron main + preload + renderer
+    .dia\                            ← 隐藏目录（NTFS HIDDEN attr 已设置）
+      internal-trace.log               LTM / PersonalityMonitor / Scheduler
+                                         三个 logger tree 的额外副本
+                                         （主 log 仍保留完整记录）
 
 <install_root>\                    ← 程序文件（默认 %LOCALAPPDATA%\Programs\HandQ）
   HandQ.exe                          Electron 主程序
   handq-bridge.exe                   Nuitka 冻结的 bridge
-  handq_config.yaml                  ship 的默认配置（首次启动拷到上面 (1)）
+  handq_config.yaml                  ship 的默认配置（首次启动拷到上面）
 ```
 
 切分原则：
@@ -87,7 +83,16 @@ INSTALL_DIR =
 | 长 /remember 镜像 | `%USERPROFILE%\HandQ\personality\memory_notes\<id>.md` | 否 | 是 | 跨升级；用户可编辑器打开 |
 | 活动截图（瞬时） | `%USERPROFILE%\HandQ\personality\ephemeral\` | 否 | 是 | 子秒级（OCR 后立删） |
 | 定时任务 | `%USERPROFILE%\HandQ\scheduled_tasks.json` | 否 | 是 | 跨升级；JSON 可手编 |
-| 框架日志 | `%LOCALAPPDATA%\HandQ\logs\<launch>\handq-bridge.log` | 否 | 否 | 一次启动 |
+| 框架日志 | `%USERPROFILE%\HandQ\logs\<launch>\` | 否 | 是 | 自动 prune（保留最近 30 个 launch） |
+| 内部排障日志 | `%USERPROFILE%\HandQ\logs\.dia\internal-trace.log` | 否 | 默认隐藏 | RotatingFileHandler 1MB×5 自封顶 |
+
+为什么是一个根：早期把 `logs/` 和 `diag/` 放到 `%LOCALAPPDATA%\HandQ\`，意图是"机器本地、不漫游"。但这两个根都不会随用户漫游（`%USERPROFILE%` 漫游的是 `Documents` / `Desktop` 等子目录，自定义子目录默认也不漫游），且都不被 NSIS 卸载器清理。三根的意义只剩"概念分层"，但带来的是用户必须记两个位置才能找到 HandQ 的全部产物。合并为一根后心智模型更清晰：**"HandQ 写到磁盘的一切都在 `%USERPROFILE%\HandQ\` 下"**。
+
+日志清理策略：
+
+- **`logs\<TS>\`**：每次启动新建一个时间戳目录。`bridge_main._prune_old_log_dirs()` 在 boot 早期跑，按 mtime 排序，只保留最近 30 个，旧的 `shutil.rmtree`。Pattern 严格匹配 `^\d{8}-\d{6}(-\d+)?$`，`.dia/` 等非时间戳目录不会被误删。
+- **`logs\.dia\internal-trace.log`**：单文件，`RotatingFileHandler(maxBytes=1MB, backupCount=5)` 自封顶 5MB，跨 launch 持续累积以便交叉关联。Prune 不动它。
+- **隐藏机制**：dot 前缀（`.dia`）只在 Linux 风格生效，Windows Explorer 默认会显示。`bridge_main._set_hidden_on_windows()` 通过 `ctypes.windll.kernel32.SetFileAttributesW(FILE_ATTRIBUTE_HIDDEN)` 设置 NTFS HIDDEN 属性，让目录在默认浏览视图下消失（"显示隐藏文件"勾上仍能看到——刻意只拦"无意路过的用户"，不防备主动排查者）。
 
 > 关键变化（vs 早期方案）：废弃 `session.workspace_base` 字段——session
 > 根目录强制为 `%USERPROFILE%\HandQ\History\`，不可由 yaml 配置。GUI
@@ -193,7 +198,7 @@ HandQ/                              ← repo 根，dev 模式下也是 INSTALL_D
 
 > Dev 模式下 session 历史依然写到 `%USERPROFILE%\HandQ\History\`——bridge
 > 只看 USERPROFILE 而不看是否打包，所以源码运行和正式运行行为一致。
-> 仅日志位置不同（dev → repo `logs/`，prod → `%LOCALAPPDATA%\HandQ\logs\`）。
+> 仅日志位置不同（dev → repo `logs/`，prod → `%USERPROFILE%\HandQ\logs\`）。
 
 ### Dev 启动流程
 
@@ -254,29 +259,31 @@ electron-builder 把这个 `.dist/` 目录作为 `extraResources` 一起 ship
 
 ### 用户级运行时数据
 
-`Program Files` 不可写，`%LOCALAPPDATA%`、`%USERPROFILE%` 普通用户均可写。
-我们把**用户拥有的数据**（配置 + session 历史）放到 `%USERPROFILE%\HandQ\`，
-**机器本地的调试产物**（日志）放到 `%LOCALAPPDATA%\HandQ\logs\`，两者刻意分离：
+`Program Files` 不可写，per-user NSIS 安装到 `%LOCALAPPDATA%\Programs\HandQ\` 用户可写。
+所有用户拥有的数据（配置、session 历史、LTM、日志）统一收纳在 `%USERPROFILE%\HandQ\` 下：
 
 ```
 %USERPROFILE%\HandQ\
 ├── handq_config.yaml               ← 用户级配置；优先于安装目录里的版本
-└── History\                        ← 会话历史（无大小限制，可手动清理）
-    └── <YYYYMMDD-HHMMSS>-<slug>\
-        ├── session_state.json
-        └── executions_logs\
-
-%LOCALAPPDATA%\HandQ\
-└── logs\                           ← packaged 模式下自动选这里
-    └── 20260521-181203\
-        ├── handq-bridge.log
-        └── handq-frontend.log
+├── scheduled_tasks.json            ← 定时任务
+├── History\                        ← 会话历史（无大小限制，可手动清理）
+│   └── <YYYYMMDD-HHMMSS>-<slug>\
+│       ├── session_state.json
+│       └── executions_logs\
+├── personality\                    ← LTM + 个性化数据
+└── logs\                           ← 框架日志，每次启动一个时间戳目录
+    ├── <YYYYMMDD-HHMMSS>\
+    │   ├── handq-bridge.log
+    │   └── handq-frontend.log
+    └── .dia\                       ← 隐藏（NTFS HIDDEN attr）
+        └── internal-trace.log
 ```
 
 `electron/main.js` 在 packaged 模式下把日志路由到
-`%LOCALAPPDATA%\HandQ\logs\<TS>\`（见 `packagedLogBase()`）。Python 端遵循
+`%USERPROFILE%\HandQ\logs\<TS>\`（见 `packagedLogBase()`）。Python 端遵循
 `HANDQ_LOG_DIR` 环境变量（由 Electron 通过 env 传入），所以前后端会写到同一个
-"每次启动一个目录" 下。
+"每次启动一个目录" 下。`bridge_main._prune_old_log_dirs()` 在 boot 早期跑，
+保留最近 30 个 launch 目录，旧的 `shutil.rmtree`。
 
 Session 目录由 `stdio_bridge._allocate_session_dir(goal)` 在收到首个
 `request` 信封时分配，路径为 `<USERPROFILE>\HandQ\History\<TS>-<slug>\`，
@@ -302,7 +309,7 @@ Session 目录由 `stdio_bridge._allocate_session_dir(goal)` 在收到首个
 7. 收到首个 `request` 信封时，`stdio_bridge._allocate_session_dir(goal)`
    在 `%USERPROFILE%\HandQ\History\<TS>-<slug>\` 下创建 session 目录，
    作为 `FlowController` 的 `working_directory` + `storage_directory`。
-8. 框架日志落到 `%LOCALAPPDATA%\HandQ\logs\<TS>\`。
+8. 框架日志落到 `%USERPROFILE%\HandQ\logs\<TS>\`，diag 落到 `%USERPROFILE%\HandQ\logs\.dia\`（NTFS HIDDEN）。
 
 ---
 
@@ -390,7 +397,7 @@ nuitka `
 |---|---|---|
 | 1 | `bridge_main.py` 自定位 `INSTALL_DIR` 和配置路径 | ✅ 已完成 |
 | 2 | `electron/main.js` `app.isPackaged` 分支选择 py 或 exe | ✅ 已完成 |
-| 3 | `electron/main.js` packaged 模式日志走 `%LOCALAPPDATA%\HandQ\logs` | ✅ 已完成 |
+| 3 | `electron/main.js` packaged 模式日志走 `%USERPROFILE%\HandQ\logs\<TS>\`；diag 走 `logs\.dia\`（HIDDEN） | ✅ 已完成 |
 | 4 | 移除 spawn 时 pin 的 `cwd` | ✅ 已完成 |
 | 5 | YAML 字段 `api_key_env` / `api_key` 硬切为 `llm.API_KEY`；后端不再走 `os.environ.get` 间接续 | ✅ 已完成 |
 | 6 | 废除 `session.workspace_base`；session 强制为 `%USERPROFILE%\HandQ\History\<id>\` | ✅ 已完成 |

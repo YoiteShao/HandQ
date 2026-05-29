@@ -154,17 +154,99 @@ from logging import StreamHandler  # noqa: E402
 from logging.handlers import RotatingFileHandler  # noqa: E402
 from pathlib import Path  # noqa: E402
 
+import re  # noqa: E402
+
+_LAUNCH_TS_RE = re.compile(r"^\d{8}-\d{6}(-\d+)?$")
+
+
+def _user_log_root() -> Path:
+    """Per-user log root: %USERPROFILE%\\HandQ\\logs\\ (Windows) or ~/HandQ/logs.
+
+    Co-located with config + History under a single user root so the user has
+    one place to find every artifact HandQ writes about them. The diag tree
+    lives as a hidden subdirectory below this (see _DIAG_DIR).
+    """
+    return Path(_user_handq_root()) / "logs"
+
+
+def _prune_old_log_dirs(base: Path, keep: int = 30) -> None:
+    """Keep only the *keep* most-recent launch directories under *base*.
+
+    Each launch creates a fresh ``<YYYYMMDD-HHMMSS>/`` subdirectory under
+    *base*; without pruning they accumulate forever. We delete the oldest
+    once the count exceeds *keep*.
+
+    Safety guards:
+      * Only directories whose name matches ``YYYYMMDD-HHMMSS`` are eligible.
+        Dot-prefixed entries (e.g. ``.dia/`` for the diag log) and any other
+        files / sibling directories are left untouched.
+      * Best-effort — silently swallows OSError. The boot logger is not yet
+        configured here, so a failure can't be reported anywhere useful.
+    """
+    if not base.is_dir():
+        return
+    try:
+        candidates = [
+            p for p in base.iterdir()
+            if p.is_dir() and _LAUNCH_TS_RE.match(p.name)
+        ]
+    except OSError:
+        return
+    if len(candidates) <= keep:
+        return
+    candidates.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    import shutil
+    for stale in candidates[keep:]:
+        try:
+            shutil.rmtree(stale, ignore_errors=True)
+        except Exception:
+            pass
+
+
+def _set_hidden_on_windows(path: Path) -> None:
+    """Apply FILE_ATTRIBUTE_HIDDEN to *path*. No-op on non-Windows.
+
+    Dot-prefixing (``.dia``) makes a directory inconspicuous on Linux but
+    Windows Explorer shows it by default. Setting the NTFS hidden attribute
+    keeps it out of the user's normal browse view (still visible with "Show
+    hidden files" enabled).
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        FILE_ATTRIBUTE_HIDDEN = 0x02
+        ctypes.windll.kernel32.SetFileAttributesW(str(path), FILE_ATTRIBUTE_HIDDEN)
+    except Exception:
+        pass
+
+
 _env_log_dir = os.environ.get("HANDQ_LOG_DIR")
 if _env_log_dir:
     _LOG_DIR = Path(_env_log_dir)
+    _LOG_BASE = _LOG_DIR.parent
 else:
-    _LOG_DIR = Path(_ROOT) / "logs" / datetime.now().strftime("%Y%m%d-%H%M%S")
+    _is_frozen_at_log_init = (
+        getattr(sys, "frozen", False) or "__compiled__" in globals()
+    )
+    if _is_frozen_at_log_init:
+        _LOG_BASE = _user_log_root()
+    else:
+        # Dev mode: keep logs next to source for easy inspection.
+        _LOG_BASE = Path(_ROOT) / "logs"
+    _LOG_DIR = _LOG_BASE / datetime.now().strftime("%Y%m%d-%H%M%S")
+_LOG_BASE.mkdir(parents=True, exist_ok=True)
 _LOG_DIR.mkdir(parents=True, exist_ok=True)
 # Write back so stdio_bridge (and any other src/ module) can find the launch
 # log dir without re-deriving it. Safe to overwrite: if Electron passed
 # HANDQ_LOG_DIR it equals _LOG_DIR; if not, we just set it for the first time.
 os.environ["HANDQ_LOG_DIR"] = str(_LOG_DIR)
 _LOG_FILE = _LOG_DIR / "handq-bridge.log"
+
+# Trim old launch dirs. Runs once per boot, BEFORE the boot logger is
+# configured (so we can't log here). 30 ≈ a few weeks of normal usage,
+# enough to cross-reference past sessions; old launches roll off silently.
+_prune_old_log_dirs(_LOG_BASE, keep=30)
 
 _LOG_FMT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
 _formatter = logging.Formatter(_LOG_FMT)
@@ -195,22 +277,25 @@ logging.basicConfig(
 # Production debugging needs deep visibility into the long-term memory and
 # activity-monitor subsystems WITHOUT cluttering the main bridge log.
 # This handler attaches to specific logger trees and writes to a separate
-# file in a deliberately non-obvious location: it's NOT named with "ltm"
-# or "memory" or "activity", and the directory is "diag" (not "logs"),
-# so a casual user poking through %LOCALAPPDATA% won't immediately see
-# what's there. We're not hiding from a determined investigator — we're
-# just keeping the visible-debug-surface small.
+# file at <logs_base>/.dia/ — a dot-prefixed sibling of the per-launch
+# directories. We additionally set the Windows HIDDEN attribute on the
+# directory so it stays out of the user's normal browse view; a curious
+# user with "Show hidden files" can still find it. We're not hiding from
+# a determined investigator — we're just keeping the visible-debug-surface
+# small.
 #
-# Rotation: 1 MB per file, 5 files; comfortably covers a multi-hour
-# session even at DEBUG verbosity.
+# The diag file is bounded by RotatingFileHandler (1 MB × 5) so it can't
+# grow without bound. It is intentionally NOT wiped by _prune_old_log_dirs
+# (which only deletes timestamped launch dirs) — diag is meant to span
+# multiple launches for cross-launch correlation.
 try:
     _diag_dir_env = os.environ.get("HANDQ_DIAG_DIR")
     if _diag_dir_env:
         _DIAG_DIR = Path(_diag_dir_env)
     else:
-        _local_appdata = os.environ.get("LOCALAPPDATA") or str(Path.home())
-        _DIAG_DIR = Path(_local_appdata) / "HandQ" / "diag"
+        _DIAG_DIR = _LOG_BASE / ".dia"
     _DIAG_DIR.mkdir(parents=True, exist_ok=True)
+    _set_hidden_on_windows(_DIAG_DIR)
     _DIAG_FILE = _DIAG_DIR / "internal-trace.log"
     _diag_handler = RotatingFileHandler(
         str(_DIAG_FILE),
@@ -349,52 +434,11 @@ async def _run_with_long_term_memory() -> None:
     stdio_bridge.personality_monitor = personality   # type: ignore[attr-defined]
     stdio_bridge.scheduler = scheduler         # type: ignore[attr-defined]
 
-    # ── Sync git post-commit hooks declared in personalization.git_hook_repos
-    # The user manages this list through the Settings UI (which writes
-    # the yaml) — on every bridge launch we walk the list and:
-    #   - install in any listed repo that doesn't already have OUR hook
-    #   - skip with warning for paths that don't exist or have a
-    #     non-HandQ hook
-    # Hooks the user wrote themselves (no marker) are never touched.
-    try:
-        from src.bridge.stdio_bridge import (
-            _install_post_commit_hook,
-        )
-        import yaml as _yaml
-        try:
-            with open(_HANDQ_CONFIG, "r", encoding="utf-8") as _f:
-                _user_cfg = _yaml.safe_load(_f) or {}
-        except Exception:
-            _user_cfg = {}
-        _personalization = _user_cfg.get("personalization") or {}
-        _declared_repos = _personalization.get("git_hook_repos") or []
-        if isinstance(_declared_repos, list):
-            _declared = set(
-                str(r).strip() for r in _declared_repos if str(r).strip()
-            )
-        else:
-            _declared = set()
-            _boot_logger.warning(
-                "personalization.git_hook_repos is not a list; ignoring",
-            )
-        for _repo in _declared:
-            try:
-                _result = _install_post_commit_hook(_repo)
-                if _result.get("ok"):
-                    _boot_logger.info(
-                        "git hook ensured at %s", _result.get("path"),
-                    )
-                else:
-                    _boot_logger.warning(
-                        "git hook install skipped for %s: %s",
-                        _repo, _result.get("error"),
-                    )
-            except Exception:
-                _boot_logger.exception(
-                    "git hook sync failed for %s", _repo,
-                )
-    except Exception:
-        _boot_logger.exception("git hook sync raised; continuing without sync")
+    # Note: git post-commit hooks declared in personalization.git_hook_repos
+    # are NOT installed at boot. The Settings UI is the single source of
+    # truth — the bridge installs/uninstalls hooks on `config_set` (see
+    # StdioBridge._handle for the diff-driven sync). Booting without
+    # touching .git/hooks/ keeps the launch path side-effect-free.
 
     try:
         await stdio_bridge.run()

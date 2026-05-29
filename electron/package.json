@@ -22,6 +22,7 @@
     "appId": "com.handq.app",
     "productName": "HandQ",
     "copyright": "Copyright © 2026 HandQ",
+    "icon": "logo.png",
     "directories": {
       "output": "../dist/installer"
     },

@@ -911,6 +911,72 @@ class StdioBridge:
             yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False)
         logger.info("config written to %s", self.config_path)
 
+    @staticmethod
+    def _normalised_hook_repos(cfg: Dict[str, Any]) -> set:
+        """Pull ``personalization.git_hook_repos`` out of *cfg* as a set
+        of stripped, non-empty strings. Returns an empty set on any
+        shape error so the diff caller can treat malformed config as
+        "no repos requested" instead of crashing the save."""
+        pers = cfg.get("personalization") if isinstance(cfg, dict) else None
+        if not isinstance(pers, dict):
+            return set()
+        raw = pers.get("git_hook_repos")
+        if not isinstance(raw, list):
+            return set()
+        return {str(r).strip() for r in raw if str(r).strip()}
+
+    async def _sync_git_hooks(
+        self,
+        *,
+        added: set,
+        removed: set,
+    ) -> Dict[str, Any]:
+        """Apply the diff of ``personalization.git_hook_repos`` to disk.
+
+        Runs the (blocking) install / uninstall helpers on a worker
+        thread so the IPC dispatcher stays responsive. Each repo is
+        independent — one failure doesn't block the others. Returns
+        a structured summary the renderer can surface to the user.
+        """
+        installed: List[Dict[str, Any]] = []
+        uninstalled: List[Dict[str, Any]] = []
+        errors: List[Dict[str, Any]] = []
+
+        for repo in sorted(added):
+            try:
+                r = await asyncio.to_thread(_install_post_commit_hook, repo)
+            except Exception as exc:
+                logger.exception("install_post_commit_hook crashed: %s", repo)
+                errors.append({"repo": repo, "op": "install", "error": str(exc)})
+                continue
+            if r.get("ok"):
+                installed.append({"repo": repo, "path": r.get("path")})
+                logger.info("git hook installed at %s", r.get("path"))
+            else:
+                errors.append({"repo": repo, "op": "install",
+                               "error": r.get("error") or "unknown"})
+                logger.warning("git hook install skipped for %s: %s",
+                               repo, r.get("error"))
+
+        for repo in sorted(removed):
+            try:
+                r = await asyncio.to_thread(_uninstall_post_commit_hook, repo)
+            except Exception as exc:
+                logger.exception("uninstall_post_commit_hook crashed: %s", repo)
+                errors.append({"repo": repo, "op": "uninstall", "error": str(exc)})
+                continue
+            if r.get("ok"):
+                uninstalled.append({"repo": repo, "removed": r.get("removed", False)})
+                logger.info("git hook uninstall ok for %s (removed=%s)",
+                            repo, r.get("removed"))
+            else:
+                errors.append({"repo": repo, "op": "uninstall",
+                               "error": r.get("error") or "unknown"})
+                logger.warning("git hook uninstall failed for %s: %s",
+                               repo, r.get("error"))
+
+        return {"installed": installed, "uninstalled": uninstalled, "errors": errors}
+
     # ------------------------------------------------------------------
     # Inbound dispatch
     # ------------------------------------------------------------------
@@ -1066,25 +1132,48 @@ class StdioBridge:
                 if not isinstance(new_cfg, dict):
                     raise ValueError("'config' must be a JSON object")
                 logger.info("config_set: path=%s keys=%d", self.config_path.resolve(), len(new_cfg))
+
+                # Snapshot the OLD personalization.git_hook_repos BEFORE
+                # writing the new config. Settings is the source of truth
+                # for which repos should carry our post-commit hook; the
+                # bridge keeps `.git/hooks/post-commit` in sync by diffing
+                # the lists on every save:
+                #   added (new \ old)   → install hook
+                #   removed (old \ new) → uninstall (only our marker)
+                # The boot path no longer touches `.git/hooks/`; this is
+                # the single place where hook side effects fire.
+                old_cfg = self._load_config_dict()
+                old_repos = self._normalised_hook_repos(old_cfg)
+
                 self._save_config_dict(new_cfg)
                 if self._flow is not None:
                     try:
                         self._flow.config_manager.reload_config()
                     except Exception:
                         logger.exception("config_set: reload_config failed (continuing)")
-                # Note: ``personalization`` (enabled / excluded_apps /
-                # git_hook_repos) takes effect on the NEXT bridge
-                # launch, not at runtime. Activity capture state is
-                # tightly coupled to startup-time monitor enumeration
-                # and OCR engine cold-start; restarting the bridge is
-                # the cleaner contract than wiring a runtime apply
-                # path that has its own subtle ordering bugs. The
-                # Settings UI surfaces this with a "restart to apply"
-                # hint when personalization fields change.
+
+                new_repos = self._normalised_hook_repos(new_cfg)
+                added = new_repos - old_repos
+                removed = old_repos - new_repos
+                hook_results = await self._sync_git_hooks(
+                    added=added, removed=removed,
+                )
+
+                # Note: ``personalization.enabled`` and
+                # ``personalization.excluded_apps`` still take effect on
+                # the NEXT bridge launch — those are wired into the
+                # PersonalityMonitor at startup and don't have a runtime
+                # apply path. ``git_hook_repos`` IS applied immediately
+                # via the diff above, so the Settings UI's "restart to
+                # apply" hint only applies to the first two fields.
                 _emit({
                     "type": "final",
                     "id": msg_id,
-                    "result": {"saved": True, "path": str(self.config_path.resolve())},
+                    "result": {
+                        "saved": True,
+                        "path": str(self.config_path.resolve()),
+                        "git_hook_sync": hook_results,
+                    },
                 }, gen=self._generation)
             except Exception as exc:
                 logger.exception("config_set failed")
@@ -1416,7 +1505,16 @@ class StdioBridge:
             )
 
         api_key = llm_cfg.get("API_KEY") or ""
-        max_tokens = int(llm_cfg.get("max_tokens", 4096))
+        # When `max_tokens` is missing or non-positive, leave it unset (None) so
+        # AnthropicStreamingService falls back to the per-model ceiling instead of
+        # capping every model at a legacy default (e.g. 4096 truncates Sonnet/Haiku
+        # mid-tool-call, breaking write/edit with "missing required parameter").
+        _mt_raw = llm_cfg.get("max_tokens")
+        try:
+            _mt_int = int(_mt_raw) if _mt_raw is not None else 0
+        except (TypeError, ValueError):
+            _mt_int = 0
+        max_tokens: Optional[int] = _mt_int if _mt_int > 0 else None
         roles = resolve_role_models(llm_cfg)
 
         # Fallback when both `roles` and `models` are absent — keep the bridge
@@ -1432,13 +1530,13 @@ class StdioBridge:
         logger.info(
             "FlowController lazy construction: top_level_keys=%s llm_keys=%s session_keys=%s "
             "roles={agent:%d, planner:%d, receptionist:%d, from_data:%d} "
-            "max_tokens=%d api_key_present=%s session_dir=%s",
+            "max_tokens=%s api_key_present=%s session_dir=%s",
             sorted(cfg.keys()) if isinstance(cfg, dict) else None,
             sorted(llm_cfg.keys()),
             sorted(sess_cfg.keys()),
             len(roles["agent"]), len(roles["planner"]),
             len(roles["receptionist"]), len(roles["from_data"]),
-            max_tokens,
+            max_tokens if max_tokens is not None else "auto(per-model ceiling)",
             bool(api_key),
             session_dir,
         )
@@ -1452,9 +1550,13 @@ class StdioBridge:
             for m in roles.get(role_key, []):
                 if m not in shared_models:
                     shared_models.append(m)
+        # Only forward max_tokens when explicitly configured; otherwise let
+        # AnthropicStreamingService pick its constructor default and per-model
+        # ceiling kick in via _resolve_max_tokens.
+        _mt_kwargs: dict = {"max_tokens": max_tokens} if max_tokens is not None else {}
         svc_map = {
             m: AnthropicStreamingService(
-                api_key=api_key, model=m, max_tokens=max_tokens, max_retries=3,
+                api_key=api_key, model=m, max_retries=3, **_mt_kwargs,
             )
             for m in shared_models
         }
@@ -1463,7 +1565,7 @@ class StdioBridge:
         from_data_services    = [svc_map[m] for m in roles.get("from_data", [])]
         planner_services      = [
             AnthropicStreamingService(
-                api_key=api_key, model=m, max_tokens=max_tokens, max_retries=50,
+                api_key=api_key, model=m, max_retries=50, **_mt_kwargs,
             )
             for m in roles.get("planner", [])
         ]

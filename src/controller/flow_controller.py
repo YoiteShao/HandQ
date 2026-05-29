@@ -156,7 +156,7 @@ class FlowController:
             shell_history_path=shell_context_path,
         )
 
-        self.memory = Memory(self.storage_directory)
+        self.memory = Memory()
         # Set config_path on the InteractionManager singleton if not already set.
         # Use getattr() with a default of None so this works for both
         # InteractionManager (which may have config_path) and
@@ -1253,7 +1253,7 @@ class FlowController:
         for the first REPLAN message which becomes the goal.
         """
         # Initialise a fresh Memory for this session.
-        self.memory = Memory(self.storage_directory)
+        self.memory = Memory()
 
         self.state = SystemState.IDLE
 
@@ -2038,65 +2038,34 @@ class FlowController:
                                     continue
 
                         if _do_complete:
-                            self._transition_state(SystemState.COMPLETED)
-                            reason = (
+                            base_reason = (
                                 self.current_plan.completion_reason
                                 or "Task completed successfully"
                             )
-                            # Snapshot the pristine planner-authored summary
-                            # BEFORE we overlay the acceptance gap_summary so
-                            # the LTM candidate sees only what the planner
-                            # actually intended to deliver. The user-facing
-                            # `reason` keeps the gap line (it's actionable
-                            # context the user wants); LTM does not, because
-                            # gap_summary is the verifier criticising the
-                            # planner — not a durable user preference.
-                            pristine_reason = reason
                             # Surface non-PASS acceptance gap to the user so
-                            # they can decide during review whether the gap
-                            # warrants a follow-up.  Per anti-pattern #5 the
-                            # synthesis prompt restricts gap_summary to the
-                            # PRIMARY deliverable, so intermediate-artifact
-                            # quirks should not show up here.  Synthesis
-                            # exceptions (verdict is None) skip this branch.
+                            # they can decide whether the gap warrants a
+                            # follow-up. The pristine `base_reason` is what
+                            # LTM triage sees — gap_summary is verifier
+                            # criticism, not a durable preference, so it must
+                            # not leak into the candidate stream. Synthesis
+                            # exceptions (verdict is None) skip the overlay.
+                            user_facing_reason = base_reason
                             if (
                                 verdict is not None
                                 and verdict.verdict != 'PASS'
                                 and verdict.gap_summary
                             ):
-                                reason = (
-                                    f"{reason}\n\n"
+                                user_facing_reason = (
+                                    f"{base_reason}\n\n"
                                     f"[Acceptance: {verdict.verdict}] "
                                     f"{verdict.gap_summary}"
                                 )
-                            if self._execution_recorder:
-                                self._execution_recorder.completion_reason = reason
-                            if self._current_plan_id:
-                                self._metrics_collector.record_task_end(
-                                    self._current_plan_id, success=True,
-                                    duration_seconds=time.monotonic() - self._task_start_time,
-                                )
-                            # Write metrics_summary.json BEFORE notifying completion so
-                            # the foreground process can read it when it detects state3.
-                            self._report_metrics()
-                            # Fire-and-forget candidate submission so triage can
-                            # mine durable user preferences + reusable knowledge
-                            # from the just-finished task. Pass the pristine
-                            # planner summary, not the verify-overlay version.
-                            self._submit_session_complete_candidate(
-                                goal=goal, summary=pristine_reason, success=True,
+                            await self._complete_task(
+                                goal=goal,
+                                user_facing_reason=user_facing_reason,
+                                candidate_summary=base_reason,
+                                log_message="Task complete (UI mode) — continuing loop for follow-up",
                             )
-                            # Run end-of-task finaliser (user hook → internal
-                            # resource flushes) BEFORE notifying the user so
-                            # side-effects are flushed to disk before the user
-                            # can see "complete" and quit the process.
-                            await self._finalize_task()
-                            self.interaction_manager.notify_task_completed(reason)
-                            self.logger.info(
-                                "Task complete (UI mode) — continuing loop for follow-up",
-                                component="FlowController",
-                            )
-                            self._transition_state(SystemState.IDLE)
                             next_steps_list = []
                             continue
 
@@ -2175,57 +2144,22 @@ class FlowController:
                     # and will be visible to the Planner in the next iteration.
                     # No additional observe_and_plan call is needed here.
                     if not new_next_steps:
-                        self._transition_state(SystemState.COMPLETED)
                         reason = (
                             self.current_plan.completion_reason
                             or "Task completed successfully"
                         )
-                        if self._execution_recorder:
-                            self._execution_recorder.completion_reason = reason
-                        # ── Notify completion, then continue loop ────────────
-                        # Do NOT return — the user may type a follow-up message
-                        # that triggers a replan within the same session.
-                        # Only :exit / :new (checked at the top of the loop via
-                        # is_exit_requested()) will end the session.
-                        # Record metrics per-task here because _planner_loop does NOT
-                        # return after completion — it continues waiting for follow-up.
-                        # record_task_end() is idempotent per plan_id, so it is safe
-                        # to call again at session-end without double-counting.
-                        if self._current_plan_id:
-                            self._metrics_collector.record_task_end(
-                                self._current_plan_id, success=True,
-                                duration_seconds=time.monotonic() - self._task_start_time,
-                            )
-                        # Write metrics_summary.json BEFORE notifying completion so
-                        # the foreground process can read it when it detects state3.
-                        self._report_metrics()
-                        # Same fire-and-forget candidate path as the regular
-                        # completion site above — keep both branches in lock-step.
-                        self._submit_session_complete_candidate(
-                            goal=goal, summary=reason, success=True,
+                        # Same completion bookkeeping as the regular site —
+                        # the planner_loop does NOT return after completion,
+                        # so the user can send follow-up messages that trigger
+                        # a replan with full history. record_task_end is
+                        # idempotent per plan_id, making re-completion safe.
+                        await self._complete_task(
+                            goal=goal,
+                            user_facing_reason=reason,
+                            candidate_summary=reason,
+                            log_message="Task complete after interrupt (UI mode) — continuing loop for follow-up",
                         )
-                        # Run end-of-task finaliser (user hook → internal
-                        # resource flushes) — same guarantee as the normal path.
-                        await self._finalize_task()
-                        self.interaction_manager.notify_task_completed(reason)
-                        self.logger.info(
-                            "Task complete after interrupt (UI mode) — continuing loop for follow-up",
-                            component="FlowController",
-                        )
-                        # FIX P0-FIX-2: reset to IDLE so the state machine is
-                        # ready for the next user message / follow-up task.
-                        self._transition_state(SystemState.IDLE)
-
-                        # Keep all execution history intact so that if the user
-                        # is unsatisfied with the result and provides feedback,
-                        # the planner can see the full context and decide whether
-                        # additional steps are needed.
-                        # next_steps_list is already empty (task complete).
-                        # When the user types a new message, it will trigger a
-                        # replan with full history visible to the planner.
-
-                        # Skip the rest of Phase 3 for this iteration and go
-                        # straight to the sleep / next iteration.
+                        next_steps_list = []
                         continue
 
                 next_steps_list = new_next_steps
@@ -3035,6 +2969,45 @@ class FlowController:
     def get_metrics(self):
         """Return aggregated TaskMetrics across all tasks recorded this session."""
         return self._metrics_collector.get_metrics()
+
+    async def _complete_task(
+        self,
+        *,
+        goal: str,
+        user_facing_reason: str,
+        candidate_summary: str,
+        log_message: str,
+    ) -> None:
+        """Centralise the bookkeeping shared by every completion site.
+
+        Order: COMPLETED→record_task_end→_report_metrics→submit candidate
+        →_finalize_task→notify→IDLE. _finalize_task runs BEFORE the user
+        notification so per-task resources are flushed before the user can
+        quit. record_task_end is idempotent per plan_id, so this is safe to
+        re-enter on a follow-up replan that re-completes within the same
+        session.
+
+        user_facing_reason is what the user sees (may include verifier gap
+        line). candidate_summary is what LTM triage sees — always the pristine
+        planner summary; verifier criticism is not a durable preference and
+        must not leak into the candidate stream.
+        """
+        self._transition_state(SystemState.COMPLETED)
+        if self._execution_recorder:
+            self._execution_recorder.completion_reason = user_facing_reason
+        if self._current_plan_id:
+            self._metrics_collector.record_task_end(
+                self._current_plan_id, success=True,
+                duration_seconds=time.monotonic() - self._task_start_time,
+            )
+        self._report_metrics()
+        self._submit_session_complete_candidate(
+            goal=goal, summary=candidate_summary, success=True,
+        )
+        await self._finalize_task()
+        self.interaction_manager.notify_task_completed(user_facing_reason)
+        self.logger.info(log_message, component="FlowController")
+        self._transition_state(SystemState.IDLE)
 
     def _report_metrics(self) -> None:
         """

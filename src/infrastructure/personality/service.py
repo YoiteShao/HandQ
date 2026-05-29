@@ -53,6 +53,12 @@ _logger = logging.getLogger("handq.personality")
 # summary cap we ring-buffer — keep the latest, drop the oldest.
 _DAILY_BUFFER_HARD_CAP: int = C.ACTIVITY_DAILY_SUMMARY_MAX_SAMPLES * 4
 
+# How often to re-check the display topology for hot-plug / unplug /
+# resolution changes. Cheap (one mss enumeration call) so we can afford
+# this faster than tier transitions, but not every tick — on the common
+# no-change path we'd burn ~30 enumerations / min for nothing.
+_MONITOR_RECONCILE_INTERVAL_SEC: float = 30.0
+
 
 def _load_config_dict(config_path: Optional[Path]) -> Dict[str, Any]:
     """Read handq_config.yaml — same contract as LongTermMemory._load_config.
@@ -159,6 +165,9 @@ class PersonalityMonitor:
         # emitted for.
         self._last_daily_date: str = ""
         self._daily_buffer: List[ActivitySample] = []
+        # Tracks the last time we re-enumerated displays. Set in start()
+        # so we don't redundantly re-enumerate on the very first tick.
+        self._last_reconcile_ts: float = 0.0
 
     # ── Lifecycle ───────────────────────────────────────────────────────────
 
@@ -206,6 +215,7 @@ class PersonalityMonitor:
         for m in self._monitors:
             _logger.info("  monitor %d: %s bbox=%s primary=%s",
                          m.info.index, m.info.label, m.info.bbox, m.info.primary)
+        self._last_reconcile_ts = time.time()
         # Lazily build the OCR client; first capture pays the cold-start.
         try:
             self._ocr = get_local_ocr()
@@ -298,6 +308,7 @@ class PersonalityMonitor:
 
     async def _tick(self) -> None:
         now = time.time()
+        await self._reconcile_monitors(now)
         idle = system_idle_seconds()
         idle = idle if idle is not None else 0.0
         cur = cursor_pos()
@@ -330,6 +341,113 @@ class PersonalityMonitor:
                 samples = m.drain_buffer()
                 if samples:
                     await self._emit_candidate(samples, monitor=m)
+
+    # ── Topology reconciliation ────────────────────────────────────────────
+
+    async def _reconcile_monitors(self, now: float) -> None:
+        """Re-enumerate displays and reconcile :attr:`_monitors`.
+
+        Runs at most once every ``_MONITOR_RECONCILE_INTERVAL_SEC``.
+        Identifies "the same monitor" across enumerations by its
+        ``(left, top)`` virtual-screen corner — stable across resolution
+        changes (the OS keeps the corner pinned), only flips when the
+        user rearranges displays in Windows settings or unplugs one.
+
+        Behaviour:
+          - Vanished corners → drain the monitor's pending buffer to
+            LTM, then drop the state. Drain is best-effort; a failure
+            here only loses the unflushed tail.
+          - New corners → append a fresh ``MonitorState`` with a new
+            ``index`` (max existing + 1) so it doesn't collide with a
+            stamped-but-vanished display.
+          - Resolution flip on a stable corner → update bbox/label in
+            place, preserve tier/buffer/text-history, drop ``last_hash``
+            (perceptual hash was computed against a different pixel
+            area and would dedupe a genuinely-different frame).
+          - Any topology change → close the mss client so the next
+            capture rebuilds it; mss caches the monitor table inside
+            and would otherwise hand out stale region coords.
+
+        An empty enumeration is treated as a transient miss (RDP race,
+        display momentarily off) and ignored — keeping the prior list
+        is safer than dropping every monitor.
+        """
+        if (now - self._last_reconcile_ts) < _MONITOR_RECONCILE_INTERVAL_SEC:
+            return
+        self._last_reconcile_ts = now
+        try:
+            new_infos = enumerate_monitors()
+        except Exception:
+            _logger.exception("monitor reconcile: enumerate failed")
+            return
+        if not new_infos:
+            return
+
+        new_by_corner = {(i.bbox[0], i.bbox[1]): i for i in new_infos}
+        existing_by_corner = {(m.info.bbox[0], m.info.bbox[1]): m for m in self._monitors}
+
+        topology_changed = False
+
+        # Vanished → drain + drop.
+        kept: List[MonitorState] = []
+        for m in self._monitors:
+            corner = (m.info.bbox[0], m.info.bbox[1])
+            if corner in new_by_corner:
+                kept.append(m)
+                continue
+            topology_changed = True
+            _logger.info(
+                "monitor reconcile: removed index=%d bbox=%s label=%r",
+                m.info.index, m.info.bbox, m.info.label,
+            )
+            if m.buffer:
+                samples = m.drain_buffer()
+                try:
+                    await self._emit_candidate(samples, monitor=m)
+                except Exception:
+                    _logger.exception(
+                        "monitor reconcile: flush failed for monitor %d",
+                        m.info.index,
+                    )
+        self._monitors = kept
+
+        # In-place updates on stable corners (resolution / label flip).
+        for corner, m in existing_by_corner.items():
+            new_info = new_by_corner.get(corner)
+            if new_info is None:
+                continue
+            if new_info.bbox != m.info.bbox or new_info.label != m.info.label:
+                topology_changed = True
+                _logger.info(
+                    "monitor reconcile: updated index=%d bbox %s -> %s",
+                    m.info.index, m.info.bbox, new_info.bbox,
+                )
+                m.info.bbox = new_info.bbox
+                m.info.label = new_info.label
+                m.info.primary = new_info.primary
+                m.last_hash = None
+
+        # New corners → append with fresh indices.
+        next_index = max((m.info.index for m in self._monitors), default=0) + 1
+        for corner, info in new_by_corner.items():
+            if corner in existing_by_corner:
+                continue
+            topology_changed = True
+            info.index = next_index
+            next_index += 1
+            _logger.info(
+                "monitor reconcile: added index=%d bbox=%s label=%r",
+                info.index, info.bbox, info.label,
+            )
+            self._monitors.append(MonitorState(info=info))
+
+        if topology_changed:
+            try:
+                self._capturer.close()
+            except Exception:
+                _logger.debug(
+                    "monitor reconcile: capturer close failed", exc_info=True,
+                )
 
     # ── Tier transitions ───────────────────────────────────────────────────
 

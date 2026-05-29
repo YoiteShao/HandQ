@@ -46,8 +46,7 @@ def model_version(model_str: str) -> tuple:
     Examples:
         "anthropic::claude-4-6-sonnet:1M" -> (4, 6)
         "anthropic::claude-4-5-haiku:thinking" -> (4, 5)
-        "anthropic::claude-4-sonnet"       -> (4, 0)
-        "anthropic::claude-3-7-sonnet"     -> (3, 7)
+        "anthropic::claude-4-7-opus"       -> (4, 7)
     """
     name = model_str.split("::")[-1].split(":")[0]
     if m := re.search(r"claude-(\d+)-(\d+)-", name):

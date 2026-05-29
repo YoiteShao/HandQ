@@ -81,17 +81,19 @@ function computeLaunchTimestamp() {
 const LAUNCH_TS = computeLaunchTimestamp();
 // Log layout (see ARCHITECTURE.md §3):
 //   * Dev mode  -> <repo>/logs/<TS>/   (kept under repo for easy inspection)
-//   * Packaged  -> %LOCALAPPDATA%\HandQ\logs\<TS>\
+//   * Packaged  -> %USERPROFILE%\HandQ\logs\<TS>\
 //
-// Logs deliberately live in LocalAppData, NOT in app.getPath('userData')
-// (Roaming) — they are large, machine-specific, and shouldn't follow the user
-// across machines. User-owned data (config, session History) lives in
-// %USERPROFILE%\HandQ\ instead, which is the bridge's per-user root.
+// Logs live under the user's HandQ root (alongside config, History, and
+// personality data) so the user has a single place to find every artifact
+// HandQ owns about them. The diag tree sits at logs\.dia\ as a hidden
+// subdirectory (bridge_main.py applies the NTFS hidden attribute).
+// bridge_main._prune_old_log_dirs keeps only the most recent 30 launch
+// directories so this does not grow without bound.
 function packagedLogBase() {
-    const localAppData =
-        process.env.LOCALAPPDATA ||
-        path.join(app.getPath('home'), 'AppData', 'Local');
-    return path.join(localAppData, 'HandQ', 'logs');
+    const userProfile =
+        process.env.USERPROFILE ||
+        app.getPath('home');
+    return path.join(userProfile, 'HandQ', 'logs');
 }
 const LOG_BASE = app.isPackaged
     ? packagedLogBase()
@@ -529,15 +531,17 @@ function spawnBridge() {
     });
 
     // stderr is reserved for backend logging (see porting_design.md §(2)).
-    // We surface it to the main-process console so a developer running with
-    // `electron .` from a terminal can see Python tracebacks. Full chunk is
-    // also appended to the frontend log file.
+    // Python's logging.StreamHandler is wired to sys.stderr because stdout
+    // is the JSON IPC channel — so EVERY log record (DEBUG/INFO/WARN/ERROR)
+    // arrives here, not just errors. Tag the line as BRIDGE-LOG so the
+    // frontend log doesn't mislead readers into thinking every record
+    // is an error; the actual level is in the line content.
     child.stderr.on('data', (chunk) => {
         process.stderr.write('[bridge] ' + chunk);
         const text = String(chunk);
         // Strip a single trailing newline so the log line isn't double-broken.
         const stripped = text.endsWith('\n') ? text.slice(0, -1) : text;
-        logLine('BRIDGE-ERR', stripped);
+        logLine('BRIDGE-LOG', stripped);
     });
 
     child.on('error', (err) => {
@@ -572,6 +576,33 @@ function spawnBridge() {
 // asset; if a user-supplied electron/tray-icon.png is dropped in alongside,
 // it takes precedence.
 const TRAY_ICON_FILE = path.join(__dirname, 'tray-icon.png');
+
+// Bundled logo (copied from <repo>/logo.png into electron/ at build time so
+// the same path resolves in dev and packaged builds). Used for the window
+// taskbar icon and as the default tray image. nativeImage handles PNG
+// decoding; we cache the decoded images per-size to avoid re-reading the
+// file every time startTrayFlash() rebuilds the normal icon.
+const LOGO_FILE = path.join(__dirname, 'logo.png');
+const _logoCache = new Map();   // sizeKey → nativeImage
+
+function loadLogoImage(size) {
+    // size === undefined → original-resolution icon, suitable for the window
+    // taskbar (Windows scales it down to 16x16 / 32x32 itself). Pass an
+    // explicit width/height for the tray, where 16x16 renders cleanly.
+    const key = size ? `${size.width}x${size.height}` : 'orig';
+    if (_logoCache.has(key)) return _logoCache.get(key);
+    try {
+        if (!fs.existsSync(LOGO_FILE)) return null;
+        let img = nativeImage.createFromPath(LOGO_FILE);
+        if (!img || img.isEmpty()) return null;
+        if (size) img = img.resize(size);
+        _logoCache.set(key, img);
+        return img;
+    } catch (err) {
+        logLine('ICON', 'loadLogoImage failed', { err: err && err.message });
+        return null;
+    }
+}
 
 const _crcTable = (() => {
     const t = new Uint32Array(256);
@@ -703,7 +734,14 @@ function buildTrayIcon() {
             if (img && !img.isEmpty()) return img;
         }
     } catch (_) { /* fall through */ }
-    // 2) Procedurally-built 16x16 H-on-blue.
+    // 2) Bundled logo.png, resized to tray dimensions. 32×32 reads better on
+    //    HiDPI displays — Windows scales it down to 16/24 for the system
+    //    tray itself. This is the primary path in normal installs; the
+    //    procedural fallback below only fires if logo.png is missing or
+    //    unreadable for some reason.
+    const logo = loadLogoImage({ width: 32, height: 32 });
+    if (logo) return logo;
+    // 3) Last-ditch procedurally-built 16x16 H-on-blue.
     try {
         const png = buildHandqIconPng();
         const img = nativeImage.createFromBuffer(png);
@@ -820,6 +858,11 @@ function createWindow() {
         transparencyOpts.backgroundColor = '#f4f6fb';
     }
 
+    // Window icon — drives the taskbar icon, alt-tab thumbnail, and the
+    // alert flash target for flashFrame(). Falls through to Electron's
+    // default if logo.png is missing.
+    const windowIcon = loadLogoImage();
+
     mainWindow = new BrowserWindow({
         width: 1200,
         height: 800,
@@ -827,6 +870,7 @@ function createWindow() {
         minHeight: 480,
         title: 'HandQ',
         frame: false,
+        ...(windowIcon ? { icon: windowIcon } : {}),
         ...transparencyOpts,
         autoHideMenuBar: true,
         webPreferences: {

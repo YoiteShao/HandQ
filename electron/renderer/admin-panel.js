@@ -552,9 +552,6 @@
     // ── Tools tab ───────────────────────────────────────────────
     const rememberText = document.getElementById('admin-remember-text');
     const rememberBtn = document.getElementById('admin-remember-btn');
-    const hookPath = document.getElementById('admin-hook-path');
-    const hookInstall = document.getElementById('admin-hook-install');
-    const hookUninstall = document.getElementById('admin-hook-uninstall');
 
     rememberBtn.addEventListener('click', async () => {
         const text = rememberText.value.trim();
@@ -569,33 +566,6 @@
             }
         } catch (err) {
             showToast('submit failed: ' + err.message, 'error');
-        }
-    });
-
-    hookInstall.addEventListener('click', async () => {
-        const repo = hookPath.value.trim();
-        if (!repo) { showToast('repo path required', 'error'); return; }
-        try {
-            const r = await rpc('ltm_install_git_hook', { repo });
-            if (r.ok) showToast('Installed at ' + r.path);
-            else showToast('install failed: ' + (r.error || ''), 'error');
-        } catch (err) {
-            showToast('install failed: ' + err.message, 'error');
-        }
-    });
-    hookUninstall.addEventListener('click', async () => {
-        const repo = hookPath.value.trim();
-        if (!repo) { showToast('repo path required', 'error'); return; }
-        if (!confirm('Uninstall HandQ post-commit hook from ' + repo + '?')) return;
-        try {
-            const r = await rpc('ltm_uninstall_git_hook', { repo });
-            if (r.ok) {
-                showToast(r.removed ? 'Uninstalled.' : (r.note || 'Nothing to remove.'));
-            } else {
-                showToast('uninstall failed: ' + (r.error || ''), 'error');
-            }
-        } catch (err) {
-            showToast('uninstall failed: ' + err.message, 'error');
         }
     });
 

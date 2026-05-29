@@ -8,7 +8,6 @@ artifacts, and failed approaches. Cross-session, durable memory lives in
 share state.
 """
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
-from pathlib import Path
 
 from ..models.plan import Step, StepStatus
 
@@ -21,10 +20,8 @@ if TYPE_CHECKING:
 class Memory:
     """Agent memory store (global, per-session)."""
 
-    def __init__(self, working_directory: str = "."):
+    def __init__(self) -> None:
         self.completed_steps: List[Step] = []
-        self.working_directory = str(Path(working_directory).absolute())
-        self.modified_files: List[str] = []
 
         # Cross-step knowledge accumulation — successful steps only.
         # Each entry is a dict extracted from a successfully completed step:
@@ -108,10 +105,6 @@ class Memory:
           - ``hint``: context hint string for effective_goal injection
         """
         return self._ssh_contexts.get(hostname)
-
-    def get_all_ssh_contexts(self) -> Dict[str, Dict[str, Any]]:
-        """Return a copy of all per-hostname SSH contexts established so far."""
-        return dict(self._ssh_contexts)
 
     # ── Browser context ──────────────────────────────────────────────────────
 
@@ -458,7 +451,7 @@ class Memory:
         are always summarised together, so repeated calls accumulate into a single
         rolling summary rather than creating nested summaries.
         """
-        _COMPRESS_THRESHOLD_CHARS: int = 480_000  
+        _COMPRESS_THRESHOLD_CHARS: int = 480_000
 
         entry_texts: List[str] = []
         for entry in self._step_context_entries:
@@ -517,48 +510,8 @@ class Memory:
         except Exception:
             pass  # Silently fall back to hard-drop in get_accumulated_findings_for_planner()
 
-    def mark_last_step_failed(self, issues: Optional[List[str]] = None) -> None:
-        """
-        Retroactively mark the most recently recorded step as FAILED.
-
-        Called by FlowController when the Planner's last_step_confidence is
-        below the verification threshold, indicating the step did not truly
-        achieve its stated goal despite the agent's success claim.
-
-        Also adds the step to _failed_approaches so the planner has visibility
-        into this failure even after it scrolls out of the detail window.
-        """
-        if not self.completed_steps:
-            return
-        last = self.completed_steps[-1]
-        last.update_status(StepStatus.FAILED)
-        if issues:
-            last.issues = issues
-        # Track as a failed approach so the planner can avoid repeating it.
-        if last.issues:
-            self._failed_approaches.append({
-                "description": last.description,
-                "goal": (last.goal[:300] + "…") if len(last.goal) > 300 else last.goal,
-                "issues": list(last.issues[:3]),
-            })
-
     def get_completed_steps(self) -> List[Step]:
         return self.completed_steps.copy()
 
-    def add_modified_file(self, file_path: str) -> None:
-        if file_path not in self.modified_files:
-            self.modified_files.append(file_path)
-
-    def clear(self) -> None:
-        self.completed_steps.clear()
-        self.modified_files.clear()
-        self._step_context_entries.clear()
-        self._failed_approaches.clear()
-        self._compressed_findings_summary = None
-        self._compressed_findings_boundary = 0
-        self._ssh_contexts.clear()
-        self._browser_contexts.clear()
-        self._desktop_contexts.clear()
-        self._email_contexts.clear()
 
 AgentMemory = Memory  # alias for backward-compatible imports

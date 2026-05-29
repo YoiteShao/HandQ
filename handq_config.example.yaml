@@ -10,9 +10,6 @@ llm:
   - anthropic::claude-4-5-sonnet
   - anthropic::claude-4-5-haiku:thinking
   - anthropic::claude-4-5-haiku
-  - anthropic::claude-4-sonnet
-  - anthropic::claude-3-7-sonnet
-  - anthropic::claude-3-5-sonnet
   roles:
     planner:
     - anthropic::claude-4-6-sonnet
@@ -28,9 +25,6 @@ llm:
     - anthropic::claude-4-5-sonnet
     - anthropic::claude-4-5-haiku:thinking
     - anthropic::claude-4-5-haiku
-    - anthropic::claude-4-sonnet
-    - anthropic::claude-3-7-sonnet
-    - anthropic::claude-3-5-sonnet
     helper:
     - anthropic::claude-4-5-sonnet
     - anthropic::claude-4-5-haiku:thinking

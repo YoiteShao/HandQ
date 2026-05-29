@@ -99,25 +99,34 @@ class StreamDoneEvent:
 # The first matching entry wins; the fallback is used when nothing matches.
 # ---------------------------------------------------------------------------
 _MODEL_MAX_OUTPUT_TOKENS: list[tuple[str, int]] = [
-    # claude-4 / claude-opus-4 series
-    # 1M-context variants support 128K output — must come before generic claude-sonnet-4 entry
-    (":1m",             128000),
-    (":1M",             128000),
-    ("[1m]",            128000),
-    ("[1M]",            128000),
-    # claude-4-7-opus has 1M context and 128K output natively
-    ("claude-4-7-opus", 128000),
-    ("claude-opus-4",   32000),
-    ("claude-sonnet-4", 64000),
-    ("claude-haiku-4",  16000),
-    # claude-3.7 series
-    ("claude-3-7",      64000),
-    ("claude-3.7",      64000),
-    # claude-3.5 series
-    ("claude-3-5",       8192),
-    ("claude-3.5",       8192),
-    # claude-3 series
-    ("claude-3",         4096),
+    # ── 1M-context variants ──────────────────────────────────────────────
+    # Sonnet at 1M context still caps output at 64K (only Opus 1M reaches 128K).
+    # These MUST come before the generic ":1m" rule below.
+    ("claude-4-6-sonnet:1m", 64000),
+    ("claude-4-5-sonnet:1m", 64000),
+    ("claude-sonnet-4:1m",   64000),  # legacy Anthropic naming
+    # Generic 1M-context suffix → assume 128K output (Opus 1M variants)
+    (":1m",                  128000),
+    ("[1m]",                 128000),
+
+    # ── Native 1M Opus (4.7) ─────────────────────────────────────────────
+    ("claude-4-7-opus",      128000),
+    ("claude-opus-4-7",      128000),  # legacy Anthropic naming
+
+    # ── Opus 4.x → 32K output ────────────────────────────────────────────
+    ("claude-4-6-opus",       32000),
+    ("claude-4-5-opus",       32000),
+    ("claude-4-opus",         32000),
+    ("claude-opus-4",         32000),  # legacy Anthropic naming
+
+    # ── Sonnet 4.x → 64K output ──────────────────────────────────────────
+    ("claude-4-6-sonnet",     64000),
+    ("claude-4-5-sonnet",     64000),
+    ("claude-sonnet-4",       64000),  # legacy Anthropic naming (4.5+ direct API)
+
+    # ── Haiku 4.5 → 16K output ───────────────────────────────────────────
+    ("claude-4-5-haiku",      16000),
+    ("claude-haiku-4",        16000),  # legacy Anthropic naming (4.5+ direct API)
 ]
 _DEFAULT_MAX_OUTPUT_TOKENS = 64000  # safe large default for unknown models
 
@@ -141,14 +150,6 @@ _MODEL_CONTEXT_WINDOW: list[tuple[str, int]] = [
     ("claude-opus-4",      200_000),
     ("claude-sonnet-4",    200_000),
     ("claude-haiku-4",     200_000),
-    # claude-3.7 series
-    ("claude-3-7",         200_000),
-    ("claude-3.7",         200_000),
-    # claude-3.5 series
-    ("claude-3-5",         200_000),
-    ("claude-3.5",         200_000),
-    # claude-3 series
-    ("claude-3",           200_000),
 ]
 _DEFAULT_CONTEXT_WINDOW = 200_000  # conservative default for unknown models
 
@@ -156,17 +157,27 @@ _DEFAULT_CONTEXT_WINDOW = 200_000  # conservative default for unknown models
 def _resolve_max_tokens(model: str, requested: Optional[int]) -> int:
     """Return the effective max_tokens for an Anthropic API call.
 
-    If *requested* is provided and positive, it is returned as-is.
-    Otherwise the per-model ceiling from ``_MODEL_MAX_OUTPUT_TOKENS`` is used,
-    falling back to ``_DEFAULT_MAX_OUTPUT_TOKENS`` for unknown models.
+    Resolution rules:
+      * The per-model ceiling from ``_MODEL_MAX_OUTPUT_TOKENS`` is always
+        looked up first (fallback ``_DEFAULT_MAX_OUTPUT_TOKENS`` for
+        unknown models).
+      * If *requested* is ``None`` or non-positive, the ceiling is used —
+        this prevents legacy default values (e.g. an old ``4096``) from
+        capping modern models far below their real capacity.
+      * If *requested* is positive, it is clamped to the ceiling so the
+        API never receives a value the model cannot satisfy (would be a
+        400) while still letting callers (vision, reranker, triage, etc.)
+        deliberately throttle output for short-response use cases.
     """
-    if requested is not None:
-        return requested
     model_lower = model.lower()
-    for substring, ceiling in _MODEL_MAX_OUTPUT_TOKENS:
+    ceiling = _DEFAULT_MAX_OUTPUT_TOKENS
+    for substring, c in _MODEL_MAX_OUTPUT_TOKENS:
         if substring in model_lower:
-            return ceiling
-    return _DEFAULT_MAX_OUTPUT_TOKENS
+            ceiling = c
+            break
+    if requested is None or requested <= 0:
+        return ceiling
+    return min(requested, ceiling)
 
 
 def _resolve_context_window(model: str, override: Optional[int]) -> int:

@@ -177,7 +177,6 @@
     // Shortcut bar
     const scSettings = document.getElementById('sc-settings');
     const scScheduler = document.getElementById('sc-scheduler');
-    const scStatus   = document.getElementById('sc-status');
     const scNew      = document.getElementById('sc-new');
 
     // Titlebar
@@ -194,10 +193,8 @@
     const activityFeed    = document.getElementById('activity-feed');
 
     // Overlays
-    const overlayStatus    = document.getElementById('overlay-status');
     const overlaySettings  = document.getElementById('overlay-settings');
     const overlayConfirm   = document.getElementById('overlay-confirmation');
-    const statusCloseBtn   = document.getElementById('status-close');
     const settingsCancel   = document.getElementById('settings-cancel');
     const confirmTitle     = document.getElementById('confirm-title');
     const confirmDescEl    = document.getElementById('confirm-description');
@@ -208,13 +205,6 @@
     const confirmGuidBtn   = document.getElementById('confirm-guidance-btn');
     const confirmRejectBtn = document.getElementById('confirm-reject');
     const confirmSubmitBtn = document.getElementById('confirm-submit');
-
-    // Status overlay readouts
-    const stState    = document.getElementById('st-state');
-    const stProgress = document.getElementById('st-progress');
-    const stStep     = document.getElementById('st-step');
-    const stLast     = document.getElementById('st-last');
-    const stEvents   = document.getElementById('st-events');
 
     // Settings form
     const settingsForm     = document.getElementById('settings-form');
@@ -282,12 +272,7 @@
 
     const session = {
         state:      'idle',
-        progress:   '',
-        currentStep:'',
-        lastUpdate: '',
-        events:     [],
     };
-    const EVENT_RING = 30;
 
     // taskCompleted "locks" the pill to the completion banner until the user
     // submits a new message (or hits New). Backend often emits a stray
@@ -348,7 +333,6 @@
         if (activityCurrent) activityCurrent.textContent = 'complete';
         session.state = 'complete';
         if (summary) addAssistantTextBubble(summary);
-        recordEvent('task completed' + (summary ? ': ' + truncate(summary, 80) : ''));
     }
 
     function clearCompleted() {
@@ -367,20 +351,15 @@
         return s.length > n ? s.slice(0, n - 1) + '…' : s;
     }
 
-    function recordEvent(line) {
-        if (!line) return;
-        session.events.push('[' + new Date().toLocaleTimeString() + '] ' + line);
-        if (session.events.length > EVENT_RING) session.events.shift();
-        session.lastUpdate = new Date().toLocaleTimeString();
-    }
-
-    function refreshStatusPanel() {
-        stState.textContent    = session.state || 'idle';
-        stProgress.textContent = session.progress || '—';
-        stStep.textContent     = session.currentStep || '—';
-        stLast.textContent     = session.lastUpdate || '—';
-        stEvents.textContent   = session.events.join('\n');
-        stEvents.scrollTop     = stEvents.scrollHeight;
+    // Whether the planner/agent has a real task in flight. Used to gate
+    // receptionist-side pill updates so a chat reply mid-task can't reset
+    // the activity strip to "idle". `session.state` is set by state_changed
+    // events; `activeExecCount` covers the brief window where a tool is
+    // running before the next state_changed lands.
+    function isTaskRunning() {
+        return session.state === 'executing'
+            || session.state === 'replanning'
+            || activeExecCount > 0;
     }
 
     // ----- Markdown rendering ---------------------------------------------
@@ -1692,8 +1671,6 @@
             evt.kind === 'ask_human') {
             // Show the confirmation modal and stop further dispatch — these
             // envelopes are not informational status updates.
-            recordEvent('confirmation requested: ' + evt.kind +
-                        (evt.tool ? ' (' + evt.tool + ')' : ''));
             try { showConfirmationModal(evt); }
             catch (e) { window.__handqLog('ERROR', 'showConfirmationModal failed',
                                            { error: String(e) }); }
@@ -1705,14 +1682,11 @@
             if (evt.state === 'replanning') {
                 if (!firstReplanSeen) {
                     firstReplanSeen = true;
-                    recordEvent('state → designing');
                     setWorking('designing…');
                 } else {
-                    recordEvent('state → replanning');
                     setWorking('replanning…');
                 }
             } else {
-                recordEvent('state → ' + evt.state);
                 if (evt.state === 'executing') {
                     clearWorking();
                 }
@@ -1722,34 +1696,27 @@
             const cur = evt.current || 0;
             const tot = evt.total || 0;
             const text = 'progress ' + cur + '/' + tot;
-            session.progress = cur + '/' + tot;
-            recordEvent(text);
             setPill(text);
         } else if (evt.kind === 'step_started') {
             const stepId = String(evt.step_id || args[0] || '');
             const desc = String(evt.desc || args[1] || '');
-            session.currentStep = desc;
-            recordEvent('step started: ' + desc);
             pushActivity('▶', 'Step started', desc);
             setWorking('▶ ' + truncate(desc, 120));
             addStepBubble('▶', desc);
         } else if (evt.kind === 'step_completed') {
             const stepId = String(evt.step_id || args[0] || '');
             const desc = String(evt.desc || args[1] || '');
-            recordEvent('step completed: ' + desc);
             pushActivity('✓', 'Step completed', desc);
             setPill('✓ ' + truncate(desc, 120));
             addStepBubble('✓', desc);
         } else if (evt.kind === 'step_confidence') {
             const conf = parseFloat(args[0]);
             if (!Number.isNaN(conf)) {
-                recordEvent('confidence: ' + conf.toFixed(2));
                 pushActivity('◎', 'Step confidence', conf.toFixed(2));
             }
         } else if (evt.kind === 'decision_made') {
             const iter = args[0] || '';
             const reasoning = args[1] || '';
-            recordEvent('decision[' + iter + ']: ' + truncate(reasoning, 120));
             pushActivity('💭', 'Decision iter ' + iter, reasoning);
             setWorking('💭 ' + truncate(reasoning, 120));
         } else if (evt.kind === 'tool_execution_started') {
@@ -1765,7 +1732,6 @@
             var effectiveTool = tool || lastCalledTool || 'action';
             const tag    = isPre ? '⊙' : '✓';
             const paramText = formatToolParams(params);
-            recordEvent(tag + ' ' + effectiveTool + '[' + iter + '] ' + truncate(paramText, 120));
             if (isPre) {
                 activeExecCount++;
                 var ctx = briefToolContext(effectiveTool, params);
@@ -1796,29 +1762,39 @@
             addAssistantTextBubble(evt.text || '');
         } else if (evt.kind === 'bridge_exit') {
             session.state = 'bridge exited';
-            recordEvent('bridge exited');
             setPill('bridge exited', { force: true });
             pushActivity('⚠', 'Bridge exited', 'code=' + evt.code + ' signal=' + evt.signal);
         } else if (evt.kind === 'reply') {
             addAssistantTextBubble(evt.text || '');
         } else if (evt.kind === 'reply_delta') {
-            // Clear thinking indicator on first streaming chunk
+            // Receptionist is streaming a chat reply. Always clear the chat-side
+            // thinking bubble so the streaming text replaces it. The activity
+            // strip pill is owned by the planner/agent task state — only reset
+            // it when no task is in flight; otherwise the pill would flash to
+            // "idle" mid-task while the receptionist chats.
             removeThinkingBubble();
-            clearWorking();
-            setPill('');
+            if (!isTaskRunning()) {
+                clearWorking();
+                setPill('');
+            }
             appendReceptionistDelta(evt.text || '');
         } else if (evt.kind === 'reply_done') {
             sealReceptionistBubble();
         } else if (evt.kind === 'message') {
             addSystemBubble(evt.text || '');
         } else if (evt.kind === 'receptionist_thinking_on') {
-            recordEvent('receptionist thinking…');
-            setWorking('thinking…');
+            // Show the chat-side thinking bubble unconditionally; only steal
+            // the activity strip pill when no real task is running, otherwise
+            // the agent's working indicator would be hidden by "thinking…".
             showThinkingBubble();
+            if (!isTaskRunning()) {
+                setWorking('thinking…');
+            }
         } else if (evt.kind === 'receptionist_thinking_off') {
-            recordEvent('receptionist idle');
             removeThinkingBubble();
-            clearWorking();
+            if (!isTaskRunning()) {
+                clearWorking();
+            }
         } else if (evt.kind === 'session_event') {
             handleSessionEvent(evt.event, evt.data || {});
         } else if (evt.kind === 'llm_server_error') {
@@ -1832,12 +1808,8 @@
             addSystemBubble('⏳ ' + errSummary
                 + '\nThis is a temporary API server issue, not a HandQ problem.'
                 + ' Retrying automatically — please wait.');
-            recordEvent('API retry: ' + errSummary);
             pushActivity('⏳', 'API retry', errSummary);
             setPill('retrying…');
-        }
-        if (!overlayStatus.classList.contains('hidden')) {
-            refreshStatusPanel();
         }
     });
 
@@ -1881,7 +1853,6 @@
             payload: window.__handqTrunc(evt, 200),
         });
         addErrorBubble(evt.message, evt.where);
-        recordEvent('error: ' + (evt.message || '(no message)'));
         pushActivity('⚠', 'Error' + (evt.where ? ' · ' + evt.where : ''),
                      evt.message || '(no message)');
         if (evt.fatal) {
@@ -2092,13 +2063,9 @@
     }
 
     // Click-outside on the overlay backdrop closes it.
-    overlayStatus.addEventListener('click', (e) => {
-        if (e.target === overlayStatus) closeOverlay(overlayStatus);
-    });
     overlaySettings.addEventListener('click', (e) => {
         if (e.target === overlaySettings) closeOverlay(overlaySettings);
     });
-    statusCloseBtn.addEventListener('click', () => closeOverlay(overlayStatus));
     settingsCancel.addEventListener('click', () => closeOverlay(overlaySettings));
 
     // ----- confirmation modal button wiring --------------------------------
@@ -2154,7 +2121,6 @@
 
     window.addEventListener('keydown', (e) => {
         if (e.key === 'Escape') {
-            if (!overlayStatus.classList.contains('hidden'))   closeOverlay(overlayStatus);
             if (!overlaySettings.classList.contains('hidden')) closeOverlay(overlaySettings);
             if (popoverOpen) closePopover();
         }
@@ -2177,11 +2143,6 @@
         } else {
             window.schedulePanel.open();
         }
-    });
-
-    scStatus.addEventListener('click', () => {
-        refreshStatusPanel();
-        openOverlay(overlayStatus);
     });
 
     scNew.addEventListener('click', () => {
@@ -2221,10 +2182,6 @@
         clearCompleted();
         clearWorking();
         session.state = 'idle';
-        session.progress = '';
-        session.currentStep = '';
-        session.events = [];
-        session.lastUpdate = '';
         setPill('idle');
         clearActivity();
         if (popoverOpen) closePopover();
@@ -2627,7 +2584,23 @@
         handq.setConfig(cfg).then((result) => {
             if (result && result.saved) {
                 settingsStatus.textContent = 'saved';
-                showToast('Settings saved.', 'ok');
+                // Surface git hook sync outcome separately so install/
+                // uninstall failures (e.g. repo path missing, foreign
+                // hook in the way) are visible, not silently swallowed.
+                const sync = result.git_hook_sync || {};
+                const errs = Array.isArray(sync.errors) ? sync.errors : [];
+                const ins = Array.isArray(sync.installed) ? sync.installed : [];
+                const uns = Array.isArray(sync.uninstalled) ? sync.uninstalled : [];
+                let msg = 'Settings saved.';
+                if (ins.length) msg += ` Installed ${ins.length} hook${ins.length === 1 ? '' : 's'}.`;
+                if (uns.length) msg += ` Uninstalled ${uns.length} hook${uns.length === 1 ? '' : 's'}.`;
+                showToast(msg, 'ok');
+                if (errs.length) {
+                    const summary = errs
+                        .map((e) => `${e.op} ${e.repo}: ${e.error}`)
+                        .join(' | ');
+                    showToast('Hook sync issues — ' + summary, 'err');
+                }
                 // Per spec: clicking Save returns the user to the chat view.
                 setTimeout(() => closeOverlay(overlaySettings), 350);
             } else {
