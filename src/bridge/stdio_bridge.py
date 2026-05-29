@@ -539,6 +539,36 @@ class _StdioUI:
         _emit({"type": "status", "kind": "reply_done"},
               gen=self._generation)
 
+    # ── GEP countdown ──────────────────────────────────────────────────────
+    # FlowController._planner_loop fires notify_gep_countdown(remaining, name)
+    # once per second while waiting for the user to confirm a matched template.
+    # remaining_secs == -1 clears the timer (templates declined / activated).
+    def show_gep_countdown(self, remaining_secs: int, template_name: str) -> None:
+        _emit({"type": "status", "kind": "gep_countdown",
+               "remaining": int(remaining_secs),
+               "template_name": str(template_name or "")},
+              gen=self._generation)
+
+    def show_gep_intro(self, template_info: Any) -> None:
+        """One-shot structured template info; renderer opens the parameter panel."""
+        info = template_info if isinstance(template_info, dict) else {}
+        _emit({"type": "status", "kind": "gep_intro",
+               "template": info},
+              gen=self._generation)
+
+    def show_inline_event(self, icon: str, desc: str) -> None:
+        """Emit a one-line status event styled like a planner step.
+
+        Used for short GEP-flow banners (saving / activated / instantiation
+        failed) that should appear as a tight icon + text line, identical
+        in style to step_started events. The renderer maps kind=inline_event
+        to addStepBubble.
+        """
+        _emit({"type": "status", "kind": "inline_event",
+               "icon": str(icon or "·"),
+               "desc": str(desc or "")},
+              gen=self._generation)
+
     # ── Desktop takeover indicator ──────────────────────────────────────────
     #
     # InteractionManager._ui_call invokes these via getattr() when the
@@ -1251,6 +1281,86 @@ class StdioBridge:
             await self._do_new_session(msg_id)
             return
 
+        if msg_type == "gep_save":
+            await self._do_gep_save(msg_id, msg)
+            return
+
+        if msg_type == "gep_list_templates":
+            try:
+                from src.infrastructure.gep_template import list_templates
+                templates = list_templates(include_invalid=True)
+                payload = []
+                for t in templates:
+                    entry = {
+                        "id":          t.id,
+                        "name":        t.name,
+                        "description": t.description,
+                        "version":     t.version,
+                        "created_at":  t.created_at,
+                        "params":      [
+                            {
+                                "name":        pname,
+                                "type":        getattr(pspec, "type", "") or "",
+                                "description": getattr(pspec, "description", "") or "",
+                                "default":     getattr(pspec, "default", None),
+                                "emphasis":    bool(getattr(pspec, "emphasis", False)),
+                            }
+                            for pname, pspec in (t.params_schema or {}).items()
+                        ],
+                        "steps": [
+                            {
+                                "step_id":     s.step_id,
+                                "description": s.description,
+                                "goal":        s.goal,
+                                "tools_required": list(s.tools_required or []),
+                            }
+                            for s in (t.guide_steps or [])
+                        ],
+                    }
+                    problems = getattr(t, "_problems", None)
+                    if problems:
+                        entry["problems"] = list(problems)
+                        entry["source_path"] = getattr(t, "_source_path", "")
+                    payload.append(entry)
+                _emit({"type": "final", "id": msg_id,
+                       "result": {"templates": payload}},
+                      gen=self._generation)
+            except Exception as exc:
+                logger.exception("gep_list_templates failed")
+                _emit({"type": "error", "id": msg_id, "where": "bridge",
+                       "message": f"gep_list_templates failed: {exc}",
+                       "fatal": False}, gen=self._generation)
+            return
+
+        if msg_type == "gep_delete_template":
+            try:
+                from src.infrastructure.gep_template import (
+                    _templates_dir, _sanitize_template_id,
+                )
+                tid = str(msg.get("id") or "").strip()
+                if not tid:
+                    raise ValueError("missing template id")
+                tdir = _templates_dir()
+                target = tdir / f"{_sanitize_template_id(tid)}.json"
+                if target.exists():
+                    target.unlink()
+                    ok = True
+                else:
+                    matches = list(tdir.glob(f"{_sanitize_template_id(tid)}*.json"))
+                    if len(matches) == 1:
+                        matches[0].unlink()
+                        ok = True
+                    else:
+                        ok = False
+                _emit({"type": "final", "id": msg_id,
+                       "result": {"ok": ok}}, gen=self._generation)
+            except Exception as exc:
+                logger.exception("gep_delete_template failed")
+                _emit({"type": "error", "id": msg_id, "where": "bridge",
+                       "message": f"gep_delete_template failed: {exc}",
+                       "fatal": False}, gen=self._generation)
+            return
+
         logger.warning("unknown inbound type=%r id=%s", msg_type, msg_id)
         _emit({"type": "error", "id": msg_id, "where": "bridge",
                "message": f"Unknown message type: {msg_type!r}",
@@ -1485,14 +1595,21 @@ class StdioBridge:
         # and can read log_level from config.  Must happen before FlowController
         # construction so every get_logger() call in src/ picks up the right
         # level and file handler.
+        #
+        # Per-task engine log lives INSIDE the session dir (not the bridge's
+        # launch-scoped log dir) so the user can find a session's full trace
+        # alongside its session_state.json + executions_logs/ without having to
+        # cross-reference two different roots. The bridge-scoped log
+        # (handq-bridge.log under HANDQ_LOG_DIR) is unaffected — it stays where
+        # it is for cross-session correlation.
         from ..infrastructure.logger import initialize_logger, LogLevel as _LogLevel
         _log_level_str = sess_cfg.get("log_level", "INFO") or "INFO"
-        _engine_log_dir = os.environ.get("HANDQ_LOG_DIR") or str(session_dir)
+        _engine_log_dir = str(session_dir)
         try:
             initialize_logger(
                 name="HandQ",
                 level=_LogLevel[_log_level_str.upper()],
-                log_file=f"handq_{time.strftime('%Y%m%d_%H%M%S')}.log",
+                log_file="handq-engine.log",
                 log_dir=_engine_log_dir,
             )
             logger.info(
@@ -1527,7 +1644,7 @@ class StdioBridge:
                 "from_data":    ["anthropic::claude-4-5-haiku"],
             }
 
-        logger.info(
+        logger.debug(
             "FlowController lazy construction: top_level_keys=%s llm_keys=%s session_keys=%s "
             "roles={agent:%d, planner:%d, receptionist:%d, from_data:%d} "
             "max_tokens=%s api_key_present=%s session_dir=%s",
@@ -1767,6 +1884,121 @@ class StdioBridge:
     _NEW_SESSION_GRACE_TIMEOUT = 2.5    # cooperative interrupt
     _NEW_SESSION_HARD_TIMEOUT  = 1.5    # after explicit cancel
     _NEW_SESSION_CLOSE_TIMEOUT = 2.0    # per-service httpx pool drain
+
+    async def _do_gep_save(
+        self, msg_id: Optional[str], msg: Dict[str, Any],
+    ) -> None:
+        """Trigger the GEP save-session flow.
+
+        Sole entry point for generating a template — invoked only by the
+        Templates panel's "Load history" file picker, which always passes
+        ``log_file``. The frontend already gates on idle, but this method
+        is the single source of truth for the server-side rules:
+
+          (a) NO task may be currently executing or replanning. We refuse
+              outright; we no longer cancel a live task to make room for
+              save (that was the old behaviour back when Save lived in the
+              completion bubble — nonsensical now that the user has to
+              navigate to Templates → Load history, which itself implies
+              "I'm done with whatever I was doing").
+          (b) A bootstrap FlowController is built on demand if none exists
+              yet, so the save flow works even before the user has sent
+              a single message in the session.
+
+        The save flow (``flow._trigger_save_session``) then constructs its
+        own fresh FlowController and takes over the InteractionManager —
+        the conversation pane becomes the template-generation chat.
+        """
+        from src.models.state import SystemState
+
+        log_file = msg.get("log_file") or None
+
+        # ── (a) hard refuse if a task is in flight ───────────────────────
+        if self._flow is not None and self._flow.state in (
+            SystemState.EXECUTING, SystemState.REPLANNING,
+        ):
+            _emit({"type": "error", "id": msg_id, "where": "bridge",
+                   "message": "GEP save: a task is currently running — wait for "
+                              "completion or click New first.",
+                   "fatal": False}, gen=self._generation)
+            return
+
+        # If the bridge already has a live flow_task whose state isn't
+        # IDLE/COMPLETED, treat that as "task running" too. Defensive: covers
+        # transient windows where state hasn't transitioned yet but the task
+        # is mid-execution.
+        if (
+            self._flow_task is not None
+            and not self._flow_task.done()
+            and self._flow is not None
+            and self._flow.state not in (SystemState.IDLE, SystemState.COMPLETED)
+        ):
+            _emit({"type": "error", "id": msg_id, "where": "bridge",
+                   "message": "GEP save: a task is currently running — wait for "
+                              "completion or click New first.",
+                   "fatal": False}, gen=self._generation)
+            return
+
+        # ── No log_file + no execution recorder = nothing to save ────────
+        # The Templates panel always supplies log_file, so this guard mostly
+        # catches programmatic callers that omit it.
+        if (
+            log_file is None
+            and (self._flow is None or self._flow._execution_recorder is None)
+        ):
+            _emit({"type": "error", "id": msg_id, "where": "bridge",
+                   "message": "GEP save: log_file is required when no completed "
+                              "task exists in the current session.",
+                   "fatal": False}, gen=self._generation)
+            return
+
+        # ── (b) bootstrap a parent flow if none exists ───────────────────
+        # _trigger_save_session builds its own save_flow but borrows the
+        # parent for config_manager / services / storage_directory. The
+        # bootstrap goal text is only used by _allocate_session_dir to slug
+        # the placeholder dir.
+        if self._flow is None:
+            try:
+                self._ensure_flow(goal="gep-save-bootstrap")
+            except Exception as exc:
+                logger.exception("gep_save: _ensure_flow failed")
+                _emit({"type": "error", "id": msg_id, "where": "bridge",
+                       "message": f"GEP save: could not initialise bridge "
+                                  f"flow: {exc}", "fatal": False},
+                      gen=self._generation)
+                return
+
+        flow = self._flow
+
+        # If there's a stale idle flow_task (planner_loop waiting for next
+        # message), gracefully cancel it so the save flow takes the IM
+        # singleton without contention. Safe because we already verified
+        # state is IDLE/COMPLETED above.
+        if self._flow_task is not None and not self._flow_task.done():
+            self._flow_task.cancel()
+            try:
+                flow.cancel_all_tasks()
+            except Exception:
+                logger.exception("gep_save: cancel_all_tasks raised")
+            try:
+                await asyncio.wait({self._flow_task}, timeout=3.0)
+            except Exception:
+                pass
+
+        # Run the save flow as a new task; it manages its own lifecycle.
+        save_task = asyncio.create_task(
+            flow._trigger_save_session(log_file=log_file),
+            name=f"handq-gep-save-{int(time.time())}",
+        )
+        # Bind the bridge's flow_task slot so subsequent gep_save / new_session
+        # calls see "task running" until the save flow concludes.
+        self._flow_task = save_task
+
+        _emit({"type": "final", "id": msg_id,
+               "result": {"started": True}},
+              gen=self._generation)
+        logger.info("gep_save: started save-session flow id=%s log_file=%s",
+                    msg_id, log_file)
 
     async def _do_new_session(
         self, msg_id: Optional[str], *, _suppress_final: bool = False,
@@ -2085,12 +2317,24 @@ class StdioBridge:
         reader.start()
         logger.info("event loop online; awaiting messages")
 
+        first_msg_seen = False
         while True:
             msg = await self._inbox.get()
             if msg is None:
                 # stdin EOF — exit cleanly.
                 logger.info("inbox sentinel received; exiting main loop")
                 break
+            if not first_msg_seen:
+                first_msg_seen = True
+                # First inbound envelope confirms the renderer→bridge IPC
+                # path is fully alive in BOTH directions (renderer wrote,
+                # we read). Logging this explicitly turns "is the bridge
+                # listening?" from a guess into a grep-able fact.
+                logger.info(
+                    "first IPC envelope received: type=%s id=%s",
+                    msg.get("type") if isinstance(msg, dict) else type(msg).__name__,
+                    msg.get("id") if isinstance(msg, dict) else None,
+                )
             try:
                 await self._handle(msg)
             except Exception as exc:
@@ -2108,7 +2352,9 @@ async def run() -> None:
     config_path = os.environ.get("HANDQ_CONFIG", DEFAULT_CONFIG_PATH)
     logger.info("StdioBridge.run() entry; config=%s", config_path)
     try:
-        await StdioBridge(config_path=config_path).run()
+        bridge = StdioBridge(config_path=config_path)
+        logger.info("StdioBridge constructed; starting main loop")
+        await bridge.run()
     except Exception:
         logger.exception("StdioBridge.run() raised")
         raise

@@ -19,6 +19,7 @@ JSON parsing / repair lives in ``Plan.from_data()`` and
 
 """
 import json
+import socket
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, AsyncGenerator, Callable, Literal, Optional
@@ -295,7 +296,7 @@ class LLMService(ABC):
         Adapters should raise immediately without retrying.
         """
         try:
-            
+
             if isinstance(error, _anthropic.BadRequestError):
                 return True
             if isinstance(error, _anthropic.AuthenticationError):
@@ -314,4 +315,103 @@ class LLMService(ABC):
             if f"http_status={code}" in error_str or f"status code: {code}" in error_str:
                 return True
         return False
+
+    def _is_likely_network_error(self, error: Exception) -> bool:
+        """Return ``True`` for errors that smell like local connectivity loss.
+
+        Cannot distinguish "PC offline" from "remote host unreachable" on
+        its own — the LLM-pool probe in
+        :mod:`~.llm_pool` makes the final call by TCP-connecting to the
+        configured endpoint host. This classifier is just the gate that
+        decides whether probing is worth doing.
+
+        Excluded by design: 4xx client errors (handled by
+        :meth:`_is_client_error`) and prompt-too-long errors (handled by
+        :meth:`_is_prompt_too_long_error`). Both indicate the request
+        itself is wrong, so retrying after network recovery is pointless.
+        """
+        # Defer to the existing classifiers first — they win even if the
+        # error string also happens to mention "timeout" etc.
+        if self._is_client_error(error):
+            return False
+        if self._is_prompt_too_long_error(error):
+            return False
+
+        # Anthropic SDK connection errors.
+        try:
+            if isinstance(error, _anthropic.APIConnectionError):
+                return True
+            _ApiTimeout = getattr(_anthropic, "APITimeoutError", None)
+            if _ApiTimeout is not None and isinstance(error, _ApiTimeout):
+                return True
+        except Exception:
+            pass
+
+        # httpx connection errors (the underlying transport for anthropic SDK).
+        try:
+            import httpx  # noqa: PLC0415
+            if isinstance(error, (
+                httpx.ConnectError,
+                httpx.ConnectTimeout,
+                httpx.ReadTimeout,
+                httpx.WriteTimeout,
+                httpx.PoolTimeout,
+                httpx.NetworkError,
+                httpx.RemoteProtocolError,
+            )):
+                return True
+        except ImportError:
+            pass
+
+        # Builtin / stdlib errors.
+        if isinstance(error, (
+            ConnectionError,
+            ConnectionResetError,
+            ConnectionRefusedError,
+            ConnectionAbortedError,
+            TimeoutError,
+            socket.gaierror,
+            socket.timeout,
+        )):
+            return True
+        # Last-resort OSError catch — narrower than including all OSErrors,
+        # check errno for known network values.
+        if isinstance(error, OSError):
+            _network_errnos = {
+                # POSIX
+                101,  # ENETUNREACH
+                110,  # ETIMEDOUT
+                111,  # ECONNREFUSED
+                104,  # ECONNRESET
+                113,  # EHOSTUNREACH
+                # Windows WinError equivalents
+                10051,  # WSAENETUNREACH
+                10060,  # WSAETIMEDOUT
+                10061,  # WSAECONNREFUSED
+                10054,  # WSAECONNRESET
+                10065,  # WSAEHOSTUNREACH
+                11001,  # WSAHOST_NOT_FOUND
+            }
+            if error.errno in _network_errnos:
+                return True
+
+        # String fallback for adapters that wrap exceptions in RuntimeError etc.
+        error_str = str(error).lower()
+        network_strs = (
+            "connection refused",
+            "connection reset",
+            "connection aborted",
+            "name or service not known",
+            "temporary failure in name resolution",
+            "getaddrinfo failed",
+            "no route to host",
+            "network is unreachable",
+            "network unreachable",
+            "host unreachable",
+            "timed out",
+            "read timeout",
+            "connect timeout",
+            "remote end closed connection",
+        )
+        return any(s in error_str for s in network_strs)
 

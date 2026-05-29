@@ -6,6 +6,12 @@ Usage (from Electron main.js):
 import io
 import os
 import sys
+import time
+
+# Wall-clock origin for boot-progress timing. Set as early as possible so
+# every phase counter measures elapsed time from the moment the entry
+# script starts running, not from logger init or import completion.
+_BOOT_T0 = time.monotonic()
 
 # Reserve the real stdin/stdout for the JSON IPC channel BEFORE any other
 # module can grab them:
@@ -37,6 +43,57 @@ sys.stdin = io.TextIOWrapper(
 )
 os.environ["HANDQ_BRIDGE_STDOUT_FD"] = str(_real_stdout_fd)
 os.environ["HANDQ_BRIDGE_STDIN_FD"] = str(_real_stdin_fd)
+
+# ---------------------------------------------------------------------------
+# Boot-progress emitter.
+#
+# A minimal, dependency-free JSON-line writer that drops envelopes onto the
+# real (dup'd) stdout fd so the Electron renderer can show "Starting…"
+# progress BEFORE the heavy src/* imports complete and stdio_bridge claims
+# the channel.
+#
+# Why json by hand and not json.dumps? We want zero runtime cost and zero
+# imports beyond what the interpreter has already loaded. json IS a stdlib
+# module and is essentially free, so we do use it — but we deliberately
+# avoid importing ANY src/* code. The whole point is that this works during
+# the import phase that we are trying to measure.
+#
+# Wire format matches stdio_bridge's status envelopes so the renderer can
+# treat boot_progress like any other status event:
+#   {"type":"status","kind":"boot_progress","phase":"<name>","elapsed_ms":<int>, ...}
+#
+# Failure modes (broken pipe, fd already closed, encoding error, …) are
+# all swallowed: boot progress is purely advisory, never a blocker.
+# ---------------------------------------------------------------------------
+import json as _json  # noqa: E402  — std-lib, tiny, only used by emitter
+
+
+def _boot_elapsed_ms() -> int:
+    return int((time.monotonic() - _BOOT_T0) * 1000)
+
+
+def _emit_boot_progress(phase: str, **fields: object) -> None:
+    """Write a single JSON line to the real stdout fd.
+
+    Safe to call before logging is configured. Never raises.
+    """
+    try:
+        envelope = {
+            "type": "status",
+            "kind": "boot_progress",
+            "phase": phase,
+            "elapsed_ms": _boot_elapsed_ms(),
+        }
+        if fields:
+            for k, v in fields.items():
+                envelope[k] = v
+        line = _json.dumps(envelope, ensure_ascii=False, default=str) + "\n"
+        os.write(_real_stdout_fd, line.encode("utf-8", errors="replace"))
+    except Exception:
+        pass
+
+
+_emit_boot_progress("fd_setup_done")
 
 # Make 'src' importable when this script is launched from the project root.
 _ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -95,22 +152,24 @@ def _resolve_config_path() -> str:
 def _ensure_user_config_present() -> None:
     """First-run: copy the shipped default to %USERPROFILE%\\HandQ\\.
 
-    Frozen-only: in dev mode the install dir IS the repo root, so a
-    copy here would create a parallel user file that silently shadows
-    the dev's repo-side edits (priority 2 beats priority 3 in
-    _resolve_config_path). Skipping the copy in dev keeps `python
-    bridge_main.py` reading the repo yaml directly. A dev who wants
-    packaged-style behaviour can `set HANDQ_CONFIG=...` (priority 1)
-    or hand-create the user copy.
+    Per ARCHITECTURE.md §1.5 / §2 the **Windows dev/prod data layout is
+    unified** under ``%USERPROFILE%\\HandQ\\`` — that includes the config
+    file. So on Windows we always run, regardless of frozen state: a dev
+    install gets the same per-user config seed as a packaged build, the
+    repo's ``handq_config.yaml`` is treated as a ship-default source only.
+
+    On **Linux/macOS** there is no equivalent user-root convention: every
+    runtime artifact (including config) stays under ``install_dir``, so
+    we skip the copy and let ``_resolve_config_path`` use the install
+    file directly.
 
     Best-effort: failures (perms / disk / AV lock) are swallowed —
-    _resolve_config_path falls back to the install default and the
+    ``_resolve_config_path`` falls back to the install default and the
     bridge still boots; we just won't have a writable user copy yet.
     The boot logger is not yet configured at this point in the file,
     so there's nowhere useful to log a copy failure.
     """
-    is_frozen = getattr(sys, "frozen", False) or "__compiled__" in globals()
-    if not is_frozen:
+    if sys.platform != "win32":
         return
     user_root = _user_handq_root()
     user_cfg = os.path.join(user_root, "handq_config.yaml")
@@ -130,6 +189,13 @@ def _ensure_user_config_present() -> None:
 _ensure_user_config_present()
 _HANDQ_CONFIG = _resolve_config_path()
 os.environ["HANDQ_CONFIG"] = _HANDQ_CONFIG
+_emit_boot_progress(
+    "config_resolved",
+    config_path=_HANDQ_CONFIG,
+    config_exists=os.path.exists(_HANDQ_CONFIG),
+    install_dir=_INSTALL_DIR,
+    frozen=bool(getattr(sys, "frozen", False) or "__compiled__" in globals()),
+)
 
 # ---------------------------------------------------------------------------
 # Logging bootstrap — MUST happen before any src/ import so that module-level
@@ -223,17 +289,26 @@ def _set_hidden_on_windows(path: Path) -> None:
 
 _env_log_dir = os.environ.get("HANDQ_LOG_DIR")
 if _env_log_dir:
+    # Electron (or another launcher) already created the per-launch dir and
+    # told us where it is via env. Use it verbatim.
     _LOG_DIR = Path(_env_log_dir)
     _LOG_BASE = _LOG_DIR.parent
 else:
-    _is_frozen_at_log_init = (
-        getattr(sys, "frozen", False) or "__compiled__" in globals()
-    )
-    if _is_frozen_at_log_init:
+    # Per-platform default — independent of dev vs frozen so behaviour is
+    # consistent across both modes:
+    #   * Windows           — %USERPROFILE%\HandQ\logs\<TS>\
+    #     (per ARCHITECTURE.md §1.5: every user-owned HandQ artifact lives
+    #     under %USERPROFILE%\HandQ\, including dev-mode logs).
+    #   * Linux / macOS     — <install_dir>/logs/<TS>\
+    #     (install_dir = parent of sys.executable for frozen builds, repo
+    #     root in dev). No equivalent "user root" convention on these
+    #     platforms; co-locating with the bridge keeps everything self-
+    #     contained. The dev-mode "logs next to source" behaviour falls
+    #     out of this for free since install_dir == repo root.
+    if sys.platform == "win32":
         _LOG_BASE = _user_log_root()
     else:
-        # Dev mode: keep logs next to source for easy inspection.
-        _LOG_BASE = Path(_ROOT) / "logs"
+        _LOG_BASE = Path(_INSTALL_DIR) / "logs"
     _LOG_DIR = _LOG_BASE / datetime.now().strftime("%Y%m%d-%H%M%S")
 _LOG_BASE.mkdir(parents=True, exist_ok=True)
 _LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -270,6 +345,8 @@ logging.basicConfig(
     format=_LOG_FMT,
     handlers=[_stderr_handler, _file_handler],
 )
+
+_emit_boot_progress("logging_ready", log_dir=str(_LOG_DIR))
 
 # ---------------------------------------------------------------------------
 # Internal-trace log (LTM / activity / scheduler).
@@ -356,12 +433,61 @@ if sys.platform != "win32":
     )
 
 import asyncio  # noqa: E402
-from src.bridge import stdio_bridge  # noqa: E402
-from src.infrastructure.long_term_memory import LongTermMemory  # noqa: E402
-from src.infrastructure.personality import PersonalityMonitor  # noqa: E402
-from src.infrastructure.scheduler import Scheduler  # noqa: E402
 
-_boot_logger.info("import phase complete; src.bridge.stdio_bridge loaded")
+
+def _timed_import(label: str, do_import):
+    """Run a single import call wrapped in wall-clock timing.
+
+    Emits both a structured log line AND a boot_progress envelope so the
+    renderer can show "Importing scheduler…" while it happens. Re-raises
+    on failure so the original ImportError surfaces to the user.
+    """
+    _t = time.monotonic()
+    _emit_boot_progress("importing", module=label)
+    _boot_logger.info("importing %s …", label)
+    try:
+        result = do_import()
+    except BaseException as exc:
+        _boot_logger.exception("import failed: %s", label)
+        _emit_boot_progress("import_failed", module=label, error=str(exc))
+        raise
+    elapsed_ms = int((time.monotonic() - _t) * 1000)
+    _boot_logger.info("imported %s (took %dms)", label, elapsed_ms)
+    _emit_boot_progress("imported", module=label, took_ms=elapsed_ms)
+    return result
+
+
+def _import_stdio_bridge():
+    from src.bridge import stdio_bridge as _m
+    return _m
+
+
+def _import_long_term_memory():
+    from src.infrastructure.long_term_memory import LongTermMemory as _m
+    return _m
+
+
+def _import_personality_monitor():
+    from src.infrastructure.personality import PersonalityMonitor as _m
+    return _m
+
+
+def _import_scheduler():
+    from src.infrastructure.scheduler import Scheduler as _m
+    return _m
+
+
+_imports_t0 = time.monotonic()
+stdio_bridge = _timed_import("src.bridge.stdio_bridge", _import_stdio_bridge)
+LongTermMemory = _timed_import(
+    "src.infrastructure.long_term_memory", _import_long_term_memory)
+PersonalityMonitor = _timed_import(
+    "src.infrastructure.personality", _import_personality_monitor)
+Scheduler = _timed_import(
+    "src.infrastructure.scheduler", _import_scheduler)
+_imports_total_ms = int((time.monotonic() - _imports_t0) * 1000)
+_boot_logger.info("import phase complete (took %dms total)", _imports_total_ms)
+_emit_boot_progress("imports_done", took_ms=_imports_total_ms)
 
 
 async def _run_with_long_term_memory() -> None:
@@ -391,7 +517,17 @@ async def _run_with_long_term_memory() -> None:
     db_path = personality_root / "memory.db"
 
     config_path = Path(_HANDQ_CONFIG)
-    ltm = await LongTermMemory.init(db_path=db_path, config_path=config_path)
+    _emit_boot_progress("ltm_init_start", db_path=str(db_path))
+    _t_ltm = time.monotonic()
+    try:
+        ltm = await LongTermMemory.init(db_path=db_path, config_path=config_path)
+    except BaseException as exc:
+        _emit_boot_progress("ltm_init_failed", error=str(exc))
+        raise
+    _ltm_ms = int((time.monotonic() - _t_ltm) * 1000)
+    _boot_logger.info("LongTermMemory.init took %dms (db=%s)",
+                      _ltm_ms, db_path)
+    _emit_boot_progress("ltm_init_done", took_ms=_ltm_ms)
 
     # ── PersonalityMonitor ────────────────────────────────────────────────
     # screenshot_root = personality_root; the monitor's ScreenshotStore
@@ -404,12 +540,19 @@ async def _run_with_long_term_memory() -> None:
         screenshot_root=str(personality_root),
         config_path=config_path,
     )
+    _emit_boot_progress("personality_start_start")
+    _t_pers = time.monotonic()
     try:
         await personality.start()
     except Exception:
         _boot_logger.exception(
             "PersonalityMonitor.start failed; continuing without personality capture",
         )
+        _emit_boot_progress("personality_start_failed")
+    else:
+        _pers_ms = int((time.monotonic() - _t_pers) * 1000)
+        _boot_logger.info("PersonalityMonitor.start took %dms", _pers_ms)
+        _emit_boot_progress("personality_start_done", took_ms=_pers_ms)
 
     # ── Scheduler ─────────────────────────────────────────────────────────
     sched_path = user_root / "scheduled_tasks.json"
@@ -422,10 +565,17 @@ async def _run_with_long_term_memory() -> None:
         return await stdio_bridge.dispatch_scheduled_task(task)
 
     scheduler = Scheduler(store_path=sched_path, dispatch=_dispatch_via_bridge)
+    _emit_boot_progress("scheduler_start_start", store_path=str(sched_path))
+    _t_sched = time.monotonic()
     try:
         await scheduler.start()
     except Exception:
         _boot_logger.exception("Scheduler.start failed; continuing without scheduler")
+        _emit_boot_progress("scheduler_start_failed")
+    else:
+        _sched_ms = int((time.monotonic() - _t_sched) * 1000)
+        _boot_logger.info("Scheduler.start took %dms", _sched_ms)
+        _emit_boot_progress("scheduler_start_done", took_ms=_sched_ms)
 
     # Plug both services into the bridge module so its IPC handlers
     # can call them. We assign before stdio_bridge.run() so the
@@ -441,6 +591,11 @@ async def _run_with_long_term_memory() -> None:
     # touching .git/hooks/ keeps the launch path side-effect-free.
 
     try:
+        _boot_logger.info(
+            "all subsystems initialised; entering stdio loop "
+            "(total boot %dms)", _boot_elapsed_ms(),
+        )
+        _emit_boot_progress("stdio_loop_ready")
         await stdio_bridge.run()
     finally:
         try:

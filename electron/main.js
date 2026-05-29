@@ -14,7 +14,7 @@
 
 'use strict';
 
-const { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, globalShortcut, Notification } = require('electron');
+const { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, globalShortcut, Notification, dialog } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const { spawn } = require('child_process');
@@ -79,25 +79,36 @@ function computeLaunchTimestamp() {
 }
 
 const LAUNCH_TS = computeLaunchTimestamp();
-// Log layout (see ARCHITECTURE.md §3):
-//   * Dev mode  -> <repo>/logs/<TS>/   (kept under repo for easy inspection)
-//   * Packaged  -> %USERPROFILE%\HandQ\logs\<TS>\
+// Log layout (see ARCHITECTURE.md §3 + bridge_main.py:_LOG_BASE):
+//   * Windows (any mode)         -> %USERPROFILE%\HandQ\logs\<TS>\
+//   * Linux/macOS, packaged      -> <install_dir>/logs/<TS>\
+//   * Linux/macOS, dev           -> <repo>/logs/<TS>\
 //
-// Logs live under the user's HandQ root (alongside config, History, and
-// personality data) so the user has a single place to find every artifact
-// HandQ owns about them. The diag tree sits at logs\.dia\ as a hidden
-// subdirectory (bridge_main.py applies the NTFS hidden attribute).
+// Per ARCHITECTURE.md §1.5, every user-owned HandQ artifact on Windows
+// belongs under %USERPROFILE%\HandQ\, alongside config, History, and
+// personality. This now applies in dev mode too so the path matches the
+// architecture independently of how Electron was launched. Linux/macOS
+// have no equivalent "user root" convention; co-locating with the bridge
+// install keeps everything self-contained — same dir as the bridge exe.
+// The diag tree sits at logs\.dia\ as a hidden subdirectory (bridge_main.py
+// applies the NTFS hidden attribute on Windows).
 // bridge_main._prune_old_log_dirs keeps only the most recent 30 launch
 // directories so this does not grow without bound.
-function packagedLogBase() {
-    const userProfile =
-        process.env.USERPROFILE ||
-        app.getPath('home');
-    return path.join(userProfile, 'HandQ', 'logs');
+function platformLogBase() {
+    if (process.platform === 'win32') {
+        const userProfile =
+            process.env.USERPROFILE ||
+            app.getPath('home');
+        return path.join(userProfile, 'HandQ', 'logs');
+    }
+    // Linux / macOS — install dir for packaged, repo root for dev (they
+    // are the same directory in dev: REPO_ROOT).
+    if (app.isPackaged) {
+        return path.join(path.dirname(app.getPath('exe')), 'logs');
+    }
+    return path.join(REPO_ROOT, 'logs');
 }
-const LOG_BASE = app.isPackaged
-    ? packagedLogBase()
-    : path.join(REPO_ROOT, 'logs');
+const LOG_BASE = platformLogBase();
 const LOG_DIR = path.join(LOG_BASE, LAUNCH_TS);
 try {
     fs.mkdirSync(LOG_DIR, { recursive: true });
@@ -1035,6 +1046,34 @@ ipcMain.handle('hotkey:set', (_event, accelerator) => {
     // Restore previous hotkey on failure.
     registerHotkey(currentHotkey);
     return { success: false, hotkey: currentHotkey, error: 'Failed to register shortcut. It may be in use by another application.' };
+});
+
+// --- "Load history" file picker for the Templates panel -------------------
+// Default path: %USERPROFILE%\HandQ\History\ (Windows) or ~/HandQ/History
+// elsewhere — same root the bridge writes session History under, so the
+// picker lands the user on the dir they're already familiar with. Filters
+// to *.log + *.json so the user sees both raw plan logs and the cleaned
+// execution_summary.json that `_trigger_save_session` produces.
+function defaultHistoryDir() {
+    const home = process.env.USERPROFILE || app.getPath('home');
+    return path.join(home, 'HandQ', 'History');
+}
+
+ipcMain.handle('dialog:pickHistoryLog', async () => {
+    const owner = BrowserWindow.getFocusedWindow() || mainWindow || null;
+    const result = await dialog.showOpenDialog(owner, {
+        title: 'Select session log to import',
+        defaultPath: defaultHistoryDir(),
+        properties: ['openFile'],
+        filters: [
+            { name: 'Session logs', extensions: ['log', 'json'] },
+            { name: 'All files',    extensions: ['*'] },
+        ],
+    });
+    if (result.canceled || !result.filePaths || !result.filePaths.length) {
+        return { canceled: true, path: null };
+    }
+    return { canceled: false, path: result.filePaths[0] };
 });
 
 // --- graceful shutdown -----------------------------------------------------

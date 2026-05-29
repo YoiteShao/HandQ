@@ -1,36 +1,54 @@
 """
-LLM Pool utilities — stateless per-call fallback for prioritised model lists.
+LLM Pool utilities — fallback for prioritised model lists with built-in
+local-network outage handling.
 
 Design
 ------
-Each component (Planner, Receptionist, RuntimeAgent) receives a *pre-sliced*
-list of LLMService instances.  The slice defines the allowed model range for
-that component/function.  Within a single call, services are tried in order
-(index 0 = highest priority); if one fails the next is tried.  There is no
-cross-call state — every call starts fresh from index 0.
+Each component (Planner, Receptionist, RuntimeAgent, …) receives a
+*pre-sliced* list of LLMService instances.  Within a single call,
+services are tried in order (index 0 = highest priority); if one fails
+the next is tried.  When **every** service in the slice fails AND the
+last error looks like a connectivity failure, the pool runs a single TCP
+probe to the LLM endpoint host and chooses one of two outcomes:
 
-All LLM calls go through streaming (chat_stream) internally.  call_with_fallback
-collects the stream into a LLMChatResult transparently; call_with_fallback_stream
-exposes the raw event stream to the caller.
+  • Probe succeeds → external service issue.  Re-raise the underlying
+    error unchanged so the caller fails fast.
+
+  • Probe fails → local network is down.  Two policies:
+
+      ``wait_on_network_down=True`` (default) — Pause and reprobe on a
+      triangular cycle (30s, 300s, 600s, 1800s, 3600s, 1800s, 600s,
+      300s, 30s, then repeat). When the host comes back, retry the
+      original call from ``services[0]``. Used by long-running roles
+      (Planner, Agent, background workers).
+      :class:`asyncio.CancelledError` propagates through the wait, so
+      cancelling the asyncio task (e.g. when the user starts a fresh
+      session) ends the wait cleanly.
+
+      ``wait_on_network_down=False`` — Raise
+      :class:`NetworkUnavailableError` immediately so the caller can
+      fail fast.  Used by Receptionist, where the user is staring at the
+      cursor and indefinite waiting would be worse than skipping.
+
+Probe state (cache + lock + last reachability) is module-level so
+concurrent callers across roles share the same view of network health.
+``is_network_down()`` exposes the most-recent probe result for callers
+that want to short-circuit before even trying the LLM.
 
 Public API
 ----------
-call_with_fallback(services, chat_kwargs, on_fallback=None)
-    Async helper that tries each service in order and returns the first
-    successful LLMChatResult.  Raises the last exception if all fail.
-    Internally uses chat_stream(); fallback happens before the stream starts.
-
-call_with_fallback_stream(services, chat_kwargs, on_fallback=None)
-    Async generator that tries each service in order and yields stream events
-    from the first service whose chat_stream() call succeeds.  Fallback only
-    happens before the stream starts; mid-stream errors propagate to the caller.
-
-make_from_data_services(all_services)
-    Build the from_data slice: index 2+ if available, else last model only.
-    Used for Plan.from_data / Decision.from_data which must never use the
-    top-priority models (index 0 or 1).
+``call_with_fallback(services, chat_kwargs, on_fallback=None, *,
+                     wait_on_network_down=True, on_network_event=None)``
+``call_with_fallback_stream(services, chat_kwargs, on_fallback=None, *,
+                            wait_on_network_down=True, on_network_event=None)``
+``is_network_down() -> bool``
+``NetworkUnavailableError``
+``make_from_data_services(all_services)``
 """
-from typing import Any, AsyncGenerator, Callable, List, Optional
+import asyncio
+import time
+from typing import Any, AsyncGenerator, Callable, List, Optional, Tuple
+from urllib.parse import urlparse
 
 from .llm_service import LLMChatResult, LLMService
 from .logger import get_logger
@@ -38,37 +56,248 @@ from .logger import get_logger
 _logger = get_logger()
 
 
-async def call_with_fallback(
+class NetworkUnavailableError(Exception):
+    """Raised by ``call_with_fallback*`` when the LLM endpoint host is
+    unreachable AND the caller passed ``wait_on_network_down=False``.
+
+    The original LLM error is preserved on ``__cause__`` so callers can
+    surface diagnostic detail.  Callers that pass the default
+    ``wait_on_network_down=True`` will never observe this exception —
+    the wrapper waits forever instead.
+    """
+
+
+# ── Network probe (shared state across all callers) ─────────────────────────
+#
+# Probe target = (host, port) parsed from services[0]._base_url.  All
+# services in a single call list typically share the same host (e.g. one
+# QGenie gateway proxying many models), so we just probe whichever target
+# the first service exposes.
+
+_PROBE_TIMEOUT: float = 1.0      # per-attempt TCP connect timeout
+_PROBE_TTL: float = 5.0          # cache TTL — coalesces probe storms
+
+# Wait schedule used by ``_wait_for_network``.
+#
+# A single triangular cycle that climbs from short to long and back
+# down: 30s → 300s → 600s → 1800s → 3600s → 1800s → 600s → 300s → 30s,
+# then repeats forever. Each cycle ≈ 2h31m of wall-clock waiting.
+#
+# Why triangular instead of monotone exponential?
+#   • The descending half re-introduces short probes within every cycle,
+#     so the *average* recovery-detection latency stays low even during
+#     a multi-hour outage.
+#   • Adjacent 30s probes at the wraparound (end of one cycle / start of
+#     the next) give a quick cluster of checks every ~2.5h to catch a
+#     network that came back during the long-wait phase.
+#
+# Probe count over a sustained 24h outage: ~9.5 cycles × 9 probes ≈ 85,
+# total TCP work ≈ 85s.  Negligible.
+
+_WAIT_CYCLE: List[int] = [30, 300, 600, 1800, 3600, 1800, 600, 300, 30]
+
+_probe_lock: asyncio.Lock = asyncio.Lock()
+_probe_status: Optional[bool] = None    # None = not probed yet, True = up, False = down
+_probe_at: float = 0.0
+
+
+def is_network_down() -> bool:
+    """Return ``True`` iff the most recent probe failed.
+
+    Returns ``False`` before any probe has run, so callers don't get
+    false negatives during cold start.  The InteractionManager queries
+    this to decide whether to invoke the receptionist at all when a new
+    user message arrives — short-circuiting saves ~the SDK's per-service
+    timeout (multiple seconds) per failed evaluation.
+    """
+    return _probe_status is False
+
+
+def _service_target(services: List[LLMService]) -> Optional[Tuple[str, int]]:
+    """Pick a (host, port) probe target from the first service's base_url.
+
+    Returns None when no service exposes ``_base_url`` — in that case the
+    pool can't tell whether the network is down, so it falls back to the
+    pre-existing "raise the last exception" behaviour.
+    """
+    for s in services:
+        url = getattr(s, "_base_url", None)
+        if not url:
+            continue
+        try:
+            parsed = urlparse(url if "://" in url else f"https://{url}")
+        except Exception:
+            continue
+        host = parsed.hostname
+        if not host:
+            continue
+        port = parsed.port or (443 if parsed.scheme != "http" else 80)
+        return host, port
+    return None
+
+
+async def _probe(target: Tuple[str, int], *, force: bool = False) -> bool:
+    """Return True iff *target* accepts a TCP connection.
+
+    The result is cached across callers for ``_PROBE_TTL`` seconds — a
+    receptionist call and an agent call hitting the same outage at the
+    same instant share one probe rather than racing.  ``force=True``
+    bypasses the cache, used by the wait loop so each retry round gets a
+    fresh reading.
+    """
+    global _probe_status, _probe_at
+    async with _probe_lock:
+        now = time.monotonic()
+        if (
+            not force
+            and _probe_status is not None
+            and (now - _probe_at) < _PROBE_TTL
+        ):
+            return _probe_status
+
+        host, port = target
+        ok = False
+        writer = None
+        try:
+            _, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port),
+                timeout=_PROBE_TIMEOUT,
+            )
+            ok = True
+        except Exception:
+            ok = False
+        finally:
+            if writer is not None:
+                try:
+                    writer.close()
+                    try:
+                        await writer.wait_closed()
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
+        _probe_status = ok
+        _probe_at = now
+        if not ok:
+            _logger.warning(
+                f"llm_pool probe FAILED: {host}:{port} unreachable",
+                component="llm_pool",
+            )
+        return ok
+
+
+def _emit_network_event(
+    cb: Optional[Callable[[str, int, int], None]],
+    state: str,
+    attempt: int,
+    sleep_secs: int,
+) -> None:
+    """Invoke *cb* defensively — UI hooks must never abort the retry loop."""
+    if cb is None:
+        return
+    try:
+        cb(state, attempt, sleep_secs)
+    except Exception:
+        _logger.debug(
+            f"on_network_event callback raised for state={state!r}; ignoring",
+            component="llm_pool",
+        )
+
+
+async def _wait_for_network(
+    target: Tuple[str, int],
+    *,
+    on_network_event: Optional[Callable[[str, int, int], None]],
+) -> None:
+    """Block until *target* is reachable, walking ``_WAIT_CYCLE`` forever.
+
+    Each cycle climbs short → long → short
+    (30s, 300s, 600s, 1800s, 3600s, 1800s, 600s, 300s, 30s) so the
+    descending half periodically re-introduces fast probes — recovery
+    detection stays bounded even during multi-hour outages.
+
+    :class:`asyncio.CancelledError` propagates through ``asyncio.sleep``,
+    so cancelling the task (e.g. ``:new`` tearing down the old
+    FlowController) ends the wait cleanly without any explicit interrupt
+    mechanism.
+    """
+    attempt = 0
+    while True:
+        for interval in _WAIT_CYCLE:
+            attempt += 1
+            _emit_network_event(on_network_event, "waiting", attempt, interval)
+            await asyncio.sleep(interval)
+            if await _probe(target, force=True):
+                return
+
+
+def _is_network_error(services: List[LLMService], exc: BaseException) -> bool:
+    """True iff the first service classifies *exc* as a connectivity failure.
+
+    ``_is_likely_network_error`` is defined on the base class and identical
+    across adapters, so picking the first service is sufficient.
+    """
+    if not services:
+        return False
+    return services[0]._is_likely_network_error(exc)
+
+
+async def _handle_network_failure(
+    services: List[LLMService],
+    exc: BaseException,
+    *,
+    wait_on_network_down: bool,
+    on_network_event: Optional[Callable[[str, int, int], None]],
+) -> None:
+    """Run the probe-and-(maybe-wait) sequence after fallback exhausted.
+
+    Returns when the caller should retry from ``services[0]``.  Raises
+    in every other case (wrong error class, no probe target, network is
+    fine but service-side failed, or wait was disabled and network is
+    down).
+    """
+    if not _is_network_error(services, exc):
+        raise exc
+    target = _service_target(services)
+    if target is None:
+        # No way to distinguish local outage from service outage — fail
+        # fast as the original wrapper would.
+        raise exc
+    # Use the cached probe (5s TTL) here so a stampede of N concurrent
+    # callers all hitting the same outage shares ONE TCP probe rather
+    # than launching N. Within the wait loop below we deliberately
+    # force=True per round because each round IS the next observation.
+    if await _probe(target):
+        # Local network reachable → service-side problem; waiting won't help.
+        raise exc
+
+    _logger.warning(
+        f"llm_pool: local network appears down ({type(exc).__name__})",
+        component="llm_pool",
+    )
+    _emit_network_event(on_network_event, "down", 0, 0)
+
+    if not wait_on_network_down:
+        raise NetworkUnavailableError(
+            "Local network unavailable (LLM endpoint unreachable)"
+        ) from exc
+
+    await _wait_for_network(target, on_network_event=on_network_event)
+    _logger.info("llm_pool: network restored, retrying", component="llm_pool")
+    _emit_network_event(on_network_event, "restored", 0, 0)
+
+
+# ── Fallback wrappers ───────────────────────────────────────────────────────
+
+
+async def _try_all_services(
     services: List[LLMService],
     chat_kwargs: dict,
-    on_fallback: Optional[Callable[[int, Exception], None]] = None,
+    on_fallback: Optional[Callable[[int, Exception], None]],
 ) -> LLMChatResult:
-    """
-    Try each LLM service in order; return the first successful LLMChatResult.
-
-    Internally opens a stream via chat_stream() and collects the result.
-    Fallback only happens before the stream starts — if chat_stream() raises
-    before yielding any event, the next service is tried.  Mid-stream errors
-    propagate immediately.
-
-    Args:
-        services:     Pre-sliced list of LLM services (index 0 = highest priority).
-        chat_kwargs:  Keyword arguments forwarded verbatim to service.chat_stream().
-        on_fallback:  Optional callback invoked as on_fallback(next_index, error)
-                      just before advancing to the next service.
-
-    Returns:
-        LLMChatResult from the first service that succeeds.
-
-    Raises:
-        The last exception raised if every service in the list fails.
-        ValueError if *services* is empty.
-
-    Fast-fail behaviour:
-        If a service raises a non-retryable client error (4xx), the exception is
-        re-raised immediately without trying remaining services.  Prompt-too-long
-        errors are NOT fast-failed here; they fall through to normal fallback so
-        that a service with a larger context window can still succeed.
+    """One pass through every service.  Returns the first success;
+    raises the last error on full exhaustion; fast-fails on 4xx.
     """
     from .anthropic_streaming_service import StreamDoneEvent  # noqa: PLC0415
 
@@ -79,7 +308,8 @@ async def call_with_fallback(
     for i, service in enumerate(services):
         if service._exhausted:
             _logger.debug(
-                f"call_with_fallback: skipping session-exhausted service index {i} ({service.model})"
+                f"call_with_fallback: skipping session-exhausted service "
+                f"index {i} ({service.model})"
             )
             continue
         try:
@@ -92,117 +322,161 @@ async def call_with_fallback(
             return result
         except Exception as exc:
             last_exc = exc
-
-            # Non-retryable 4xx client error: re-raise immediately.
             if service._is_client_error(exc):
                 _logger.warning(
-                    f"call_with_fallback: non-retryable client error from service "
-                    f"index {i}, not trying remaining services: {exc}",
-                )
-                raise
-
-            if i < len(services) - 1:
-                # More services to try — invoke callback and continue.
-                if on_fallback is not None:
-                    try:
-                        on_fallback(i + 1, exc)
-                    except Exception:
-                        pass  # never let callback errors abort the retry loop
-            else:
-                # Last service also failed — will raise below.
-                _logger.warning(
-                    f"call_with_fallback: all {len(services)} service(s) failed; "
-                    f"last error: {exc}",
-                )
-
-    # All services failed or were skipped — re-raise the last exception.
-    if last_exc is None:
-        raise RuntimeError("All configured LLM services are session-exhausted (rate limit)")
-    raise last_exc  # type: ignore[misc]
-
-
-async def call_with_fallback_stream(
-    services: List[LLMService],
-    chat_kwargs: dict,
-    on_fallback: Optional[Callable[[int, Exception], None]] = None,
-) -> AsyncGenerator[Any, None]:
-    """
-    Try each LLM service in order and yield stream events from the first that
-    successfully opens a stream.
-
-    Fallback policy
-    ---------------
-    Fallback only happens *before* the stream starts — i.e. if
-    service.chat_stream() raises before yielding any events.  Once the first
-    event has been yielded, the stream is considered "open" and any subsequent
-    error is re-raised directly to the caller.  The caller should treat such
-    mid-stream errors as observations for the next agent iteration rather than
-    retrying the same request on a different service.
-
-    Args:
-        services:     Pre-sliced list of LLM services (index 0 = highest priority).
-        chat_kwargs:  Keyword arguments forwarded verbatim to service.chat_stream().
-        on_fallback:  Optional callback invoked as on_fallback(next_index, error)
-                      just before advancing to the next service.
-
-    Yields:
-        Stream events from the first service that successfully opens a stream.
-
-    Raises:
-        The last open-stream exception if every service fails to open.
-        ValueError if *services* is empty.
-        Any mid-stream exception from the chosen service (re-raised as-is).
-    """
-    if not services:
-        raise ValueError("call_with_fallback_stream: services list is empty")
-
-    last_exc: Optional[Exception] = None
-
-    for i, service in enumerate(services):
-        if service._exhausted:
-            _logger.debug(
-                f"call_with_fallback_stream: skipping session-exhausted service index {i} ({service.model})"
-            )
-            continue
-        try:
-            gen = service.chat_stream(**chat_kwargs)
-            # Fetch the first event to confirm the stream opened successfully.
-            # If this raises, we can still fall back to the next service.
-            first_event = await gen.__anext__()
-        except StopAsyncIteration:
-            # Empty stream — treat as success with no events.
-            return
-        except Exception as exc:
-            last_exc = exc
-
-            if service._is_client_error(exc):
-                _logger.warning(
-                    f"call_with_fallback_stream: non-retryable client error from "
+                    f"call_with_fallback: non-retryable client error from "
                     f"service index {i}, not trying remaining services: {exc}",
                 )
                 raise
-
             if i < len(services) - 1:
                 if on_fallback is not None:
                     try:
                         on_fallback(i + 1, exc)
                     except Exception:
                         pass
-                continue
             else:
+                _logger.warning(
+                    f"call_with_fallback: all {len(services)} service(s) failed; "
+                    f"last error: {exc}",
+                )
+
+    if last_exc is None:
+        raise RuntimeError(
+            "All configured LLM services are session-exhausted (rate limit)"
+        )
+    raise last_exc
+
+
+async def call_with_fallback(
+    services: List[LLMService],
+    chat_kwargs: dict,
+    on_fallback: Optional[Callable[[int, Exception], None]] = None,
+    *,
+    wait_on_network_down: bool = True,
+    on_network_event: Optional[Callable[[str, int, int], None]] = None,
+) -> LLMChatResult:
+    """Try each service in order; on full network-class exhaustion, probe
+    the LLM host and either pause-retry or fail fast based on
+    ``wait_on_network_down``.
+
+    Args:
+        services:        Pre-sliced list of LLM services (priority order).
+        chat_kwargs:     Forwarded verbatim to ``service.chat_stream``.
+        on_fallback:     ``(next_index, error) -> None`` callback fired
+                         before each within-pass fallback step.
+        wait_on_network_down: When True (default), the wrapper sleeps
+                         with exponential backoff until the LLM host
+                         comes back, then retries from ``services[0]``.
+                         When False, raises
+                         :class:`NetworkUnavailableError` so the caller
+                         can short-circuit (used by Receptionist).
+        on_network_event: ``(state, attempt, sleep_secs) -> None`` UI hook
+                         where ``state ∈ {"down", "waiting", "restored"}``.
+
+    Raises:
+        :class:`NetworkUnavailableError`: only when
+            ``wait_on_network_down=False`` and the LLM host is unreachable.
+        4xx client errors: re-raised immediately without fallback.
+        The last underlying error: when failure is service-side, not
+            network-side.
+        :class:`asyncio.CancelledError`: propagates through the wait.
+    """
+    while True:
+        try:
+            return await _try_all_services(services, chat_kwargs, on_fallback)
+        except Exception as exc:
+            await _handle_network_failure(
+                services, exc,
+                wait_on_network_down=wait_on_network_down,
+                on_network_event=on_network_event,
+            )
+            # _handle_network_failure either raises or returns ("retry").
+            # loop and retry from services[0]
+
+
+async def call_with_fallback_stream(
+    services: List[LLMService],
+    chat_kwargs: dict,
+    on_fallback: Optional[Callable[[int, Exception], None]] = None,
+    *,
+    wait_on_network_down: bool = True,
+    on_network_event: Optional[Callable[[str, int, int], None]] = None,
+) -> AsyncGenerator[Any, None]:
+    """Streaming counterpart to :func:`call_with_fallback`.
+
+    Network-aware pause-retry triggers ONLY before the stream opens.
+    Once the first event has been yielded the stream is "live" and any
+    mid-stream error propagates unchanged — replaying half a stream onto
+    the caller would corrupt event ordering and token accounting.
+
+    Args/Raises mirror :func:`call_with_fallback`.
+    """
+    if not services:
+        raise ValueError("call_with_fallback_stream: services list is empty")
+
+    while True:
+        last_exc: Optional[Exception] = None
+        first_event: Any = None
+        gen = None
+
+        for i, service in enumerate(services):
+            if service._exhausted:
+                _logger.debug(
+                    f"call_with_fallback_stream: skipping session-exhausted "
+                    f"service index {i} ({service.model})"
+                )
+                continue
+            try:
+                gen = service.chat_stream(**chat_kwargs)
+                first_event = await gen.__anext__()
+            except StopAsyncIteration:
+                # Empty stream — treat as success with no events.
+                return
+            except Exception as exc:
+                last_exc = exc
+                gen = None
+                if service._is_client_error(exc):
+                    _logger.warning(
+                        f"call_with_fallback_stream: non-retryable client error "
+                        f"from service index {i}, not trying remaining services: {exc}",
+                    )
+                    raise
+                if i < len(services) - 1:
+                    if on_fallback is not None:
+                        try:
+                            on_fallback(i + 1, exc)
+                        except Exception:
+                            pass
+                    continue
                 _logger.warning(
                     f"call_with_fallback_stream: all {len(services)} service(s) "
                     f"failed to open stream; last error: {exc}",
                 )
-                raise
+                # All services failed at open — drop out of the loop so the
+                # network handler runs.
+                break
+            else:
+                # Stream opened successfully.
+                break
 
-        # Stream opened — yield first event then the rest; mid-stream errors propagate.
-        yield first_event
-        async for event in gen:
-            yield event
-        return
+        if gen is not None and first_event is not None:
+            yield first_event
+            async for event in gen:
+                yield event
+            return
 
-    raise last_exc  # type: ignore[misc]
+        # Every service failed before yielding any event.  Run the
+        # network handler; on retry, restart from services[0].
+        if last_exc is None:
+            raise RuntimeError(
+                "All configured LLM services are session-exhausted (rate limit)"
+            )
+        await _handle_network_failure(
+            services, last_exc,
+            wait_on_network_down=wait_on_network_down,
+            on_network_event=on_network_event,
+        )
+        # _handle_network_failure either raised (propagated up) or returned (retry).
 
 
 def make_from_data_services(all_services: List[LLMService]) -> List[LLMService]:

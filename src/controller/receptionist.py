@@ -28,7 +28,11 @@ from typing import Callable, Dict, List, Optional, cast
 
 from ..infrastructure.gep_template import list_templates_summary
 from ..infrastructure.json_key_streamer import JsonKeyStreamer
-from ..infrastructure.llm_pool import call_with_fallback, call_with_fallback_stream
+from ..infrastructure.llm_pool import (
+    NetworkUnavailableError,
+    call_with_fallback,
+    call_with_fallback_stream,
+)
 from ..infrastructure.llm_service import LLMChatResult, LLMService
 from ..infrastructure.long_term_memory import LongTermMemory
 from ..infrastructure.long_term_memory.candidates import submit_user_turn
@@ -59,6 +63,13 @@ class UserMessageIntent(Enum):
     Note: termination is NOT decided here.  observe_and_plan has full
     execution context and is the sole authority on whether to stop via
     Plan.should_terminate.
+
+    Note: there is intentionally no NETWORK_ERROR intent. When the LLM
+    is unreachable the receptionist's evaluate_* methods raise
+    :class:`NetworkUnavailableError`; the InteractionManager dispatcher
+    silent-skips that case so the user message is neither displayed nor
+    enqueued. The frontend shows the "server unreachable" indicator
+    based on the on_network_event signal coming from the LLM pool.
     """
     RESPOND_ONLY   = "respond_only"
     REPLAN         = "replan"
@@ -388,6 +399,13 @@ class Receptionist:
         Call the LLM with fallback and return the parsed JSON dict.
         Returns None if the response cannot be parsed as a dict.
         Raises on LLM/network errors so callers can handle the fallback path.
+
+        Passes ``wait_on_network_down=False`` so that — if the pool's TCP
+        probe confirms the LLM endpoint is unreachable — the wrapper
+        raises :class:`NetworkUnavailableError` instead of waiting.
+        Receptionist runs on the user-facing hot path; pausing
+        indefinitely would leave the user staring at a frozen cursor.
+        The InteractionManager catches the exception and silent-skips.
         """
         raw = cast(LLMChatResult, await call_with_fallback(
             self._services,
@@ -396,6 +414,7 @@ class Receptionist:
                 f"Receptionist {log_context} fallback to index {idx}: {e}",
                 component="Receptionist",
             ),
+            wait_on_network_down=False,
         ))
         parsed = try_parse_json(raw.content or "")
         return parsed if isinstance(parsed, dict) else None
@@ -410,6 +429,11 @@ class Receptionist:
         Streaming variant of _call_and_parse(). Forwards response_to_user
         chunks to on_response_chunk as they arrive, then returns the full
         parsed JSON dict.
+
+        Like :meth:`_call_and_parse`, opts OUT of pause-and-retry. A
+        ``NetworkUnavailableError`` raised before any chunk arrives
+        propagates to the caller; mid-stream errors fall through to the
+        non-streaming retry path.
         """
         streamer = JsonKeyStreamer("response_to_user")
         accumulated = []
@@ -422,6 +446,7 @@ class Receptionist:
                     f"Receptionist {log_context} stream fallback to index {idx}: {e}",
                     component="Receptionist",
                 ),
+                wait_on_network_down=False,
             ):
                 if isinstance(event, StreamTextDeltaEvent):
                     accumulated.append(event.text)
@@ -434,6 +459,11 @@ class Receptionist:
             full_text = "".join(accumulated)
             parsed = try_parse_json(full_text)
             return parsed if isinstance(parsed, dict) else None
+        except NetworkUnavailableError:
+            # Don't degrade to the non-streaming retry — that wrapper is
+            # also network-aware and will hit the same wall. Let the
+            # caller propagate this so InteractionManager can silent-skip.
+            raise
         except Exception as e:
             self.logger.warning(
                 f"Receptionist {log_context} streaming failed: {e} — falling back to non-streaming",
@@ -569,6 +599,9 @@ class Receptionist:
                     component="Receptionist",
                 )
                 return evaluation
+        except NetworkUnavailableError:
+            self._rewind_user_turn()
+            raise
         except Exception as e:
             self.logger.warning(
                 f"classify_initial_goal LLM call failed: {e} — defaulting to task",
@@ -651,6 +684,9 @@ class Receptionist:
                     component="Receptionist",
                 )
                 return evaluation
+        except NetworkUnavailableError:
+            self._rewind_user_turn()
+            raise
         except Exception as e:
             self.logger.warning(
                 f"evaluate_gep_confirmation LLM call failed: {e} — defaulting to respond_only",
@@ -748,6 +784,9 @@ class Receptionist:
                     component="Receptionist",
                 )
                 return evaluation
+        except NetworkUnavailableError:
+            self._rewind_user_turn()
+            raise
         except Exception as e:
             self.logger.warning(
                 f"evaluate_user_message LLM call failed: {e} — defaulting to REPLAN",
@@ -769,3 +808,20 @@ class Receptionist:
         if intent == UserMessageIntent.RESPOND_ONLY:
             return "Noted."
         return "Got it — I'll adjust the plan on the next cycle."
+
+    def _rewind_user_turn(self) -> None:
+        """Pop the most-recently-pushed user turn from conversation_history.
+
+        Called by evaluate_* methods when they re-raise
+        :class:`NetworkUnavailableError`: the LLM never replied, so the
+        history would otherwise be left with an orphaned user turn that
+        misaligns the user/assistant pairs assumed by
+        :meth:`_format_conversation_history`. Rewind keeps the history
+        clean so that when the network comes back the next user message
+        starts from a balanced state.
+        """
+        if (
+            self.conversation_history
+            and self.conversation_history[-1].get("role") == "user"
+        ):
+            self.conversation_history.pop()

@@ -263,3 +263,14 @@ contextBridge.exposeInMainWorld('hotkeySettings', {
         return ipcRenderer.invoke('hotkey:set', accelerator);
     },
 });
+
+// Native open-file dialog used by the Templates panel's "Load history"
+// button. Default path lands on %USERPROFILE%\HandQ\History\ (Windows) or
+// the platform-appropriate fallback resolved in main.js. Returns either
+// the absolute path the user picked, or null if they cancelled.
+contextBridge.exposeInMainWorld('handqDialog', {
+    pickHistoryLog: () => {
+        preloadLog('dialog:pickHistoryLog');
+        return ipcRenderer.invoke('dialog:pickHistoryLog');
+    },
+});

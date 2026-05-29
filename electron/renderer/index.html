@@ -11,6 +11,23 @@
 <body>
     <div class="app">
         <!-- ============================================================ -->
+        <!-- Boot overlay — covers the entire window until the bridge      -->
+        <!-- has emitted its first non-boot status event. Visible by       -->
+        <!-- default so first paint is "Starting…" instead of an empty UI. -->
+        <!-- ============================================================ -->
+        <div class="boot-overlay" id="boot-overlay" aria-live="polite">
+            <div class="boot-card">
+                <img class="boot-logo" src="../logo.png" alt="HandQ" />
+                <div class="boot-spinner" aria-hidden="true"></div>
+                <div class="boot-title" id="boot-title">Starting HandQ…</div>
+                <div class="boot-phase" id="boot-phase">launching backend</div>
+                <div class="boot-elapsed" id="boot-elapsed">0.0s</div>
+                <div class="boot-hint hidden" id="boot-hint"></div>
+                <div class="boot-error hidden" id="boot-error"></div>
+            </div>
+        </div>
+
+        <!-- ============================================================ -->
         <!-- Custom title bar (frameless window, drag region)              -->
         <!-- Windows-style controls on the right.                          -->
         <!-- ============================================================ -->
@@ -86,6 +103,11 @@
                     <span class="sc-icon" aria-hidden="true">⚙</span>
                     <span class="sc-label">Settings</span>
                 </button>
+                <button class="shortcut-btn" id="sc-templates" type="button"
+                        title="Browse saved GEP templates">
+                    <span class="sc-icon" aria-hidden="true">📋</span>
+                    <span class="sc-label">Templates</span>
+                </button>
                 <button class="shortcut-btn" id="sc-scheduler" type="button">
                     <span class="sc-icon" aria-hidden="true">⏱</span>
                     <span class="sc-label">Scheduler</span>
@@ -100,7 +122,13 @@
                         aria-haspopup="true"
                         aria-expanded="false"
                         title="Click to view recent activity">
-                    <span class="activity-dot" aria-hidden="true"></span>
+                    <span class="activity-gauge" id="activity-gauge" aria-hidden="true">
+                        <span class="ag-bar" data-level="1"></span>
+                        <span class="ag-bar" data-level="2"></span>
+                        <span class="ag-bar" data-level="3"></span>
+                        <span class="ag-bar" data-level="4"></span>
+                        <span class="ag-bar" data-level="5"></span>
+                    </span>
                     <span class="activity-current" id="activity-current">idle</span>
                     <span class="activity-chevron" aria-hidden="true">
                         <svg viewBox="0 0 10 10" aria-hidden="true">
@@ -711,6 +739,114 @@
                         <button type="submit" id="sched-create">Create</button>
                     </div>
                 </form>
+            </div>
+        </div>
+
+        <!-- ============================================================ -->
+        <!-- GEP parameters panel — opens automatically when the Receptionist -->
+        <!-- detects a matching template and the planner enters the GEP    -->
+        <!-- confirmation window.  Lets the user review template steps,    -->
+        <!-- edit per-parameter values, and confirm / skip — with a live   -->
+        <!-- countdown driven by gep_countdown status events.              -->
+        <!-- ============================================================ -->
+        <div class="overlay hidden" id="overlay-gep" aria-hidden="true">
+            <div class="overlay-card gep-card" role="dialog" aria-modal="true">
+                <header class="overlay-header">
+                    <h2>
+                        <span aria-hidden="true">📋</span>
+                        <span id="gep-title">GEP Template</span>
+                    </h2>
+                    <span class="gep-countdown-pill" id="gep-countdown">--s</span>
+                    <button type="button" class="overlay-close" id="gep-close"
+                            aria-label="Close (defer to chat)">×</button>
+                </header>
+
+                <div class="gep-progress">
+                    <div class="gep-progress-bar" id="gep-progress-bar"></div>
+                </div>
+
+                <form class="settings-form gep-form" id="gep-form">
+                    <p class="gep-description help-text" id="gep-description"></p>
+
+                    <fieldset class="gep-section" id="gep-steps-section">
+                        <legend>Steps</legend>
+                        <ol class="gep-steps" id="gep-steps"></ol>
+                    </fieldset>
+
+                    <fieldset class="gep-section" id="gep-key-params-section" hidden>
+                        <legend>Key parameters — please review</legend>
+                        <div class="gep-params" id="gep-key-params"></div>
+                    </fieldset>
+
+                    <fieldset class="gep-section" id="gep-other-params-section" hidden>
+                        <legend>Other parameters</legend>
+                        <div class="gep-params" id="gep-other-params"></div>
+                    </fieldset>
+
+                    <p class="help-text gep-hint">
+                        Edit any parameter above, then click <b>Confirm now</b> —
+                        your values are sent along with the confirmation. Skip GEP
+                        to fall back to normal planning.
+                    </p>
+
+                    <div class="settings-actions gep-actions">
+                        <button type="button" id="gep-skip">Skip GEP</button>
+                        <button type="submit" id="gep-confirm" class="primary">Confirm now</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+
+        <!-- ============================================================ -->
+        <!-- Templates review panel — opened from the Templates shortcut.  -->
+        <!-- Lists every GEP template in the user's templates dir with    -->
+        <!-- a clickable detail view (steps + params + problems).         -->
+        <!-- ============================================================ -->
+        <div class="overlay hidden" id="overlay-templates" aria-hidden="true">
+            <div class="overlay-card settings-card templates-card" role="dialog" aria-modal="true">
+                <header class="overlay-header">
+                    <h2>GEP Templates</h2>
+                    <button type="button" class="overlay-close" id="templates-close"
+                            aria-label="Close">×</button>
+                </header>
+                <div class="settings-toast hidden" id="templates-toast" role="status"></div>
+                <div class="templates-body">
+                    <div class="templates-list-header">
+                        <button type="button" id="templates-refresh">Refresh</button>
+                        <button type="button" id="templates-load-history" class="primary">📂 Load history…</button>
+                        <span class="templates-count muted" id="templates-count"></span>
+                    </div>
+                    <ul class="templates-list" id="templates-list"></ul>
+                    <section class="templates-detail-pane">
+                        <div class="templates-detail-empty muted" id="templates-detail-empty">
+                            Select a template above to view its steps and parameters.
+                        </div>
+                        <div class="templates-detail hidden" id="templates-detail">
+                            <header class="templates-detail-header">
+                                <h3 id="templates-detail-name"></h3>
+                                <span class="templates-detail-version" id="templates-detail-version"></span>
+                            </header>
+                            <p class="templates-detail-desc" id="templates-detail-desc"></p>
+                            <div class="templates-detail-problems hidden"
+                                 id="templates-detail-problems"></div>
+                            <section class="templates-detail-section" id="templates-detail-params-wrap">
+                                <h4>Parameters</h4>
+                                <div class="templates-detail-params" id="templates-detail-params"></div>
+                            </section>
+                            <section class="templates-detail-section" id="templates-detail-steps-wrap">
+                                <h4>Steps</h4>
+                                <ol class="templates-detail-steps" id="templates-detail-steps"></ol>
+                            </section>
+                            <dl class="templates-detail-meta">
+                                <dt>ID</dt><dd id="templates-detail-id"></dd>
+                                <dt>Created</dt><dd id="templates-detail-created"></dd>
+                            </dl>
+                            <div class="settings-actions templates-detail-actions">
+                                <button type="button" id="templates-detail-delete" class="danger">Delete</button>
+                            </div>
+                        </div>
+                    </section>
+                </div>
             </div>
         </div>
 

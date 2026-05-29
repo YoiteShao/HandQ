@@ -38,6 +38,7 @@ from .planner_prompts import (
     GEP_REPLAN_CONSTRAINT,
     GEP_ADAPTIVE_INSTANTIATION_SYSTEM,
     GEP_ADAPTIVE_INSTANTIATION_TEMPLATE,
+    GEP_TOOL_CONSTRAINT_PREFIX,
     STEP_COMPRESSION_SYSTEM_PROMPT,
     STEP_COMPRESSION_TEMPLATE,
 )
@@ -213,6 +214,24 @@ class Planner:
         self._compressed_steps_cache: Optional[List[dict]] = None
         self._compressed_up_to_count: int = 0  # how many early steps are cached
 
+    @staticmethod
+    def _apply_gep_tool_constraint(goal: str, tools_required: List[str]) -> str:
+        """Prepend the strict tool-constraint prefix to a GEP step goal.
+
+        Lives here so both instantiation paths (LLM-adaptive and mechanical
+        fallback) produce identical goal text. The prefix template itself
+        comes from planner_prompts.GEP_TOOL_CONSTRAINT_PREFIX so the wording
+        is owned by the prompt module, not flow-controller wiring.
+
+        No-op when tools_required is empty (aggregation steps, legacy
+        templates without the field).
+        """
+        clean = [str(t).strip() for t in (tools_required or []) if str(t).strip()]
+        if not clean:
+            return goal
+        tool_list = ", ".join(f"`{t}`" for t in clean)
+        return GEP_TOOL_CONSTRAINT_PREFIX.format(tool_list=tool_list) + goal
+
     def _instantiate_gep_steps(self, params: dict) -> List[Step]:
         """
         Instantiate GEP template steps as proper Step objects with parameter
@@ -261,6 +280,7 @@ class Planner:
                 expected   = list(raw.get('expected_outcomes', []))
                 risk       = _sub(raw.get('risk_assessment', ''))
                 req_ctx    = list(raw.get('required_context_keys', []))
+                tools_req  = list(raw.get('tools_required', []))
             else:
                 sid        = getattr(raw, 'step_id', f'gep_step_{len(result) + 1}')
                 desc       = getattr(raw, 'description', '')
@@ -272,11 +292,12 @@ class Planner:
                 expected   = list(getattr(raw, 'expected_outcomes', []))
                 risk       = _sub(getattr(raw, 'risk_assessment', ''))
                 req_ctx    = list(getattr(raw, 'required_context_keys', []))
+                tools_req  = list(getattr(raw, 'tools_required', []))
 
             result.append(Step.from_planner(
                 step_id=sid,
                 description=desc,
-                goal=goal,
+                goal=self._apply_gep_tool_constraint(goal, tools_req),
                 step_supplement=supplement,
                 parallel_group=pg,
                 is_aggregation=is_agg,
@@ -288,6 +309,7 @@ class Planner:
                     raw.get('ssh_target', '') if isinstance(raw, dict)
                     else getattr(raw, 'ssh_target', '')
                 ),
+                tools_required=tools_req,
             ))
 
         return result
@@ -451,6 +473,7 @@ class Planner:
                 "risk_assessment": getattr(s, 'risk_assessment', ''),
                 "required_context_keys": list(getattr(s, 'required_context_keys', [])),
                 "ssh_target": getattr(s, 'ssh_target', ''),
+                "tools_required": list(getattr(s, 'tools_required', []) or []),
             }
 
         template_json = _json.dumps({
@@ -487,10 +510,23 @@ class Planner:
             for i, s in enumerate(parsed["adapted_steps"]):
                 if not isinstance(s, dict):
                     continue
+                # tools_required: prefer the value the LLM emitted, fall back
+                # to the original guide_step's tools_required (so older
+                # templates that lack the field still benefit from any value
+                # the adaptation LLM happened to infer; and even when the LLM
+                # drops the field by accident, the proven tool list survives).
+                _tr = s.get("tools_required")
+                if not isinstance(_tr, list) or not _tr:
+                    if i < len(guide_steps) and guide_steps[i] is not None:
+                        _tr = list(getattr(guide_steps[i], "tools_required", []) or [])
+                    else:
+                        _tr = []
+                else:
+                    _tr = [str(t) for t in _tr if t]
                 result.append(Step.from_planner(
                     step_id=s.get("step_id", f"gep_step_{i + 1}"),
                     description=s.get("description", ""),
-                    goal=s.get("goal", ""),
+                    goal=self._apply_gep_tool_constraint(s.get("goal", ""), _tr),
                     step_supplement=s.get("step_supplement", ""),
                     parallel_group=s.get("parallel_group", ""),
                     is_aggregation=bool(s.get("is_aggregation", False)),
@@ -499,6 +535,7 @@ class Planner:
                     risk_assessment=s.get("risk_assessment", ""),
                     required_context_keys=list(s.get("required_context_keys", [])),
                     ssh_target=s.get("ssh_target", ""),
+                    tools_required=_tr,
                 ))
             if not result:
                 raise ValueError("LLM returned empty adapted_steps list")

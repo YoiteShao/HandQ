@@ -914,6 +914,24 @@ Output ONLY JSON, no prose, no markdown fences."""
 # to detect that the session is running a proven GEP trajectory.
 GEP_MARKER = "[Execution Plan — Proven Step Sequence (Historical Success Trajectory)]"
 
+# Strict tool-constraint clause prepended to a GEP step's goal whenever the
+# step's tools_required list is non-empty. The clause is intentionally
+# generic — no concrete tool examples — so it stays correct as the tool
+# roster evolves and across platforms (a tool the source run used may not
+# exist on the current host; flow_controller filters tool_list to locally
+# registered providers before substituting). Format params: {tool_list}.
+GEP_TOOL_CONSTRAINT_PREFIX = (
+    "[STRICT TOOL CONSTRAINT]\n"
+    "This step is part of a proven execution pattern. You MUST execute it "
+    "using only the following tool(s): {tool_list}. Do NOT substitute, "
+    "wrap, or replace them with any other tool — the listed tools were "
+    "verified to succeed on this exact step in the source run, and any "
+    "substitution risks reproducing failures the original run already "
+    "eliminated. If a listed tool is genuinely unavailable on this host, "
+    "stop and surface a clear error naming the missing tool — do not "
+    "improvise an alternative.\n\n"
+)
+
 # Template for the enriched session goal injected after GEP instantiation.
 # Format params: {original_goal}, {step_lines} (newline-joined numbered step list).
 GEP_ENRICHED_GOAL_TEMPLATE = """\
@@ -957,7 +975,21 @@ step and continue on the proven trajectory.
 
 # ── GEP save-session goal template ───────────────────────────────────────────
 
-SAVE_SESSION_GOAL_TEMPLATE = """\
+# Platform-specific list of on-demand tool names that the save-flow agent
+# may legitimately list in ``tools_required``. Mirrors what
+# ``flow_controller._register_default_providers`` actually registers on
+# this host: Linux skips browser/desktop/email/web_search/ask_human/session.
+# Always-available core tools (read/write/edit/glob/grep/shell/notebook_edit)
+# are deliberately excluded — per the planner system prompt's
+# "DO NOT list" rule, they never appear in tools_required.
+_SAVE_TOOLS_AVAILABLE_LINE = (
+    '"browser", "desktop", "session", "ssh", "email", "web_search", '
+    '"ask_human", "coding"'
+    if _IS_WINDOWS
+    else '"ssh", "coding"'
+)
+
+_SAVE_SESSION_GOAL_RAW = """\
 Distill a completed task execution into a reusable GEP template — an optimized
 step sequence that can efficiently reproduce the same outcome on a future task
 of the same type, without repeating the mistakes and dead-ends of this run.
@@ -1032,10 +1064,38 @@ SHOULD happen next time.
       "expected_outcomes": ["<observable success criterion>"],
       "risk_assessment": "<known failure modes from this run and how to avoid them>",
       "required_context_keys": [],
-      "ssh_target": ""
+      "ssh_target": "",
+      "tools_required": ["<tool>", "..."]
     }}
   ]
 }}
+
+[tools_required rules — mandatory]
+
+For every guide_step, populate ``tools_required`` with the canonical names of
+the on-demand tools the original successful run used to complete that step.
+Future agents treat the saved template as authoritative — listing the wrong
+tool forces them down a path that may not work in their environment.
+
+Rules:
+  • Read the tool calls in the execution log for the steps that ultimately
+    succeeded (NOT the failed dead-ends excluded from guide_steps).
+  • List ONLY tools from this host's available roster:
+    {available_tools_line}.
+    Do NOT invent names, do NOT list tools that are not on this list, and do
+    NOT list always-available core tools (read / write / edit / glob / grep /
+    shell / notebook_edit) — they are implicit on every step.
+  • If a step legitimately required more than one on-demand tool, include all
+    of them in declaration order.
+  • If the original run completed the step via an ad-hoc external dependency
+    instead of a HandQ tool, identify the HandQ tool with equivalent
+    capability and list that — do NOT list the ad-hoc dependency, the future
+    agent cannot install it on demand.
+
+Empty ``tools_required: []`` is allowed only when no on-demand tool was used
+(pure reasoning / aggregation step, or a step that runs entirely on core
+tools). Aggregation steps with is_aggregation=true typically have empty
+tools_required.
 
 [Parameterization rules — mandatory]
 
@@ -1080,7 +1140,15 @@ confirm it is a universal literal. Then write the file.
    planner_reasoning (capture lessons) and risk_assessment (capture failure modes).
 3. Write the template JSON to {templates_dir}/<name>.json immediately — do NOT wait
    for user confirmation before writing. The file must be written as part of this task.
-   After writing, read the file back and confirm it is valid JSON.
+   After writing, read the file back and verify the SHAPE (not just JSON validity):
+     • Top level MUST contain these exact keys: name, description, params_schema, guide_steps.
+     • Use these field names verbatim — `template_id`, `params`, `steps`, `tool`, `action`,
+       `inputs`, `success_criteria`, `output` are NOT recognised by the loader and will
+       cause the template to be rejected as malformed.
+     • params_schema MUST be an object whose values each have type/description/default.
+     • guide_steps MUST be a non-empty list. Each entry MUST have step_id, description, goal.
+   If any of those checks fail, rewrite the file with the correct shape before declaring
+   success.
    If the user asks for changes, overwrite the same file in place — do NOT create a
    new file or use a different name unless the user explicitly asks for a new template.
 4. Present a concise summary to the user:
@@ -1089,6 +1157,16 @@ confirm it is a universal literal. Then write the file.
      • Key lessons absorbed from any failed steps
      • All parameters with types and defaults
 """
+
+# Bake the platform-specific tool list into the constant once at module load.
+# Use ``str.replace`` rather than ``.format`` so the literal ``{...}`` braces
+# in the JSON example don't need to be doubly escaped just for this one
+# substitution — the {original_goal} / {completion_block} / {log_file} /
+# {templates_dir} placeholders that the runtime caller fills via .format
+# stay untouched.
+SAVE_SESSION_GOAL_TEMPLATE = _SAVE_SESSION_GOAL_RAW.replace(
+    "{available_tools_line}", _SAVE_TOOLS_AVAILABLE_LINE,
+)
 
 # ── GEP adaptive instantiation prompt ────────────────────────────────────────
 # Used by Planner._adapt_gep_steps() to replace the mechanical
@@ -1108,12 +1186,13 @@ from the user's actual task.
 
 RULES:
 1. Replace every {{{{params.X}}}} placeholder with the value inferred from the \
-user's task (or the schema default when the user did not mention it).
+user's task (or the schema default when the user did not mention them).
 2. Also replace hardcoded paths/names/identifiers in step goals that are \
 session-specific and would differ for the user's task — do NOT copy them \
 literally unless they are universal system paths (e.g. /usr/bin, /tmp, C:\\Windows).
 3. Keep all structural fields unchanged: step_id, parallel_group, is_aggregation, \
-ssh_target.
+ssh_target, tools_required. tools_required in particular is the proven tool \
+sequence — never substitute it for what you "think" might work better.
 4. Every "goal" field in the output must be fully resolved — no {{{{params.X}}}} \
 tokens may remain.
 5. If a step's goal refers to a file or directory that cannot be inferred from the \
@@ -1140,7 +1219,8 @@ Output a single JSON object:
       "expected_outcomes": [...],
       "risk_assessment": "...",
       "required_context_keys": [],
-      "ssh_target": ""
+      "ssh_target": "",
+      "tools_required": [...]
     }}
   ]
 }}

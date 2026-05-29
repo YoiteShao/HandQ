@@ -1,0 +1,87 @@
+{
+  "name": "check boards ownership",
+  "description": "Query APTAuto to find all devices currently assigned to a given user, count the total boards, and report each device hostname, hardware type, SP type, booking date, and purpose. Use when asked: '帮我检查我名下有几块板子', 'how many boards do I own on APTAuto', 'list devices assigned to user X'.",
+  "params_schema": {
+    "username": {
+      "type": "string",
+      "description": "The APTAuto username to query (e.g. fengxuan). Leave empty to default to the current OS user.",
+      "default": "fengxuan",
+      "emphasis": true
+    },
+    "site_url": {
+      "type": "string",
+      "description": "Base URL of the APTAuto instance.",
+      "default": "https://aptauto.qualcomm.com"
+    }
+  },
+  "guide_steps": [
+    {
+      "step_id": "step_1",
+      "description": "Open APTAuto device-assignment dashboard",
+      "goal": "Navigate browser to {{params.site_url}}/dashboard/autoDeviceShare/. If a login page appears, authenticate via Qualcomm SSO (existing session cookies are reused automatically). Wait until the device assignment table is fully loaded and visible.",
+      "step_supplement": "",
+      "parallel_group": "",
+      "is_aggregation": false,
+      "planner_reasoning": "APTAuto's device-assignment page is the authoritative source for board ownership. The dashboard URL /dashboard/autoDeviceShare/ lists all currently assigned devices. SSO cookies from prior browser sessions are reused automatically — no manual login is needed in most cases.",
+      "expected_outcomes": [
+        "Browser is on {{params.site_url}}/dashboard/autoDeviceShare/",
+        "Device assignment table is visible with at least one column header"
+      ],
+      "risk_assessment": "SSO session may have expired, requiring re-authentication. If the login page appears, complete SSO flow before proceeding. Page may load slowly — wait for the table to fully render before extracting data.",
+      "required_context_keys": [],
+      "ssh_target": "",
+      "tools_required": ["browser"]
+    },
+    {
+      "step_id": "step_2",
+      "description": "Filter device table by username",
+      "goal": "On the APTAuto device-assignment dashboard at {{params.site_url}}/dashboard/autoDeviceShare/, locate the user/owner filter field and enter '{{params.username}}'. Apply the filter and wait for the table to refresh showing only rows assigned to that user. If {{params.username}} is empty, use the current OS username (run 'whoami' to obtain it).",
+      "step_supplement": "",
+      "parallel_group": "",
+      "is_aggregation": false,
+      "planner_reasoning": "Filtering by username reduces the table to only the target user's boards, making extraction accurate. In the original run, the user was 'fengxuan' and 11 boards were returned after filtering. If no filter field exists, use the browser's page search or scroll to find rows matching the username.",
+      "expected_outcomes": [
+        "Table is filtered and shows only rows where the assigned user matches {{params.username}}",
+        "Row count is visible or countable"
+      ],
+      "risk_assessment": "The filter field name or location may differ across APTAuto versions. If the standard filter is absent, fall back to Ctrl+F page search for the username. If the table is paginated, note that not all rows may be visible on one page.",
+      "required_context_keys": [],
+      "ssh_target": "",
+      "tools_required": ["browser"]
+    },
+    {
+      "step_id": "step_3",
+      "description": "Extract and count all assigned boards",
+      "goal": "From the filtered APTAuto device table, extract every row assigned to '{{params.username}}'. For each board record, capture: hostname, hardware type, SP type, booking date, and purpose. Count the total number of rows to get the total board count. If the table is paginated, navigate through all pages to collect all records.",
+      "step_supplement": "",
+      "parallel_group": "",
+      "is_aggregation": false,
+      "planner_reasoning": "Extracting the full row data for each board gives a complete picture of the user's device holdings. The count of rows equals the number of boards owned. Capturing hostname, hardware type, SP type, booking date, and purpose matches the fields visible in the APTAuto assignment table.",
+      "expected_outcomes": [
+        "A list of all boards assigned to {{params.username}} with hostname, hardware type, SP type, booking date, and purpose for each",
+        "A total board count is determined"
+      ],
+      "risk_assessment": "Table may be paginated — ensure all pages are visited. Some fields may be empty or use abbreviated values; record them as-is. If the table shows zero rows, confirm the username spelling is correct.",
+      "required_context_keys": [],
+      "ssh_target": "",
+      "tools_required": ["browser"]
+    },
+    {
+      "step_id": "step_4",
+      "description": "Report board ownership summary",
+      "goal": "Compile and present the results: state the total number of boards owned by '{{params.username}}', then list each board with its hostname, hardware type, SP type, booking date, and purpose in a clear, readable format (e.g. a table or numbered list).",
+      "step_supplement": "",
+      "parallel_group": "",
+      "is_aggregation": true,
+      "planner_reasoning": "Aggregating and presenting the extracted data in a structured summary directly answers the user's question about how many boards they own and what those boards are.",
+      "expected_outcomes": [
+        "Total board count for {{params.username}} is stated clearly",
+        "Each board's hostname, hardware type, SP type, booking date, and purpose are listed"
+      ],
+      "risk_assessment": "If zero boards are found, report that clearly and suggest verifying the username. If some fields were missing from the table, note them as unavailable in the report.",
+      "required_context_keys": [],
+      "ssh_target": "",
+      "tools_required": []
+    }
+  ]
+}

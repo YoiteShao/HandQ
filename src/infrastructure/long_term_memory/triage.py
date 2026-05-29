@@ -1042,6 +1042,19 @@ class DreamWorker:
             since_seconds=window_seconds,
         )
         if len(rows) < min_size:
+            # Record the skip in dream_runs so _should_run_synthesis can
+            # latch the cadence gate. Without this row the gate sees
+            # latest=0 forever and keeps re-entering every cycle, which
+            # spams "L%d/%s skipped" logs (especially L3, whose source is
+            # synthesis_level=2 — empty until L2 has produced patterns).
+            run_id = await self._store.insert_dream_run(level=level, kind=kind)
+            await self._store.update_dream_run(
+                run_id, status="skipped",
+                source_count=len(rows),
+                cluster_count=0,
+                accepted_count=0,
+                skipped_count=0,
+            )
             _logger.info(
                 "L%d/%s skipped: only %d source entries (need >=%d)",
                 level, kind, len(rows), min_size,

@@ -8,6 +8,7 @@ import threading
 from typing import Any, Awaitable, Callable, ClassVar, Optional
 
 from ..infrastructure.logger import get_logger
+from ..infrastructure.llm_pool import NetworkUnavailableError, is_network_down
 from ..models.state import UserConfirmation
 from ..models.decision import Decision
 
@@ -238,6 +239,18 @@ class InteractionManager:
             self._replan_queue.put(msg)
             return
 
+        # Short-circuit when the LLM endpoint is known-unreachable: don't
+        # invoke the receptionist at all (its LLM call would just fail
+        # again and burn the per-service SDK timeouts before getting
+        # there). The frontend already shows the "server unreachable"
+        # indicator from the most recent on_network_event signal.
+        if is_network_down():
+            self.logger.info(
+                f"Skipping evaluation (network down): {msg[:60]}",
+                component="InteractionManager",
+            )
+            return
+
         try:
             self._ui_call("show_receptionist_thinking")
             evaluation = await callback(msg)
@@ -262,6 +275,16 @@ class InteractionManager:
                     f"Message handled (respond_only): {msg[:60]}",
                     component="InteractionManager",
                 )
+        except NetworkUnavailableError:
+            # Receptionist's wrapper detected the LLM endpoint is unreachable
+            # mid-evaluation. Silent skip — no UI message, no replan enqueue.
+            # The frontend's "server unreachable" indicator is already lit
+            # via the on_network_event signal raised by the wrapper.
+            self._ui_call("clear_receptionist_thinking")
+            self.logger.info(
+                f"Receptionist skipped (network down): {msg[:60]}",
+                component="InteractionManager",
+            )
         except Exception as exc:
             self.logger.error(
                 f"Message evaluation failed: {exc}",
@@ -519,6 +542,28 @@ class InteractionManager:
         status bar countdown.  Pass remaining_secs=-1 to clear.
         """
         self._ui_call("show_gep_countdown", remaining_secs, template_name)
+
+    def notify_gep_template_info(self, template_info: dict) -> None:
+        """
+        One-shot push of structured template metadata to the UI when GEP
+        confirmation begins.  The UI uses this to render a parameter panel
+        (template name / description / steps / params_schema with emphasis
+        flags / total countdown seconds) — independent of the per-second
+        countdown ticks emitted via notify_gep_countdown.
+        """
+        self._ui_call("show_gep_intro", template_info)
+
+    def notify_inline_event(self, icon: str, desc: str) -> None:
+        """
+        Emit a one-line status event styled like a planner step in the UI.
+
+        Used for short status banners (e.g. "Saving template…", "Template
+        activated") that should NOT render as a chunky system blockquote
+        but as a tight icon + text line, identical to step_started events.
+
+        Falls back to a printed line in CLI mode.
+        """
+        self._ui_call("show_inline_event", str(icon or "·"), str(desc or ""))
 
     def notify_step_started(self, step_id: str, desc: str) -> None:
         """

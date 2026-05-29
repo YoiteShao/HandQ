@@ -9,20 +9,50 @@ See gep_design.md Section B for the full field specification.
 from __future__ import annotations
 
 import json
+import os
 import re
+import sys
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-# Root directory of the HandQ installation (the directory containing handq.py).
-# gep_template.py lives at src/infrastructure/gep_template.py, so go up two levels.
-_HANDQ_ROOT = Path(__file__).parent.parent.parent.resolve()
+# Repo / install root resolution.
+#
+# Mirrors the logic in bridge_main.py so frozen (Nuitka standalone /
+# PyInstaller) builds locate gep_templates/ next to the bridge executable,
+# not via __file__ — which Nuitka may virtualise to a path inside the dist
+# tree that is not predictable across builds.
+#
+#   * Frozen build  → parent directory of sys.executable
+#   * Dev / source  → repo root (this file's grandparent)
 
-# Templates are stored in a fixed sub-directory of the HandQ root,
-# independent of the session's working directory.
 _TEMPLATES_SUBDIR = "gep_templates"
+
+
+def _install_dir() -> Path:
+    """Return the directory next to the bridge entry point.
+
+    Same algorithm as bridge_main._INSTALL_DIR. Used as the "shipped
+    defaults" location for templates on every platform, and as the active
+    templates directory on Linux/macOS.
+    """
+    if getattr(sys, "frozen", False) or "__compiled__" in globals():
+        return Path(os.path.dirname(os.path.abspath(sys.executable)))
+    # Dev: gep_template.py lives at src/infrastructure/gep_template.py,
+    # so two levels up is the repo root.
+    return Path(__file__).parent.parent.parent.resolve()
+
+
+def _user_handq_root() -> Path:
+    """Per-user HandQ root: %USERPROFILE%\\HandQ on Windows, ~/HandQ elsewhere.
+
+    Matches bridge_main._user_handq_root() — single source of truth for user-
+    owned data per ARCHITECTURE.md §1.5.
+    """
+    home = os.environ.get("USERPROFILE") or os.path.expanduser("~")
+    return Path(home) / "HandQ"
 
 
 @dataclass
@@ -57,6 +87,13 @@ class StepSpec:
     risk_assessment: str = ""
     required_context_keys: List[str] = field(default_factory=list)
     ssh_target: str = ""             # "user@hostname"; empty = local
+    # Tools that the original successful run actually used for this step
+    # (e.g. ["browser"], ["shell"], ["browser","desktop"]). Surfaced in
+    # the agent prompt during GEP execution as a hard constraint so the
+    # agent doesn't reinvent the wheel with a different tool that may
+    # have different dependencies. Empty = no constraint (legacy templates
+    # written before this field existed).
+    tools_required: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -103,6 +140,7 @@ class GEPTemplate:
                     "risk_assessment": s.risk_assessment,
                     "required_context_keys": s.required_context_keys,
                     "ssh_target": s.ssh_target,
+                    "tools_required": s.tools_required,
                 }
                 for s in self.guide_steps
             ],
@@ -121,6 +159,15 @@ class GEPTemplate:
 
         guide_steps: List[StepSpec] = []
         for s in data.get("guide_steps", []):
+            _tr_raw = s.get("tools_required", [])
+            if isinstance(_tr_raw, str):
+                # Tolerate "browser" as well as ["browser"] from older / hand-written
+                # templates.
+                _tools_required = [_tr_raw] if _tr_raw else []
+            elif isinstance(_tr_raw, list):
+                _tools_required = [str(t) for t in _tr_raw if t]
+            else:
+                _tools_required = []
             guide_steps.append(StepSpec(
                 step_id=s.get("step_id", ""),
                 description=s.get("description", ""),
@@ -133,6 +180,7 @@ class GEPTemplate:
                 risk_assessment=s.get("risk_assessment", ""),
                 required_context_keys=s.get("required_context_keys", []),
                 ssh_target=s.get("ssh_target", ""),
+                tools_required=_tools_required,
             ))
 
         _id = data.get("id") or data.get("name") or str(uuid.uuid4())
@@ -158,8 +206,53 @@ class GEPTemplate:
 # ── Template directory helpers ─────────────────────────────────────────────────
 
 def _templates_dir() -> Path:
-    """Return the fixed templates directory (HandQ/gep_templates/)."""
-    return _HANDQ_ROOT / _TEMPLATES_SUBDIR
+    """Return the templates directory.
+
+    Platform split (per ARCHITECTURE.md §1.5 — no dev/prod variation):
+
+    * **Windows** (any mode) — ``%USERPROFILE%\\HandQ\\gep_templates\\``.
+      Templates always live next to the user's other HandQ artifacts
+      (config, History, personality, scheduled_tasks.json). Dev mode no
+      longer falls back to the repo tree; the architecture is the source
+      of truth and applies uniformly. The directory is auto-seeded from
+      the install copy on first launch (so a packaged build's shipped
+      defaults reach the user dir, and a dev install with a populated
+      repo gets the same starter content).
+
+    * **Linux / macOS** (any mode) — ``<install_dir>/gep_templates/``.
+      No equivalent "user root" convention; co-locating with the bridge
+      install keeps everything self-contained. install_dir = parent of
+      sys.executable for frozen, repo root in dev.
+
+    First match wins:
+      1. ``HANDQ_GEP_TEMPLATES_DIR`` env override (CI / portable mode).
+      2. Per-platform default (above).
+    """
+    env_override = os.environ.get("HANDQ_GEP_TEMPLATES_DIR")
+    if env_override:
+        return Path(env_override).expanduser().resolve()
+
+    install_dir = _install_dir() / _TEMPLATES_SUBDIR
+
+    if sys.platform != "win32":
+        # Linux / macOS: install dir always.
+        return install_dir
+
+    # ── Windows: always %USERPROFILE%\HandQ\gep_templates\ ───────────────
+    user_dir = _user_handq_root() / _TEMPLATES_SUBDIR
+    try:
+        user_dir.mkdir(parents=True, exist_ok=True)
+        # Seed from install copy on first run so the user dir starts
+        # populated with whatever ships in the repo / installer.
+        if install_dir.exists() and not any(user_dir.glob("*.json")):
+            import shutil
+            for src in install_dir.glob("*.json"):
+                dst = user_dir / src.name
+                if not dst.exists():
+                    shutil.copy2(src, dst)
+    except OSError:
+        pass
+    return user_dir
 
 
 def _sanitize_template_id(template_id: str) -> str:
@@ -385,6 +478,7 @@ def normalize_template_params(template: GEPTemplate) -> Tuple[GEPTemplate, List[
             risk_assessment=_sub(s.risk_assessment),
             required_context_keys=list(s.required_context_keys),
             ssh_target=s.ssh_target,
+            tools_required=list(s.tools_required),
         ))
 
     # ── Pass 3: extend params_schema with new entries ──────────────────────
@@ -475,6 +569,34 @@ def validate_instantiated_steps(
 
     return violations
 
+def validate_template_shape(t: GEPTemplate) -> List[str]:
+    """Return a list of human-readable problems with *t* (empty = OK).
+
+    Catches malformed templates that load_template happily parses but that
+    later break the GEP flow:
+      * Missing ``name`` → the receptionist intro shows a blank "Template:"
+        header and instantiation cannot identify the template by name.
+      * Empty ``guide_steps`` → instantiate_gep_plan returns no steps and
+        the planner falls through to normal planning, silently bypassing
+        the template the user just confirmed.
+      * Step missing ``goal`` → instantiation has nothing to substitute
+        params into.
+
+    Used by load_template (to fail fast on broken files) and by
+    list_templates (to filter them out of the receptionist's match pool).
+    """
+    problems: List[str] = []
+    if not (t.name or "").strip():
+        problems.append("missing 'name' field")
+    if not t.guide_steps:
+        problems.append("empty 'guide_steps' — template would activate to a no-op")
+    else:
+        for i, s in enumerate(t.guide_steps):
+            if not (s.description or s.goal or "").strip():
+                problems.append(f"guide_steps[{i}] has neither description nor goal")
+    return problems
+
+
 def load_template(template_id: str) -> GEPTemplate:
     """
     Load a GEPTemplate from HandQ/gep_templates/<template_id>.json.
@@ -484,13 +606,22 @@ def load_template(template_id: str) -> GEPTemplate:
     (e.g. "4bb46009-dd25-4597-8a79-255f64c481ee.json").
 
     Raises FileNotFoundError if no matching template is found.
-    Raises ValueError if the short ID matches more than one file.
+    Raises ValueError if the short ID matches more than one file, OR if the
+    matched file fails validate_template_shape (so a malformed template
+    cannot silently activate to nothing).
     """
     def _load_from_path(p: Path) -> GEPTemplate:
         data = json.loads(p.read_text(encoding="utf-8"))
         if not data.get("id"):
             data["id"] = p.stem
-        return GEPTemplate.from_dict(data)
+        t = GEPTemplate.from_dict(data)
+        problems = validate_template_shape(t)
+        if problems:
+            raise ValueError(
+                f"Template at {p} is malformed: {'; '.join(problems)}. "
+                "Re-save it via the Save GEP flow or fix the JSON manually."
+            )
+        return t
 
     path = _template_path(template_id)
     if path.exists():
@@ -527,11 +658,19 @@ def save_template(template: GEPTemplate) -> str:
     return str(path.resolve())
 
 
-def list_templates() -> List[GEPTemplate]:
+def list_templates(*, include_invalid: bool = False) -> List[GEPTemplate]:
     """
     Return all GEPTemplate objects found in HandQ/gep_templates/.
 
     Files that cannot be parsed are silently skipped.
+
+    When ``include_invalid`` is False (the default), templates that fail
+    validate_template_shape are also skipped — this keeps the receptionist's
+    match pool free of templates that would activate to a no-op.
+
+    When ``include_invalid`` is True, every parseable template is returned;
+    callers (e.g. the Templates review panel) can then inspect each entry's
+    ``_problems`` attribute to surface broken entries to the user.
     """
     tdir = _templates_dir()
     if not tdir.exists():
@@ -542,9 +681,18 @@ def list_templates() -> List[GEPTemplate]:
             data = json.loads(json_file.read_text(encoding="utf-8"))
             if not data.get("id"):
                 data["id"] = json_file.stem
-            templates.append(GEPTemplate.from_dict(data))
+            t = GEPTemplate.from_dict(data)
         except Exception:
-            pass
+            continue
+        problems = validate_template_shape(t)
+        if problems:
+            if not include_invalid:
+                continue
+            # Stash the problems on the object so admin views can render them
+            # without re-running the validator.
+            setattr(t, "_problems", problems)
+            setattr(t, "_source_path", str(json_file.resolve()))
+        templates.append(t)
     return templates
 
 

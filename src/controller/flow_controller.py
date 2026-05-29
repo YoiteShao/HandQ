@@ -341,8 +341,8 @@ class FlowController:
         except Exception:
             save_context = {}
 
-        self.interaction_manager.display_message(
-            "Starting template generation session…"
+        self.interaction_manager.notify_inline_event(
+            "⤓", "Starting template generation session"
         )
         self.logger.info(
             "Starting independent save-session flow", component="FlowController"
@@ -439,9 +439,44 @@ class FlowController:
         """
         from pathlib import Path as _Path
         import uuid as _uuid
-        from ..infrastructure.gep_template import list_templates, save_template
+        from ..infrastructure.gep_template import (
+            list_templates, save_template, validate_template_shape,
+        )
 
         new_templates = [t for t in list_templates() if t.id not in existing_ids]
+
+        # ── Malformed-template detection ─────────────────────────────────────
+        # The agent may write a JSON file that parses but fails the schema
+        # check (wrong field names, empty guide_steps). list_templates() with
+        # the default filter skips those, so we'd report "no template found"
+        # — misleading, since the file IS on disk. Re-scan including invalid
+        # entries so we can call the agent's mistake out specifically.
+        invalid_new = []
+        if not new_templates:
+            all_after = list_templates(include_invalid=True)
+            invalid_new = [
+                t for t in all_after
+                if t.id not in existing_ids and getattr(t, "_problems", None)
+            ]
+            if invalid_new:
+                bad = invalid_new[0]
+                problems = list(getattr(bad, "_problems", []) or [])
+                src = getattr(bad, "_source_path", "") or ""
+                self.logger.warning(
+                    f"Save-session: template at {src} is malformed: "
+                    f"{'; '.join(problems)}",
+                    component="FlowController",
+                )
+                self.interaction_manager.display_error(
+                    f"[GEP] The generated template was rejected: "
+                    f"{'; '.join(problems)}. "
+                    f"Expected top-level keys: name, description, params_schema, "
+                    f"guide_steps (NOT template_id / params / steps). "
+                    f"File: {src}"
+                )
+                # Don't proceed — invalid template would just confuse the user
+                # if we stamped system fields onto it.
+                return
 
         # If the agent didn't write to gep_templates/, scan fallback dirs for any
         # JSON file that looks like a template (has name + guide_steps).
@@ -1172,32 +1207,55 @@ class FlowController:
 
             if evaluation.intent == UserMessageIntent.GEP_CONFIRM:
                 self._gep_confirm_deadline = 0.0
-                return UserMessageEvaluation(
+                result = UserMessageEvaluation(
                     intent=UserMessageIntent.RESPOND_ONLY,
                     response_to_user=evaluation.response_to_user or "Confirmed — activating template shortly.",
                     reasoning=evaluation.reasoning,
                 )
+                # Propagate the streaming flag — the receptionist already
+                # painted the reply via stream_receptionist_reply_chunk; if we
+                # leave _streamed unset the IM will display response_to_user
+                # AGAIN as a fresh bubble (see _message_processor_loop:245-248).
+                if getattr(evaluation, "_streamed", False):
+                    result._streamed = True  # type: ignore[attr-defined]
+                return result
 
             if evaluation.intent == UserMessageIntent.GEP_DECLINE:
                 self._pending_gep_template_id = None
-                return UserMessageEvaluation(
+                result = UserMessageEvaluation(
                     intent=UserMessageIntent.RESPOND_ONLY,
                     response_to_user=evaluation.response_to_user or "GEP declined. Using normal planning mode.",
                     reasoning=evaluation.reasoning,
                 )
+                if getattr(evaluation, "_streamed", False):
+                    result._streamed = True  # type: ignore[attr-defined]
+                return result
 
             # Any other intent (e.g. parameter update): reset the countdown to
             # the full timeout so the user has the full window to finish
             # reviewing/setting parameters before auto-activation.
             self._gep_confirm_deadline = time.monotonic() + self._GEP_CONFIRM_TIMEOUT
             response = evaluation.response_to_user or "Noted."
-            response = (
-                f"{response}\n\n"
-                f"[GEP] {int(self._GEP_CONFIRM_TIMEOUT)}s remaining — type 'yes' to confirm or 'no' to skip."
+            hint = (
+                f"[GEP] {int(self._GEP_CONFIRM_TIMEOUT)}s remaining — "
+                f"type 'yes' to confirm or 'no' to skip."
             )
+            if getattr(evaluation, "_streamed", False):
+                # The receptionist already streamed `response` to the chat;
+                # painting it again via response_to_user would duplicate it.
+                # Surface the countdown hint as a separate system message so
+                # the user still sees it without the reply being repeated.
+                self.interaction_manager.display_message(hint)
+                result = UserMessageEvaluation(
+                    intent=UserMessageIntent.RESPOND_ONLY,
+                    response_to_user=response,
+                    reasoning=evaluation.reasoning,
+                )
+                result._streamed = True  # type: ignore[attr-defined]
+                return result
             return UserMessageEvaluation(
                 intent=UserMessageIntent.RESPOND_ONLY,
-                response_to_user=response,
+                response_to_user=f"{response}\n\n{hint}",
                 reasoning=evaluation.reasoning,
             )
 
@@ -1489,6 +1547,56 @@ class FlowController:
             self.interaction_manager.display_receptionist_reply("\n\n".join(_gep_intro_lines)+
                                                                 f"\n\n> ⏱️ GEP mode will start in {int(self._GEP_CONFIRM_TIMEOUT)} seconds. "
                     f"Please prepare your input.")
+            # Push a structured snapshot to the UI so it can render a
+            # parameter-entry panel alongside the markdown summary.
+            try:
+                _t_info: Dict[str, Any] = {
+                    "id":          getattr(_t_obj, "id", None) if _t_obj else None,
+                    "name":        _display_name,
+                    "description": getattr(_t_obj, "description", "") if _t_obj else "",
+                    "timeout_secs": int(self._GEP_CONFIRM_TIMEOUT),
+                    "steps":       [],
+                    "params":      [],
+                }
+                if _t_obj is not None:
+                    _t_steps = getattr(_t_obj, "guide_steps", None) or getattr(_t_obj, "steps", None) or []
+                    for _ts in _t_steps:
+                        if isinstance(_ts, dict):
+                            _t_info["steps"].append({
+                                "step_id":     _ts.get("step_id", ""),
+                                "description": _ts.get("description", ""),
+                                "goal":        _ts.get("goal", ""),
+                            })
+                        else:
+                            _t_info["steps"].append({
+                                "step_id":     getattr(_ts, "step_id", "") or "",
+                                "description": getattr(_ts, "description", "") or "",
+                                "goal":        getattr(_ts, "goal", "") or "",
+                            })
+                    _t_ps = getattr(_t_obj, "params_schema", {}) or {}
+                    for _pname, _pspec in _t_ps.items():
+                        if isinstance(_pspec, dict):
+                            _t_info["params"].append({
+                                "name":        _pname,
+                                "type":        _pspec.get("type", ""),
+                                "description": _pspec.get("description", ""),
+                                "default":     _pspec.get("default", None),
+                                "emphasis":    bool(_pspec.get("emphasis", False)),
+                            })
+                        else:
+                            _t_info["params"].append({
+                                "name":        _pname,
+                                "type":        getattr(_pspec, "type", "") or "",
+                                "description": getattr(_pspec, "description", "") or "",
+                                "default":     getattr(_pspec, "default", None),
+                                "emphasis":    bool(getattr(_pspec, "emphasis", False)),
+                            })
+                self.interaction_manager.notify_gep_template_info(_t_info)
+            except Exception as _gep_intro_exc:
+                self.logger.warning(
+                    f"notify_gep_template_info failed (non-critical): {_gep_intro_exc}",
+                    component="FlowController",
+                )
             _last_tmux_tick_second: int = -1
             try:
               while self._pending_gep_template_id:
@@ -1516,12 +1624,11 @@ class FlowController:
                         )
                     if template is not None:
                         self.planner._gep_template = template
-                        _activation_msg = (
-                            f"[GEP] Template '{template.name}' (v{template.version}) activated. "
-                            "GEP execution is now starting "
-                            "-- the plan will follow the proven step sequence from the template."
+                        self.interaction_manager.notify_inline_event(
+                            "✦",
+                            f"GEP template '{template.name}' (v{template.version}) "
+                            "activated — following the proven step sequence",
                         )
-                        self.interaction_manager.display_message(_activation_msg)
                         self.logger.info(
                             f"GEP template activated: {template.name}",
                             component="FlowController",
@@ -1582,8 +1689,9 @@ class FlowController:
                     if not isinstance(self.planner._gep_template, dict)
                     else self.planner._gep_template.get('name', 'template')
                 )
-                self.interaction_manager.display_message(
-                    f"[GEP] Resolving parameters and adapting steps for '{_tmpl_name_hint}' — please wait..."
+                self.interaction_manager.notify_inline_event(
+                    "⚙",
+                    f"Adapting GEP template '{_tmpl_name_hint}' to your task",
                 )
                 gep_plan = await self.planner.instantiate_gep_plan(_instantiation_goal)
                 if gep_plan is not None and gep_plan.next_steps:
@@ -1635,9 +1743,9 @@ class FlowController:
                     f"— falling back to normal planning",
                     component="FlowController",
                 )
-                self.interaction_manager.display_message(
-                    "[GEP] Template instantiation failed — using normal planning mode. "
-                    f"Reason: {_gep_exc}"
+                self.interaction_manager.notify_inline_event(
+                    "⚠",
+                    f"GEP instantiation failed — falling back to normal planning ({_gep_exc})",
                 )
             finally:
                 self.planner._gep_template = None
@@ -2608,11 +2716,12 @@ class FlowController:
             f"{len(self._step_context_providers)} providers registered",
             component="FlowController",
         )
-        # Warn when the planner declared a tool that has no registered provider —
-        # this indicates the planner prompt may be out of sync with the registered
-        # providers (e.g. a tool name from LLM training data on a platform where
-        # it is not available). The tools still pass through to RuntimeAgent, which
-        # surfaces a clean "unknown tool" error if the agent tries to call one.
+        # Build the set of locally-registered providers so we can warn when
+        # the planner names a tool this host doesn't carry. The actual
+        # "MUST use these tools, no substitution" wording lives in the GEP
+        # prompt prefix (see planner_prompts.GEP_TOOL_CONSTRAINT_PREFIX, baked
+        # into step.goal during instantiate_gep_plan / _instantiate_gep_steps)
+        # — flow_controller no longer adds its own hard-tool notice.
         _registered_tools = {
             getattr(p, "tool_name", None)
             for p in self._step_context_providers

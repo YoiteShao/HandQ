@@ -23,9 +23,12 @@ INSTALL_DIR =
 随后按以下优先级（首个命中即用）选取 `handq_config.yaml`：
 
 1. `HANDQ_CONFIG` 环境变量 — 显式覆盖（CI、便携模式）。
-2. `%USERPROFILE%\HandQ\handq_config.yaml` — 用户级配置；与 session 历史
-   `%USERPROFILE%\HandQ\History\` 同根，方便用户在一个地方找到所有"属于他自己"的东西。
-3. `<INSTALL_DIR>\handq_config.yaml` — 与构建一起 ship 的默认配置（首次启动可拷到 (2)）。
+2. `%USERPROFILE%\HandQ\handq_config.yaml`（**Windows**） / `<INSTALL_DIR>\handq_config.yaml`（**Linux/macOS**）。
+3. `<INSTALL_DIR>\handq_config.yaml` —— 仅在 Windows 上作为 ship-default 源使用：当用户根下不存在时，bridge 在 boot 时自动从 (3) 拷贝到 (2)，之后所有读写都走 (2)。
+
+> Windows 不再区分 dev/prod —— dev 模式也会走 `%USERPROFILE%\HandQ\` 这条路径，
+> 与 ARCHITECTURE.md §1.5 描述的 prod 布局完全对齐。Linux/macOS 没有等价的
+> user-root 惯例，永远走 INSTALL_DIR。
 
 解析出的绝对路径会被写回 `os.environ["HANDQ_CONFIG"]`，再 import
 `src.bridge.stdio_bridge`，下游所有消费方拿到的都是同一个值。
@@ -35,15 +38,18 @@ INSTALL_DIR =
 
 ---
 
-## 1.5 用户根目录布局（Windows）
+## 1.5 用户根目录布局（Windows，dev/prod 统一）
 
 ```
 %USERPROFILE%\HandQ\               ← 唯一用户根 — 所有 HandQ 写到磁盘的东西
   handq_config.yaml                  用户配置（小、可漫游）
   scheduled_tasks.json               定时任务持久化（与 personality 解耦）
+  gep_templates\                     ← GEP 模板（每个一个 .json，UUID 命名）
+    <uuid>.json                        Save flow 写入；Templates 面板可 review
   History\                           会话历史（大、可手动清理）
     <YYYYMMDD-HHMMSS>-<slug>\        每个 `request` 一个目录
       session_state.json
+      handq-engine.log                 ← 该 session 完整的 engine 日志
       executions_logs\
       ... (FlowController 的所有输出)
   personality\                       ← "HandQ 学到的关于我"的所有数据
@@ -56,7 +62,7 @@ INSTALL_DIR =
       frame_m<i>.png                   每显示器 1 张，OCR 后立刻 unlink
   browser_profile\screenshots\       browser_tool 截图（vision §1.6）
   desktop_shots\                     desktop_tool 截图（vision §1.6）
-  logs\                              ← 框架日志，每次启动一个目录
+  logs\                              ← 框架日志（跨 session），每次 launch 一个目录
     <YYYYMMDD-HHMMSS>\
       handq-bridge.log                 Python 端框架日志（含 LTM /
                                          PersonalityMonitor / Scheduler 全部
@@ -71,14 +77,23 @@ INSTALL_DIR =
   HandQ.exe                          Electron 主程序
   handq-bridge.exe                   Nuitka 冻结的 bridge
   handq_config.yaml                  ship 的默认配置（首次启动拷到上面）
+  gep_templates\                     ship 的默认模板（首次启动拷到上面）
 ```
+
+> **关键不变量**：Windows 下，dev 模式与 frozen prod 模式访问的 user-root
+> 是**同一棵 `%USERPROFILE%\HandQ\` 树**。dev 模式的 repo `gep_templates/`
+> 与 `handq_config.yaml` 仅作为首次启动的 seed 源——拷贝到 user 根之后，
+> repo 下的副本不再被读写。这降低了"换模式行为变了"的认知成本，与 §2 的
+> Dev 启动流程描述保持一致。
 
 切分原则：
 
 | 数据 | 路径 | 漫游？ | 用户可见？ | 生命周期 |
 |---|---|---|---|---|
 | 用户配置 | `%USERPROFILE%\HandQ\handq_config.yaml` | 是 | 是 | 跨升级 |
+| GEP 模板 | `%USERPROFILE%\HandQ\gep_templates\<uuid>.json` | 否 | 是 | 跨升级；Templates 面板可 Delete |
 | Session 历史 | `%USERPROFILE%\HandQ\History\<id>\` | 否 | 是 | 跨升级，可手动清理 |
+| Per-session engine log | `%USERPROFILE%\HandQ\History\<id>\handq-engine.log` | 否 | 是 | 跟随 session |
 | LTM SQLite | `%USERPROFILE%\HandQ\personality\memory.db` | 否 | 是 | 跨升级；详见 LTM 设计文档 |
 | 长 /remember 镜像 | `%USERPROFILE%\HandQ\personality\memory_notes\<id>.md` | 否 | 是 | 跨升级；用户可编辑器打开 |
 | 活动截图（瞬时） | `%USERPROFILE%\HandQ\personality\ephemeral\` | 否 | 是 | 子秒级（OCR 后立删） |
@@ -174,6 +189,8 @@ HandQ/                              ← repo 根，dev 模式下也是 INSTALL_D
 ├── bridge_main.py                  ← bridge 入口（将来编译成 handq-bridge.exe）
 ├── handq_config.yaml               ← 用户配置（应进 .gitignore，由 example 拷贝得到）
 ├── handq_config.example.yaml       ← 跟进 git 的模板（待办：拆出来）
+├── gep_templates/                  ← 仅作为 ship-default 源（首次启动会被
+│                                     拷贝到 %USERPROFILE%\HandQ\gep_templates\）
 ├── src/                            ← Python 后端
 │   ├── bridge/
 │   │   └── stdio_bridge.py         ← stdio JSON 调度器
@@ -189,16 +206,18 @@ HandQ/                              ← repo 根，dev 模式下也是 INSTALL_D
 │   │   └── styles.css
 │   ├── package.json
 │   └── node_modules/
-├── logs/                           ← Dev 模式下保留在 repo 内便于检查
-│   └── 20260521-180449/
-│       ├── handq-bridge.log        ← Python 端
-│       └── handq-frontend.log      ← Electron 端
 └── ARCHITECTURE.md                 ← 本文件
 ```
 
-> Dev 模式下 session 历史依然写到 `%USERPROFILE%\HandQ\History\`——bridge
-> 只看 USERPROFILE 而不看是否打包，所以源码运行和正式运行行为一致。
-> 仅日志位置不同（dev → repo `logs/`，prod → `%USERPROFILE%\HandQ\logs\`）。
+> **Windows dev 与 prod 的运行时数据布局完全一致** —— 都写入
+> `%USERPROFILE%\HandQ\` 下的同一套目录（config / History / personality /
+> logs / gep_templates / scheduled_tasks.json）。dev 模式下也不再把任何
+> 用户数据留在 repo 里。这降低了"换模式行为变了"的认知成本，也让
+> ARCHITECTURE.md §1.5 的描述对所有 Windows 运行时都适用。
+>
+> 唯一例外是 **Linux/macOS** —— 没有等价的 user-root 惯例，所有运行时
+> 数据（包括 logs / gep_templates）都放在 `<install_dir>/` 下；dev
+> 即 repo 根，frozen 即 `dirname(sys.executable)`。
 
 ### Dev 启动流程
 
@@ -210,10 +229,15 @@ HandQ/                              ← repo 根，dev 模式下也是 INSTALL_D
    ```
 3. `spawn(cmd, args, { env, stdio: pipe×3 })` — **不传 cwd**。
 4. `bridge_main.py` 计算 `INSTALL_DIR = dirname(__file__) = <repo>`，
-   将配置定位为 `<repo>/handq_config.yaml`，并写入 `HANDQ_CONFIG` env。
+   将配置定位为：(1) `HANDQ_CONFIG` env override → (2) `%USERPROFILE%\HandQ\handq_config.yaml`
+   → (3) `<repo>/handq_config.yaml` 的回落顺序。同时把 `HANDQ_LOG_DIR`
+   指向 `%USERPROFILE%\HandQ\logs\<TS>\`（**Windows dev 也走 user 根**，
+   不再保留在 repo `logs/` 下），并写入 env。
 5. `stdio_bridge.run()` 读取 `HANDQ_CONFIG` 后正常运行。
-6. 日志落到 `<repo>/logs/<TS>/`；session 历史落到
-   `%USERPROFILE%\HandQ\History\<TS>-<slug>/`（与 prod 一致）。
+6. 所有运行时产物——logs / session History / personality / gep_templates /
+   scheduled_tasks.json——都落在 `%USERPROFILE%\HandQ\` 下，与 prod 完全一致。
+   `<repo>/gep_templates/` 仅作为首次启动 seed 的源（拷贝到 user 根后，repo
+   下的副本不再被读写）。
 
 ---
 

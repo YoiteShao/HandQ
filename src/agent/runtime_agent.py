@@ -365,6 +365,48 @@ class RuntimeAgent:
         # before the tool completes and an observation is recorded.
         self._in_flight_tools: List[Dict[str, Any]] = []
 
+    def _on_network_event(self, state: str, attempt: int, sleep_secs: int) -> None:
+        """UI hook for the network-aware fallback wrappers.
+
+        Surfaces local-network outage / restoration to the InteractionManager
+        so the user sees the pause without parsing logs. Failures inside the
+        callback never propagate — the wrapper itself swallows callback
+        errors, but we belt-and-braces here so a flaky IM never crashes
+        the Think step.
+
+        ``state`` is one of ``"down"`` / ``"waiting"`` / ``"restored"``.
+        ``attempt`` and ``sleep_secs`` are 0 on ``"down"`` / ``"restored"``.
+        """
+        im = self._interaction_manager
+        try:
+            if state == "down":
+                if im is not None:
+                    im.notify_inline_event(
+                        "📡",
+                        f"Network appears down — pausing iteration "
+                        f"{self.current_iteration}; waiting for restoration",
+                    )
+                self.logger.warning(
+                    f"[{self.current_iteration}][NetworkWait] local network down — pausing",
+                    component="RuntimeAgent",
+                )
+            elif state == "waiting":
+                # Don't spam the inline event log; debug-only.
+                self.logger.debug(
+                    f"[{self.current_iteration}][NetworkWait] retry #{attempt}, "
+                    f"backoff {sleep_secs}s",
+                    component="RuntimeAgent",
+                )
+            elif state == "restored":
+                if im is not None:
+                    im.notify_inline_event("📡", "Network restored — resuming")
+                self.logger.info(
+                    f"[{self.current_iteration}][NetworkWait] network restored",
+                    component="RuntimeAgent",
+                )
+        except Exception:
+            pass
+
     def get_progress_summary(self, max_chars: int = 5000) -> str:
         """
         Return a compact summary of the agent's current execution state.
@@ -1450,6 +1492,7 @@ class RuntimeAgent:
                     f"to service index {service_offset + idx}: {type(e).__name__}: {e}",
                     component="RuntimeAgent",
                 ),
+                on_network_event=self._on_network_event,
             )
 
             # ── Streaming dispatch state (reset per attempt) ──────────────────

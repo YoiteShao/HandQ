@@ -178,6 +178,7 @@
     const scSettings = document.getElementById('sc-settings');
     const scScheduler = document.getElementById('sc-scheduler');
     const scNew      = document.getElementById('sc-new');
+    const scTemplates = document.getElementById('sc-templates');
 
     // Titlebar
     const tbMin   = document.getElementById('tb-min');
@@ -192,9 +193,133 @@
     const activityClose   = document.getElementById('activity-close');
     const activityFeed    = document.getElementById('activity-feed');
 
+    // Boot overlay — visible by default; we hide it on first real status
+    // event (or bridge_exit if boot crashed).
+    const bootOverlay  = document.getElementById('boot-overlay');
+    const bootPhaseEl  = document.getElementById('boot-phase');
+    const bootElapsedEl= document.getElementById('boot-elapsed');
+    const bootHintEl   = document.getElementById('boot-hint');
+    const bootErrorEl  = document.getElementById('boot-error');
+    const bootTitleEl  = document.getElementById('boot-title');
+
+    let bootHidden = false;
+    const bootStartedAt = Date.now();
+    let bootElapsedTimer = null;
+    let bootSlowHintTimer = null;
+    let bootErrorState = false;
+
+    // Friendly labels for the structured phase names emitted by
+    // bridge_main.py:_emit_boot_progress. Anything we don't have a label
+    // for falls back to a humanised version of the phase string itself.
+    const BOOT_PHASE_LABELS = {
+        fd_setup_done:           'preparing IPC channel',
+        config_resolved:         'reading config',
+        logging_ready:           'starting log handlers',
+        importing:               'loading module',
+        imported:                'module loaded',
+        import_failed:           'module failed to load',
+        imports_done:            'all modules loaded',
+        ltm_init_start:          'opening long-term memory',
+        ltm_init_done:           'long-term memory ready',
+        ltm_init_failed:         'long-term memory failed',
+        personality_start_start: 'starting activity monitor',
+        personality_start_done:  'activity monitor ready',
+        personality_start_failed:'activity monitor failed',
+        scheduler_start_start:   'starting scheduler',
+        scheduler_start_done:    'scheduler ready',
+        scheduler_start_failed:  'scheduler failed',
+        stdio_loop_ready:        'ready',
+    };
+
+    function formatPhase(evt) {
+        const phase = String(evt && evt.phase || '');
+        let base = BOOT_PHASE_LABELS[phase] || phase.replace(/_/g, ' ');
+        if (phase === 'importing' && evt.module) {
+            base = 'loading ' + String(evt.module);
+        } else if (phase === 'imported' && evt.module) {
+            base = 'loaded ' + String(evt.module) +
+                   (evt.took_ms ? ' (' + evt.took_ms + 'ms)' : '');
+        } else if (phase === 'imports_done' && evt.took_ms) {
+            base = 'all modules loaded (' + evt.took_ms + 'ms)';
+        } else if (phase.endsWith('_done') && evt.took_ms) {
+            base += ' (' + evt.took_ms + 'ms)';
+        }
+        return base;
+    }
+
+    function refreshBootElapsed() {
+        if (!bootElapsedEl) return;
+        const sec = (Date.now() - bootStartedAt) / 1000;
+        bootElapsedEl.textContent = sec.toFixed(1) + 's';
+    }
+
+    function updateBootProgress(evt) {
+        if (bootHidden || bootErrorState) return;
+        if (bootPhaseEl) bootPhaseEl.textContent = formatPhase(evt);
+        refreshBootElapsed();
+    }
+
+    function showBootError(message) {
+        if (!bootOverlay) return;
+        bootErrorState = true;
+        if (bootTitleEl) bootTitleEl.textContent = 'HandQ failed to start';
+        if (bootErrorEl) {
+            bootErrorEl.textContent = String(message || 'unknown error');
+            bootErrorEl.classList.remove('hidden');
+        }
+        if (bootHintEl) bootHintEl.classList.add('hidden');
+        const spin = bootOverlay.querySelector('.boot-spinner');
+        if (spin) spin.style.display = 'none';
+        // Don't auto-hide on error; user has to read it. Stop the elapsed
+        // clock so the number freezes at the failure time.
+        if (bootElapsedTimer) {
+            clearInterval(bootElapsedTimer);
+            bootElapsedTimer = null;
+        }
+        if (bootSlowHintTimer) {
+            clearTimeout(bootSlowHintTimer);
+            bootSlowHintTimer = null;
+        }
+    }
+
+    function hideBootOverlay() {
+        if (bootHidden || bootErrorState) return;
+        bootHidden = true;
+        if (bootOverlay) bootOverlay.classList.add('hidden');
+        if (bootElapsedTimer) {
+            clearInterval(bootElapsedTimer);
+            bootElapsedTimer = null;
+        }
+        if (bootSlowHintTimer) {
+            clearTimeout(bootSlowHintTimer);
+            bootSlowHintTimer = null;
+        }
+    }
+
+    if (bootOverlay) {
+        // Tick the elapsed clock every 100ms so the user sees the number
+        // moving — proof of life when the bridge is silent for long
+        // stretches (e.g. unzipping _internal/ on first launch).
+        bootElapsedTimer = setInterval(refreshBootElapsed, 100);
+        // After 30s with no "ready" signal, swap the phase line for an
+        // explanatory hint. The bridge keeps emitting boot_progress so
+        // formatPhase() will keep updating, but we add a yellow hint
+        // strip below it so the user knows nothing is wrong.
+        bootSlowHintTimer = setTimeout(() => {
+            if (bootHintEl && !bootHidden && !bootErrorState) {
+                bootHintEl.textContent =
+                    "First launch can take up to a minute as the runtime " +
+                    "unpacks. Subsequent launches are much faster.";
+                bootHintEl.classList.remove('hidden');
+            }
+        }, 30000);
+    }
+
     // Overlays
     const overlaySettings  = document.getElementById('overlay-settings');
     const overlayConfirm   = document.getElementById('overlay-confirmation');
+    const overlayGep       = document.getElementById('overlay-gep');
+    const overlayTemplates = document.getElementById('overlay-templates');
     const settingsCancel   = document.getElementById('settings-cancel');
     const confirmTitle     = document.getElementById('confirm-title');
     const confirmDescEl    = document.getElementById('confirm-description');
@@ -608,6 +733,54 @@
     function clearWorking() {
         if (!activityStrip) return;
         activityStrip.classList.remove('working');
+    }
+
+    // ----- Confidence gauge ------------------------------------------------
+    //
+    // The 5-bar gauge replaces the old single dot. It serves two distinct
+    // signals at once:
+    //   1. "Step is in flight, here's how confident the planner is"
+    //      — driven by the step_confidence envelope (stdio_bridge.py
+    //      `notify_step_confidence`). Number of lit bars = ceil(conf*5),
+    //      tier color = red ≤0.4 / amber ≤threshold / green > threshold.
+    //   2. "Idle / unknown" — gauge dims to neutral grey when no task is
+    //      running (see resetGauge).
+    // The threshold defaults to 0.8 to match the backend default
+    // (handq_config.yaml: session.step_threshold). It is refreshed from
+    // the config payload after the first getConfig() — see wire-up below.
+
+    const activityGauge = document.getElementById('activity-gauge');
+    let confThreshold = 0.8;
+
+    function setConfidenceGauge(conf) {
+        if (!activityStrip || !activityGauge) return;
+        let c = Number(conf);
+        if (!Number.isFinite(c)) return;
+        if (c < 0) c = 0;
+        if (c > 1) c = 1;
+        // ceil so anything > 0 lights at least one bar.
+        const lit = Math.max(0, Math.min(5, Math.ceil(c * 5)));
+        const tier = c <= 0.4 ? 'low' : (c <= confThreshold ? 'mid' : 'high');
+        activityStrip.dataset.confTier = tier;
+        const bars = activityGauge.querySelectorAll('.ag-bar');
+        for (let i = 0; i < bars.length; i++) {
+            // data-level is 1-indexed and corresponds to the bar's height,
+            // so we light bars 1..lit. Selector `:last-of-type` for the
+            // pulse animation will then target whichever lit bar is
+            // visually rightmost.
+            const level = i + 1;
+            bars[i].classList.toggle('ag-on', level <= lit);
+        }
+        activityStrip.title = activityStrip.title +
+            (activityStrip.title ? ' · ' : '') +
+            'conf ' + c.toFixed(2);
+    }
+
+    function resetGauge() {
+        if (!activityStrip || !activityGauge) return;
+        delete activityStrip.dataset.confTier;
+        const bars = activityGauge.querySelectorAll('.ag-bar');
+        for (const b of bars) b.classList.remove('ag-on');
     }
 
     // Track last tool name for post-execution display (backend sends None for tool in post events)
@@ -1299,6 +1472,10 @@
             event: kind,
             payload: window.__handqTrunc(evt, 200),
         });
+        // Token stream = bridge is fully alive and the engine is producing
+        // output. Drop the boot overlay if it somehow lingered past the
+        // first status event.
+        if (!bootHidden) hideBootOverlay();
         if (kind === 'text_delta') {
             appendTextDelta(evt.text || '');
         } else if (kind === 'tool_call') {
@@ -1663,6 +1840,36 @@
             payload: window.__handqTrunc(evt, 200),
         });
 
+        // Boot-progress envelope (emitted by bridge_main.py before stdio
+        // bridge takes over). Two cases:
+        //   * boot_progress     — keep updating the boot overlay
+        //   * any other status  — first real event ⇒ fade overlay out
+        // bridge_exit during boot is handled separately at the bottom of
+        // the dispatcher (it's already a status event with kind=bridge_exit
+        // generated by main.js).
+        if (evt.kind === 'boot_progress') {
+            updateBootProgress(evt);
+            return;
+        }
+        if (!bootHidden && evt.kind !== 'bridge_exit') {
+            hideBootOverlay();
+        }
+        if (evt.kind === 'bridge_exit') {
+            // If the bridge died while the overlay is still up, the user
+            // was waiting for it to start — translate the exit into a
+            // visible failure. Don't double-fire if we already painted
+            // an error.
+            if (!bootHidden && !bootErrorState) {
+                showBootError(
+                    'Backend exited during startup ' +
+                    '(code=' + (evt.code != null ? evt.code : '?') +
+                    ', signal=' + (evt.signal != null ? evt.signal : '?') +
+                    '). Check the bridge log under ' +
+                    '%USERPROFILE%\\HandQ\\logs\\ for details.'
+                );
+            }
+        }
+
         const args = Array.isArray(evt.args) ? evt.args : [];
 
         if (evt.kind === 'risk_confirmation' ||
@@ -1692,6 +1899,29 @@
                 }
                 setPill(evt.state);
             }
+            // Keep the Templates panel "Load history" button in sync with
+            // the running-task state — it should refuse imports while a
+            // task is in flight.
+            try { refreshLoadHistoryEnabled(); } catch (_) { /* declared later */ }
+        } else if (evt.kind === 'gep_intro') {
+            try {
+                gepRenderTemplate(evt.template || {});
+            } catch (e) {
+                window.__handqLog('ERROR', 'gep_intro render failed',
+                    { error: String(e) });
+            }
+        } else if (evt.kind === 'gep_countdown') {
+            try {
+                gepUpdateCountdown(typeof evt.remaining === 'number' ? evt.remaining : -1);
+            } catch (e) {
+                window.__handqLog('ERROR', 'gep_countdown update failed',
+                    { error: String(e) });
+            }
+        } else if (evt.kind === 'inline_event') {
+            // Backend-emitted step-style line (e.g. GEP banner messages).
+            // Render with addStepBubble so it visually matches planner step
+            // events instead of the chunkier system bubble used by display_message.
+            addStepBubble(String(evt.icon || '·'), String(evt.desc || ''));
         } else if (evt.kind === 'progress') {
             const cur = evt.current || 0;
             const tot = evt.total || 0;
@@ -1713,6 +1943,7 @@
             const conf = parseFloat(args[0]);
             if (!Number.isNaN(conf)) {
                 pushActivity('◎', 'Step confidence', conf.toFixed(2));
+                setConfidenceGauge(conf);
             }
         } else if (evt.kind === 'decision_made') {
             const iter = args[0] || '';
@@ -1821,6 +2052,9 @@
             payload: window.__handqTrunc(window.__handqRedact(evt), 200),
         });
         if (!evt || !evt.result) return;
+        // Any final response means the bridge is alive and serving — fade
+        // the boot overlay if it's still up.
+        if (!bootHidden) hideBootOverlay();
 
         if (activeAssistantBubble) sealActiveBubble('final');
 
@@ -1852,6 +2086,16 @@
             fatal: !!evt.fatal,
             payload: window.__handqTrunc(evt, 200),
         });
+        // Fatal startup errors (bridge spawn failure) arrive on the error
+        // channel before any status events. Surface them on the boot
+        // overlay rather than buried in the chat.
+        if (!bootHidden && evt.fatal) {
+            showBootError(
+                (evt.where ? '[' + evt.where + '] ' : '') +
+                String(evt.message || 'fatal error during startup')
+            );
+            return;
+        }
         addErrorBubble(evt.message, evt.where);
         pushActivity('⚠', 'Error' + (evt.where ? ' · ' + evt.where : ''),
                      evt.message || '(no message)');
@@ -2181,13 +2425,574 @@
         firstReplanSeen = false;
         clearCompleted();
         clearWorking();
+        resetGauge();
         session.state = 'idle';
         setPill('idle');
         clearActivity();
         if (popoverOpen) closePopover();
         composerInput.focus();
+        // New session: reset GEP-confirm state.
+        closeGepOverlay();
+        gepInfo = null;
+        gepCountdownActive = false;
     });
 
+    // ----- GEP parameter panel + Templates review panel --------------------
+    //
+    // GEP save no longer has an in-conversation Save button. The only entry
+    // point is the Templates panel (Load history) — see further down. This
+    // section sets up the GEP confirmation/parameter panel and the templates
+    // browser overlay.
+
+    let gepInfo = null;            // last template descriptor from gep_intro
+    let gepCountdownActive = false;
+    let gepTotalSecs = 300;        // updated when gep_intro lands
+
+    // ── Templates review panel (browse / inspect / delete) ────────────────
+
+    const templatesListEl     = document.getElementById('templates-list');
+    const templatesCountEl    = document.getElementById('templates-count');
+    const templatesRefreshBtn = document.getElementById('templates-refresh');
+    const templatesLoadHistoryBtn = document.getElementById('templates-load-history');
+    const templatesCloseBtn   = document.getElementById('templates-close');
+    const templatesToastEl    = document.getElementById('templates-toast');
+    const templatesDetailEl       = document.getElementById('templates-detail');
+    const templatesDetailEmptyEl  = document.getElementById('templates-detail-empty');
+    const templatesDetailNameEl    = document.getElementById('templates-detail-name');
+    const templatesDetailVersionEl = document.getElementById('templates-detail-version');
+    const templatesDetailDescEl    = document.getElementById('templates-detail-desc');
+    const templatesDetailProblemsEl = document.getElementById('templates-detail-problems');
+    const templatesDetailParamsEl  = document.getElementById('templates-detail-params');
+    const templatesDetailParamsWrap= document.getElementById('templates-detail-params-wrap');
+    const templatesDetailStepsEl   = document.getElementById('templates-detail-steps');
+    const templatesDetailStepsWrap = document.getElementById('templates-detail-steps-wrap');
+    const templatesDetailIdEl      = document.getElementById('templates-detail-id');
+    const templatesDetailCreatedEl = document.getElementById('templates-detail-created');
+    const templatesDetailDeleteBtn = document.getElementById('templates-detail-delete');
+
+    let templatesCache = [];
+    let templatesActiveId = null;
+    // id-correlated response waiters for the Templates panel.
+    // The bridge replies with a `final` envelope carrying the same id we
+    // sent. handq.sendRequest itself is fire-and-forget, so we wire up a
+    // small map and inspect each `final` arrival via handq.onFinal.
+    const _templatesPending = new Map(); // id → {resolve, reject, timer}
+    let _templatesNextId = 1;
+
+    function templatesRpc(type, payload) {
+        const id = `templates-${type}-${_templatesNextId++}-${Date.now()}`;
+        return new Promise((resolve, reject) => {
+            const timer = setTimeout(() => {
+                if (_templatesPending.has(id)) {
+                    _templatesPending.delete(id);
+                    reject(new Error(`${type} timed out after 10s`));
+                }
+            }, 10000);
+            _templatesPending.set(id, { resolve, reject, timer });
+            try {
+                handq.sendRequest(Object.assign({ type: type, id: id }, payload || {}));
+            } catch (err) {
+                clearTimeout(timer);
+                _templatesPending.delete(id);
+                reject(err);
+            }
+        });
+    }
+
+    handq.onFinal((evt) => {
+        if (!evt || !evt.id || !_templatesPending.has(evt.id)) return;
+        const pending = _templatesPending.get(evt.id);
+        _templatesPending.delete(evt.id);
+        clearTimeout(pending.timer);
+        pending.resolve(evt.result || {});
+    });
+    handq.onError((evt) => {
+        if (!evt || !evt.id || !_templatesPending.has(evt.id)) return;
+        const pending = _templatesPending.get(evt.id);
+        _templatesPending.delete(evt.id);
+        clearTimeout(pending.timer);
+        pending.reject(new Error(evt.message || 'bridge error'));
+    });
+
+    function templatesShowToast(text, kind) {
+        if (!templatesToastEl) return;
+        templatesToastEl.textContent = text;
+        templatesToastEl.classList.remove('hidden', 'ok', 'err');
+        templatesToastEl.classList.add(kind === 'err' ? 'err' : 'ok');
+        clearTimeout(templatesShowToast._t);
+        templatesShowToast._t = setTimeout(() => {
+            templatesToastEl.classList.add('hidden');
+        }, 3500);
+    }
+
+    function templatesRenderList() {
+        if (!templatesListEl) return;
+        templatesListEl.innerHTML = '';
+        if (templatesCountEl) {
+            templatesCountEl.textContent = templatesCache.length
+                ? `${templatesCache.length} template${templatesCache.length === 1 ? '' : 's'}`
+                : '';
+        }
+        for (const t of templatesCache) {
+            const li = el('li', 'templates-list-item');
+            li.dataset.id = String(t.id || '');
+            if (Array.isArray(t.problems) && t.problems.length) li.classList.add('invalid');
+            if (t.id === templatesActiveId) li.classList.add('active');
+
+            const title = el('div', 'templates-list-item-title');
+            title.appendChild(document.createTextNode(t.name || '(unnamed)'));
+            if (t.version != null) {
+                title.appendChild(el('span', 'templates-version-badge', `v${t.version}`));
+            }
+            if (Array.isArray(t.problems) && t.problems.length) {
+                title.appendChild(el('span', 'templates-invalid-badge', 'invalid'));
+            }
+            li.appendChild(title);
+
+            const desc = el('div', 'templates-list-item-desc',
+                (t.description || '').replace(/\s+/g, ' '));
+            li.appendChild(desc);
+
+            li.addEventListener('click', () => {
+                templatesActiveId = t.id;
+                templatesRenderList();
+                templatesRenderDetail(t);
+            });
+            templatesListEl.appendChild(li);
+        }
+    }
+
+    function templatesRenderDetail(t) {
+        if (!templatesDetailEl || !t) return;
+        templatesDetailEmptyEl.classList.add('hidden');
+        templatesDetailEl.classList.remove('hidden');
+
+        templatesDetailNameEl.textContent = t.name || '(unnamed)';
+        templatesDetailVersionEl.textContent = t.version != null ? `v${t.version}` : '';
+        templatesDetailDescEl.textContent = t.description || '';
+        templatesDetailIdEl.textContent = t.id || '';
+        templatesDetailCreatedEl.textContent = t.created_at || '';
+
+        const problems = Array.isArray(t.problems) ? t.problems : [];
+        if (problems.length) {
+            templatesDetailProblemsEl.innerHTML = '';
+            const intro = el('strong', null, 'This template is invalid and will be skipped:');
+            templatesDetailProblemsEl.appendChild(intro);
+            const ul = document.createElement('ul');
+            for (const p of problems) ul.appendChild(el('li', null, p));
+            templatesDetailProblemsEl.appendChild(ul);
+            templatesDetailProblemsEl.classList.remove('hidden');
+        } else {
+            templatesDetailProblemsEl.classList.add('hidden');
+            templatesDetailProblemsEl.innerHTML = '';
+        }
+
+        const params = Array.isArray(t.params) ? t.params : [];
+        templatesDetailParamsEl.innerHTML = '';
+        if (params.length) {
+            for (const p of params) {
+                const row = el('div', 'templates-detail-param');
+                if (p.emphasis) row.classList.add('emphasis');
+                const left = el('div', 'templates-detail-param-name');
+                left.appendChild(document.createTextNode(p.name || ''));
+                if (p.type) left.appendChild(el('span', 'templates-detail-param-type', p.type));
+                row.appendChild(left);
+
+                const right = el('div');
+                if (p.default !== null && p.default !== undefined && p.default !== '') {
+                    const defaultStr = (typeof p.default === 'object')
+                        ? JSON.stringify(p.default)
+                        : String(p.default);
+                    right.appendChild(el('span', 'templates-detail-param-default',
+                        `default: ${defaultStr}`));
+                }
+                if (p.description) {
+                    right.appendChild(el('div', 'templates-detail-param-desc', p.description));
+                }
+                row.appendChild(right);
+                templatesDetailParamsEl.appendChild(row);
+            }
+            templatesDetailParamsWrap.hidden = false;
+        } else {
+            templatesDetailParamsWrap.hidden = true;
+        }
+
+        const steps = Array.isArray(t.steps) ? t.steps : [];
+        templatesDetailStepsEl.innerHTML = '';
+        if (steps.length) {
+            for (const s of steps) {
+                const li = el('li');
+                li.appendChild(el('span', 'templates-detail-step-desc',
+                    s.description || s.step_id || '(step)'));
+                if (Array.isArray(s.tools_required) && s.tools_required.length) {
+                    const tools = el('span', 'templates-detail-step-tools');
+                    tools.textContent =
+                        ' [' + s.tools_required.map(String).join(', ') + ']';
+                    li.appendChild(tools);
+                }
+                if (s.goal) {
+                    li.appendChild(el('span', 'templates-detail-step-goal', s.goal));
+                }
+                templatesDetailStepsEl.appendChild(li);
+            }
+            templatesDetailStepsWrap.hidden = false;
+        } else {
+            templatesDetailStepsWrap.hidden = true;
+        }
+    }
+
+    function templatesLoad() {
+        if (!handq.sendRequest) return;
+        if (templatesCountEl) templatesCountEl.textContent = 'loading…';
+        templatesRpc('gep_list_templates').then((result) => {
+            templatesCache = (result && Array.isArray(result.templates))
+                ? result.templates : [];
+            if (templatesActiveId
+                && !templatesCache.some((t) => t.id === templatesActiveId)) {
+                templatesActiveId = null;
+                templatesDetailEl.classList.add('hidden');
+                templatesDetailEmptyEl.classList.remove('hidden');
+            }
+            templatesRenderList();
+            if (templatesActiveId) {
+                const active = templatesCache.find((t) => t.id === templatesActiveId);
+                if (active) templatesRenderDetail(active);
+            }
+        }).catch((err) => {
+            templatesShowToast('Load failed: ' + (err && err.message), 'err');
+            if (templatesCountEl) templatesCountEl.textContent = '';
+        });
+    }
+
+    function openTemplatesOverlay() {
+        if (!overlayTemplates) return;
+        overlayTemplates.classList.remove('hidden');
+        overlayTemplates.setAttribute('aria-hidden', 'false');
+        templatesLoad();
+        refreshLoadHistoryEnabled();
+    }
+    function closeTemplatesOverlay() {
+        if (!overlayTemplates) return;
+        overlayTemplates.classList.add('hidden');
+        overlayTemplates.setAttribute('aria-hidden', 'true');
+    }
+
+    if (scTemplates) {
+        scTemplates.addEventListener('click', () => {
+            if (overlayTemplates && !overlayTemplates.classList.contains('hidden')) {
+                closeTemplatesOverlay();
+            } else {
+                openTemplatesOverlay();
+            }
+        });
+    }
+    if (templatesCloseBtn) templatesCloseBtn.addEventListener('click', closeTemplatesOverlay);
+    if (templatesRefreshBtn) templatesRefreshBtn.addEventListener('click', templatesLoad);
+
+    // Load-history is the SOLE entry point for generating a new template.
+    // No in-conversation Save button exists anymore — every save goes
+    // through this picker, which:
+    //   1) requires no active task (server-side gate refuses if any),
+    //   2) defaults to %USERPROFILE%\HandQ\History\ so users see their
+    //      own session list without typing a path,
+    //   3) sends gep_save with the chosen log_file.
+    // The save flow then takes over the conversation pane just like any
+    // other request — the user can refine the template via chat.
+    function templatesIsBusy() {
+        return isTaskRunning() || gepCountdownActive;
+    }
+    function refreshLoadHistoryEnabled() {
+        if (!templatesLoadHistoryBtn) return;
+        const busy = templatesIsBusy();
+        templatesLoadHistoryBtn.disabled = busy;
+        templatesLoadHistoryBtn.title = busy
+            ? 'Finish or cancel the current task before importing a session log'
+            : 'Generate a GEP template from any past session log';
+    }
+    if (templatesLoadHistoryBtn) {
+        templatesLoadHistoryBtn.addEventListener('click', async () => {
+            if (templatesIsBusy()) {
+                templatesShowToast(
+                    'Cannot import while a task is running — wait for completion or click New first.',
+                    'err',
+                );
+                return;
+            }
+            const dlg = window.handqDialog;
+            if (!dlg || !dlg.pickHistoryLog) {
+                templatesShowToast('File picker unavailable.', 'err');
+                return;
+            }
+            let result;
+            try {
+                result = await dlg.pickHistoryLog();
+            } catch (err) {
+                templatesShowToast('Picker failed: ' + (err && err.message), 'err');
+                return;
+            }
+            if (!result || result.canceled || !result.path) return;
+            window.__handqLog('INFO', 'load history picked', { path: result.path });
+            try {
+                handq.sendRequest({ type: 'gep_save', log_file: result.path });
+                closeTemplatesOverlay();
+                addStepBubble('⤓', 'Importing session log: ' + result.path);
+                clearCompleted();
+                setWorking('saving template…');
+            } catch (err) {
+                templatesShowToast('Send failed: ' + (err && err.message), 'err');
+            }
+        });
+    }
+
+    if (templatesDetailDeleteBtn) {
+        templatesDetailDeleteBtn.addEventListener('click', () => {
+            if (!templatesActiveId) return;
+            const t = templatesCache.find((x) => x.id === templatesActiveId);
+            if (!t) return;
+            const ok = window.confirm(
+                `Delete template "${t.name || t.id}"? This removes the JSON file from disk and cannot be undone.`
+            );
+            if (!ok) return;
+            templatesRpc('gep_delete_template', { id: templatesActiveId })
+                .then((result) => {
+                    if (result && result.ok) {
+                        templatesShowToast('Template deleted.', 'ok');
+                        templatesActiveId = null;
+                        templatesLoad();
+                    } else {
+                        templatesShowToast(
+                            'Delete failed: ' + ((result && result.error) || 'unknown'),
+                            'err',
+                        );
+                    }
+                })
+                .catch((err) => {
+                    templatesShowToast('Delete failed: ' + (err && err.message), 'err');
+                });
+        });
+    }
+
+    if (overlayTemplates) {
+        overlayTemplates.addEventListener('click', (e) => {
+            if (e.target === overlayTemplates) closeTemplatesOverlay();
+        });
+    }
+
+    // ── GEP parameter panel ────────────────────────────────────────────────
+
+    const gepTitleEl       = document.getElementById('gep-title');
+    const gepDescriptionEl = document.getElementById('gep-description');
+    const gepStepsEl       = document.getElementById('gep-steps');
+    const gepStepsSection  = document.getElementById('gep-steps-section');
+    const gepKeyParamsEl       = document.getElementById('gep-key-params');
+    const gepKeyParamsSection  = document.getElementById('gep-key-params-section');
+    const gepOtherParamsEl       = document.getElementById('gep-other-params');
+    const gepOtherParamsSection  = document.getElementById('gep-other-params-section');
+    const gepCountdownEl   = document.getElementById('gep-countdown');
+    const gepProgressBar   = document.getElementById('gep-progress-bar');
+    const gepFormEl        = document.getElementById('gep-form');
+    const gepCloseBtn      = document.getElementById('gep-close');
+    const gepSkipBtn       = document.getElementById('gep-skip');
+    const gepConfirmBtn    = document.getElementById('gep-confirm');
+
+    function gepRenderParam(spec) {
+        const row = el('div', 'gep-param-row');
+        if (spec.emphasis) row.classList.add('emphasis');
+        const label = el('label', 'gep-param-label');
+        const name  = el('span', 'gep-param-name', String(spec.name || ''));
+        label.appendChild(name);
+        const typeStr = (spec.type || '').toString();
+        if (typeStr) {
+            const t = el('span', 'gep-param-type', '[' + typeStr + ']');
+            label.appendChild(t);
+        }
+        const desc = (spec.description || '').toString();
+        if (desc) {
+            label.appendChild(el('span', 'gep-param-desc', desc));
+        }
+        row.appendChild(label);
+
+        let input;
+        const lower = typeStr.toLowerCase();
+        if (lower === 'bool' || lower === 'boolean') {
+            input = document.createElement('input');
+            input.type = 'checkbox';
+            input.checked = spec.default === true || spec.default === 'true';
+        } else if (lower === 'int' || lower === 'integer' || lower === 'number') {
+            input = document.createElement('input');
+            input.type = 'number';
+            if (spec.default !== null && spec.default !== undefined) {
+                input.value = String(spec.default);
+            }
+        } else if (lower === 'list') {
+            input = document.createElement('textarea');
+            input.rows = 2;
+            input.placeholder = 'one item per line';
+            if (Array.isArray(spec.default)) {
+                input.value = spec.default.join('\n');
+            } else if (spec.default != null) {
+                input.value = String(spec.default);
+            }
+        } else {
+            input = document.createElement('input');
+            input.type = 'text';
+            if (spec.default !== null && spec.default !== undefined) {
+                input.value = String(spec.default);
+            }
+        }
+        input.dataset.paramName = String(spec.name || '');
+        input.dataset.paramType = typeStr;
+        input.classList.add('gep-param-input');
+        row.appendChild(input);
+        return row;
+    }
+
+    function gepCollectParams() {
+        if (!gepFormEl) return [];
+        const out = [];
+        const inputs = gepFormEl.querySelectorAll('.gep-param-input');
+        inputs.forEach((inp) => {
+            const name = inp.dataset.paramName;
+            if (!name) return;
+            let value;
+            if (inp.type === 'checkbox') {
+                value = inp.checked ? 'true' : 'false';
+            } else {
+                value = (inp.value || '').toString();
+            }
+            out.push({ name: name, value: value });
+        });
+        return out;
+    }
+
+    function gepFormatParamsAsMessage() {
+        const params = gepCollectParams();
+        if (!params.length) return '';
+        const lines = params
+            .filter((p) => p.value !== '' && p.value != null)
+            .map((p) => `- ${p.name} = ${p.value}`);
+        if (!lines.length) return '';
+        return 'GEP parameters:\n' + lines.join('\n');
+    }
+
+    function openGepOverlay() {
+        if (!overlayGep) return;
+        overlayGep.classList.remove('hidden');
+        overlayGep.setAttribute('aria-hidden', 'false');
+    }
+    function closeGepOverlay() {
+        if (!overlayGep) return;
+        overlayGep.classList.add('hidden');
+        overlayGep.setAttribute('aria-hidden', 'true');
+    }
+
+    function gepRenderTemplate(info) {
+        gepInfo = info || {};
+        if (gepTitleEl) gepTitleEl.textContent = info && info.name ? info.name : 'GEP Template';
+        if (gepDescriptionEl) gepDescriptionEl.textContent = (info && info.description) || '';
+
+        if (gepStepsEl) gepStepsEl.innerHTML = '';
+        const steps = (info && Array.isArray(info.steps)) ? info.steps : [];
+        if (steps.length && gepStepsEl) {
+            for (const s of steps) {
+                const li = el('li');
+                const desc = (s.description || s.goal || '').toString();
+                li.appendChild(el('span', 'gep-step-name', desc || s.step_id || '(step)'));
+                if (s.goal && s.goal !== desc) {
+                    li.appendChild(document.createElement('br'));
+                    li.appendChild(el('span', 'gep-step-desc', s.goal));
+                }
+                gepStepsEl.appendChild(li);
+            }
+            if (gepStepsSection) gepStepsSection.hidden = false;
+        } else if (gepStepsSection) {
+            gepStepsSection.hidden = true;
+        }
+
+        const params = (info && Array.isArray(info.params)) ? info.params : [];
+        const keyParams = params.filter((p) => p.emphasis);
+        const otherParams = params.filter((p) => !p.emphasis);
+
+        if (gepKeyParamsEl)   gepKeyParamsEl.innerHTML = '';
+        if (gepOtherParamsEl) gepOtherParamsEl.innerHTML = '';
+
+        if (keyParams.length && gepKeyParamsEl) {
+            for (const p of keyParams) gepKeyParamsEl.appendChild(gepRenderParam(p));
+            if (gepKeyParamsSection) gepKeyParamsSection.hidden = false;
+        } else if (gepKeyParamsSection) {
+            gepKeyParamsSection.hidden = true;
+        }
+        if (otherParams.length && gepOtherParamsEl) {
+            for (const p of otherParams) gepOtherParamsEl.appendChild(gepRenderParam(p));
+            if (gepOtherParamsSection) gepOtherParamsSection.hidden = false;
+        } else if (gepOtherParamsSection) {
+            gepOtherParamsSection.hidden = true;
+        }
+
+        gepTotalSecs = (info && Number(info.timeout_secs)) || 300;
+        gepCountdownActive = true;
+        gepUpdateCountdown(gepTotalSecs);
+        openGepOverlay();
+    }
+
+    function gepUpdateCountdown(remaining) {
+        if (!gepCountdownEl || !gepProgressBar) return;
+        if (typeof remaining !== 'number' || remaining < 0) {
+            // -1 from backend == clear
+            gepCountdownActive = false;
+            gepCountdownEl.textContent = '--';
+            gepProgressBar.style.width = '0%';
+            closeGepOverlay();
+            return;
+        }
+        gepCountdownActive = true;
+        const total = Math.max(1, gepTotalSecs || 300);
+        const pct = Math.max(0, Math.min(100, (remaining / total) * 100));
+        gepProgressBar.style.width = pct + '%';
+        const mm = Math.floor(remaining / 60);
+        const ss = remaining % 60;
+        gepCountdownEl.textContent =
+            (mm > 0 ? (mm + 'm ') : '') + (ss < 10 ? '0' + ss : ss) + 's';
+        gepCountdownEl.classList.remove('warn', 'urgent');
+        if (remaining <= 10)       gepCountdownEl.classList.add('urgent');
+        else if (remaining <= 60)  gepCountdownEl.classList.add('warn');
+    }
+
+    function gepSendChatMessage(text) {
+        if (!text) return;
+        addUserBubble(text);
+        try {
+            handq.sendRequest({ type: 'user_input', kind: 'message', text: text });
+        } catch (err) {
+            addErrorBubble(String(err && err.message || err), 'gep');
+        }
+    }
+
+    if (gepFormEl) {
+        gepFormEl.addEventListener('submit', (e) => {
+            e.preventDefault();
+            const paramsBlock = gepFormatParamsAsMessage();
+            const lines = ['yes'];
+            if (paramsBlock) lines.push('', paramsBlock);
+            gepSendChatMessage(lines.join('\n'));
+            // Optimistically close the overlay; backend will clear the
+            // countdown via gep_countdown=-1 when the template activates.
+            closeGepOverlay();
+        });
+    }
+    if (gepCloseBtn) {
+        gepCloseBtn.addEventListener('click', () => {
+            // "Close" only hides the overlay — countdown keeps running so
+            // the user can re-open it via the chat or wait for auto-activation.
+            closeGepOverlay();
+        });
+    }
+    if (gepSkipBtn) {
+        gepSkipBtn.addEventListener('click', () => {
+            gepSendChatMessage('no');
+            closeGepOverlay();
+        });
+    }
     // ----- settings form helpers (model master-list + per-role checkboxes) -----
 
     function textToModels(text) {
@@ -2343,6 +3148,14 @@
         const sessCfg  = cfg.session || {};
         const switches = cfg.interaction_switches || {};
         const emailCfg = cfg.email || {};
+
+        // Refresh the confidence-gauge threshold so the green/amber boundary
+        // tracks the user's setting. Falls back to 0.8 (the backend default)
+        // if the field is missing or non-numeric.
+        const thr = parseFloat(sessCfg.step_threshold);
+        if (Number.isFinite(thr) && thr > 0 && thr <= 1) {
+            confThreshold = thr;
+        }
 
         cfgLlmApiKey.value =
             (llm.API_KEY === undefined || llm.API_KEY === null) ? '' : String(llm.API_KEY);
@@ -2544,6 +3357,28 @@
     }
 
     settingsLoadBtn.addEventListener('click', loadConfig);
+
+    // Silent prefetch of session.step_threshold so the confidence gauge
+    // colour boundary is correct before the first step_confidence event
+    // arrives. Failures are non-fatal — the gauge falls back to the 0.8
+    // default. Wrapped in setTimeout so we don't fight loadConfig() if
+    // the user opens Settings within the first frame.
+    setTimeout(() => {
+        try {
+            handq.getConfig().then((result) => {
+                const cfg = (result && result.config) || {};
+                const thr = parseFloat((cfg.session || {}).step_threshold);
+                if (Number.isFinite(thr) && thr > 0 && thr <= 1) {
+                    confThreshold = thr;
+                    window.__handqLog('INFO', 'gauge threshold prefetched',
+                        { threshold: confThreshold });
+                }
+            }).catch((err) => {
+                window.__handqLog('WARN', 'gauge threshold prefetch failed',
+                    { err: err && err.message });
+            });
+        } catch (_) { /* ignore */ }
+    }, 1500);
 
     if (cfgLlmApiKeyToggle) {
         const eyeShow = cfgLlmApiKeyToggle.querySelector('.eye-show');
