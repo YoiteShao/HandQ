@@ -1,7 +1,9 @@
 """HandQ git post-commit hook.
 
 This file is installed into ``<repo>/.git/hooks/post-commit`` (either
-manually or via the ``ltm_install_git_hook`` IPC). It runs in the git
+manually or via Settings → Personalization → "Learn from commits in"
+on Save, which diff-syncs the configured repo list against existing
+hooks). It runs in the git
 hook environment — short-lived, no HandQ runtime — and writes a fresh
 candidate row into ``%USERPROFILE%/HandQ/memory.db`` for the bridge's
 DreamWorker to triage on its next cycle.

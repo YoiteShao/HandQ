@@ -94,6 +94,16 @@ def _get_app():
     return _outlook_app
 
 
+def is_outlook_app_ready() -> bool:
+    """True if the Outlook.Application handle is already cached.
+
+    Read-safe from any thread — only inspects a module-level reference. Used
+    by ``EmailContextProvider.prepare`` to skip the 5s smoke-test round-trip
+    on every step's prepare after the first successful one in this process.
+    """
+    return _outlook_app is not None
+
+
 def _shutdown() -> None:
     try:
         import pythoncom  # type: ignore[import-untyped]
@@ -186,12 +196,14 @@ def _resolve_folder(namespace, folder_path: str):
     return current
 
 
-def _walk_folders(folder, max_depth: int = 10):
+def _walk_folders(folder, max_depth: int = 4):
     """Yield ``folder`` then every descendant folder, depth-first.
 
-    Bounded by ``max_depth`` to defuse pathological / cyclic stores. Errors
-    while iterating a sub-folder are swallowed so one bad branch doesn't
-    abort the whole walk.
+    Bounded by ``max_depth`` to defuse pathological / cyclic stores. The
+    default of 4 levels covers any realistic Outlook profile (rule-routed
+    sub-folders rarely nest deeper); raise via ``email.max_recursion_depth``
+    in handq_config.yaml when needed. Errors while iterating a sub-folder
+    are swallowed so one bad branch doesn't abort the whole walk.
     """
     yield folder
     if max_depth <= 0:
@@ -272,12 +284,25 @@ def _folder_to_dict(folder, display_name: str) -> Dict[str, Any]:
     }
 
 
-def _mail_item_to_summary(item, preview_chars: int) -> Dict[str, Any]:
-    """Return list_messages / search dict for a MailItem. All plain Python."""
-    try:
-        folder_path = str(item.Parent.FolderPath)
-    except Exception:
-        folder_path = ""
+def _mail_item_to_summary(
+    item, preview_chars: int, folder_path: str, include_body_preview: bool = True,
+) -> Dict[str, Any]:
+    """Return list_messages / search dict for a MailItem. All plain Python.
+
+    ``folder_path`` is read once per folder by the caller and threaded through —
+    avoids a per-item ``item.Parent.FolderPath`` round-trip (saves 2 COM calls
+    per matched item).
+
+    ``include_body_preview=False`` skips the ``item.Body`` property read, which
+    is the single most expensive COM access per item (Body materialises the
+    full body text — 50-150ms per HTML mail). Set False when the caller only
+    needs metadata (subject / sender / date); body_preview is returned as ""
+    in that case so the response shape stays stable.
+    """
+    if include_body_preview:
+        body_preview = str(item.Body or "")[:preview_chars]
+    else:
+        body_preview = ""
     return {
         "entry_id": str(item.EntryID),
         "subject": str(item.Subject or ""),
@@ -286,7 +311,7 @@ def _mail_item_to_summary(item, preview_chars: int) -> Dict[str, Any]:
         "received_at": _to_iso(item.ReceivedTime),
         "is_read": not bool(item.UnRead),
         "has_attachments": bool(item.Attachments.Count > 0),
-        "body_preview": str(item.Body or "")[:preview_chars],
+        "body_preview": body_preview,
         "folder": folder_path,
     }
 
@@ -437,48 +462,36 @@ def _build_dasl_prefilter(
     return "@SQL=" + " AND ".join(parts)
 
 
-def _count_folder_prefilter(folder, dasl_prefilter: Optional[str]) -> int:
-    """Index-side count of items in ``folder`` matching the DASL prefilter.
-
-    Returns -1 when the count couldn't be obtained — the caller should treat
-    that as "unknown" and disable the aggregated total estimate.
-    """
-    try:
-        if dasl_prefilter is None:
-            return int(folder.Items.Count)
-        return int(folder.Items.Restrict(dasl_prefilter).Count)
-    except Exception:
-        return -1
-
-
 def _scan_folder_messages(
-    folder,
+    items,
     *,
+    folder_path: str,
     since_dt: Optional[datetime],
     sender_filter: str,
     subject_filter: str,
     unread_only: bool,
     preview_chars: int,
+    include_body_preview: bool,
     cap: int,
+    fallback_python_filter: bool,
 ) -> tuple:
     """Per-folder message scan honoring all list_messages filters.
+
+    ``items`` is the already-Restricted collection from the caller (so the
+    DASL prefilter for since + unread is applied index-side). When the
+    Restrict failed and the caller passed the unfiltered collection, set
+    ``fallback_python_filter=True`` to re-enable the Python-side since /
+    unread guard inside the loop.
+
+    ``folder_path`` is read once by the caller from the folder handle and
+    threaded through to ``_mail_item_to_summary`` — avoids per-item
+    ``item.Parent.FolderPath`` round-trips.
 
     Returns ``(summaries, hit_cap)`` — ``hit_cap`` is True iff iteration
     stopped because the cap was reached (i.e. there were more matching
     candidates we didn't materialise). Callers use it to drive the
     response-level ``truncated`` flag.
     """
-    try:
-        items = folder.Items
-    except Exception:
-        return [], False
-
-    if unread_only:
-        try:
-            items = items.Restrict("[Unread] = True")
-        except Exception:
-            pass
-
     try:
         items.Sort("[ReceivedTime]", True)  # newest first
     except Exception:
@@ -496,13 +509,21 @@ def _scan_folder_messages(
         except Exception:
             continue
 
-        # Items are sorted newest-first → break as soon as we cross the floor
-        if since_dt:
-            rt = _to_python_datetime(item.ReceivedTime)
-            if rt is None:
-                continue
-            if rt < since_dt:
-                break
+        if fallback_python_filter:
+            # Restrict failed — re-apply since + unread in Python.
+            if unread_only:
+                try:
+                    if not bool(item.UnRead):
+                        continue
+                except Exception:
+                    continue
+            if since_dt:
+                rt = _to_python_datetime(item.ReceivedTime)
+                if rt is None:
+                    continue
+                if rt < since_dt:
+                    # Items are sorted newest-first → break on first miss
+                    break
 
         if sender_filter:
             try:
@@ -521,7 +542,9 @@ def _scan_folder_messages(
                 continue
 
         try:
-            out.append(_mail_item_to_summary(item, preview_chars))
+            out.append(_mail_item_to_summary(
+                item, preview_chars, folder_path, include_body_preview,
+            ))
         except Exception:
             pass
 
@@ -558,6 +581,14 @@ def _sync_list_messages(params: Dict[str, Any]) -> Dict[str, Any]:
     unread_only = bool(params.get("unread_only"))
     limit = min(int(params.get("limit") or 50), 200)
     preview_chars = int(params.get("_preview_chars") or 500)
+    max_depth = int(params.get("_max_depth") or 4)
+    # Default True for backward compatibility — agents can opt out via the
+    # public include_body_preview param when only metadata is needed (saves
+    # ~50-150ms per item by skipping the Body COM materialisation).
+    include_body_preview = bool(
+        True if params.get("include_body_preview") is None
+        else params["include_body_preview"]
+    )
 
     # list_messages defaults to recursive=true: enterprise mailboxes commonly
     # route incoming mail into Inbox sub-folders via rules, and a single-folder
@@ -565,7 +596,10 @@ def _sync_list_messages(params: Dict[str, Any]) -> Dict[str, Any]:
     recursive_param = params.get("recursive")
     recursive = True if recursive_param is None else bool(recursive_param)
 
-    folders_to_scan = list(_walk_folders(root_folder)) if recursive else [root_folder]
+    folders_to_scan = (
+        list(_walk_folders(root_folder, max_depth=max_depth))
+        if recursive else [root_folder]
+    )
     if blacklist:
         folders_to_scan = [
             f for f in folders_to_scan
@@ -582,27 +616,67 @@ def _sync_list_messages(params: Dict[str, Any]) -> Dict[str, Any]:
     merged: List[Dict[str, Any]] = []
     any_folder_hit_cap = False
     for fld in folders_to_scan:
+        # E4: skip empty folders before paying for Restrict + Sort.
+        try:
+            if int(fld.Items.Count) == 0:
+                continue
+        except Exception:
+            pass
+
+        try:
+            folder_path = str(getattr(fld, "FolderPath", "") or "")
+        except Exception:
+            folder_path = ""
+
+        # E1+E2: apply DASL prefilter once and share the Restricted collection
+        # for both count and scan. Falls back to the unfiltered Items if
+        # Restrict raises — _scan_folder_messages re-applies since/unread in
+        # Python in that case.
+        try:
+            items = fld.Items
+        except Exception:
+            continue
+
+        fallback_python_filter = False
+        if dasl_prefilter:
+            try:
+                items = items.Restrict(dasl_prefilter)
+            except Exception:
+                fallback_python_filter = True
+
+        if total_estimated is not None:
+            if fallback_python_filter:
+                # Restrict failed → items.Count would over-count (it includes
+                # items that don't match the prefilter). Disable total tracking.
+                total_estimated = None
+            else:
+                try:
+                    folder_total = int(items.Count)
+                except Exception:
+                    folder_total = -1
+                if folder_total < 0:
+                    total_estimated = None  # one failed count poisons the sum
+                else:
+                    total_estimated += folder_total
+
         try:
             results, hit_cap = _scan_folder_messages(
-                fld,
+                items,
+                folder_path=folder_path,
                 since_dt=since_dt,
                 sender_filter=sender_filter,
                 subject_filter=subject_filter,
                 unread_only=unread_only,
                 preview_chars=preview_chars,
+                include_body_preview=include_body_preview,
                 cap=limit,
+                fallback_python_filter=fallback_python_filter,
             )
         except Exception:
             continue
         merged.extend(results)
         if hit_cap:
             any_folder_hit_cap = True
-        if total_estimated is not None:
-            count_in_folder = _count_folder_prefilter(fld, dasl_prefilter)
-            if count_in_folder < 0:
-                total_estimated = None  # one failed count poisons the sum
-            else:
-                total_estimated += count_in_folder
 
     # ISO-8601 strings sort lexicographically as dates → desc by received_at
     merged.sort(key=lambda m: m.get("received_at") or "", reverse=True)
@@ -710,6 +784,11 @@ def _sync_search(params: Dict[str, Any]) -> Dict[str, Any]:
 
     limit = min(int(params.get("limit") or 20), 100)
     preview_chars = int(params.get("_preview_chars") or 500)
+    max_depth = int(params.get("_max_depth") or 4)
+    include_body_preview = bool(
+        True if params.get("include_body_preview") is None
+        else params["include_body_preview"]
+    )
 
     # search defaults to recursive=true for the same reason as list_messages:
     # auto-routed mail is the common case, and DASL Restrict per-folder is
@@ -717,7 +796,10 @@ def _sync_search(params: Dict[str, Any]) -> Dict[str, Any]:
     recursive_param = params.get("recursive")
     recursive = True if recursive_param is None else bool(recursive_param)
 
-    folders_to_scan = list(_walk_folders(root_folder)) if recursive else [root_folder]
+    folders_to_scan = (
+        list(_walk_folders(root_folder, max_depth=max_depth))
+        if recursive else [root_folder]
+    )
     if blacklist:
         folders_to_scan = [
             f for f in folders_to_scan
@@ -731,6 +813,18 @@ def _sync_search(params: Dict[str, Any]) -> Dict[str, Any]:
     merged: List[Dict[str, Any]] = []
     any_folder_hit_cap = False
     for fld in folders_to_scan:
+        # E4: skip empty folders before the index round-trip.
+        try:
+            if int(fld.Items.Count) == 0:
+                continue
+        except Exception:
+            pass
+
+        try:
+            folder_path = str(getattr(fld, "FolderPath", "") or "")
+        except Exception:
+            folder_path = ""
+
         try:
             items = fld.Items.Restrict(dasl)
             try:
@@ -760,7 +854,9 @@ def _sync_search(params: Dict[str, Any]) -> Dict[str, Any]:
             try:
                 if item.Class != _OL_MAIL_CLASS:
                     continue
-                merged.append(_mail_item_to_summary(item, preview_chars))
+                merged.append(_mail_item_to_summary(
+                    item, preview_chars, folder_path, include_body_preview,
+                ))
                 per_folder_count += 1
             except Exception:
                 pass
@@ -961,6 +1057,21 @@ class EmailTool(BaseTool):
                     "full bodies can be large and consume LLM context budget."
                 ),
             },
+            "include_body_preview": {
+                "type": "boolean",
+                "description": (
+                    "[list_messages / search] Include the 500-char body_preview "
+                    "field. Default: true.\n"
+                    "Set false when you only need metadata (subject + sender + "
+                    "date) — skipping the Body COM materialisation gives "
+                    "roughly 30-40% speedup on bulk listings (measured on a "
+                    "67k-mail Inbox: limit=100 → 11s→8s, limit=50 → 5s→3s, "
+                    "limit=20 → 15% saving). When false, body_preview is "
+                    "returned as an empty string so the response shape is "
+                    "unchanged. Recommended for limit >= 50 or when the agent "
+                    "is counting / categorising messages without reading content."
+                ),
+            },
             "include_attachments_meta": {
                 "type": "boolean",
                 "description": (
@@ -1060,6 +1171,7 @@ class EmailTool(BaseTool):
         run_params = dict(kwargs)
         run_params["_preview_chars"] = int(email_cfg.get("body_preview_chars", 500))
         run_params["_folder_blacklist"] = email_cfg.get("folder_blacklist") or []
+        run_params["_max_depth"] = int(email_cfg.get("max_recursion_depth", 4))
         loop = asyncio.get_running_loop()
         try:
             data = await loop.run_in_executor(
@@ -1086,6 +1198,7 @@ class EmailTool(BaseTool):
         run_params = dict(kwargs)
         run_params["_preview_chars"] = int(email_cfg.get("body_preview_chars", 500))
         run_params["_folder_blacklist"] = email_cfg.get("folder_blacklist") or []
+        run_params["_max_depth"] = int(email_cfg.get("max_recursion_depth", 4))
         loop = asyncio.get_running_loop()
         try:
             data = await loop.run_in_executor(_outlook_executor, _sync_search, run_params)

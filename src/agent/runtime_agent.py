@@ -144,14 +144,18 @@ _OBS_BUDGET_CHARS: int = 480_000
 # iteration drop ~50% on long sessions (proportional to how often the
 # agent re-screenshots).
 #
-# We deliberately leave list_windows / find_element / find_and_click
-# alone — those return small structured values the agent may compare
-# across turns. Only the "expensive snapshot of UI" calls are trimmed.
+# We deliberately leave list_windows alone — it returns a small structured
+# value the agent may compare across turns. find_element / find_and_click
+# results, by contrast, are stale the moment their click consumes them
+# (or the next state_after delta lands), so older copies are also
+# superseded — only the latest remains intact.
 
 _SUPERSEDABLE_TOOL_ACTIONS: frozenset = frozenset({
     ("desktop", "screenshot"),
     ("desktop", "snapshot"),
     ("desktop", "hover_at"),
+    ("desktop", "find_element"),
+    ("desktop", "find_and_click"),
     ("browser", "screenshot"),
     ("browser", "snapshot"),
 })

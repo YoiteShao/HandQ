@@ -737,20 +737,50 @@
 
     // ----- Confidence gauge ------------------------------------------------
     //
-    // The 5-bar gauge replaces the old single dot. It serves two distinct
-    // signals at once:
-    //   1. "Step is in flight, here's how confident the planner is"
-    //      — driven by the step_confidence envelope (stdio_bridge.py
-    //      `notify_step_confidence`). Number of lit bars = ceil(conf*5),
-    //      tier color = red ≤0.4 / amber ≤threshold / green > threshold.
-    //   2. "Idle / unknown" — gauge dims to neutral grey when no task is
-    //      running (see resetGauge).
-    // The threshold defaults to 0.8 to match the backend default
-    // (handq_config.yaml: session.step_threshold). It is refreshed from
-    // the config payload after the first getConfig() — see wire-up below.
+    // The 5-bar gauge shows a rolling history of the last 5 completed steps'
+    // confidence values — newest on the right. Each bar is independent:
+    //   - height = max(2, round(conf*14))px, proportional to that step's conf
+    //   - color tier = red ≤0.4 / amber ≤threshold / green > threshold,
+    //     applied per-bar via .ag-tier-{low,mid,high}
+    //   - bars without a corresponding history entry are hidden (CSS).
+    // Driven by the step_confidence envelope (stdio_bridge.py
+    // `notify_step_confidence`). The threshold defaults to 0.8 to match
+    // the backend default (handq_config.yaml: session.step_threshold) and
+    // is refreshed from the config payload after the first getConfig().
 
     const activityGauge = document.getElementById('activity-gauge');
+    const GAUGE_CAPACITY = 5;
+    const GAUGE_MAX_PX   = 14;
+    const GAUGE_MIN_PX   = 2;
+    const confidenceHistory = [];
     let confThreshold = 0.8;
+
+    function _confTier(c) {
+        return c <= 0.4 ? 'low' : (c <= confThreshold ? 'mid' : 'high');
+    }
+
+    function _renderGauge() {
+        if (!activityStrip || !activityGauge) return;
+        const bars = activityGauge.querySelectorAll('.ag-bar');
+        const n = confidenceHistory.length;
+        // Right-align history: bar index i ∈ [0..4] left→right.
+        // history slot for bar i = i - (GAUGE_CAPACITY - n)
+        const offset = GAUGE_CAPACITY - n;
+        for (let i = 0; i < bars.length; i++) {
+            const bar = bars[i];
+            const slot = i - offset;
+            bar.classList.remove('ag-tier-low', 'ag-tier-mid', 'ag-tier-high');
+            if (slot < 0) {
+                bar.classList.remove('ag-on');
+                bar.style.height = '';
+                continue;
+            }
+            const c = confidenceHistory[slot];
+            const px = Math.max(GAUGE_MIN_PX, Math.round(c * GAUGE_MAX_PX));
+            bar.style.height = px + 'px';
+            bar.classList.add('ag-on', 'ag-tier-' + _confTier(c));
+        }
+    }
 
     function setConfidenceGauge(conf) {
         if (!activityStrip || !activityGauge) return;
@@ -758,19 +788,9 @@
         if (!Number.isFinite(c)) return;
         if (c < 0) c = 0;
         if (c > 1) c = 1;
-        // ceil so anything > 0 lights at least one bar.
-        const lit = Math.max(0, Math.min(5, Math.ceil(c * 5)));
-        const tier = c <= 0.4 ? 'low' : (c <= confThreshold ? 'mid' : 'high');
-        activityStrip.dataset.confTier = tier;
-        const bars = activityGauge.querySelectorAll('.ag-bar');
-        for (let i = 0; i < bars.length; i++) {
-            // data-level is 1-indexed and corresponds to the bar's height,
-            // so we light bars 1..lit. Selector `:last-of-type` for the
-            // pulse animation will then target whichever lit bar is
-            // visually rightmost.
-            const level = i + 1;
-            bars[i].classList.toggle('ag-on', level <= lit);
-        }
+        confidenceHistory.push(c);
+        if (confidenceHistory.length > GAUGE_CAPACITY) confidenceHistory.shift();
+        _renderGauge();
         activityStrip.title = activityStrip.title +
             (activityStrip.title ? ' · ' : '') +
             'conf ' + c.toFixed(2);
@@ -778,9 +798,12 @@
 
     function resetGauge() {
         if (!activityStrip || !activityGauge) return;
-        delete activityStrip.dataset.confTier;
+        confidenceHistory.length = 0;
         const bars = activityGauge.querySelectorAll('.ag-bar');
-        for (const b of bars) b.classList.remove('ag-on');
+        for (const b of bars) {
+            b.classList.remove('ag-on', 'ag-tier-low', 'ag-tier-mid', 'ag-tier-high');
+            b.style.height = '';
+        }
     }
 
     // Track last tool name for post-execution display (backend sends None for tool in post events)

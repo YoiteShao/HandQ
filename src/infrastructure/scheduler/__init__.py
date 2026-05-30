@@ -24,7 +24,7 @@ Safety story (the user's "is this safe?" question)
 
 UI integration
 --------------
-The bridge exposes ``cron_list`` / ``cron_create`` / ``cron_update`` /
+The bridge exposes ``cron_list`` / ``cron_create`` /
 ``cron_delete`` / ``cron_set_enabled`` / ``cron_run_now`` IPC envelopes.
 When a task fires, the scheduler synthesises a regular ``request``
 envelope through the bridge so the renderer sees the new conversation

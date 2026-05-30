@@ -44,7 +44,7 @@
     width: 22px;
     height: 22px;
     border: 2px solid rgba(15, 20, 30, 0.12);
-    border-top-color: #4f8ef7;
+    border-top-color: #9b87d4;
     border-radius: 50%;
     animation: boot-spin 0.9s linear infinite;
 }
@@ -77,9 +77,9 @@
     margin-top: 12px;
     padding: 8px 14px;
     font-size: 12px;
-    color: #876b1a;
-    background: #fff7e0;
-    border: 1px solid #f0d27a;
+    color: #3a3f48;
+    background: #f0f0f2;
+    border: 1px solid rgba(0, 0, 0, 0.10);
     border-radius: 8px;
     max-width: 360px;
 }
@@ -88,9 +88,9 @@
     margin-top: 10px;
     padding: 10px 14px;
     font-size: 12px;
-    color: #b00020;
-    background: #ffe9ec;
-    border: 1px solid #f4b4be;
+    color: #b85050;
+    background: rgba(255, 230, 230, 0.85);
+    border: 1px solid rgba(220, 130, 130, 0.50);
     border-radius: 8px;
     max-width: 420px;
     text-align: left;
@@ -104,8 +104,8 @@
     --fg:           #1a1d22;
     --fg-soft:      #3a3f48;
     --fg-mute:      #6e737d;
-    --tint:         #0a84ff;
-    --tint-strong:  #0066d8;
+    --tint:         #9b87d4;
+    --tint-strong:  #6e58a8;
     --hairline:     rgba(0, 0, 0, 0.10);
     --hairline-soft:rgba(0, 0, 0, 0.06);
     --hairline-bright: rgba(255, 255, 255, 0.60);
@@ -119,8 +119,8 @@
     --asst-bubble:        rgba(255, 255, 255, 0.55);
     --asst-bubble-border: rgba(0, 0, 0, 0.08);
 
-    --error-bg:     rgba(255, 225, 225, 0.70);
-    --error-fg:     #b71c1c;
+    --error-bg:     rgba(255, 230, 230, 0.75);
+    --error-fg:     #b85050;
     --tool-bg:      rgba(255, 255, 255, 0.40);
     --tool-fg:      #2c313a;
     --tool-border:  rgba(0, 0, 0, 0.08);
@@ -253,11 +253,11 @@ html, body {
 }
 
 .tb-close:hover {
-    background: rgba(232, 17, 35, 0.88);
+    background: rgba(220, 130, 130, 0.85);
     color: #fff;
 }
 .tb-close:active {
-    background: rgba(200, 15, 30, 0.78);
+    background: rgba(200, 110, 110, 0.78);
     color: #fff;
 }
 
@@ -331,9 +331,9 @@ html, body {
 .bubble.system {
     align-self: stretch;
     max-width: 100%;
-    background: rgba(255, 248, 230, 0.42);
-    border-color: rgba(230, 200, 130, 0.40);
-    color: #644a14;
+    background: rgba(245, 245, 248, 0.65);
+    border-color: rgba(0, 0, 0, 0.10);
+    color: #3a3f48;
     text-align: center;
     border-top-left-radius: 16px;
 }
@@ -359,7 +359,7 @@ html, body {
     align-self: stretch;
     max-width: 100%;
     background: var(--error-bg);
-    border-color: rgba(220, 90, 90, 0.50);
+    border-color: rgba(220, 130, 130, 0.50);
     color: var(--error-fg);
     border-top-left-radius: 16px;
 }
@@ -414,9 +414,9 @@ html, body {
 }
 
 .md-rendered .md-bq {
-    border-left: 3px solid rgba(10, 132, 255, 0.45);
+    border-left: 3px solid rgba(155, 130, 200, 0.45);
     padding: 4px 10px;
-    background: rgba(10, 132, 255, 0.06);
+    background: rgba(155, 130, 200, 0.06);
     border-radius: 6px;
     color: var(--fg-soft);
 }
@@ -427,7 +427,7 @@ html, body {
     background: rgba(15, 20, 30, 0.07);
     padding: 1px 5px;
     border-radius: 4px;
-    color: #b14b00;
+    color: #5a5e68;
 }
 
 .md-rendered .md-pre {
@@ -458,7 +458,7 @@ html, body {
 .md-rendered a {
     color: var(--tint);
     text-decoration: none;
-    border-bottom: 1px solid rgba(10, 132, 255, 0.30);
+    border-bottom: 1px solid rgba(155, 130, 200, 0.30);
 }
 .md-rendered a:hover {
     border-bottom-color: var(--tint);
@@ -501,7 +501,7 @@ html, body {
 .tool-card[open] > summary { border-bottom: 1px solid var(--tool-border); }
 
 .tool-badge {
-    background: var(--tint);
+    background: var(--tint-strong);
     color: white;
     font-size: 10px;
     padding: 2px 7px;
@@ -551,7 +551,7 @@ html, body {
     color: var(--fg);
     background:
         rgba(255, 255, 255, 0.55) padding-box,
-        linear-gradient(135deg, #ff6b6b, #ffa94d, #ffd43b, #69db7c, #4dabf7, #9775fa, #f06595) border-box;
+        linear-gradient(135deg, #d6cdf0, #c3b3df, #b9a8e6, #c3b3df, #d6cdf0) border-box;
     backdrop-filter: blur(12px) saturate(140%);
     -webkit-backdrop-filter: blur(12px) saturate(140%);
     box-shadow: 0 1px 0 rgba(255, 255, 255, 0.50) inset;
@@ -561,7 +561,7 @@ html, body {
     outline: none;
     background:
         rgba(255, 255, 255, 0.72) padding-box,
-        linear-gradient(135deg, #ff6b6b, #ffa94d, #ffd43b, #69db7c, #4dabf7, #9775fa, #f06595) border-box;
+        linear-gradient(135deg, #d6cdf0, #c3b3df, #b9a8e6, #c3b3df, #d6cdf0) border-box;
     box-shadow: 0 0 0 3px rgba(150, 120, 255, 0.12),
                 0 1px 0 rgba(255, 255, 255, 0.55) inset;
 }
@@ -591,7 +591,7 @@ html, body {
 .composer button:disabled { opacity: 0.5; cursor: not-allowed; }
 .composer button:focus-visible {
     outline: none;
-    border-color: rgba(10, 132, 255, 0.55);
+    border-color: rgba(155, 130, 200, 0.55);
 }
 
 /* ---------- Floating expanded editor (draggable + resizable) ---------- */
@@ -619,7 +619,7 @@ html, body {
     /* Rainbow border */
     background:
         rgba(255, 255, 255, 0.97) padding-box,
-        linear-gradient(135deg, #ff6b6b, #ffa94d, #ffd43b, #69db7c, #4dabf7, #9775fa, #f06595) border-box;
+        linear-gradient(135deg, #d6cdf0, #c3b3df, #b9a8e6, #c3b3df, #d6cdf0) border-box;
     resize: both;
 }
 .composer-expanded.hidden { display: none; }
@@ -707,7 +707,7 @@ html, body {
     border-color: rgba(0, 0, 0, 0.12);
 }
 .shortcut-btn:active { transform: translateY(1px); }
-.shortcut-btn:focus  { outline: none; border-color: rgba(10, 132, 255, 0.55); }
+.shortcut-btn:focus  { outline: none; border-color: rgba(155, 130, 200, 0.55); }
 .shortcut-btn .sc-icon  { font-size: 14px; line-height: 1; }
 .shortcut-btn .sc-label { font-weight: 500; }
 
@@ -738,7 +738,7 @@ html, body {
     color: var(--fg-soft);
     border-color: rgba(0, 0, 0, 0.12);
 }
-.activity-strip:focus { outline: none; border-color: rgba(10, 132, 255, 0.55); }
+.activity-strip:focus { outline: none; border-color: rgba(155, 130, 200, 0.55); }
 
 .activity-strip .activity-gauge {
     flex: 0 0 auto;
@@ -757,32 +757,32 @@ html, body {
     border-radius: 1px;
     transition: background 200ms ease, height 160ms ease, opacity 160ms ease;
     opacity: 0.55;
+    height: 0;
 }
-/* Bars start at increasing heights so even an unlit gauge reads as a
-   gauge ("no signal") rather than an empty box. */
-.activity-strip .ag-bar[data-level="1"] { height: 3px; }
-.activity-strip .ag-bar[data-level="2"] { height: 5px; }
-.activity-strip .ag-bar[data-level="3"] { height: 8px; }
-.activity-strip .ag-bar[data-level="4"] { height: 11px; }
-.activity-strip .ag-bar[data-level="5"] { height: 14px; }
+/* Bars without a corresponding step in the history are fully hidden but
+   keep their layout slot so the rolling history slides in from the right. */
+.activity-strip .ag-bar:not(.ag-on) {
+    visibility: hidden;
+}
 
-/* Coloring is driven by data-conf-tier on the strip:
-     low  (≤0.4) → red
-     mid  (≤thr) → amber
-     high (>thr) → green
-   Tier is set by JS each time a step_confidence event arrives. The
-   number of LIT bars is set by toggling .ag-on on the bars; .ag-on
-   reads the strip-level color so all lit bars share one palette. */
+/* Coloring is per-bar — each bar reflects its own step's confidence.
+     low  (≤0.4)         → red
+     mid  (≤confThr)     → amber
+     high (>confThr)     → green
+   Tier classes are set by JS in _renderGauge() each time a step_confidence
+   event arrives. */
 .activity-strip .ag-bar.ag-on {
     opacity: 1;
+    visibility: visible;
 }
-.activity-strip[data-conf-tier="low"]  .ag-bar.ag-on { background: #e74c3c; }
-.activity-strip[data-conf-tier="mid"]  .ag-bar.ag-on { background: #f5a623; }
-.activity-strip[data-conf-tier="high"] .ag-bar.ag-on { background: #28c840; }
-/* Default (no data-conf-tier set) — neutral blue used for "in-flight,
-   confidence unknown" so the gauge isn't dead-grey when a step kicks
-   off before its confidence number arrives. */
-.activity-strip .ag-bar.ag-on { background: #4f8ef7; }
+.activity-strip .ag-bar.ag-tier-low  { background: #d97a7a; }
+.activity-strip .ag-bar.ag-tier-mid  { background: #9aa0ad; }
+.activity-strip .ag-bar.ag-tier-high { background: #9b87d4; }
+/* Default fallback — neutral blue if a bar is .ag-on but somehow has no
+   tier class (defensive only). */
+.activity-strip .ag-bar.ag-on:not(.ag-tier-low):not(.ag-tier-mid):not(.ag-tier-high) {
+    background: #9b87d4;
+}
 
 /* Live pulse on the brightest lit bar — single-bar pulse beats the
    old whole-dot pulse: cheaper and stays out of the gauge's way. */
@@ -790,9 +790,9 @@ html, body {
     animation: gauge-pulse 1.6s ease-out infinite;
 }
 @keyframes gauge-pulse {
-    0%   { box-shadow: 0 0 0 0 rgba(40, 200, 64, 0.55); }
-    70%  { box-shadow: 0 0 0 4px rgba(40, 200, 64, 0); }
-    100% { box-shadow: 0 0 0 0 rgba(40, 200, 64, 0); }
+    0%   { box-shadow: 0 0 0 0 rgba(155, 130, 200, 0.55); }
+    70%  { box-shadow: 0 0 0 4px rgba(155, 130, 200, 0); }
+    100% { box-shadow: 0 0 0 0 rgba(155, 130, 200, 0); }
 }
 
 .activity-strip .activity-current {
@@ -821,15 +821,14 @@ html, body {
 }
 
 .activity-strip.complete {
-    color: #1e6b3a;
-    background: #e8f5ec;
-    border-color: rgba(0, 0, 0, 0.06);
+    color: #3a3f48;
+    background: #ededef;
+    border-color: rgba(0, 0, 0, 0.10);
     font-weight: 600;
 }
-.activity-strip.complete .ag-bar {
-    background: #28c840;
-    opacity: 1;
-}
+/* When the task completes the strip turns green, but each bar keeps its
+   own per-step tier color — the gauge is meant to be a *history* of
+   confidences, not a "task succeeded" stamp. */
 
 /* ---------- Activity popover — opaque neutral white ---------- */
 
@@ -1022,17 +1021,17 @@ html, body {
     padding: 1px 0;
 }
 .ai-json-key {
-    color: #0066d8;
+    color: #6e58a8;
     font-weight: 600;
 }
 .ai-json-str {
-    color: #1e6b3a;
+    color: #3a3f48;
 }
 .ai-json-num {
-    color: #b14b00;
+    color: #5a5e68;
 }
 .ai-json-bool {
-    color: #9333ea;
+    color: #6e58a8;
     font-weight: 600;
 }
 .ai-json-null {
@@ -1113,13 +1112,13 @@ html, body {
 }
 .settings-toast.hidden { display: none; }
 .settings-toast.ok {
-    background: rgba(220, 245, 225, 0.72);
-    border-color: rgba(165, 215, 180, 0.55);
-    color: #1e6b3a;
+    background: rgba(235, 230, 250, 0.72);
+    border-color: rgba(155, 130, 200, 0.45);
+    color: #6e58a8;
 }
 .settings-toast.err {
     background: var(--error-bg);
-    border-color: rgba(220, 90, 90, 0.50);
+    border-color: rgba(220, 130, 130, 0.50);
     color: var(--error-fg);
 }
 
@@ -1193,9 +1192,9 @@ html, body {
 .settings-form select:focus,
 .settings-form textarea:focus {
     outline: none;
-    border-color: rgba(10, 132, 255, 0.55);
+    border-color: rgba(155, 130, 200, 0.55);
     background: rgba(255, 255, 255, 0.78);
-    box-shadow: 0 0 0 3px rgba(10, 132, 255, 0.15);
+    box-shadow: 0 0 0 3px rgba(155, 130, 200, 0.15);
 }
 .settings-form input[type="password"] {
     font-family: var(--mono);
@@ -1232,7 +1231,7 @@ html, body {
 .settings-form .input-eye-btn:hover { color: var(--fg); }
 .settings-form .input-eye-btn:focus { outline: none; }
 .settings-form .input-eye-btn:focus-visible {
-    outline: 2px solid rgba(10, 132, 255, 0.55);
+    outline: 2px solid rgba(155, 130, 200, 0.55);
     outline-offset: 2px;
     border-radius: 4px;
 }
@@ -1303,7 +1302,7 @@ html, body {
     font-weight: 500;
     padding: 1px 6px;
     border-radius: 8px;
-    background: rgba(10, 132, 255, 0.15);
+    background: rgba(155, 130, 200, 0.15);
     color: var(--tint-strong);
 }
 .settings-form label.checkbox-row.tool-sub {
@@ -1336,17 +1335,17 @@ html, body {
 }
 .settings-actions button:active { transform: translateY(1px); }
 .settings-actions button[type="submit"] {
-    background: rgba(10, 132, 255, 0.20);
+    background: rgba(155, 130, 200, 0.20);
     backdrop-filter: blur(20px) saturate(180%);
     -webkit-backdrop-filter: blur(20px) saturate(180%);
     color: var(--tint-strong);
-    border-color: rgba(10, 132, 255, 0.45);
+    border-color: rgba(155, 130, 200, 0.45);
     font-weight: 600;
     box-shadow: 0 1px 0 rgba(255, 255, 255, 0.45) inset;
 }
 .settings-actions button:hover { background: rgba(255, 255, 255, 0.78); }
 .settings-actions button[type="submit"]:hover {
-    background: rgba(10, 132, 255, 0.30);
+    background: rgba(155, 130, 200, 0.30);
     color: var(--tint-strong);
 }
 
@@ -1360,8 +1359,8 @@ html, body {
 }
 .settings-form input[readonly]#cfg-hotkey:focus {
     background: rgba(255, 255, 255, 0.85);
-    border-color: rgba(10, 132, 255, 0.65);
-    box-shadow: 0 0 0 3px rgba(10, 132, 255, 0.18);
+    border-color: rgba(155, 130, 200, 0.65);
+    box-shadow: 0 0 0 3px rgba(155, 130, 200, 0.18);
 }
 
 code {
@@ -1410,7 +1409,7 @@ code {
 }
 .settings-form .role-tab:focus {
     outline: none;
-    border-color: rgba(10, 132, 255, 0.55);
+    border-color: rgba(155, 130, 200, 0.55);
     color: var(--fg);
 }
 
@@ -1456,7 +1455,7 @@ code {
 .settings-form .model-checkbox input[type="checkbox"] {
     width: 13px;
     height: 13px;
-    accent-color: rgba(10, 132, 255, 0.85);
+    accent-color: rgba(155, 130, 200, 0.85);
     cursor: pointer;
     flex-shrink: 0;
     margin: 0;
@@ -1508,20 +1507,20 @@ code {
  * control until the task ends.
  */
 .confirmation-card.desktop-takeover {
-    border: 2px solid #ff9500;
+    border: 2px solid #d97a7a;
     box-shadow:
-        0 18px 46px rgba(255, 149, 0, 0.22),
-        0 0 0 1px rgba(255, 149, 0, 0.5);
+        0 18px 46px rgba(220, 130, 130, 0.22),
+        0 0 0 1px rgba(220, 130, 130, 0.5);
 }
 .confirmation-card.desktop-takeover .overlay-header {
     background: linear-gradient(
         90deg,
-        rgba(255, 149, 0, 0.18),
-        rgba(255, 45, 85, 0.14)
+        rgba(220, 130, 130, 0.18),
+        rgba(220, 130, 130, 0.10)
     );
 }
 .confirmation-card.desktop-takeover .overlay-header h2 {
-    color: #d97200;
+    color: #b85050;
 }
 
 .confirmation-body {
@@ -1584,8 +1583,8 @@ code {
 }
 .confirmation-secret input:focus {
     outline: none;
-    border-color: rgba(10, 132, 255, 0.65);
-    box-shadow: 0 0 0 3px rgba(10, 132, 255, 0.18);
+    border-color: rgba(155, 130, 200, 0.65);
+    box-shadow: 0 0 0 3px rgba(155, 130, 200, 0.18);
 }
 
 .confirmation-guidance {
@@ -1611,7 +1610,7 @@ code {
     height: 380px;
     display: flex;
     flex-direction: column;
-    background: rgba(30, 30, 46, 0.97);
+    background: rgba(38, 40, 48, 0.97);
     border: 1px solid rgba(255, 255, 255, 0.08);
     border-radius: 12px;
     box-shadow: 0 14px 40px rgba(0, 0, 0, 0.35);
@@ -1642,7 +1641,7 @@ code {
     height: 36px;
     min-height: 36px;
     padding: 0 8px 0 12px;
-    background: rgba(24, 24, 37, 0.9);
+    background: rgba(28, 30, 38, 0.9);
     border-bottom: 1px solid rgba(255, 255, 255, 0.06);
     gap: 4px;
     cursor: grab;
@@ -1671,7 +1670,7 @@ code {
     padding: 4px 10px;
     border: none;
     background: transparent;
-    color: #6c7086;
+    color: #8a8d96;
     font-family: var(--mono, monospace);
     font-size: 11px;
     border-radius: 6px;
@@ -1682,25 +1681,25 @@ code {
 
 .terminal-tab:hover {
     background: rgba(255, 255, 255, 0.06);
-    color: #cdd6f4;
+    color: #d8dae0;
 }
 
 .terminal-tab.active {
-    background: rgba(137, 180, 250, 0.15);
-    color: #89b4fa;
+    background: rgba(155, 130, 200, 0.18);
+    color: #c5b8e8;
 }
 
 .terminal-tab .tab-dot {
     width: 6px;
     height: 6px;
     border-radius: 50%;
-    background: #a6e3a1;
+    background: #c5b8e8;
     margin-right: 6px;
     flex-shrink: 0;
 }
 
 .terminal-tab.dead .tab-dot {
-    background: #f38ba8;
+    background: #d97a7a;
 }
 
 .terminal-panel-controls {
@@ -1714,7 +1713,7 @@ code {
     height: 24px;
     border: none;
     background: transparent;
-    color: #6c7086;
+    color: #8a8d96;
     border-radius: 4px;
     cursor: pointer;
     display: flex;
@@ -1726,7 +1725,7 @@ code {
 
 .terminal-panel-controls button:hover {
     background: rgba(255, 255, 255, 0.08);
-    color: #cdd6f4;
+    color: #d8dae0;
 }
 
 .terminal-panel-body {
@@ -1776,7 +1775,7 @@ code {
     margin-left: 6px;
     font-size: 13px;
     display: none;
-    color: #6c7086;
+    color: #8a8d96;
     transition: color 0.15s;
 }
 
@@ -1789,13 +1788,13 @@ code {
 }
 
 .tab-close:hover {
-    color: #f38ba8;
+    color: #d97a7a;
 }
 .confirmation-guidance.hidden { display: none; }
 .confirmation-guidance:focus {
     outline: none;
-    border-color: rgba(10, 132, 255, 0.65);
-    box-shadow: 0 0 0 3px rgba(10, 132, 255, 0.18);
+    border-color: rgba(155, 130, 200, 0.65);
+    box-shadow: 0 0 0 3px rgba(155, 130, 200, 0.18);
 }
 
 .confirmation-actions {
@@ -1822,20 +1821,20 @@ code {
 }
 .confirmation-actions button:active { transform: translateY(1px); }
 .confirmation-actions button.primary {
-    background: rgba(10, 132, 255, 0.20);
+    background: rgba(155, 130, 200, 0.20);
     color: var(--tint-strong);
-    border-color: rgba(10, 132, 255, 0.45);
+    border-color: rgba(155, 130, 200, 0.45);
 }
 .confirmation-actions button.primary:hover {
-    background: rgba(10, 132, 255, 0.30);
+    background: rgba(155, 130, 200, 0.30);
 }
 .confirmation-actions button#confirm-reject {
-    background: rgba(220, 60, 60, 0.10);
-    color: rgba(180, 30, 30, 0.95);
-    border-color: rgba(220, 60, 60, 0.35);
+    background: rgba(220, 130, 130, 0.10);
+    color: #b85050;
+    border-color: rgba(220, 130, 130, 0.35);
 }
 .confirmation-actions button#confirm-reject:hover {
-    background: rgba(220, 60, 60, 0.20);
+    background: rgba(220, 130, 130, 0.20);
 }
 
 /* ---------- Settings loading overlay ---------- */
@@ -1897,14 +1896,8 @@ code {
     0%, 100% { opacity: 1; }
     50% { opacity: 0.4; }
 }
-/* When working but no confidence yet, light the bottom 3 bars in the
-   neutral "in-flight" blue so the gauge isn't blank during early steps. */
-.activity-strip.working:not([data-conf-tier]) .ag-bar[data-level="1"],
-.activity-strip.working:not([data-conf-tier]) .ag-bar[data-level="2"],
-.activity-strip.working:not([data-conf-tier]) .ag-bar[data-level="3"] {
-    background: #4f8ef7;
-    opacity: 1;
-}
+/* When working but no confidence has arrived yet, the gauge is empty —
+   the strip-blink animation on the text already conveys "in flight". */
 
 
 
@@ -1952,7 +1945,7 @@ code {
 .admin-tab:focus-visible {
     outline: none;
     color: var(--fg);
-    box-shadow: 0 0 0 2px rgba(10, 132, 255, 0.30);
+    box-shadow: 0 0 0 2px rgba(155, 130, 200, 0.30);
     border-radius: 4px;
 }
 
@@ -1961,14 +1954,14 @@ code {
     padding: 8px 14px;
     border-radius: 8px;
     font-size: 12px;
-    background: rgba(10, 132, 255, 0.10);
-    border: 1px solid rgba(10, 132, 255, 0.30);
+    background: rgba(155, 130, 200, 0.10);
+    border: 1px solid rgba(155, 130, 200, 0.30);
     color: var(--fg);
 }
 .admin-toast.error {
-    background: rgba(255, 90, 90, 0.10);
-    border-color: rgba(255, 90, 90, 0.45);
-    color: rgba(200, 40, 40, 0.92);
+    background: rgba(220, 130, 130, 0.10);
+    border-color: rgba(220, 130, 130, 0.45);
+    color: #b85050;
 }
 .admin-toast.hidden { display: none; }
 
@@ -2002,9 +1995,9 @@ code {
 .admin-pane-header > select:focus,
 .admin-pane-header > input:focus {
     outline: none;
-    border-color: rgba(10, 132, 255, 0.55);
+    border-color: rgba(155, 130, 200, 0.55);
     background: rgba(255, 255, 255, 0.78);
-    box-shadow: 0 0 0 3px rgba(10, 132, 255, 0.15);
+    box-shadow: 0 0 0 3px rgba(155, 130, 200, 0.15);
 }
 .admin-pane-header > button {
     padding: 6px 14px;
@@ -2169,9 +2162,9 @@ code {
 .admin-tool-block input:focus,
 .admin-tool-block textarea:focus {
     outline: none;
-    border-color: rgba(10, 132, 255, 0.55);
+    border-color: rgba(155, 130, 200, 0.55);
     background: rgba(255, 255, 255, 0.78);
-    box-shadow: 0 0 0 3px rgba(10, 132, 255, 0.15);
+    box-shadow: 0 0 0 3px rgba(155, 130, 200, 0.15);
 }
 .admin-tool-block button {
     padding: 8px 16px;
@@ -2187,16 +2180,16 @@ code {
 .admin-tool-block button:hover { background: rgba(255, 255, 255, 0.78); }
 .admin-tool-block button:active { transform: translateY(1px); }
 .admin-tool-block button.primary {
-    background: rgba(10, 132, 255, 0.20);
+    background: rgba(155, 130, 200, 0.20);
     backdrop-filter: blur(20px) saturate(180%);
     -webkit-backdrop-filter: blur(20px) saturate(180%);
     color: var(--tint-strong);
-    border-color: rgba(10, 132, 255, 0.45);
+    border-color: rgba(155, 130, 200, 0.45);
     font-weight: 600;
     box-shadow: 0 1px 0 rgba(255, 255, 255, 0.45) inset;
 }
 .admin-tool-block button.primary:hover {
-    background: rgba(10, 132, 255, 0.30);
+    background: rgba(155, 130, 200, 0.30);
 }
 
 /* ===== Scheduler panel — list + detail + create FAB ===== */
@@ -2270,8 +2263,8 @@ code {
     background: rgba(255, 255, 255, 0.55);
 }
 .sched-list-item.selected {
-    background: rgba(10, 132, 255, 0.08);
-    border-color: rgba(10, 132, 255, 0.30);
+    background: rgba(155, 130, 200, 0.08);
+    border-color: rgba(155, 130, 200, 0.30);
 }
 .sched-list-row {
     display: flex;
@@ -2353,12 +2346,12 @@ code {
 
 /* Danger button — sits on the same .settings-actions visual base. */
 button.danger {
-    background: rgba(255, 90, 90, 0.10);
-    border-color: rgba(255, 90, 90, 0.45);
-    color: rgba(200, 40, 40, 0.92);
+    background: rgba(220, 130, 130, 0.10);
+    border-color: rgba(220, 130, 130, 0.45);
+    color: #b85050;
 }
 button.danger:hover:not(:disabled) {
-    background: rgba(255, 90, 90, 0.18);
+    background: rgba(220, 130, 130, 0.18);
 }
 
 /* ── Create modal — reuses .settings-card and .settings-form ──── */
@@ -2402,9 +2395,9 @@ button.danger:hover:not(:disabled) {
     gap: 4px;
     padding: 3px 12px;
     border-radius: 999px;
-    background: rgba(10, 132, 255, 0.12);
+    background: rgba(155, 130, 200, 0.12);
     color: var(--tint-strong);
-    border: 1px solid rgba(10, 132, 255, 0.28);
+    border: 1px solid rgba(155, 130, 200, 0.28);
     font-family: var(--mono);
     font-size: 12.5px;
     font-weight: 600;
@@ -2412,9 +2405,9 @@ button.danger:hover:not(:disabled) {
     transition: background 200ms ease, color 200ms ease, border-color 200ms ease;
 }
 .gep-countdown-pill.warn {
-    background: rgba(255, 149, 0, 0.16);
-    color: #b25c00;
-    border-color: rgba(255, 149, 0, 0.45);
+    background: rgba(155, 130, 200, 0.16);
+    color: #6e58a8;
+    border-color: rgba(155, 130, 200, 0.45);
 }
 .gep-countdown-pill.urgent {
     /* Same warn palette — no red, no scale animation. The pill is purely
@@ -2422,21 +2415,21 @@ button.danger:hover:not(:disabled) {
        "empty red region" against the surrounding chrome rather than an
        urgency cue. We still distinguish the urgent class so JS callers
        don't have to be reworked. */
-    background: rgba(255, 149, 0, 0.22);
-    color: #8c4500;
-    border-color: rgba(255, 149, 0, 0.55);
+    background: rgba(220, 130, 130, 0.18);
+    color: #b85050;
+    border-color: rgba(220, 130, 130, 0.45);
 }
 
 .gep-progress {
     flex: 0 0 4px;
     width: 100%;
-    background: rgba(10, 132, 255, 0.08);
+    background: rgba(155, 130, 200, 0.08);
     overflow: hidden;
 }
 .gep-progress-bar {
     height: 100%;
     width: 100%;
-    background: linear-gradient(90deg, rgba(10, 132, 255, 0.85), rgba(10, 132, 255, 0.55));
+    background: linear-gradient(90deg, rgba(155, 130, 200, 0.85), rgba(155, 130, 200, 0.55));
     transition: width 600ms linear;
 }
 
@@ -2595,14 +2588,14 @@ button.danger:hover:not(:disabled) {
     /* Confirm now — slightly emphasized but still pill-shaped.
        Same palette as the shortcut bar's hover state on a primary
        affordance, blue tint. */
-    background: rgba(10, 132, 255, 0.14);
+    background: rgba(155, 130, 200, 0.14);
     color: var(--tint-strong);
-    border-color: rgba(10, 132, 255, 0.40);
+    border-color: rgba(155, 130, 200, 0.40);
 }
 .gep-actions button.primary:hover,
 .gep-actions button[type="submit"]:hover {
-    background: rgba(10, 132, 255, 0.24);
-    border-color: rgba(10, 132, 255, 0.55);
+    background: rgba(155, 130, 200, 0.24);
+    border-color: rgba(155, 130, 200, 0.55);
     color: var(--tint-strong);
 }
 
@@ -2657,12 +2650,12 @@ button.danger:hover:not(:disabled) {
 .templates-list-header button:active { transform: translateY(1px); }
 .templates-list-header button.primary {
     color: var(--tint-strong);
-    border-color: rgba(10, 132, 255, 0.40);
-    background: rgba(10, 132, 255, 0.10);
+    border-color: rgba(155, 130, 200, 0.40);
+    background: rgba(155, 130, 200, 0.10);
 }
 .templates-list-header button.primary:hover {
-    background: rgba(10, 132, 255, 0.20);
-    border-color: rgba(10, 132, 255, 0.55);
+    background: rgba(155, 130, 200, 0.20);
+    border-color: rgba(155, 130, 200, 0.55);
 }
 .templates-list-header button.primary:disabled,
 .templates-list-header button:disabled {
@@ -2703,12 +2696,12 @@ button.danger:hover:not(:disabled) {
     transition: background 120ms ease;
 }
 .templates-list-item:last-child { border-bottom: none; }
-.templates-list-item:hover { background: rgba(10, 132, 255, 0.06); }
+.templates-list-item:hover { background: rgba(155, 130, 200, 0.06); }
 .templates-list-item.active {
-    background: rgba(10, 132, 255, 0.12);
-    box-shadow: inset 3px 0 0 rgba(10, 132, 255, 0.65);
+    background: rgba(155, 130, 200, 0.12);
+    box-shadow: inset 3px 0 0 rgba(155, 130, 200, 0.65);
 }
-.templates-list-item.invalid { background: rgba(220, 60, 60, 0.06); }
+.templates-list-item.invalid { background: rgba(220, 130, 130, 0.06); }
 .templates-list-item-title {
     font-size: 13.5px;
     font-weight: 600;
@@ -2727,8 +2720,8 @@ button.danger:hover:not(:disabled) {
     font-size: 10.5px;
     padding: 1px 7px;
     border-radius: 999px;
-    background: rgba(220, 60, 60, 0.18);
-    color: rgba(150, 30, 30, 0.95);
+    background: rgba(220, 130, 130, 0.18);
+    color: #b85050;
     font-weight: 600;
 }
 .templates-list-item-desc {
@@ -2765,9 +2758,9 @@ button.danger:hover:not(:disabled) {
 .templates-detail-desc { margin: 4px 0 12px 0; color: var(--fg-soft); line-height: 1.5; }
 
 .templates-detail-problems {
-    border: 1px solid rgba(220, 60, 60, 0.35);
-    background: rgba(220, 60, 60, 0.08);
-    color: rgba(150, 30, 30, 0.95);
+    border: 1px solid rgba(220, 130, 130, 0.35);
+    background: rgba(220, 130, 130, 0.08);
+    color: #b85050;
     border-radius: 6px;
     padding: 8px 12px;
     margin-bottom: 10px;
@@ -2800,8 +2793,8 @@ button.danger:hover:not(:disabled) {
     font-size: 12.5px;
 }
 .templates-detail-param.emphasis {
-    background: rgba(10, 132, 255, 0.06);
-    border-left: 3px solid rgba(10, 132, 255, 0.45);
+    background: rgba(155, 130, 200, 0.06);
+    border-left: 3px solid rgba(155, 130, 200, 0.45);
     padding-left: 8px;
 }
 .templates-detail-param-name {
@@ -2877,11 +2870,11 @@ button.danger:hover:not(:disabled) {
 }
 .templates-detail-actions { padding-top: 10px; }
 .templates-detail-actions .danger {
-    background: rgba(220, 60, 60, 0.10);
-    color: rgba(180, 30, 30, 0.95);
-    border-color: rgba(220, 60, 60, 0.35);
+    background: rgba(220, 130, 130, 0.10);
+    color: #b85050;
+    border-color: rgba(220, 130, 130, 0.35);
 }
-.templates-detail-actions .danger:hover { background: rgba(220, 60, 60, 0.20); }
+.templates-detail-actions .danger:hover { background: rgba(220, 130, 130, 0.20); }
 
 #overlay-templates { z-index: 1300; }
 
@@ -2890,13 +2883,13 @@ button.danger:hover:not(:disabled) {
     margin: 0 22px;
     padding: 8px 14px;
     border-radius: 8px;
-    background: rgba(10, 132, 255, 0.10);
-    border: 1px solid rgba(10, 132, 255, 0.30);
+    background: rgba(155, 130, 200, 0.10);
+    border: 1px solid rgba(155, 130, 200, 0.30);
     font-size: 12px;
 }
 .settings-toast.error {
-    background: rgba(255, 90, 90, 0.10);
-    border-color: rgba(255, 90, 90, 0.45);
-    color: rgba(200, 40, 40, 0.92);
+    background: rgba(220, 130, 130, 0.10);
+    border-color: rgba(220, 130, 130, 0.45);
+    color: #b85050;
 }
 .settings-toast.hidden { display: none; }

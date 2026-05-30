@@ -146,9 +146,10 @@ class Scheduler:
 
     @staticmethod
     def validate_schedule(spec: str) -> None:
-        """Raise ``ScheduleSyntaxError`` if *spec* is invalid. The bridge
-        IPC layer calls this directly on ``cron_create`` / ``cron_update``
-        so the renderer surfaces the error message verbatim.
+        """Raise ``ScheduleSyntaxError`` if *spec* is invalid. Kept as a
+        public helper so callers can validate without round-tripping
+        through ``create_task``; ``cron_create`` itself relies on the
+        same ``parse_schedule`` indirectly via the store.
         """
         parse_schedule(spec)
 

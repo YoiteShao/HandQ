@@ -135,6 +135,62 @@ _desktop_store_instance: Optional[Any] = None
 _ocr_prewarm_started: bool = False
 
 
+# ── Snapshot result cache ────────────────────────────────────────────────────
+#
+# Every desktop.snapshot call without a cache pays for a UIA tree walk
+# (~300-500 ms) plus, on UIA miss, an OCR pass (~700 ms). The agent
+# typically calls snapshot, picks an element, clicks it, then calls
+# snapshot AGAIN to find the next element — even though the UI hasn't
+# materially changed. The cache below short-circuits the second call.
+#
+# Key:    hwnd (int)
+# Value:  {
+#           "output": <full snapshot ToolResult.output dict>,
+#           "sig":    (foreground_pid, foreground_title, n_visible_windows),
+#           "ts":     time.time() at population
+#         }
+#
+# A hit requires:
+#   1. matching hwnd
+#   2. matching sig (catches focus-loss / window-list change)
+#   3. age < TTL (catches in-window state drift the sig misses)
+#
+# Invalidation:
+#   • Input actions whose state_after shows foreground_changed,
+#     title_changed, or new_windows clear the entire cache.
+#   • TTL expiry (lazy — checked at hit time, no sweeper).
+#   • reset_takeover_state() clears at task boundary so a stale cache
+#     can never bleed across tasks.
+_snapshot_cache: Dict[int, Dict[str, Any]] = {}
+_SNAPSHOT_CACHE_TTL_S: float = 30.0
+
+
+def _snapshot_sig(state: Dict[str, Any]) -> Tuple[int, str, int]:
+    """Build a 3-tuple sig from a _capture_state_before/after dict."""
+    return (
+        int(state.get("foreground_pid", 0) or 0),
+        str(state.get("foreground_title", "") or ""),
+        len(state.get("visible_hwnds") or ()),
+    )
+
+
+def _invalidate_snapshot_cache_on_state_change(state_after: Dict[str, Any]) -> None:
+    """Drop the cache when an input action moved the UI.
+
+    Whole-cache nuke is fine — there is at most 1-2 entries (one per
+    foreground hwnd the agent has snapshotted this task). Rebuilding
+    is the same cost as the first call.
+    """
+    if not _snapshot_cache:
+        return
+    if (
+        state_after.get("foreground_changed")
+        or state_after.get("title_changed")
+        or state_after.get("new_windows")
+    ):
+        _snapshot_cache.clear()
+
+
 def _prewarm_local_ocr_async() -> None:
     """Kick off a background task that loads the RapidOCR engine.
 
@@ -345,6 +401,10 @@ def reset_takeover_state() -> None:
         _end_takeover("task_ended")
     _task_approved = False
     _task_user_rescinded = False
+    # Snapshot cache must not bleed across tasks — a new task may target a
+    # different process living on the same hwnd, or the user may have
+    # rearranged the desktop while the agent was idle.
+    _snapshot_cache.clear()
 
 
 # ── Per-action tunables ──────────────────────────────────────────────────────
@@ -1286,11 +1346,40 @@ class DesktopTool(BaseTool):
                 "the sensitive_window_patterns list.",
             )
 
+        # ── Cache check ────────────────────────────────────────────────────
+        # _capture_state_before is also our cache-validity probe. Cheap (~5 ms).
+        hwnd = int(info.get("hwnd", 0) or 0)
+        current_state = _capture_state_before()
+        current_sig = _snapshot_sig(current_state)
+        now = time.time()
+        cached = _snapshot_cache.get(hwnd)
+        if (
+            cached is not None
+            and cached.get("sig") == current_sig
+            and now - float(cached.get("ts", 0.0)) < _SNAPSHOT_CACHE_TTL_S
+        ):
+            cached_output = dict(cached.get("output") or {})
+            cached_output["cached"] = True
+            cached_output["cache_age_ms"] = int((now - float(cached["ts"])) * 1000)
+            return ToolResult(
+                success=True,
+                output=cached_output,
+                tool_name=self.name,
+                tool_parameters=params,
+                execution_time=time.time() - start,
+            )
+        # Sig mismatch on this hwnd → drop the entry now to keep the dict
+        # small. (The whole-cache nuke runs from input actions; this path
+        # only fires when the cache went stale without an input action,
+        # e.g. user moved the mouse manually.)
+        if cached is not None and cached.get("sig") != current_sig:
+            _snapshot_cache.pop(hwnd, None)
+
         loop = asyncio.get_event_loop()
         # 1. Try UIA tree.
         try:
             elements = await loop.run_in_executor(
-                None, _uia_enumerate, int(info["hwnd"])
+                None, _uia_enumerate, hwnd
             )
         except Exception as exc:
             self.logger.warning(
@@ -1375,6 +1464,16 @@ class DesktopTool(BaseTool):
         }
         if screenshot_path:
             out["screenshot"] = screenshot_path
+
+        # Populate cache. Store a copy of `out` BEFORE the per-call
+        # "cached"/"cache_age_ms" markers are added so future hits can
+        # inject those markers freshly without compounding.
+        _snapshot_cache[hwnd] = {
+            "output": dict(out),
+            "sig":    current_sig,
+            "ts":     time.time(),
+        }
+
         return ToolResult(
             success=True,
             output=out,
@@ -1741,6 +1840,7 @@ class DesktopTool(BaseTool):
             return self._error(params, start, guard)
 
         _ensure_dpi_aware()
+        state_before = _capture_state_before()
         try:
             await asyncio.get_event_loop().run_in_executor(
                 None,
@@ -1754,6 +1854,9 @@ class DesktopTool(BaseTool):
                 "find_and_click: PyAutoGUI failsafe triggered (mouse hit "
                 "corner). Move the mouse away from screen corners and retry.",
             )
+        await asyncio.sleep(0.1)
+        state_after = _capture_state_after(state_before)
+        _invalidate_snapshot_cache_on_state_change(state_after)
 
         # Combined result: the find metadata + the click outcome. Lets the
         # LLM verify the OCR/vision match without an extra screenshot.
@@ -1763,6 +1866,7 @@ class DesktopTool(BaseTool):
             "confidence": out.get("confidence"),
             "matched_text": out.get("matched_text"),
             "screenshot": out.get("screenshot"),
+            "state_after": state_after,
         }
         return ToolResult(
             success=True,
@@ -1810,6 +1914,7 @@ class DesktopTool(BaseTool):
         # while staying well below the user-visible threshold.
         await asyncio.sleep(0.1)
         state_after = _capture_state_after(state_before)
+        _invalidate_snapshot_cache_on_state_change(state_after)
         return ToolResult(
             success=True,
             output={
@@ -1859,6 +1964,7 @@ class DesktopTool(BaseTool):
             return self._error(params, start, f"type_text: {exc}")
         await asyncio.sleep(0.1)
         state_after = _capture_state_after(state_before)
+        _invalidate_snapshot_cache_on_state_change(state_after)
         return ToolResult(
             success=True,
             output={
@@ -1912,6 +2018,7 @@ class DesktopTool(BaseTool):
             )
         await asyncio.sleep(0.1)
         state_after = _capture_state_after(state_before)
+        _invalidate_snapshot_cache_on_state_change(state_after)
         return ToolResult(
             success=True,
             output={
@@ -1952,6 +2059,7 @@ class DesktopTool(BaseTool):
             return self._error(params, start, f"scroll: {exc}")
         await asyncio.sleep(0.1)
         state_after = _capture_state_after(state_before)
+        _invalidate_snapshot_cache_on_state_change(state_after)
         return ToolResult(
             success=True,
             output={"x": x, "y": y, "dy": dy, "state_after": state_after},
@@ -1989,6 +2097,7 @@ class DesktopTool(BaseTool):
             return self._error(params, start, f"hotkey: {exc}")
         await asyncio.sleep(0.1)
         state_after = _capture_state_after(state_before)
+        _invalidate_snapshot_cache_on_state_change(state_after)
         return ToolResult(
             success=True,
             output={"keys": keys, "state_after": state_after},
@@ -2022,6 +2131,7 @@ class DesktopTool(BaseTool):
             return self._error(params, start, f"key_press: {exc}")
         await asyncio.sleep(0.1)
         state_after = _capture_state_after(state_before)
+        _invalidate_snapshot_cache_on_state_change(state_after)
         return ToolResult(
             success=True,
             output={"key": key, "state_after": state_after},

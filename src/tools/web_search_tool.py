@@ -36,8 +36,9 @@ import json
 import re
 import time
 import urllib.parse
+from collections import OrderedDict
 from dataclasses import asdict, dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .base_tool import BaseTool, ToolResult
 from .browser_tool import acquire_browser_lock, evaluate_fetch, is_browser_available
@@ -49,6 +50,42 @@ from ..infrastructure.logger import get_logger
 _DEFAULT_LIMIT = 10
 _HARD_MAX_LIMIT = 25
 _DEFAULT_SNIPPET_MAX_CHARS = 300
+_DEFAULT_ORBIT_TIMEOUT_MS = 10_000
+
+# Per-process cache for repeat (source, query, limit) lookups. Bounded LRU
+# with a 60s TTL — covers the common case where the agent re-runs the same
+# query during retry / re-plan within a single task. Skipped for orbit
+# because its DOM-extract path may legitimately return different results
+# as the portal mutates.
+#
+# TODO(perf): cross-source parallel fan-out is gated on ``acquire_browser_lock``
+# holding the global session lock for each fetch. True parallelism needs a
+# refactor of ``evaluate_fetch`` (per-source dedicated tabs so concurrent
+# fetches don't collide on same_origin navigation).
+_QUERY_CACHE_TTL = 60.0
+_QUERY_CACHE_MAX = 50
+_query_cache: "OrderedDict[Tuple[str, str, int], Tuple[float, List[Dict[str, Any]]]]" = OrderedDict()
+
+
+def _cache_get(key: Tuple[str, str, int]) -> Optional[List[Dict[str, Any]]]:
+    """Return cached hits if present and unexpired; refresh LRU position."""
+    entry = _query_cache.get(key)
+    if entry is None:
+        return None
+    timestamp, hits = entry
+    if (time.time() - timestamp) > _QUERY_CACHE_TTL:
+        _query_cache.pop(key, None)
+        return None
+    _query_cache.move_to_end(key)
+    return hits
+
+
+def _cache_put(key: Tuple[str, str, int], hits: List[Dict[str, Any]]) -> None:
+    """Insert hits into the cache, evicting the oldest entry on overflow."""
+    _query_cache[key] = (time.time(), hits)
+    _query_cache.move_to_end(key)
+    while len(_query_cache) > _QUERY_CACHE_MAX:
+        _query_cache.popitem(last=False)
 
 # Markers that indicate a body is actually an SSO login page rather than the
 # requested JSON. The list is intentionally conservative — only well-known
@@ -218,6 +255,29 @@ class WebSearchTool(BaseTool):
         if executor is None:
             return self._fail(params, start, f"unknown source {source!r}.")
 
+        # Per-process cache lookup — skips the browser round-trip when the
+        # same (source, query, limit) was answered recently. Orbit isn't
+        # cached because its DOM-extract may legitimately change.
+        cache_key: Optional[Tuple[str, str, int]] = (
+            None if source == "orbit" else (source, query, limit)
+        )
+        if cache_key is not None:
+            cached_hits = _cache_get(cache_key)
+            if cached_hits is not None:
+                return ToolResult(
+                    success=True,
+                    output={
+                        "source": source,
+                        "query": query,
+                        "count": len(cached_hits),
+                        "hits": cached_hits,
+                        "cached": True,
+                    },
+                    tool_name=self.name,
+                    tool_parameters=params,
+                    execution_time=time.time() - start,
+                )
+
         try:
             async with acquire_browser_lock() as session:
                 hits = await executor(session, query, limit, src_cfg)
@@ -244,13 +304,17 @@ class WebSearchTool(BaseTool):
             if h.snippet and len(h.snippet) > snippet_max:
                 h.snippet = h.snippet[:snippet_max] + "…"
 
+        hit_dicts = [h.to_dict() for h in hits]
+        if cache_key is not None:
+            _cache_put(cache_key, hit_dicts)
+
         return ToolResult(
             success=True,
             output={
                 "source": source,
                 "query": query,
                 "count": len(hits),
-                "hits": [h.to_dict() for h in hits],
+                "hits": hit_dicts,
             },
             tool_name=self.name,
             tool_parameters=params,
@@ -453,6 +517,9 @@ class WebSearchTool(BaseTool):
         base_url = (src_cfg.get("base_url") or "https://orbit").rstrip("/")
         template = src_cfg.get("search_url_template") or "https://orbit/?q={q}"
         result_selector = src_cfg.get("result_selector") or "a"
+        # 10s default keeps stalled-DNS failures actionable. Override via
+        # web_search.sources.orbit.timeout_ms when the portal is genuinely slow.
+        goto_timeout_ms = int(src_cfg.get("timeout_ms") or _DEFAULT_ORBIT_TIMEOUT_MS)
 
         try:
             search_url = template.format(q=urllib.parse.quote(query))
@@ -469,7 +536,7 @@ class WebSearchTool(BaseTool):
 
         try:
             await page.goto(
-                search_url, wait_until="domcontentloaded", timeout=30_000,
+                search_url, wait_until="domcontentloaded", timeout=goto_timeout_ms,
             )
         except Exception as exc:
             raise RuntimeError(f"orbit navigate {search_url} failed: {exc}")

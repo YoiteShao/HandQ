@@ -40,6 +40,7 @@ def _build_full_hint() -> str:
         "  2. action='list_messages' folder='Inbox' [unread_only=true] [limit=20]\n"
         "     → returns entry_id + subject + sender + 500-char body_preview\n"
         "     → DEFAULTS to recursive=true: scans 'Inbox' AND every sub-folder\n"
+        "       up to 4 levels deep (configurable via email.max_recursion_depth)\n"
         "  3. action='read_message' entry_id='<from list>' [include_full_body=true]\n"
         "     → ONLY needed when you want full body, to/cc/bcc, or attachment\n"
         "       metadata that aren't already in list_messages / search output.\n"
@@ -72,7 +73,15 @@ def _build_full_hint() -> str:
         "     → saved to %USERPROFILE%\\HandQ\\email_attachments\\ by default\n"
         "\n"
         "Key invariants:\n"
-        "  - body_preview is always 500 chars; set include_full_body=true for all.\n"
+        "  - body_preview is 500 chars by default. Set include_body_preview=false\n"
+        "    on list_messages / search when you only need metadata — this skips\n"
+        "    the Body COM materialisation. Measured savings on a 67k-mail Inbox:\n"
+        "    limit=100 → ~30% faster (11s → 8s); limit=50 → ~38% faster (5s →\n"
+        "    3s); limit=20 → ~15%. Recommended whenever limit >= 50, or when the\n"
+        "    agent is counting / bucketing messages by sender/date without\n"
+        "    reading content. The response shape is unchanged — body_preview is\n"
+        "    just \"\" when off.\n"
+        "  - For full body / to / cc, use read_message with include_full_body=true.\n"
         "  - list_messages / search default to recursive=true. Enterprise users\n"
         "    typically have rules routing mail into Inbox sub-folders (Inbox/MST,\n"
         "    Inbox/AUTO, Inbox/Project-X, …); recursive=true is what 'show me\n"
@@ -108,10 +117,12 @@ def _build_brief_hint() -> str:
         "[Email Context] 'email' tool active — Outlook MAPI session is warm. "
         "Reminders: search/list_messages already include 500-char body_preview "
         "(don't re-fetch with read_message unless you need full body or to/cc); "
-        "match_mode='phrase' is the default and is sub-second even on huge "
-        "folders — only use 'substring' on small folders or when phrase returned "
-        "empty; email is COM-STA-serialised so parallel email dispatches give "
-        "no speedup, just call sequentially."
+        "set include_body_preview=false for ~30-40% speedup when you only need "
+        "metadata (limit >= 50, counting/bucketing); match_mode='phrase' is the "
+        "default and is sub-second even on huge folders — only use 'substring' "
+        "on small folders or when phrase returned empty; email is "
+        "COM-STA-serialised so parallel email dispatches give no speedup, just "
+        "call sequentially."
     )
 
 
@@ -172,14 +183,20 @@ class EmailContextProvider(StepContextProvider):
 
         # Smoke-test: verify Outlook.Application is reachable before the agent
         # spends tokens on email steps that will just fail with COM errors.
+        # Skip the 5s executor round-trip when the handle is already cached
+        # (i.e. a previous step already paid the cost) — common case after the
+        # first activation in a process.
+        import asyncio
         try:
-            import asyncio
-            from ..tools.email_tool import _outlook_executor, _get_app
-            loop = asyncio.get_running_loop()
-            await asyncio.wait_for(
-                loop.run_in_executor(_outlook_executor, _get_app),
-                timeout=5.0,
+            from ..tools.email_tool import (
+                _outlook_executor, _get_app, is_outlook_app_ready,
             )
+            if not is_outlook_app_ready():
+                loop = asyncio.get_running_loop()
+                await asyncio.wait_for(
+                    loop.run_in_executor(_outlook_executor, _get_app),
+                    timeout=5.0,
+                )
         except asyncio.TimeoutError:
             return (
                 "[Email Context — UNAVAILABLE]\n"

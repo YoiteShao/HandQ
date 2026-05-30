@@ -1124,9 +1124,8 @@ class StdioBridge:
 
         # ── Scheduler / Cron IPC ───────────────────────────────────────
         if msg_type in (
-            "cron_list", "cron_create", "cron_update",
+            "cron_list", "cron_create",
             "cron_delete", "cron_set_enabled", "cron_run_now",
-            "cron_validate",
         ):
             try:
                 if scheduler is None:
@@ -1141,12 +1140,21 @@ class StdioBridge:
                        "fatal": False}, gen=self._generation)
             return
 
-        # ── /remember + git post-commit hook install ────────────────────
-        if msg_type in (
-            "ltm_remember", "ltm_install_git_hook", "ltm_uninstall_git_hook",
-        ):
+        # ── /remember (manual high-trust memory candidate) ──────────────
+        if msg_type == "ltm_remember":
             try:
-                result = await self._handle_ltm_aux(msg_type, msg)
+                text = str(msg.get("text") or "").strip()
+                if not text:
+                    result: Dict[str, Any] = {"ok": False, "error": "text is required"}
+                else:
+                    from src.infrastructure.long_term_memory import LongTermMemory
+                    from src.infrastructure.long_term_memory.candidates import (
+                        submit_manual,
+                    )
+                    ltm = LongTermMemory.get()
+                    ref = str(msg.get("ref") or "")
+                    cid = await submit_manual(ltm=ltm, text=text, ref=ref)
+                    result = {"ok": bool(cid), "candidate_id": cid}
                 _emit({"type": "final", "id": msg_id, "result": result},
                       gen=self._generation)
             except Exception as exc:
@@ -1406,21 +1414,6 @@ class StdioBridge:
                 return {"ok": False, "error": str(exc)}
             return {"ok": True, "task": t}
 
-        if msg_type == "cron_update":
-            tid = str(msg.get("id") or "")
-            if not tid:
-                return {"ok": False, "error": "missing id"}
-            try:
-                t = await scheduler.update_task(  # type: ignore[union-attr]
-                    tid,
-                    name=msg.get("name"),
-                    prompt=msg.get("prompt"),
-                    schedule=msg.get("schedule"),
-                )
-            except ScheduleSyntaxError as exc:
-                return {"ok": False, "error": str(exc)}
-            return {"ok": bool(t), "task": t}
-
         if msg_type == "cron_delete":
             tid = str(msg.get("id") or "")
             ok = await scheduler.delete_task(tid)  # type: ignore[union-attr]
@@ -1438,71 +1431,7 @@ class StdioBridge:
             t = await scheduler.run_now(tid)  # type: ignore[union-attr]
             return {"ok": bool(t), "task": t}
 
-        if msg_type == "cron_validate":
-            from src.infrastructure.scheduler import Scheduler as _S
-            try:
-                _S.validate_schedule(str(msg.get("schedule", "")))
-                return {"ok": True}
-            except ScheduleSyntaxError as exc:
-                return {"ok": False, "error": str(exc)}
-
         return {"ok": False, "error": f"unknown cron op: {msg_type}"}
-
-    # ------------------------------------------------------------------
-    # /remember + git post-commit hook IPC
-    # ------------------------------------------------------------------
-
-    async def _handle_ltm_aux(self, msg_type: str, msg: Dict[str, Any]) -> Dict[str, Any]:
-        """Handle the auxiliary LTM IPC envelopes that don't fit the
-        list/archive/stats group:
-
-          - ``ltm_remember`` — explicit /remember command. Submits a
-            high-trust MANUAL_REMEMBER candidate.
-          - ``ltm_install_git_hook`` — copy
-            ``scripts/handq_post_commit.py`` into a target repo's
-            ``.git/hooks/post-commit`` (chmod +x on POSIX). Returns the
-            installed path on success.
-          - ``ltm_uninstall_git_hook`` — delete the hook file IF and
-            only if it's the one we installed (heuristic: head line
-            matches our shebang + module docstring marker).
-
-        These are bundled in one method because they all sit at the
-        same trust boundary (admin-grade operations on the user's
-        memory.db / git workspaces) and share error-handling.
-        """
-        if msg_type == "ltm_remember":
-            text = str(msg.get("text") or "").strip()
-            if not text:
-                return {"ok": False, "error": "text is required"}
-            try:
-                from src.infrastructure.long_term_memory import LongTermMemory
-                from src.infrastructure.long_term_memory.candidates import (
-                    submit_manual,
-                )
-                ltm = LongTermMemory.get()
-                ref = str(msg.get("ref") or "")
-                cid = await submit_manual(ltm=ltm, text=text, ref=ref)
-                return {"ok": bool(cid), "candidate_id": cid}
-            except Exception as exc:
-                return {"ok": False, "error": str(exc)}
-
-        if msg_type == "ltm_install_git_hook":
-            repo_path = str(msg.get("repo") or "").strip()
-            if not repo_path:
-                return {"ok": False, "error": "repo path required"}
-            return await asyncio.to_thread(
-                _install_post_commit_hook, repo_path,
-            )
-
-        if msg_type == "ltm_uninstall_git_hook":
-            repo_path = str(msg.get("repo") or "").strip()
-            if not repo_path:
-                return {"ok": False, "error": "repo path required"}
-            return await asyncio.to_thread(
-                _uninstall_post_commit_hook, repo_path,
-            )
-
-        return {"ok": False, "error": f"unknown op: {msg_type}"}
 
     # ------------------------------------------------------------------
     # Scheduler dispatch — bridge-side hook called from
