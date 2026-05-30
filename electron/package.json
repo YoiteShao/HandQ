@@ -1,7 +1,7 @@
 {
   "name": "handq-electron",
   "version": "0.1.0",
-  "description": "Electron frontend for HandQ — talks to the Python bridge over line-delimited JSON on stdio.",
+  "description": "Your AI-driven integration engineer",
   "main": "main.js",
   "private": true,
   "scripts": {

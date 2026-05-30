@@ -614,7 +614,7 @@ Completed steps: {completed_count}
 {lookahead_summary}
 
 (Use the session storage directory to save intermediate artifacts, analysis files, and outputs that need to persist across steps.{directory_note})
-{gep_template_section}{user_instruction}
+{skills_section}{gep_template_section}{user_instruction}
 ---
 Before deciding, reason through the following:
 

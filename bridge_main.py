@@ -462,6 +462,11 @@ def _import_stdio_bridge():
     return _m
 
 
+def _import_skill_registry():
+    from src.infrastructure.skills import SkillRegistry as _m
+    return _m
+
+
 def _import_long_term_memory():
     from src.infrastructure.long_term_memory import LongTermMemory as _m
     return _m
@@ -479,6 +484,8 @@ def _import_scheduler():
 
 _imports_t0 = time.monotonic()
 stdio_bridge = _timed_import("src.bridge.stdio_bridge", _import_stdio_bridge)
+SkillRegistry = _timed_import(
+    "src.infrastructure.skills", _import_skill_registry)
 LongTermMemory = _timed_import(
     "src.infrastructure.long_term_memory", _import_long_term_memory)
 PersonalityMonitor = _timed_import(
@@ -505,6 +512,26 @@ async def _run_with_long_term_memory() -> None:
     losing core flows.
     """
     user_root = Path(_user_handq_root())
+
+    # ── Skill registry ────────────────────────────────────────────────
+    # Built once at boot from %USERPROFILE%\HandQ\Skill\<name>\SKILL.md.
+    # The receptionist sees the L0 menu (name + description) on every user
+    # message; planner sees full bodies of activated skills. Bad files are
+    # skipped with a warning — a single broken skill must not block boot.
+    _emit_boot_progress("skills_init_start")
+    _t_skills = time.monotonic()
+    try:
+        SkillRegistry.init()
+    except Exception as exc:
+        _boot_logger.exception(
+            "SkillRegistry.init failed; continuing with empty registry"
+        )
+        _emit_boot_progress("skills_init_failed", error=str(exc))
+    else:
+        _skills_ms = int((time.monotonic() - _t_skills) * 1000)
+        _boot_logger.info("SkillRegistry.init took %dms", _skills_ms)
+        _emit_boot_progress("skills_init_done", took_ms=_skills_ms)
+
     # ── Personality data root ─────────────────────────────────────────
     # Per ARCHITECTURE.md §1.5, every "what HandQ has learned about
     # me" artifact lives under %USERPROFILE%\HandQ\personality\:

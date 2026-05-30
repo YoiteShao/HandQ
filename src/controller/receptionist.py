@@ -16,15 +16,25 @@ GEP-aware intents (in addition to RESPOND_ONLY / REPLAN):
   GEP_CONFIRM    — user explicitly confirms using a specific GEP template.
   GEP_DECLINE    — user explicitly declines a pending GEP suggestion.
 
+Skill activation (orthogonal to intent):
+  Receptionist additionally returns ``activated_skills`` — names of skills that
+  semantically match the user's request (LLM-judged) or were explicitly invoked
+  via ``@skill-name`` in the message text. FlowController merges this list into
+  the session-level active skill set; Planner then sees the activated skills'
+  full bodies on its next observe_and_plan call. Activation is silent (no
+  confirmation modal) — the receptionist mentions the activation in
+  ``response_to_user`` but does not block on user confirmation.
+
 Note: SAVE_SESSION and LIST_TEMPLATES are handled via CLI (handq --save / handq --list),
 not through the receptionist.
 """
 import asyncio
+import re
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, cast
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, cast
 
 from ..infrastructure.gep_template import list_templates_summary
 from ..infrastructure.json_key_streamer import JsonKeyStreamer
@@ -36,6 +46,7 @@ from ..infrastructure.llm_pool import (
 from ..infrastructure.llm_service import LLMChatResult, LLMService
 from ..infrastructure.long_term_memory import LongTermMemory
 from ..infrastructure.long_term_memory.candidates import submit_user_turn
+from ..infrastructure.skills import SkillRegistry
 from ..infrastructure.anthropic_streaming_service import StreamTextDeltaEvent, StreamDoneEvent
 from ..infrastructure.logger import get_logger
 from ..infrastructure.utils import try_parse_json
@@ -47,6 +58,14 @@ from .receptionist_prompts import (
     GEP_CONFIRMATION_WINDOW_SYSTEM_PROMPT,
     GEP_CONFIRMATION_WINDOW_TEMPLATE,
 )
+
+
+# ── @skill-name prescan ───────────────────────────────────────────────────────
+# Lookbehind avoids matching @user (email-style), @property (decorator), or
+# /@foo (path component). The pattern is intentionally narrow: anything after
+# the @ sign that isn't a registered skill name is silently dropped, so this
+# regex is a *filter* not an *extractor*.
+_SKILL_MENTION_RE = re.compile(r"(?<![\w/.])@([a-zA-Z0-9_\-]{1,64})")
 
 
 # ── User-message intent types ─────────────────────────────────────────────────
@@ -98,6 +117,12 @@ class UserMessageEvaluation:
                           response_to_user. Non-empty list forces intent=REPLAN
                           so the planner sees every promised future action;
                           empty list means the reply made no commitments.
+    activated_skills    — skill names the receptionist (or the user via
+                          @skill-name) is asking the FlowController to add to
+                          the session-level active set. Orthogonal to intent —
+                          a skill activation can accompany ANY intent value.
+                          The list is already filtered against SkillRegistry,
+                          so unknown names never reach the FlowController.
     """
     intent: UserMessageIntent
     response_to_user: str          # always required
@@ -106,6 +131,7 @@ class UserMessageEvaluation:
     gep_suggested: bool = False
     matched_template_id: str = ""
     deferred_actions: List[str] = field(default_factory=list)
+    activated_skills: List[str] = field(default_factory=list)
 
 
 # ── Intent string → enum mapping ──────────────────────────────────────────────
@@ -171,6 +197,79 @@ def _format_templates_list() -> str:
     return "\n".join(lines)
 
 
+# ── Skill prompt block builder ────────────────────────────────────────────────
+
+def _build_skills_section(active: Iterable[str]) -> str:
+    """
+    Emit the entire skill-related prompt block, or "" when no skill is
+    installed. Both the [Active / Available Skills] sections AND the teaching
+    that tells the LLM to populate ``activated_skills`` live here, so that a
+    user with no skills installed pays zero token cost — the receptionist's
+    base system prompt and JSON schema stay clean.
+
+    Strengthened language follows Anthropic's Claude Code skill prompt:
+      • BLOCKING REQUIREMENT on match — list the skill in activated_skills.
+      • NEVER mention a skill in response_to_user without listing it.
+      • Never invent skill names not in [Available Skills].
+      • Don't re-list skills already in [Active Skills].
+    """
+    try:
+        registry = SkillRegistry.get()
+    except Exception:
+        return ""
+    all_names = registry.names()
+    if not all_names:
+        return ""
+
+    active_set = {n for n in active if registry.has(n)}
+    inactive = [n for n in all_names if n not in active_set]
+
+    lines: List[str] = ["[Skills — additional methodology you may activate]"]
+
+    if active_set:
+        lines.append("\nActive Skills (already on for this session — do NOT re-list):")
+        for name in sorted(active_set):
+            entry = registry.get_skill(name)
+            if entry is None:
+                continue
+            lines.append(f"  - {entry.name}: {entry.description}")
+
+    if inactive:
+        lines.append("\nAvailable Skills (off — list in `activated_skills` to turn on):")
+        for name in inactive:
+            entry = registry.get_skill(name)
+            if entry is None:
+                continue
+            lines.append(f"  - {entry.name}: {entry.description}")
+
+    lines.append(
+        "\nRules:\n"
+        "  - When the user's request semantically matches an Available Skill "
+        "(same task type, same domain — match on meaning, not keywords), this "
+        "is a BLOCKING REQUIREMENT: list the skill name in `activated_skills`. "
+        "If multiple match, list them all.\n"
+        "  - NEVER mention a skill in `response_to_user` without also listing "
+        "it in `activated_skills` — the planner only sees what the JSON field "
+        "carries; promising the user \"I'll apply X skill\" without activating "
+        "it is a leak.\n"
+        "  - Never invent skill names. Only names that appear above are valid.\n"
+        "  - Skills in [Active Skills] are already on — do NOT re-list them.\n"
+        "  - Skill activation is ORTHOGONAL to intent: chat / task / "
+        "respond_only / replan / gep_confirm can all carry skill activation.\n"
+        "  - Explicit @skill-name mentions in the user's message are activated "
+        "automatically — you don't need to echo them.\n"
+        "  - When in doubt, leave `activated_skills` empty. Over-activation "
+        "pollutes the planner's context."
+    )
+    lines.append(
+        "\nJSON output extension: in addition to your normal response fields, "
+        "include `\"activated_skills\": [\"name1\", \"name2\"]` (or `[]` when "
+        "no Available Skill matches)."
+    )
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
 # ── Receptionist ──────────────────────────────────────────────────────────────
 
 class Receptionist:
@@ -209,7 +308,44 @@ class Receptionist:
             self.conversation_history: List[Dict[str, str]] = []
         self.current_screen: str = ""
 
+        # Session-level active skills (names). Set by FlowController via
+        # set_active_skills(). Used to render the [Active Skills] block and
+        # to exclude already-active entries from the [Available Skills] menu.
+        self._active_skills: Set[str] = set()
+
         self.logger.info("Receptionist initialized", component="Receptionist")
+
+    # ── Skill activation passthrough ──────────────────────────────────────────
+
+    def set_active_skills(self, names: Iterable[str]) -> None:
+        """Set the session-level active skill names.
+
+        Called by FlowController after every successful skill activation so
+        that the receptionist's prompt blocks reflect the current active
+        set on the next user message. The set is taken as authoritative —
+        callers are responsible for filtering against SkillRegistry first.
+        """
+        self._active_skills = {str(n).strip() for n in names if str(n).strip()}
+
+    def _extract_at_mentions(self, text: str) -> Set[str]:
+        """Return the registered skill names mentioned via ``@name`` in *text*.
+
+        Unknown @mentions (decorator names, email handles, paths, made-up
+        skills) are filtered out — only names that resolve in SkillRegistry
+        survive. This makes the prescan a defense-in-depth filter, not a
+        hostile name extractor.
+        """
+        if not text or "@" not in text:
+            return set()
+        try:
+            registry = SkillRegistry.get()
+        except Exception:
+            return set()
+        found = set()
+        for match in _SKILL_MENTION_RE.findall(text):
+            if registry.has(match):
+                found.add(match)
+        return found
 
     # ── Conversation context helper ───────────────────────────────────────────
 
@@ -345,6 +481,7 @@ class Receptionist:
         include_shell_history: bool = True,
         include_conversation_history: bool = True,
         include_templates: bool = True,
+        include_skills: bool = True,
     ) -> List[Dict[str, str]]:
         """
         Build interleaved user/assistant message pairs for context injection.
@@ -356,9 +493,12 @@ class Receptionist:
         Order (most-static → most-volatile) for KV cache hit rate:
           1. long-term memory  — survives across sessions, recalled per query.
           2. templates          — changes only when a GEP template is saved.
-          3. conversation       — append-only within a session (no truncation,
+          3. skills             — append-only within a session (active set
+                                  grows but never shrinks), so the prefix
+                                  stays stable for early messages.
+          4. conversation       — append-only within a session (no truncation,
                                   so the prefix stays stable).
-          4. shell history      — sliding window (Linux only).
+          5. shell history      — sliding window (Linux only).
         """
         extra: List[Dict[str, str]] = []
 
@@ -372,6 +512,12 @@ class Receptionist:
             templates = _build_templates_section()
             if templates:
                 extra.append({"role": "user",      "content": templates})
+                extra.append({"role": "assistant",  "content": "Noted."})
+
+        if include_skills:
+            skills = _build_skills_section(self._active_skills)
+            if skills:
+                extra.append({"role": "user",      "content": skills})
                 extra.append({"role": "assistant",  "content": "Noted."})
 
         if include_conversation_history:
@@ -476,6 +622,7 @@ class Receptionist:
         parsed: Dict,
         raw_message: str,
         default_intent: UserMessageIntent,
+        prescan_skills: Optional[Set[str]] = None,
     ) -> UserMessageEvaluation:
         """
         Build a UserMessageEvaluation from a parsed LLM response dict.
@@ -489,6 +636,13 @@ class Receptionist:
         and the deferred actions are embedded into context_for_planner. This
         means even when the LLM mis-routes the intent, any explicit promise of
         future work still reaches the planner.
+
+        ``prescan_skills`` is the set of @-mentions extracted from the raw
+        message before the LLM call. Merged with the LLM's ``activated_skills``
+        and filtered against SkillRegistry; the result is attached to the
+        evaluation so the FlowController can union it into the session active
+        set. Activation is independent of intent — a skill mention can ride
+        on a chat / replan / gep_confirm intent equally.
         """
         intent_str = parsed.get("intent", default_intent.value)
         response = parsed.get("response_to_user") or ""
@@ -502,6 +656,28 @@ class Receptionist:
         deferred_actions: List[str] = [
             str(a).strip() for a in deferred_raw if str(a).strip()
         ]
+
+        # ── Skill activation ──────────────────────────────────────────────────
+        # LLM-suggested + prescan @-mentions, both filtered against the
+        # registry so an unknown name from either source is silently dropped.
+        try:
+            registry = SkillRegistry.get()
+            registry_has = registry.has
+        except Exception:
+            registry_has = lambda _n: False  # noqa: E731
+
+        skills_raw = parsed.get("activated_skills") or []
+        if not isinstance(skills_raw, list):
+            skills_raw = [skills_raw]
+        llm_skills = {str(s).strip() for s in skills_raw if str(s).strip()}
+        unknown = {s for s in llm_skills if not registry_has(s)}
+        if unknown:
+            self.logger.warning(
+                f"LLM returned unknown skill names {sorted(unknown)} — dropping",
+                component="Receptionist",
+            )
+            llm_skills -= unknown
+        merged_skills = sorted((prescan_skills or set()) | llm_skills)
 
         # Resolve intent: map lookup covers aliases; fallback tries direct enum value.
         lower = intent_str.lower()
@@ -548,6 +724,7 @@ class Receptionist:
             gep_suggested=(intent == UserMessageIntent.GEP_CONFIRM),
             matched_template_id=matched_template_id,
             deferred_actions=deferred_actions,
+            activated_skills=merged_skills,
         )
 
     # ── Initial goal classification ───────────────────────────────────────────
@@ -573,6 +750,11 @@ class Receptionist:
         # initial goal are captured even if the user never sends a follow-up.
         self._submit_user_turn_candidate(user_input)
 
+        # @-prescan — extracted ONCE before the LLM call so it survives
+        # network failures and parse failures further down. Filtered against
+        # SkillRegistry by _extract_at_mentions; unknown @names drop silently.
+        prescan_skills = self._extract_at_mentions(user_input)
+
         messages = [
             {"role": "system", "content": CLASSIFY_INITIAL_GOAL_SYSTEM_PROMPT},
             *(await self._build_context_messages(query_for_long_term=user_input)),
@@ -588,13 +770,16 @@ class Receptionist:
                 parsed = await self._call_and_parse(messages, "classify_initial_goal")
             if parsed is not None:
                 evaluation = self._build_evaluation_result(
-                    parsed, user_input, default_intent=UserMessageIntent.REPLAN
+                    parsed, user_input,
+                    default_intent=UserMessageIntent.REPLAN,
+                    prescan_skills=prescan_skills,
                 )
                 if on_response_chunk is not None:
                     evaluation._streamed = True  # type: ignore[attr-defined]
                 self.logger.info(
                     f"Initial goal classification: intent={evaluation.intent.value}, "
                     f"matched_template_id={evaluation.matched_template_id!r}, "
+                    f"activated_skills={evaluation.activated_skills}, "
                     f"reasoning={evaluation.reasoning}",
                     component="Receptionist",
                 )
@@ -608,7 +793,8 @@ class Receptionist:
                 component="Receptionist",
             )
 
-        # Safe fallback: treat as task
+        # Safe fallback: treat as task. Even on LLM failure we still honour
+        # explicit @-mentions because the user typed them deliberately.
         fallback_response = "Got it, I'll start working on that."
         self.conversation_history.append({"role": "assistant", "content": fallback_response})
         return UserMessageEvaluation(
@@ -616,6 +802,7 @@ class Receptionist:
             response_to_user=fallback_response,
             reasoning="LLM classification failed; defaulting to task.",
             context_for_planner=user_input,
+            activated_skills=sorted(prescan_skills),
         )
 
     # ── GEP confirmation window ───────────────────────────────────────────────
@@ -726,6 +913,10 @@ class Receptionist:
         self.conversation_history.append({"role": "user", "content": message})
         self._submit_user_turn_candidate(message, current_goal=goal)
 
+        # @-prescan — same logic as classify_initial_goal: extract once,
+        # filter against registry, and apply even if the LLM call fails.
+        prescan_skills = self._extract_at_mentions(message)
+
         current_step = current_step_description or "(no step currently executing)"
         lookahead = (
             "\n".join(f"  {i+1}. {d}" for i, d in enumerate(lookahead_descriptions))
@@ -773,13 +964,16 @@ class Receptionist:
                 parsed = await self._call_and_parse(messages, "evaluate_user_message")
             if parsed is not None:
                 evaluation = self._build_evaluation_result(
-                    parsed, message, default_intent=UserMessageIntent.REPLAN
+                    parsed, message,
+                    default_intent=UserMessageIntent.REPLAN,
+                    prescan_skills=prescan_skills,
                 )
                 if on_response_chunk is not None:
                     evaluation._streamed = True  # type: ignore[attr-defined]
                 self.logger.info(
                     f"Message evaluation: intent={evaluation.intent.value}, "
                     f"matched_template_id={evaluation.matched_template_id!r}, "
+                    f"activated_skills={evaluation.activated_skills}, "
                     f"reasoning={evaluation.reasoning}",
                     component="Receptionist",
                 )
@@ -793,7 +987,7 @@ class Receptionist:
                 component="Receptionist",
             )
 
-        # Safe fallback
+        # Safe fallback — preserve any explicit @-mentions even when the LLM fails.
         fallback_response = "Got it — I'll incorporate your message into the plan on the next cycle."
         self.conversation_history.append({"role": "assistant", "content": fallback_response})
         return UserMessageEvaluation(
@@ -801,6 +995,7 @@ class Receptionist:
             response_to_user=fallback_response,
             reasoning="LLM evaluation failed; defaulting to replan.",
             context_for_planner=message,
+            activated_skills=sorted(prescan_skills),
         )
 
     def _default_response(self, intent: UserMessageIntent, message: str) -> str:

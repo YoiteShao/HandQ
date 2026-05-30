@@ -51,6 +51,7 @@ class Step:
     required_context_keys: List[str] = field(default_factory=list)  # step_id values of prior steps whose findings this step needs; empty = full isolation
     ssh_target: str = ""             # "user@hostname" — Planner fills when step requires SSH remote work; empty for local steps
     tools_required: List[str] = field(default_factory=list)  # On-demand tool names to activate for this step (e.g. ["ssh"], ["session"]); merged with provider matches via UNION at runtime
+    skills_required: List[str] = field(default_factory=list)  # Skill names whose bodies should be appended to effective_goal at execution time. Filled by Planner; resolved against SkillRegistry by FlowController._execute_step.
 
     # ── Execution state ──────────────────────────────────────────────────────
     status: StepStatus = StepStatus.PENDING
@@ -84,7 +85,8 @@ class Step:
                      risk_assessment: str = "",
                      required_context_keys: Optional[List[str]] = None,
                      ssh_target: str = "",
-                     tools_required: Optional[List[str]] = None) -> "Step":
+                     tools_required: Optional[List[str]] = None,
+                     skills_required: Optional[List[str]] = None) -> "Step":
         """Create a step from planner output."""
         return cls(
             step_id=step_id,
@@ -99,6 +101,7 @@ class Step:
             required_context_keys=required_context_keys or [],
             ssh_target=ssh_target,
             tools_required=tools_required or [],
+            skills_required=skills_required or [],
         )
 
     @classmethod
@@ -237,6 +240,7 @@ class Step:
             "required_context_keys": self.required_context_keys,
             "ssh_target": self.ssh_target,
             "tools_required": self.tools_required,
+            "skills_required": self.skills_required,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "started_at": self.started_at.isoformat() if self.started_at else None,
             "completed_at": self.completed_at.isoformat() if self.completed_at else None,
@@ -281,6 +285,12 @@ class Plan:
     # Token count from the LLM call that produced this plan.
     # Set by Planner.observe_and_plan() after the chat() call returns.
     token_count: int = 0
+    # Skill names the planner wants to add to the session-level active set.
+    # Read by FlowController after observe_and_plan returns; merged into the
+    # session's active skills so the next planning cycle sees the bodies.
+    # Orthogonal to per-step skills_required (which is the executor's
+    # narrow per-step contract).
+    skills_to_activate: List[str] = field(default_factory=list)
 
     # ── Planner response parsing ──────────────────────────────────────────────
 
@@ -301,11 +311,18 @@ class Plan:
                 required_context_keys=s.get("required_context_keys", []),
                 ssh_target=s.get("ssh_target", ""),
                 tools_required=s.get("tools_required", []),
+                skills_required=s.get("skills_required", []),
             )
             for s in data.get("next_steps", [])
         ]
         raw = data.get("last_step_confidence", None)
         last_step_confidence = float(raw) if raw is not None else None
+        skills_to_activate_raw = data.get("skills_to_activate", []) or []
+        if not isinstance(skills_to_activate_raw, list):
+            skills_to_activate_raw = [skills_to_activate_raw]
+        skills_to_activate = [
+            str(n).strip() for n in skills_to_activate_raw if str(n).strip()
+        ]
         plan = cls(
             goal=goal,
             next_steps=next_steps,
@@ -313,6 +330,7 @@ class Plan:
             interrupt_current_step=bool(data.get("interrupt_current_step", False)),
             completion_reason=data.get("completion_reason") or None,
             confidence_rationale=data.get("confidence_rationale") or '',
+            skills_to_activate=skills_to_activate,
         )
         plan._validate()
         return plan
@@ -425,6 +443,7 @@ class Plan:
   "last_step_confidence": <number 0.0-1.0 | null: confidence that the last completed step achieved its goal; omit or set empty next_steps to signal task completion>,
   "confidence_rationale": "<string | null: one sentence explaining why this confidence score was assigned, referencing specific evidence from tool outputs>",
   "completion_reason": "<string | null: required when next_steps is empty — one sentence explaining what was accomplished or why the task is infeasible>",
+  "skills_to_activate": ["<string: name of an Available Skill the planner wants added to the session-level active set; activated for the rest of the session and shown in full on the next cycle>"],
   "next_steps": [
     {
       "step_id": "<string: unique id>",
@@ -436,7 +455,8 @@ class Plan:
       "planner_reasoning": "<string: why this step is needed (set on first step only)>",
       "expected_outcomes": ["<string: one observable dimension of success>", "<string: another dimension>"],
       "risk_assessment": "<string: what could go wrong and the fallback strategy>",
-      "required_context_keys": ["<string: step_id of a prior step whose findings this step needs>"]
+      "required_context_keys": ["<string: step_id of a prior step whose findings this step needs>"],
+      "skills_required": ["<string: name of an already-active skill whose body should be appended to this step's effective_goal at execution time>"]
     }
   ]
 }"""

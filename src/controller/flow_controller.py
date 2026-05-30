@@ -85,6 +85,7 @@ from .planner import Planner, PlannerProgressTracker
 from .receptionist import Receptionist, UserMessageIntent, UserMessageEvaluation
 from .interaction_manager import InteractionManager
 from ..infrastructure.gep_template import load_template, GEPTemplate
+from ..infrastructure.skills import SkillRegistry
 from .planner_prompts import GEP_ENRICHED_GOAL_TEMPLATE
 
 
@@ -209,6 +210,16 @@ class FlowController:
         # LLM sees all parameter values the user provided before activation.
         self._gep_param_context: str = ""
 
+        # Skill activation state (session-level, not task-level):
+        # Receptionist and Planner both write here via _merge_skills().
+        # Receptionist sees only the names+descriptions of the entire pool;
+        # Planner sees full bodies of these active skills plus the L0 menu of
+        # the rest. Per-step injection at execution time uses Step.skills_required
+        # which the Planner fills explicitly — _session_active_skills is the
+        # broader audience-side state, skills_required is the narrower
+        # executor-side contract.
+        self._session_active_skills: set[str] = set()
+
         # Reference to the currently executing RuntimeAgent instance.
         # Set in _execute_step() before agent.run_streaming() and cleared after.
         # Read by _planner_loop() during replan to get the in-flight
@@ -246,6 +257,80 @@ class FlowController:
             f"step_verification_threshold:{self.step_verification_threshold}",
             component="FlowController"
         )
+
+    # ── Skill activation ──────────────────────────────────────────────────────
+
+    def _merge_skills(self, names) -> None:
+        """Add *names* to the session's active skill set.
+
+        Called from two places:
+          • Receptionist evaluation paths (initial classify + mid-task evaluate)
+            so that user-mentioned or LLM-matched skills activate immediately.
+          • Planner observe_and_plan() return path so that mid-task discovery
+            (planner saw the L0 menu and decided "this run actually needs X")
+            also feeds the active set.
+
+        Filters against the registry — names the LLM might have hallucinated or
+        legacy names referring to a deleted skill are dropped with a warning.
+        Notifies the user inline ("✦ Skills activated: foo, bar") on the first
+        time a skill enters the active set; subsequent calls naming the same
+        skill are no-ops because the diff is empty.
+
+        Receptionist and Planner both have a setter — we push the full active
+        set to each so they can render their own L0 menu / [Active Skills]
+        sections on the next turn.
+        """
+        if not names:
+            return
+        try:
+            registry = SkillRegistry.get()
+        except Exception:
+            self.logger.error(
+                "SkillRegistry unavailable; cannot activate skills",
+                component="FlowController",
+                exc_info=True,
+            )
+            return
+        wanted = set()
+        unknown = []
+        for raw in names:
+            n = str(raw or "").strip()
+            if not n:
+                continue
+            if registry.has(n):
+                wanted.add(n)
+            else:
+                unknown.append(n)
+        if unknown:
+            self.logger.warning(
+                f"Skill activation request ignored unknown names: {unknown}",
+                component="FlowController",
+            )
+        new = wanted - self._session_active_skills
+        if not new:
+            return
+        self._session_active_skills |= new
+        # Push the updated set to the controllers that render skill prompt
+        # blocks. set_active_skills accepts an iterable of names.
+        try:
+            self.receptionist.set_active_skills(self._session_active_skills)
+        except AttributeError:
+            pass
+        try:
+            self.planner.set_active_skills(self._session_active_skills)
+        except AttributeError:
+            pass
+        try:
+            self.interaction_manager.notify_inline_event(
+                "✦", f"Skills activated: {', '.join(sorted(new))}"
+            )
+        except Exception:
+            # InteractionManager not always wired during early boot / tests.
+            self.logger.debug(
+                "notify_inline_event failed for skill activation; "
+                "skills are still active in session state",
+                component="FlowController",
+            )
 
     # ── Save session (triggered by CLI `handq --save`) ────────────────────────
 
@@ -1052,6 +1137,13 @@ class FlowController:
                 self.interaction_manager.display_error(f"LLM API error: {e}")
                 raise
 
+            # Merge activated skills BEFORE any intent-based early returns —
+            # skill activation is orthogonal to intent (chat / replan / gep
+            # can all carry an activation), and the GEP downgrade path below
+            # constructs a fresh UserMessageEvaluation that would otherwise
+            # drop the activated_skills field.
+            self._merge_skills(getattr(evaluation, "activated_skills", []) or [])
+
             if evaluation.intent == UserMessageIntent.RESPOND_ONLY:
                 evaluation.response_to_user = f"{evaluation.response_to_user}"
 
@@ -1100,6 +1192,12 @@ class FlowController:
             evaluation = await self.receptionist.classify_initial_goal(
                 msg, on_response_chunk=chunk_cb
             )
+
+            # Merge activated skills BEFORE the GEP_CONFIRM early return —
+            # both flows can carry skill activation, and the GEP branch below
+            # constructs a fresh UserMessageEvaluation that would otherwise
+            # drop the field.
+            self._merge_skills(getattr(evaluation, "activated_skills", []) or [])
 
             # ── GEP_CONFIRM ───────────────────────────────────────────────────
             # Store the template id for timeout-confirm and route as REPLAN so
@@ -1834,6 +1932,13 @@ class FlowController:
                         already_covered_count=self.memory.count_context_entries_in_last_n_steps(self.planner.detail_window)
                     ),
                     long_term_context=self._long_term_context_snapshot,
+                )
+                # Planner-side skill activation: merge any skills the planner
+                # asked the system to add to the session active set. Mirrors
+                # the receptionist-side merge in the eval callbacks. Filtered
+                # against SkillRegistry by _merge_skills.
+                self._merge_skills(
+                    list(getattr(self.current_plan, "skills_to_activate", []) or [])
                 )
                 # Compress early steps when context grows large; takes effect for the next call.
                 await self.planner.maybe_compress_steps(completed_for_plan)
@@ -2674,6 +2779,28 @@ class FlowController:
             f"{step.goal}\n\nInput: {step.step_supplement}"
             if step.step_supplement else step.goal
         )
+
+        # ── Skill body injection ──────────────────────────────────────────────
+        # step.skills_required is the planner's per-step contract: only skills
+        # listed here have their bodies appended to effective_goal for THIS
+        # step. Use SkillRegistry.render_active_block (which silently skips
+        # unknown / empty-body skills) so a stale name in skills_required can
+        # never crash execution. Placed before [Prior step findings] so the
+        # methodology framing comes first and the prior-step content second.
+        sk_required = list(getattr(step, "skills_required", []) or [])
+        if sk_required:
+            try:
+                skill_block = SkillRegistry.get().render_active_block(sk_required)
+            except Exception:
+                self.logger.error(
+                    f"Step {step.step_id!r}: skill block render failed; "
+                    f"continuing without skill context",
+                    component="FlowController",
+                    exc_info=True,
+                )
+                skill_block = ""
+            if skill_block:
+                effective_goal = f"{effective_goal}\n\n{skill_block}"
 
         # Selective context injection: only inject findings for steps explicitly
         # declared in required_context_keys. If the list is empty, the step runs

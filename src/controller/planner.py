@@ -19,12 +19,13 @@ The Planner never reads stdin directly.
 """
 import re
 from dataclasses import dataclass, field
-from typing import Any, List, Optional, cast
+from typing import Any, Iterable, List, Optional, Set, cast
 
 from ..infrastructure.llm_pool import call_with_fallback
 from ..infrastructure.llm_service import LLMChatResult, LLMService
 from ..infrastructure.logger import get_logger
 from ..infrastructure.progress_checker import ProgressAnalyzerBase
+from ..infrastructure.skills import SkillRegistry
 from ..infrastructure.utils import try_parse_json
 from ..infrastructure.gep_template import validate_instantiated_steps
 from ..models.plan import Plan, Step, StepStatus
@@ -203,6 +204,11 @@ class Planner:
         self._on_demand_routing_rules: str = ""
         self._on_demand_antipatterns: str = ""
         self._coding_rule_num: int = 6
+        # Session-level active skills (names). Set by FlowController via
+        # set_active_skills(). Used to render the [Active Skills] block
+        # (full bodies for planning) and the [Available Skills] menu
+        # (excluded from menu).
+        self._active_skills: Set[str] = set()
         self.logger.info("Planner initialized successfully", component="Planner")
 
         # ── Context compression state ─────────────────────────────────────────
@@ -814,6 +820,7 @@ class Planner:
             coding_rule_num=self._coding_rule_num,
         )
         gep_template_section = self._build_gep_template_section()
+        skills_section = self._build_skills_section()
 
         # Build directory section dynamically. When working_directory is None
         # (Windows GUI mode) we show only [Session Storage Directory] and adapt
@@ -857,6 +864,7 @@ class Planner:
                 lookahead_summary=self._build_lookahead_summary(current_lookahead),
                 directory_block=directory_block,
                 directory_note=directory_note,
+                skills_section=skills_section,
                 gep_template_section=gep_template_section,
                 user_instruction=user_instruction_block,
                 step_verification_threshold=self.step_verification_threshold
@@ -1366,6 +1374,93 @@ class Planner:
 
         lines.append("")
         return "\n".join(lines) + "\n"
+
+    # ── Skill section builder ────────────────────────────────────────────────
+
+    def set_active_skills(self, names: Iterable[str]) -> None:
+        """Set the session-level active skill names.
+
+        Mirrors :meth:`Receptionist.set_active_skills`. FlowController calls
+        both after every successful skill activation so each controller
+        renders its own skill prompt block on the next turn.
+        """
+        self._active_skills = {str(n).strip() for n in names if str(n).strip()}
+
+    def _build_skills_section(self) -> str:
+        """Single skill block injected into ``OBSERVE_AND_PLAN_TEMPLATE``.
+
+        Returns "" when no skill is installed at all — keeps the prompt
+        clean for fresh installs and avoids per-turn token cost when the
+        feature is unused. When skills exist, this block contains:
+
+          • [Active Skills] full bodies (so the planner can reason WITH the
+            methodology) for skills currently in the session active set.
+          • [Available Skills] L0 menu (name + description) for inactive
+            skills the planner can choose to activate via
+            ``skills_to_activate``.
+          • Strengthened rules following Anthropic's Claude Code skill prompt:
+            BLOCKING REQUIREMENT on semantic match, never invent names, GEP
+            outranks skill methodology on conflict.
+          • JSON schema extension instructions for
+            ``skills_to_activate`` (top-level) and ``skills_required``
+            (per-step).
+        """
+        try:
+            registry = SkillRegistry.get()
+        except Exception:
+            return ""
+        all_names = registry.names()
+        if not all_names:
+            return ""
+
+        active = {n for n in self._active_skills if registry.has(n)}
+
+        parts: List[str] = []
+
+        active_block = registry.render_active_block(active) if active else ""
+        if active_block:
+            parts.append(active_block)
+
+        menu_block = registry.render_menu_block(exclude=active)
+        if menu_block:
+            parts.append(menu_block)
+
+        rules = (
+            "Skill rules:\n"
+            "  - Active Skills above are general methodology. While planning, "
+            "    apply their guidance to the relevant steps.\n"
+            "  - When a step should follow an Active Skill's methodology, "
+            "    list that skill's name in `skills_required` on that step. "
+            "    `skills_required` accepts ONLY currently-active skills — "
+            "    listing an Available (not yet active) skill there is a "
+            "    no-op because the body is not in context yet.\n"
+            "  - When an Available Skill would meaningfully improve a step "
+            "    you are about to plan, this is a BLOCKING REQUIREMENT: add "
+            "    its name to the top-level `skills_to_activate`. The system "
+            "    activates it for the rest of the session and the full body "
+            "    will be visible on the next cycle. Do NOT pre-fill "
+            "    `skills_required` referencing a not-yet-active skill.\n"
+            "  - Never invent skill names. Only names that appear under "
+            "    [Active Skills] or [Available Skills] are valid.\n"
+            "  - Do NOT re-add skills already in [Active Skills] to "
+            "    `skills_to_activate` — they are already on.\n"
+            "  - GEP precedence: when a GEP template is also active, the "
+            "    GEP step sequence outranks skill methodology on conflict. "
+            "    Skills are general guidance; GEP is the proven blueprint."
+        )
+        parts.append(rules)
+
+        json_ext = (
+            "JSON output extensions (in addition to the schema in your "
+            "system prompt):\n"
+            "  - top-level: `\"skills_to_activate\": [\"name\", ...]` "
+            "(`[]` when none).\n"
+            "  - per next_steps[i]: `\"skills_required\": [\"name\", ...]` "
+            "(`[]` when none)."
+        )
+        parts.append(json_ext)
+
+        return "\n" + "\n\n".join(parts).rstrip() + "\n"
 
 
 # ── Planner-level progress tracker ───────────────────────────────────────────
