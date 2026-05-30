@@ -1,6 +1,6 @@
 ﻿<#
 .SYNOPSIS
-    Build HandQ: Python bridge (Nuitka / Python 3.14) + Electron frontend (electron-builder).
+    Build HandQ: Python bridge (Nuitka / Python 3.12) + Electron frontend (electron-builder).
 
 .DESCRIPTION
     Step 1 — Compile bridge_main.py into a standalone Windows exe via Nuitka.
@@ -20,9 +20,11 @@
             resources\app.asar   ← Electron renderer/main
 
 .PARAMETER Python
-    Python 3.14 interpreter to call for Nuitka.
-    Accepts a bare executable name ("python", "python3.14") or a full path.
-    Default: "py -3.14" (Windows Launcher).
+    Python 3.12 interpreter to call for Nuitka.
+    Accepts a bare executable name ("python", "python3.12") or a full path.
+    Default: "py -3.12" (Windows Launcher).
+    Note: rapidocr-onnxruntime 1.4.x caps at Python <3.13 (see requirements.txt),
+    so 3.12 is the highest supported version.
 
 .PARAMETER Jobs
     Parallel C-compilation jobs passed to Nuitka --jobs.
@@ -49,7 +51,7 @@
     .\packaging\build.ps1 -Clean
 
     # Bridge only with explicit Python path
-    .\packaging\build.ps1 -BridgeOnly -Python "C:\Python314\python.exe"
+    .\packaging\build.ps1 -BridgeOnly -Python "C:\Python312\python.exe"
 
     # Electron only (reuse existing bridge dist)
     .\packaging\build.ps1 -ElectronOnly
@@ -97,8 +99,8 @@ Write-Host @"
 
 ============================================================
   HandQ Build Script
-  Bridge : Nuitka standalone (Python 3.14)
-  Frontend: electron-builder (Windows NSIS + dir)
+  Bridge : Nuitka standalone (Python 3.12)
+  Frontend: electron-builder (Windows NSIS)
 ------------------------------------------------------------
   Repo root : $REPO_ROOT
   Nuitka cache: $NUITKA_CACHE
@@ -132,7 +134,7 @@ function Invoke-Python {
 # Python version check
 $pyVer = & $pyCmd ($pyArgs.Split(' ') + @('--version')) 2>&1
 if ($LASTEXITCODE -ne 0) { Fail "Python interpreter not found: $Python" }
-if ($pyVer -notmatch '3\.14') { Warn "Expected Python 3.14, got: $pyVer  (continuing anyway)" }
+if ($pyVer -notmatch '3\.12') { Warn "Expected Python 3.12, got: $pyVer  (continuing anyway)" }
 Ok "Python: $pyVer"
 
 if (-not $ElectronOnly) {
@@ -415,9 +417,13 @@ if (-not $BridgeOnly) {
             if ($LASTEXITCODE -ne 0) { Fail 'npm install failed' }
         }
 
-        # Run electron-builder via local npx (avoids global install requirement)
-        Write-Host '  Running electron-builder (NSIS + dir targets)...' -ForegroundColor DarkGray
-        npx electron-builder --win nsis dir --x64
+        # Run electron-builder via local npx (avoids global install requirement).
+        # Default = NSIS installer only. To also produce an unpacked smoke-test
+        # tree, run `npm run dist:dir` separately from electron/ — the dir target
+        # is intentionally not part of the default build to keep dist/installer
+        # to a single artifact.
+        Write-Host '  Running electron-builder (NSIS target only)...' -ForegroundColor DarkGray
+        npx electron-builder --win nsis --x64
         if ($LASTEXITCODE -ne 0) { Fail 'electron-builder failed' }
     }
     finally {
@@ -442,14 +448,15 @@ if (-not $ElectronOnly) {
 }
 if (-not $BridgeOnly) {
     $installerOut = "$REPO_ROOT\dist\installer"
-    Write-Host "  Installer   : $installerOut" -ForegroundColor White
-    Write-Host "  Unpacked    : $installerOut\win-unpacked\" -ForegroundColor White
+    Write-Host "  Installer   : $installerOut\HandQ Setup <ver>.exe" -ForegroundColor White
 }
 
 Write-Host @"
 
-  Quick smoke-test (unpacked build):
-    $REPO_ROOT\dist\installer\win-unpacked\HandQ.exe
+  Smoke-test (install on this machine):
+    Run the installer from $REPO_ROOT\dist\installer
+    OR for an unpacked tree without installing, run separately:
+      cd $ELECTRON_DIR && npm run dist:dir
 
   First-run note:
     %USERPROFILE%\HandQ\handq_config.yaml does not exist yet.

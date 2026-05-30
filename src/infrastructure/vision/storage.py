@@ -15,9 +15,12 @@ strictly scratch space.
 
 Each producer holds its OWN ScreenshotStore instance with a different
 ``root`` directory (browser → ``browser_profile/screenshots/``, desktop
-→ ``desktop_shots/``, activity_monitor → ``activity/``). All three
-share the ``handq_config.yaml`` ``screenshots:`` section for retention
-limits, so behaviour is uniform.
+→ ``desktop_shots/``, activity_monitor → ``activity/``). The
+``ephemeral`` and ``task`` retention limits come from the
+``handq_config.yaml`` ``screenshots:`` section (user-tunable). The
+``activity`` retention is a debug-only backstop and lives in
+``long_term_memory/_constants.py`` (``ACTIVITY_SCREENSHOT_*``) — see
+``_category_cfg`` for the lookup.
 
 Cleanup is amortised at write time (each ``enforce_retention`` call
 runs LRU + age in one stat-sort-unlink pass) plus a full
@@ -76,16 +79,34 @@ class ScreenshotStore:
     # ── Retention helpers ────────────────────────────────────────────────────
 
     def _category_cfg(self, category: str) -> Dict[str, Any]:
+        # The `activity` tier is a debug-only backstop for the
+        # activity_monitor (frames are normally unlinked the moment OCR
+        # returns; this only matters when ACTIVITY_KEEP_FRAME_FILES is
+        # flipped on for debugging). Its caps live in
+        # long_term_memory/_constants.py alongside every other ACTIVITY_*
+        # knob, NOT in handq_config.yaml — wrong values silently degrade
+        # disk hygiene and we don't want users touching them.
+        if category == "activity":
+            from ..long_term_memory import _constants as _C
+            return {
+                "max_files": _C.ACTIVITY_SCREENSHOT_MAX_FILES,
+                "max_age_days": _C.ACTIVITY_SCREENSHOT_MAX_AGE_DAYS,
+            }
         return (self._cfg.get(category) or {}) if isinstance(self._cfg, dict) else {}
 
     def enforce_retention(self, category: str) -> None:
         """LRU + age sweep on one category. Called after every write so
         cleanup amortises across writes (no separate timer task).
 
-        Limits read from config:
-          * ``max_files``        — drop oldest beyond this count
-          * ``max_age_minutes``  — used by ephemeral
-          * ``max_age_days``     — used by activity
+        Limits:
+          * ephemeral / task — read from ``handq_config.yaml``
+            (``screenshots:`` section passed to ``__init__``)
+          * activity         — read from ``long_term_memory/_constants.py``
+            (``ACTIVITY_SCREENSHOT_*``); see ``_category_cfg``
+        Fields per category:
+          * ``max_files``       — drop oldest beyond this count
+          * ``max_age_minutes`` — used by ephemeral
+          * ``max_age_days``    — used by activity
 
         Best-effort: any IO error is logged at debug and swallowed.
         """

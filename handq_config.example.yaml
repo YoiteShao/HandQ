@@ -133,9 +133,6 @@ screenshots:
   task:
     retain_after_task_days: 1
     max_files: 50
-  activity:
-    max_files: 100
-    max_age_days: 1
 desktop:
   sensitive_window_patterns:
   - (?i)bitwarden|1password|keepass|lastpass|dashlane
@@ -162,7 +159,18 @@ web_search:
       base_url: https://orbit
       search_url_template: 'https://orbit/search?query={q}&pagesize=10'
       result_selector: 'a[href*="/CR/"]'
+      timeout_ms: 10000   # page.goto deadline; raise if intranet DNS is slow
 email:
   body_preview_chars: 500
   attachment_sandbox: '%USERPROFILE%\HandQ\email_attachments'
   folder_blacklist: []
+  max_recursion_depth: 4   # Inbox sub-folder walk depth for list_messages / search
+personalization:
+  # When ON, HandQ tailors its plans to the tools and project conventions
+  # it sees you working with. When OFF, every task starts from a blank
+  # slate — HandQ won't carry context across sessions.
+  enabled: true
+  excluded_apps: []
+  git_hook_repos: []
+update:
+  share_path: '\\wine\APTAuto\ADAS\fengxuan\HandQ'

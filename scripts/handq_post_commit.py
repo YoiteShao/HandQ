@@ -5,8 +5,8 @@ manually or via Settings → Personalization → "Learn from commits in"
 on Save, which diff-syncs the configured repo list against existing
 hooks). It runs in the git
 hook environment — short-lived, no HandQ runtime — and writes a fresh
-candidate row into ``%USERPROFILE%/HandQ/memory.db`` for the bridge's
-DreamWorker to triage on its next cycle.
+candidate row into ``%USERPROFILE%/HandQ/personality/memory.db`` for
+the bridge's DreamWorker to triage on its next cycle.
 
 Why self-contained
 ------------------
@@ -54,7 +54,10 @@ def _user_handq_root() -> Path:
 
 
 def _memory_db_path() -> Path:
-    return _user_handq_root() / "memory.db"
+    # Mirrors src/infrastructure/long_term_memory/_constants.py
+    # PERSONALITY_DATA_DIR = "personality" and bridge_main._run_with_long_term_memory
+    # which constructs db_path = personality_root / "memory.db".
+    return _user_handq_root() / "personality" / "memory.db"
 
 
 # ── Git helpers ──────────────────────────────────────────────────────

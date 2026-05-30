@@ -14,11 +14,12 @@
 
 'use strict';
 
-const { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, globalShortcut, Notification, dialog } = require('electron');
+const { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, globalShortcut, Notification, dialog, shell } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const { spawn } = require('child_process');
 const readline = require('readline');
+const { checkForUpdates } = require('./updater');
 
 // --- configuration ---------------------------------------------------------
 
@@ -166,6 +167,26 @@ let pythonChild = null;
 let _trayFlashTimer = null;
 let stdoutReader = null;
 let isShuttingDown = false;
+
+// --- bridge crash diagnostics ----------------------------------------------
+//
+// When `handq-bridge.exe` (or `python bridge_main.py`) dies before the
+// Electron renderer finishes booting, the user is left staring at a stuck
+// "Starting…" screen with no actionable info. We catch that case by:
+//   * recording the spawn time + a flag that flips true once any IPC line
+//     arrives or `boot_progress phase=stdio_loop_ready` lands;
+//   * keeping the last STDERR_RING_SIZE bridge stderr lines in memory;
+// on `exit` (when not user-initiated), if the bridge never booted OR died
+// inside the startup grace window, we show a dialog with the tail of stderr,
+// the log file path, and offer "Open Log Folder", "Reset Config & Relaunch",
+// "Quit". One-shot — `_crashDialogShown` makes sure we don't loop.
+
+const STDERR_RING_SIZE = 50;
+const STARTUP_GRACE_MS = 10000;
+let bridgeStartedAt = 0;
+let bridgeBooted = false;
+let stderrRing = [];
+let _crashDialogShown = false;
 
 // --- desktop takeover overlay ----------------------------------------------
 //
@@ -442,6 +463,11 @@ function spawnBridge() {
 
     const launch = resolveBridgeLaunch();
 
+    // Reset crash-detection state for this spawn.
+    bridgeStartedAt = Date.now();
+    bridgeBooted = false;
+    stderrRing = [];
+
     // Log the resolved spawn parameters and the env *keys only* — never the
     // values, which may contain API keys, tokens, and other secrets.
     logLine('MAIN', 'spawning bridge', {
@@ -504,6 +530,17 @@ function spawnBridge() {
             id: evt && evt.id,
             raw: truncated,
         });
+        // Mark bridge as booted once we see any non-error envelope (or the
+        // explicit stdio_loop_ready phase). Used by the early-exit detector
+        // in child.on('exit') below.
+        if (!bridgeBooted) {
+            if (evtType === 'status' && evt && evt.kind === 'boot_progress'
+                && evt.phase === 'stdio_loop_ready') {
+                bridgeBooted = true;
+            } else if (evtType && evtType !== 'error') {
+                bridgeBooted = true;
+            }
+        }
         // Desktop takeover overlay control. We act on these BEFORE
         // forwarding to the renderer so the overlay reaction isn't
         // blocked by a slow renderer process. The renderer is also free
@@ -553,6 +590,14 @@ function spawnBridge() {
         // Strip a single trailing newline so the log line isn't double-broken.
         const stripped = text.endsWith('\n') ? text.slice(0, -1) : text;
         logLine('BRIDGE-LOG', stripped);
+        // Buffer for the crash dialog. Split on newlines so multi-line
+        // tracebacks don't get glued together visually. Cap at
+        // STDERR_RING_SIZE total lines.
+        for (const ln of stripped.split(/\r?\n/)) {
+            if (!ln) continue;
+            stderrRing.push(ln);
+            if (stderrRing.length > STDERR_RING_SIZE) stderrRing.shift();
+        }
     });
 
     child.on('error', (err) => {
@@ -576,9 +621,98 @@ function spawnBridge() {
             code: code,
             signal: signal,
         });
+        // Crash detector — only when the user did NOT initiate the quit.
+        const elapsed = Date.now() - bridgeStartedAt;
+        const isStartupFailure = !bridgeBooted || elapsed < STARTUP_GRACE_MS;
+        if (!isQuitting && !isShuttingDown && !_crashDialogShown
+                && isStartupFailure) {
+            _crashDialogShown = true;
+            logLine('MAIN', 'bridge early-exit detected; showing crash dialog',
+                    { elapsed_ms: elapsed, booted: bridgeBooted });
+            showBridgeCrashDialog({ code, signal, elapsed });
+        }
     });
 
     return child;
+}
+
+// --- bridge crash dialog ---------------------------------------------------
+//
+// Called when the bridge child exits before booting (or within the startup
+// grace window) and the user did not initiate the quit. We surface what
+// happened with the tail of bridge stderr, the log file path, and three
+// actions:
+//   * "Open Log Folder & Quit" — for the user to send us logs;
+//   * "Reset Config & Relaunch" — rename %USERPROFILE%\HandQ\handq_config.yaml
+//     to handq_config.yaml.broken-<TS> so first-run path re-seeds from the
+//     install default; then app.relaunch() + app.quit();
+//   * "Quit" — give up.
+// Reset Config is the foot-gun button (it shadows the user's API key and
+// any custom switches), so we add a confirmation message and the user can
+// recover the broken file after the relaunch.
+function showBridgeCrashDialog({ code, signal, elapsed }) {
+    const tail = stderrRing.slice(-20).join('\n');
+    const exitDesc = signal
+        ? `signal=${signal}`
+        : `exit code=${code === null ? 'null' : code}`;
+    const detail = [
+        `Bridge ${exitDesc} after ${elapsed}ms`
+            + (bridgeBooted ? '' : ' (never reached stdio_loop_ready)'),
+        `Log file: ${LOG_FILE}`,
+        '',
+        '── Last bridge stderr ────────────────────────────',
+        tail || '(no stderr captured)',
+    ].join('\n');
+
+    dialog.showMessageBox({
+        type: 'error',
+        title: 'HandQ 启动失败',
+        message: 'HandQ 后端进程未能正常启动。',
+        detail,
+        buttons: ['打开日志目录并退出', '重置配置并重启', '退出'],
+        defaultId: 0,
+        cancelId: 2,
+        noLink: true,
+    }).then(({ response }) => {
+        if (response === 0) {
+            try { shell.openPath(LOG_DIR); } catch (e) {
+                logLine('MAIN', 'openPath(LOG_DIR) failed',
+                        { err: e && e.message });
+            }
+            isQuitting = true;
+            app.quit();
+        } else if (response === 1) {
+            try { resetUserConfig(); } catch (e) {
+                logLine('MAIN', 'resetUserConfig failed',
+                        { err: e && e.message });
+            }
+            isQuitting = true;
+            app.relaunch();
+            app.quit();
+        } else {
+            isQuitting = true;
+            app.quit();
+        }
+    }).catch((err) => {
+        logLine('MAIN', 'showBridgeCrashDialog dialog error',
+                { err: err && err.message });
+        isQuitting = true;
+        app.quit();
+    });
+}
+
+function resetUserConfig() {
+    const home = process.env.USERPROFILE || app.getPath('home');
+    const cfg = path.join(home, 'HandQ', 'handq_config.yaml');
+    if (!fs.existsSync(cfg)) {
+        logLine('MAIN', 'resetUserConfig: no config file to reset', { cfg });
+        return;
+    }
+    const ts = new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 14);
+    const broken = `${cfg}.broken-${ts}`;
+    fs.renameSync(cfg, broken);
+    logLine('MAIN', 'resetUserConfig: renamed broken config',
+            { from: cfg, to: broken });
 }
 
 // Procedurally-built 16x16 tray icon — a white "H" on a tinted-blue square,
@@ -918,15 +1052,29 @@ function createWindow() {
         try { mainWindow.flashFrame(false); } catch (_) { /* ignore */ }
         stopTrayFlash();
     });
+
+    // Update check — fires once after the renderer has painted, so the
+    // dialog never appears over a black window. Errors are logged inside
+    // the updater; this catch is the last-resort safety net.
+    mainWindow.webContents.once('did-finish-load', () => {
+        checkForUpdates({ logLine, mainWindow }).catch((err) => {
+            logLine('UPDATER', 'unexpected error',
+                    { err: err && err.message });
+        });
+    });
 }
 
 // --- single-instance lock --------------------------------------------------
 
 // Windows: set AppUserModelId so that native Toast notifications are
 // attributed to this app. Must be called before app.whenReady().
+// Value MUST match electron/package.json :: build.appId so the prod NSIS
+// shortcut (which embeds appId as the shortcut's AUMID) and the running
+// process register under the same identity — otherwise toasts get
+// orphaned with the raw AUMID string as the source.
 if (process.platform === 'win32') {
     app.setName('HandQ');
-    app.setAppUserModelId('com.handq.app');
+    app.setAppUserModelId('HandQ');
 }
 
 const gotLock = app.requestSingleInstanceLock();

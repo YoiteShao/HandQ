@@ -451,12 +451,16 @@ ACTIVITY_DAILY_SUMMARY_MAX_SAMPLES: int = 80  # cap prompt size
 # We aim for ZERO accumulating PNG files. Each capture writes to a single
 # rotating filename per monitor; OCR runs against it; the file is unlinked
 # immediately after. The activity tier of ScreenshotStore acts as a backstop
-# (max_files / max_age_days from handq_config.yaml).
+# (LRU + age cap) for the case where ACTIVITY_KEEP_FRAME_FILES is flipped on
+# for debugging. Values live here (not handq_config.yaml) — this is a
+# debug-only knob, not a user-facing tuning surface.
 #
-# Setting this False (the default) makes the activity_monitor unlink each
-# frame the moment OCR returns. Flip to True only for debugging — it's a
-# privacy footgun in production.
+# Setting ACTIVITY_KEEP_FRAME_FILES to False (the default) makes the
+# activity_monitor unlink each frame the moment OCR returns. Flip to True
+# only for debugging — it's a privacy footgun in production.
 ACTIVITY_KEEP_FRAME_FILES: bool = False
+ACTIVITY_SCREENSHOT_MAX_FILES: int = 100
+ACTIVITY_SCREENSHOT_MAX_AGE_DAYS: float = 1.0
 
 # Sensitive-window patterns for the activity monitor's foreground-app probe.
 # These complement the desktop_tool list (handq_config.yaml :: desktop ::

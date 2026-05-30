@@ -19,7 +19,7 @@
     "esbuild": "^0.21.0"
   },
   "build": {
-    "appId": "com.handq.app",
+    "appId": "HandQ",
     "productName": "HandQ",
     "copyright": "Copyright © 2026 HandQ",
     "icon": "logo.png",
@@ -40,13 +40,12 @@
       {
         "from": "../scripts",
         "to": "scripts",
-        "filter": ["*.bat"]
+        "filter": ["*.bat", "*.py"]
       }
     ],
     "win": {
       "target": [
-        { "target": "nsis", "arch": ["x64"] },
-        { "target": "dir",  "arch": ["x64"] }
+        { "target": "nsis", "arch": ["x64"] }
       ]
     },
     "nsis": {
@@ -55,7 +54,8 @@
       "allowToChangeInstallationDirectory": true,
       "shortcutName": "HandQ",
       "createDesktopShortcut": true,
-      "createStartMenuShortcut": true
+      "createStartMenuShortcut": true,
+      "differentialPackage": false
     }
   }
 }
