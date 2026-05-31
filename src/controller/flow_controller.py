@@ -955,6 +955,14 @@ class FlowController:
                 component="FlowController",
             )
         try:
+            from ..infrastructure.remote_handq_setup import RemoteHandQContextProvider
+            self.register_step_context_provider(RemoteHandQContextProvider())
+        except ImportError:
+            self.logger.debug(
+                "RemoteHandQContextProvider not registered",
+                component="FlowController",
+            )
+        try:
             from ..infrastructure.web_search_setup import WebSearchContextProvider
             self.register_step_context_provider(WebSearchContextProvider())
         except ImportError:

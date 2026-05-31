@@ -432,7 +432,64 @@ npm start
 
 ---
 
-## 7. 待办
+## 8. 远程委托（分身）
+
+Windows HandQ 可以将复杂任务委托给远程 Linux HandQ 代理自主执行。用户在对话中指明远端地址（如"在 fengxuan@xfeng-lnx 上分析代码"），planner 据此设置 `ssh_target` 并路由到 `remote_handq` 工具。
+
+### 8.1 架构原则
+
+- **通信 only**：Windows 端仅通过 SSH 与已安装的 Linux HandQ 通信，不负责部署
+- **Linux 端由用户预装**：用户在 Linux 上运行 `bash handq_setup.sh --config <config>`
+- **文件 IPC**：通过 `state.json`（状态）和 `messages/`（消息队列）交互
+- **on-demand 工具**：planner 声明 `tools_required: ["remote_handq"]` 时才激活
+- **地址由 prompt 提供**：远端地址不在 yaml 配置中硬编码，适应频繁变动的开发机
+
+### 8.2 前置条件
+
+1. Linux 端已安装 HandQ（`handq` 在 PATH 或 `~/.local/bin/`）— 用户运行 `bash handq_setup.sh`
+2. Windows 端可 SSH 到该 Linux 主机（凭据由 SSHSetupManager 首次交互时建立）
+3. 用户在对话中提供目标地址（`user@hostname`）
+
+### 8.3 通信协议
+
+Windows 端通过 SSH exec 读写 Linux 端的文件 IPC：
+
+| Windows 动作 | 远端操作 | 用途 |
+|---|---|---|
+| `discover` | probe `~/.handq/<user>@<host>/` + `which handq` | 确认已安装、定位工作目录 |
+| `submit_goal` | `handq --new` + write `messages/<ts>.txt` | 启动空闲 HandQ 并提交任务 |
+| `get_status` | read `state.json`（可 poll） | 轮询进度 |
+| `send_message` | write `messages/<ts>_msg.txt` | 中途注入指令/修正 |
+| `get_result` | read `state.json` + tail execution log | 收集最终结果 |
+| `exit_handq` | `handq --exit` | 清理关闭 |
+
+### 8.4 Planner 路由
+
+- 远端任务需要推理/规划（"分析代码"、"修复所有测试"）→ `tools_required: ["remote_handq"]` + `ssh_target`
+- 远端任务是已知命令（"重启服务"、"跑脚本"）→ `tools_required: ["ssh"]`（Windows agent 驱动）
+- 不可组合 `["ssh", "remote_handq"]` 在同一 step
+
+### 8.5 平台限制
+
+- 工具和 provider 仅在 `sys.platform == "win32"` 时注册
+- `tool_registry.py`: `if _IS_WINDOWS:` 门控
+- `flow_controller.py`: `if not _is_windows: return` 早退
+
+Linux HandQ 不需要委托给自己。
+
+### 8.6 相关文件
+
+| 文件 | 职责 |
+|---|---|
+| `src/tools/remote_handq_tool.py` | RemoteHandQTool — SSH 通信层（6 actions） |
+| `src/infrastructure/remote_handq_setup.py` | RemoteHandQContextProvider — 凭据建立 + HANDQ_DIR 发现 |
+| `src/infrastructure/memory.py` | per-host 缓存（`_remote_handq_contexts`） |
+| `src/tools/tool_registry.py` | on-demand 注册（Windows-only, line ~954） |
+| `src/controller/flow_controller.py` | provider 注册（Windows-only, line ~958） |
+
+---
+
+## 9. 待办
 
 | # | 项目 | 状态 |
 |---|---|---|

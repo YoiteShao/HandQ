@@ -76,6 +76,27 @@ class Memory:
         # _browser_contexts and _desktop_contexts but kept separate so all
         # three providers can be cleared independently.
         self._email_contexts: Dict[str, Dict[str, Any]] = {}
+        # Remote HandQ delegation cache — keyed by hostname, stores
+        # credentials_file path + discovered HANDQ_DIR on the remote host.
+        self._remote_handq_contexts: Dict[str, Dict[str, Any]] = {}
+
+    # ── Remote HandQ context ────────────────────────────────────────────────
+
+    def set_remote_handq_context(
+        self, hostname: str, creds_file: str, handq_dir: str, hint: str
+    ) -> None:
+        """Store remote HandQ context for a specific host."""
+        self._remote_handq_contexts[hostname] = {
+            "creds_file": creds_file,
+            "handq_dir": handq_dir,
+            "hint": hint,
+        }
+
+    def get_remote_handq_context(self, hostname: str) -> Optional[Dict[str, Any]]:
+        """Return stored remote HandQ context for *hostname*, or None."""
+        return self._remote_handq_contexts.get(hostname)
+
+    # ── SSH context ─────────────────────────────────────────────────────────
 
     def set_ssh_context(self, hostname: str, creds_file: str, hint: str) -> None:
         """

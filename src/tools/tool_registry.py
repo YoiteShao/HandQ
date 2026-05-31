@@ -10,6 +10,7 @@ from .write_tool import WriteTool
 from .edit_tool import EditTool
 from .shell_tool import ShellTool
 from .ssh_tool import StatelessSSHTool
+from .remote_handq_tool import RemoteHandQTool
 from .glob_tool import GlobTool
 from .grep_tool import GrepTool
 from .notebook_edit_tool import NotebookEditTool
@@ -72,6 +73,7 @@ class ToolRegistry:
     GREP = "grep"
     NOTEBOOK_EDIT = "notebook_edit"
     SSH  = "ssh"
+    REMOTE_HANDQ = "remote_handq"
     SESSION = "session"
     BROWSER = "browser"
     DESKTOP = "desktop"
@@ -945,6 +947,59 @@ EXAMPLES
             tool_class=StatelessSSHTool,
             on_demand=True,
         )
+
+        # Register REMOTE_HANDQ tool — delegate tasks to a remote Linux HandQ
+        # agent over SSH. Windows-only: the Windows GUI delegates complex work
+        # to Linux agents; Linux HandQ doesn't delegate to itself.
+        if _IS_WINDOWS:
+            _remote_handq_usage_guide = """\
+WHEN TO USE
+  - The remote task requires REASONING or PLANNING — not just a known command.
+  - You cannot write out the full solution as a bash script in advance.
+  - Complex multi-step work: "analyze this code", "fix all test failures",
+    "investigate and resolve the build error".
+  - Fire-and-forget: submit a goal and check back later.
+
+WHEN NOT TO USE (use ssh tool instead)
+  - You know the exact command(s) to run → ssh exec / run_script.
+  - Single command, file copy, known script → ssh tool.
+  - Real-time interactive session → session tool.
+  - Never combine ["ssh", "remote_handq"] in one step.
+
+KEY DISTINCTION: ssh vs remote_handq
+  - ssh tool:        YOU drive the remote work step by step (intelligence here)
+  - remote_handq:    REMOTE AGENT drives autonomously (intelligence there)
+  - Rule of thumb:   "Can I write the bash commands?" → ssh.
+                     "I need an agent to figure it out?" → remote_handq.
+
+PREREQUISITES
+  Remote Linux host must have HandQ pre-installed by the user.
+  User runs: bash handq_setup.sh --config <config> on the Linux machine.
+  submit_goal can start an idle HandQ (handq --new) but cannot install it.
+
+WORKFLOW
+  1. submit_goal  — starts remote HandQ if idle, submits task
+  2. get_status   — poll until task_status="completed" (or use wait_timeout)
+  3. get_result   — read completion_reason + execution log tail
+  4. exit_handq   — clean shutdown (optional; remote HandQ idles on its own)
+
+MID-TASK MESSAGING
+  Use send_message to inject instructions/corrections into a running task.
+  The remote HandQ's receptionist evaluates and may replan.
+"""
+            cls._tools[cls.REMOTE_HANDQ] = ToolMetadata(
+                name=cls.REMOTE_HANDQ,
+                description=(
+                    "Delegate a task to a remote Linux HandQ agent over SSH. "
+                    "Manages the full lifecycle: submit goal, monitor progress, "
+                    "collect result. The remote agent plans and executes independently. "
+                    "SECURITY: credentials read from local file only."
+                ),
+                usage_guide=_remote_handq_usage_guide,
+                parameter_schema=RemoteHandQTool().parameter_schema,
+                tool_class=RemoteHandQTool,
+                on_demand=True,
+            )
 
         # Register SESSION tool — interactive subprocess sessions (adb shell,
         # Python REPL, telnet, etc.). Windows-only: the irreplaceable scenarios

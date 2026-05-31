@@ -531,18 +531,20 @@ html, body {
     flex: 0 0 auto;
     display: flex;
     align-items: stretch;
-    gap: 10px;
     padding: 8px 18px 6px;
 }
 
-/* Rainbow gradient border — achieved via a wrapper background gradient
-   showing through a 2px padding gap around the inner background. */
-.composer textarea {
+.composer-input-wrap {
+    position: relative;
     flex: 1;
+}
+
+.composer textarea {
+    width: 100%;
     resize: none;
     min-height: 56px;
     max-height: 30vh;
-    padding: 10px 14px;
+    padding: 10px 48px 10px 14px;
     border: 2px solid transparent;
     border-radius: 14px;
     font: inherit;
@@ -566,32 +568,47 @@ html, body {
                 0 1px 0 rgba(255, 255, 255, 0.55) inset;
 }
 
-/* Send button — same style as shortcut buttons. */
-.composer button {
-    align-self: stretch;
-    padding: 0 18px;
-    min-height: 56px;
+.composer-input-wrap > button,
+.composer-expanded-body > button {
+    position: absolute;
+    bottom: 8px;
+    right: 8px;
+    width: 32px;
+    height: 32px;
+    padding: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
     border: 1px solid rgba(0, 0, 0, 0.08);
-    border-radius: 999px;
-    background: rgba(255, 255, 255, 0.45);
-    color: var(--fg-soft);
-    font-family: var(--sans);
-    font-size: 13px;
-    font-weight: 500;
+    border-radius: 50%;
+    background: rgba(155, 130, 200, 0.18);
+    color: var(--tint-strong);
     cursor: pointer;
     transition: background 120ms ease, color 120ms ease,
-                border-color 120ms ease, transform 80ms ease;
+                border-color 120ms ease, transform 80ms ease,
+                box-shadow 120ms ease;
+    z-index: 1;
 }
-.composer button:hover {
+.composer-input-wrap > button:hover,
+.composer-expanded-body > button:hover {
+    background: rgba(155, 130, 200, 0.35);
     color: var(--fg);
-    background: rgba(255, 255, 255, 0.65);
-    border-color: rgba(0, 0, 0, 0.12);
+    border-color: rgba(110, 88, 168, 0.3);
+    box-shadow: 0 2px 8px rgba(155, 130, 200, 0.25);
 }
-.composer button:active   { transform: translateY(1px); }
-.composer button:disabled { opacity: 0.5; cursor: not-allowed; }
-.composer button:focus-visible {
+.composer-input-wrap > button:active,
+.composer-expanded-body > button:active {
+    transform: scale(0.92);
+}
+.composer-input-wrap > button:disabled,
+.composer-expanded-body > button:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+.composer-input-wrap > button:focus-visible,
+.composer-expanded-body > button:focus-visible {
     outline: none;
-    border-color: rgba(155, 130, 200, 0.55);
+    box-shadow: 0 0 0 2px rgba(155, 130, 200, 0.55);
 }
 
 /* ---------- Floating expanded editor (draggable + resizable) ---------- */
@@ -661,7 +678,7 @@ html, body {
 .composer-expanded textarea {
     flex: 1;
     min-height: 0;
-    padding: 12px 14px;
+    padding: 12px 48px 12px 14px;
     border: none;
     border-radius: 0;
     font: inherit;
@@ -672,6 +689,14 @@ html, body {
     resize: none;
 }
 .composer-expanded textarea:focus { outline: none; }
+
+.composer-expanded-body {
+    position: relative;
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+}
 
 /* ---------- Shortcut bar ---------- */
 

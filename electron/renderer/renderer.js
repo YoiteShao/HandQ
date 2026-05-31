@@ -2194,7 +2194,7 @@
     });
 
     composerInput.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter' && !e.shiftKey) {
+        if (e.key === 'Enter' && e.ctrlKey) {
             e.preventDefault();
             composer.requestSubmit();
         }
@@ -2232,7 +2232,7 @@
     composerExpandedClose.addEventListener('click', closeExpanded);
 
     composerExpandedInput.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter' && !e.shiftKey) {
+        if (e.key === 'Enter' && e.ctrlKey) {
             e.preventDefault();
             composerInput.value = composerExpandedInput.value;
             closeExpanded();
@@ -2241,6 +2241,12 @@
         if (e.key === 'Escape') {
             closeExpanded();
         }
+    });
+
+    document.getElementById('composer-expanded-send').addEventListener('click', () => {
+        composerInput.value = composerExpandedInput.value;
+        closeExpanded();
+        composer.requestSubmit();
     });
 
     // Drag-to-move: header acts as the drag handle.
