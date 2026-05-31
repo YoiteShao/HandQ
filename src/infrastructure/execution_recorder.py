@@ -317,6 +317,10 @@ class ExecutionRecorder:
         goal: str = "",
         planner_reasoning: str = "",
         expected_outcomes: Optional[List[str]] = None,
+        tools_required: Optional[List[str]] = None,
+        ssh_target: str = "",
+        required_context_keys: Optional[List[str]] = None,
+        skills_required: Optional[List[str]] = None,
     ) -> None:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         lines = [
@@ -327,6 +331,14 @@ class ExecutionRecorder:
             f"goal       : {goal}",
             f"started_at : {now}",
         ]
+        if tools_required:
+            lines.append(f"tools_required: {', '.join(tools_required)}")
+        if skills_required:
+            lines.append(f"skills_required: {', '.join(skills_required)}")
+        if ssh_target:
+            lines.append(f"ssh_target : {ssh_target}")
+        if required_context_keys:
+            lines.append(f"context_keys: {', '.join(required_context_keys)}")
         if planner_reasoning:
             lines.append(self._multiline("reasoning", planner_reasoning))
         if expected_outcomes:
@@ -653,6 +665,10 @@ class ExecutionRecorder:
             "factual_outcome": [],
             "artifacts": [], "findings": [], "issues": [],
             "expected_outcomes": [],
+            "tools_required": [],
+            "skills_required": [],
+            "ssh_target": "",
+            "context_keys": [],
             "confidence": None, "iterations": 0,
             "tools_used": [], "thinking": "",
             "reasoning": "",
@@ -766,6 +782,16 @@ class ExecutionRecorder:
                     started_at=fields.get("started_at", ""),
                 )
                 step["reasoning"] = fields.get("reasoning", "")
+                tools_req_raw = fields.get("tools_required", "")
+                if tools_req_raw:
+                    step["tools_required"] = [t.strip() for t in tools_req_raw.split(",") if t.strip()]
+                skills_req_raw = fields.get("skills_required", "")
+                if skills_req_raw:
+                    step["skills_required"] = [t.strip() for t in skills_req_raw.split(",") if t.strip()]
+                step["ssh_target"] = fields.get("ssh_target", "")
+                ctx_keys_raw = fields.get("context_keys", "")
+                if ctx_keys_raw:
+                    step["context_keys"] = [t.strip() for t in ctx_keys_raw.split(",") if t.strip()]
                 # Parse numbered list fields back into plain string lists
                 for list_field in ("expected_outcomes",):
                     raw = fields.get(list_field, "")
@@ -912,7 +938,7 @@ class ExecutionRecorder:
 
         cleaned_steps = []
         for step in parsed.get('steps', []):
-            cleaned_steps.append({
+            cleaned = {
                 'step_id':           step.get('step_id', ''),
                 'description':       step.get('description', ''),
                 'goal':              step.get('goal', ''),
@@ -923,7 +949,18 @@ class ExecutionRecorder:
                 'artifacts':         step.get('artifacts', []),
                 'reasoning':         step.get('reasoning', ''),
                 'expected_outcomes': step.get('expected_outcomes', []),
-            })
+            }
+            # Routing fields — preserved so GEP templates carry tool/context
+            # declarations from the proven execution into the template steps.
+            if step.get('tools_required'):
+                cleaned['tools_required'] = step['tools_required']
+            if step.get('ssh_target'):
+                cleaned['ssh_target'] = step['ssh_target']
+            if step.get('context_keys'):
+                cleaned['required_context_keys'] = step['context_keys']
+            if step.get('skills_required'):
+                cleaned['skills_required'] = step['skills_required']
+            cleaned_steps.append(cleaned)
 
         return {
             'goal':       parsed.get('goal', ''),

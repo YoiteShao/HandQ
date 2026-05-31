@@ -2458,6 +2458,13 @@
         closeGepOverlay();
         gepInfo = null;
         gepCountdownActive = false;
+        // Tear down any open session terminals — the generation bump above
+        // blocks future session_closed events from the old flow, so we must
+        // clean up the panel synchronously here.
+        for (const sid of [..._sessionTerminals.keys()]) {
+            removeSessionTerminal(sid);
+        }
+        hideTerminalPanel();
     });
 
     // ----- GEP parameter panel + Templates review panel --------------------

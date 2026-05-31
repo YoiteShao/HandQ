@@ -180,7 +180,8 @@ class GEPTemplate:
                 risk_assessment=s.get("risk_assessment", ""),
                 required_context_keys=s.get("required_context_keys", []),
                 ssh_target=s.get("ssh_target", ""),
-                tools_required=_tools_required,
+                tools_required=_tools_required if "ssh" in _tools_required or not s.get("ssh_target", "")
+                    else _tools_required + ["ssh"],
             ))
 
         _id = data.get("id") or data.get("name") or str(uuid.uuid4())

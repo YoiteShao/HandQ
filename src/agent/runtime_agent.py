@@ -1776,6 +1776,10 @@ class RuntimeAgent:
                 goal=self.step.goal,
                 planner_reasoning=self.step.planner_reasoning,
                 expected_outcomes=self.step.expected_outcomes,
+                tools_required=self.step.tools_required,
+                ssh_target=self.step.ssh_target,
+                required_context_keys=self.step.required_context_keys,
+                skills_required=self.step.skills_required,
             )
 
         iteration = 0

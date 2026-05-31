@@ -88,6 +88,9 @@ class Step:
                      tools_required: Optional[List[str]] = None,
                      skills_required: Optional[List[str]] = None) -> "Step":
         """Create a step from planner output."""
+        _tools = list(tools_required or [])
+        if ssh_target and "ssh" not in _tools:
+            _tools.append("ssh")
         return cls(
             step_id=step_id,
             description=description,
@@ -100,7 +103,7 @@ class Step:
             risk_assessment=risk_assessment,
             required_context_keys=required_context_keys or [],
             ssh_target=ssh_target,
-            tools_required=tools_required or [],
+            tools_required=_tools,
             skills_required=skills_required or [],
         )
 
