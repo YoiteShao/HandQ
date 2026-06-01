@@ -17,7 +17,7 @@ Commands:
 """
 from __future__ import annotations
 
-__version__ = "3.0.2"
+__version__ = "1.1.1"
 
 import argparse
 import asyncio
@@ -2325,13 +2325,28 @@ def _build_session(
     from src.infrastructure.role_resolver import resolve_role_models
     _d("OK: AnthropicStreamingService")
     cfg_path = Path(config_path) if config_path else DEFAULT_CONFIG
+    _d(f"config path: {cfg_path}  exists={cfg_path.exists()}")
     try:
         with open(cfg_path, "r", encoding="utf-8") as f:
             config = yaml.safe_load(f) or {}
-    except Exception:
-        config = {}
+        _d(f"config loaded: top-level keys={list(config.keys())}")
+    except FileNotFoundError:
+        _d(f"config file not found: {cfg_path}")
+        raise FileNotFoundError(
+            f"Config file not found: {cfg_path}. "
+            "Pass --config <path>, or place handq_config.yaml next to the binary."
+        )
+    except yaml.YAMLError as _cfg_err:
+        # Common cause: missing space after a colon (e.g. "API_KEY:value" instead
+        # of "API_KEY: value") — silently swallowing this used to surface as
+        # "No agent models configured", which sent users on a wild goose chase.
+        _d(f"config YAML parse FAILED: {_cfg_err}")
+        raise ValueError(
+            f"Invalid YAML in config file {cfg_path}: {_cfg_err}"
+        ) from _cfg_err
 
-    llm_cfg       = config.get("llm", {})
+    llm_cfg       = config.get("llm") or {}
+    _d(f"llm_cfg keys: {list(llm_cfg.keys())}")
     api_key_val   = llm_cfg.get("API_KEY") or ""
     max_tokens    = llm_cfg.get("max_tokens", None)
     # Per-role model lists. Internal keys: agent / planner / receptionist / from_data

@@ -78,6 +78,13 @@ class Decision:
         Handles the legacy single-tool format where the LLM returns
         ``tool_name`` + ``parameters`` as top-level keys.
         """
+        def _coerce_str_list(v: Any) -> Optional[List[str]]:
+            if v is None:
+                return None
+            if isinstance(v, list):
+                return [str(x) for x in v if x is not None]
+            return [str(v)]
+
         tool_calls: List[ToolCall] = []
         tool_name = data.get("tool_name")
         if tool_name:
@@ -89,10 +96,10 @@ class Decision:
         return cls(
             reasoning=data.get("reasoning", ""),
             error=data.get("error"),
-            factual_outcome=data.get("factual_outcome"),
-            artifacts=data.get("artifacts"),
-            key_findings=data.get("key_findings"),
-            blockers=data.get("blockers"),
+            factual_outcome=_coerce_str_list(data.get("factual_outcome")),
+            artifacts=_coerce_str_list(data.get("artifacts")),
+            key_findings=_coerce_str_list(data.get("key_findings")),
+            blockers=_coerce_str_list(data.get("blockers")),
             tool_calls=tool_calls,
         )
 

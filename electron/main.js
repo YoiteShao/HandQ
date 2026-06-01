@@ -429,6 +429,35 @@ function notifyConfirmationNeeded(evt) {
     startTrayFlash();
 }
 
+function notifyTaskCompleted(evt) {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    const windowNeedsAttention =
+        !mainWindow.isVisible() ||
+        mainWindow.isMinimized() ||
+        !mainWindow.isFocused();
+    if (!windowNeedsAttention) return;
+
+    const summary = String((evt && evt.summary) || '');
+    const title = 'HandQ — 任务完成';
+    let body = summary || '任务已完成。';
+    if (body.length > 120) body = body.slice(0, 117) + '…';
+
+    if (Notification.isSupported()) {
+        const note = new Notification({ title, body, silent: false });
+        note.on('click', () => {
+            if (!mainWindow || mainWindow.isDestroyed()) return;
+            if (mainWindow.isMinimized()) mainWindow.restore();
+            mainWindow.show();
+            mainWindow.focus();
+        });
+        note.show();
+        logLine('NOTIFY', 'task_completed toast shown');
+    }
+
+    try { mainWindow.flashFrame(true); } catch (_) { /* ignore */ }
+    startTrayFlash();
+}
+
 function writeToBridge(obj) {
     if (!pythonChild || !pythonChild.stdin || pythonChild.stdin.destroyed) {
         logLine('IPC-OUT', 'bridge stdin unavailable',
@@ -572,6 +601,14 @@ function spawnBridge() {
             try { notifyConfirmationNeeded(evt); }
             catch (err) {
                 logLine('NOTIFY', 'notifyConfirmationNeeded threw',
+                        { err: err && err.message });
+            }
+        }
+        // Notify the user when a task completes and the window is not in focus.
+        if (evtType === 'status' && evt && evt.kind === 'task_completed') {
+            try { notifyTaskCompleted(evt); }
+            catch (err) {
+                logLine('NOTIFY', 'notifyTaskCompleted threw',
                         { err: err && err.message });
             }
         }

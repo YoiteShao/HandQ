@@ -88,7 +88,14 @@ class Step:
                      tools_required: Optional[List[str]] = None,
                      skills_required: Optional[List[str]] = None) -> "Step":
         """Create a step from planner output."""
-        _tools = list(tools_required or [])
+        def _coerce_list(v: Any) -> List[str]:
+            if isinstance(v, list):
+                return [str(x) for x in v if x is not None]
+            if v is None:
+                return []
+            return [str(v)]
+
+        _tools = _coerce_list(tools_required)
         if ssh_target and "ssh" not in _tools:
             _tools.append("ssh")
         return cls(
@@ -99,12 +106,12 @@ class Step:
             parallel_group=parallel_group,
             is_aggregation=is_aggregation,
             planner_reasoning=planner_reasoning,
-            expected_outcomes=expected_outcomes or [],
+            expected_outcomes=_coerce_list(expected_outcomes),
             risk_assessment=risk_assessment,
-            required_context_keys=required_context_keys or [],
+            required_context_keys=_coerce_list(required_context_keys),
             ssh_target=ssh_target,
             tools_required=_tools,
-            skills_required=skills_required or [],
+            skills_required=_coerce_list(skills_required),
         )
 
     @classmethod
@@ -300,8 +307,15 @@ class Plan:
     @classmethod
     def from_planner_dict(cls, goal: str, data: dict) -> "Plan":
         """Parse a planner LLM response dict into a Plan."""
-        next_steps = [
-            Step.from_planner(
+        raw_steps = data.get("next_steps", []) or []
+        next_steps = []
+        for i, s in enumerate(raw_steps):
+            if not isinstance(s, dict):
+                raise ValueError(
+                    f"next_steps[{i}] has type {type(s).__name__!r} "
+                    f"(expected dict): {str(s)[:80]!r}"
+                )
+            next_steps.append(Step.from_planner(
                 step_id=s.get("step_id", str(_uuid.uuid4())),
                 description=s.get("description", ""),
                 goal=s.get("goal", ""),
@@ -315,9 +329,7 @@ class Plan:
                 ssh_target=s.get("ssh_target", ""),
                 tools_required=s.get("tools_required", []),
                 skills_required=s.get("skills_required", []),
-            )
-            for s in data.get("next_steps", [])
-        ]
+            ))
         raw = data.get("last_step_confidence", None)
         last_step_confidence = float(raw) if raw is not None else None
         skills_to_activate_raw = data.get("skills_to_activate", []) or []
@@ -476,7 +488,7 @@ class Plan:
         if isinstance(parsed, dict) and all(k in parsed for k in _EXPECTED):
             try:
                 return cls.from_planner_dict(goal=goal, data=parsed)
-            except ValueError as exc:
+            except (ValueError, AttributeError, TypeError) as exc:
                 _validation_error = str(exc)
                 # fall through to LLM extraction
 
@@ -491,7 +503,7 @@ class Plan:
             if isinstance(result, dict):
                 try:
                     return cls.from_planner_dict(goal=goal, data=result)
-                except ValueError as exc:
+                except (ValueError, AttributeError, TypeError) as exc:
                     _validation_error = str(exc)
                     # fall through to final fallback
 

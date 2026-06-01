@@ -638,8 +638,8 @@ Output a JSON object with this structure:
 
 // Single-agent step (most cases):
 {{
-    "interrupt_current_step": false,  // true = abort the currently running step immediately
-    "last_step_confidence": 1.0,  // 0.0–1.0; omit when no completed steps yet
+    "interrupt_current_step": false,
+    "last_step_confidence": 1.0,
     "confidence_rationale": "one sentence citing specific evidence from tool outputs",
     "next_steps": [
         {{
@@ -656,15 +656,12 @@ Output a JSON object with this structure:
             ],
             "risk_assessment": "what could go wrong and the fallback strategy; 'Low risk — read-only' for safe steps",
             "required_context_keys": [],
-            "tools_required": [],  // [] = core tools only; ["ssh"] / ["session"] per Tool Selection rules
-            "ssh_target": "",  // "user@hostname" — set when this step runs commands on a remote host via SSH; empty otherwise
+            "tools_required": [],
+            "ssh_target": "",
             "epistemic_inventory": [
-                // optional — list ASSUMED claims and their scheduled observation steps
-                // {{ "claim": "...", "tag": "ASSUMED", "risk_if_wrong": "...", "observation_step_id": "step_N" }}
+                {{ "claim": "...", "tag": "ASSUMED", "risk_if_wrong": "...", "observation_step_id": "step_N" }}
             ]
         }},
-        // ... remaining lookahead steps (no planner_reasoning needed) ...
-        // Steps that need prior findings declare them explicitly:
         {{
             "step_id": "step_N+1",
             "description": "...",

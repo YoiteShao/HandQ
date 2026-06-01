@@ -81,11 +81,16 @@ class AcceptanceVerdict:
       code_test_step   — narrow shell test step (e.g. py_compile / pytest)
                          emitted ONLY when has_code_edits=True and the work
                          has not yet been tested.  None otherwise.
+      fallback         — True when the verdict is a fail-open default because
+                         the LLM call or JSON parsing failed.  The task still
+                         completes, but FlowController surfaces a note to the
+                         user so the silent degradation is visible.
     """
     verdict: str = "PASS"
     gap_summary: str = ""
     corrective_step: Optional[Step] = None
     code_test_step: Optional[Step] = None
+    fallback: bool = False
 
     @classmethod
     def from_dict(cls, data: dict) -> 'AcceptanceVerdict':
@@ -722,8 +727,13 @@ class Planner:
             entries = parsed["compressed_entries"]
             if not isinstance(entries, list) or not entries:
                 raise ValueError("Empty or non-list 'compressed_entries'")
+            non_dict_idx = [i for i, e in enumerate(entries) if not isinstance(e, dict)]
+            if non_dict_idx:
+                raise ValueError(
+                    f"compressed_entries items at indices {non_dict_idx} are not dicts"
+                )
             # Validate all input step_ids are covered
-            covered = {sid for e in entries for sid in (e.get("covers") or [])}
+            covered = {sid for e in entries if isinstance(e, dict) for sid in (e.get("covers") or [])}
             input_ids = {s["step_id"] for s in steps_data}
             missing = input_ids - covered
             if missing:
@@ -1101,7 +1111,7 @@ class Planner:
                 f'falling back to PASS to avoid blocking task completion.',
                 component='Planner',
             )
-            return AcceptanceVerdict(verdict='PASS')
+            return AcceptanceVerdict(verdict='PASS', fallback=True)
 
     def _detect_loops(self, completed_steps: List[Step]) -> str:
         """
@@ -1272,6 +1282,8 @@ class Planner:
                 if cached_early and self._compressed_steps_cache:
                     lines.append("[Compressed History]")
                     for entry in self._compressed_steps_cache:
+                        if not isinstance(entry, dict):
+                            continue
                         covers_str = ", ".join(entry.get("covers") or [])
                         lines.append(f"  [{covers_str}] {entry.get('summary', '')}")
                         artifacts = entry.get("artifacts") or []

@@ -2292,6 +2292,12 @@ class FlowController:
                                     f"[Acceptance: {verdict.verdict}] "
                                     f"{verdict.gap_summary}"
                                 )
+                            elif verdict is not None and verdict.fallback:
+                                user_facing_reason = (
+                                    f"{base_reason}\n\n"
+                                    f"[Note: acceptance check could not run — "
+                                    f"results were not independently verified]"
+                                )
                             await self._complete_task(
                                 goal=goal,
                                 user_facing_reason=user_facing_reason,

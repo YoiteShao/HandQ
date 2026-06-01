@@ -150,6 +150,8 @@ class GEPTemplate:
     def from_dict(cls, data: dict) -> "GEPTemplate":
         params_schema: Dict[str, ParamSpec] = {}
         for k, v in data.get("params_schema", {}).items():
+            if not isinstance(v, dict):
+                continue
             params_schema[k] = ParamSpec(
                 type=v.get("type", "string"),
                 description=v.get("description", ""),
@@ -159,6 +161,8 @@ class GEPTemplate:
 
         guide_steps: List[StepSpec] = []
         for s in data.get("guide_steps", []):
+            if not isinstance(s, dict):
+                continue
             _tr_raw = s.get("tools_required", [])
             if isinstance(_tr_raw, str):
                 # Tolerate "browser" as well as ["browser"] from older / hand-written
