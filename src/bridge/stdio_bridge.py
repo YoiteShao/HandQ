@@ -237,7 +237,21 @@ def _install_post_commit_hook(repo_path: str) -> Dict[str, Any]:
     # is a Python script.
     script_body = src.read_text(encoding="utf-8")
     if not script_body.lstrip().startswith("#!"):
-        script_body = "#!/usr/bin/env python\n" + script_body
+        import shutil
+        python_exe = (
+            "python3" if shutil.which("python3") else
+            "python"  if shutil.which("python")  else
+            None
+        )
+        if python_exe is None:
+            return {
+                "ok": False,
+                "error": (
+                    "no python or python3 found in PATH; "
+                    "install Python and ensure it is on PATH before enabling this feature"
+                ),
+            }
+        script_body = f"#!/usr/bin/env {python_exe}\n" + script_body
     target.write_text(script_body, encoding="utf-8")
     # chmod +x — git refuses to run hooks without the bit on POSIX.
     if sys.platform != "win32":

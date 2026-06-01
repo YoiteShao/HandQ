@@ -173,4 +173,4 @@ personalization:
   excluded_apps: []
   git_hook_repos: []
 update:
-  share_path: '\\wine\APTAuto\ADAS\fengxuan\HandQ'
+  share_path: '\\wine\APTAuto\ADAS\fengxuan\HandQ\Windows'

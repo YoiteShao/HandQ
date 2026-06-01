@@ -172,6 +172,7 @@ INCLUDE_COMMON=(
     "--include-package=httpx"           # dep of anthropic SDK
     "--include-package=paramiko"        # SSHTool (src/tools/ssh_tool.py)
     "--include-package=keyring"         # SSH credential storage (src/tools/ssh_tool.py)
+    "--include-package=keyrings"        # keyrings.alt: file-based backend for headless Linux envs
     "--include-package=cffi"            # required by cryptography (paramiko dep); must be explicit
     "--include-package=cryptography"    # required by paramiko for SSH crypto
     # Note: ./handq_config.yaml is NOT embedded — it lives at the dist root
@@ -320,7 +321,7 @@ build_linux() {
     cp "${PROJECT_ROOT}/handq_setup.sh" "${DIST_DIR}/handq_setup.sh"
     chmod +x "${DIST_DIR}/handq_setup.sh"
     # Config at top level — easy for users to find and edit before running setup
-    cp "${PROJECT_ROOT}/handq_config.yaml" "${DIST_DIR}/handq_config.yaml"
+    cp "${PROJECT_ROOT}/handq_config.example.yaml" "${DIST_DIR}/handq_config.yaml"
 
     print_info "Package contents:"
     ls -lh "${DIST_DIR}/handq_config.yaml" "${DIST_DIR}/handq_setup.sh"
