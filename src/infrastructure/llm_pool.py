@@ -44,6 +44,8 @@ Public API
 ``is_network_down() -> bool``
 ``NetworkUnavailableError``
 ``make_from_data_services(all_services)``
+``set_fallback_notifier(cb)``
+``set_network_event_notifier(cb)``
 """
 import asyncio
 import time
@@ -99,6 +101,35 @@ _WAIT_CYCLE: List[int] = [30, 300, 600, 1800, 3600, 1800, 600, 300, 30]
 _probe_lock: asyncio.Lock = asyncio.Lock()
 _probe_status: Optional[bool] = None    # None = not probed yet, True = up, False = down
 _probe_at: float = 0.0
+
+# Module-level hook called by the bridge to surface service-fallback events
+# in the renderer UI.  Set once by stdio_bridge._ensure_flow via
+# set_fallback_notifier(); None in tests / non-bridge contexts.
+# Signature: (from_model: str, to_model: str, exc: Exception) -> None
+_fallback_notifier: Optional[Callable[[str, str, Exception], None]] = None
+
+
+def set_fallback_notifier(
+    cb: Optional[Callable[[str, str, Exception], None]],
+) -> None:
+    """Register (or clear) a bridge hook for service-fallback notifications."""
+    global _fallback_notifier
+    _fallback_notifier = cb
+
+
+# Module-level hook for network-state changes ("down" / "waiting" / "restored").
+# Wired by stdio_bridge._ensure_flow; fires for ALL roles (Receptionist,
+# Planner, Agent) so the renderer can show a single, coherent offline banner.
+# Signature: (state: str, attempt: int, sleep_secs: int) -> None
+_network_event_notifier: Optional[Callable[[str, int, int], None]] = None
+
+
+def set_network_event_notifier(
+    cb: Optional[Callable[[str, int, int], None]],
+) -> None:
+    """Register (or clear) the bridge hook for network-state notifications."""
+    global _network_event_notifier
+    _network_event_notifier = cb
 
 
 def is_network_down() -> bool:
@@ -193,16 +224,24 @@ def _emit_network_event(
     attempt: int,
     sleep_secs: int,
 ) -> None:
-    """Invoke *cb* defensively — UI hooks must never abort the retry loop."""
-    if cb is None:
-        return
-    try:
-        cb(state, attempt, sleep_secs)
-    except Exception:
-        _logger.debug(
-            f"on_network_event callback raised for state={state!r}; ignoring",
-            component="llm_pool",
-        )
+    """Invoke *cb* and the module-level notifier defensively.
+
+    UI hooks must never abort the retry loop, so every call is wrapped in
+    try/except.  Both the per-call callback *cb* and the module-level
+    ``_network_event_notifier`` (wired by the bridge) are fired so that
+    all roles (Receptionist, Planner, Agent) surface network events to the
+    renderer without each caller having to pass its own callback.
+    """
+    for hook in (cb, _network_event_notifier):
+        if hook is None:
+            continue
+        try:
+            hook(state, attempt, sleep_secs)
+        except Exception:
+            _logger.debug(
+                f"network_event hook raised for state={state!r}; ignoring",
+                component="llm_pool",
+            )
 
 
 async def _wait_for_network(
@@ -332,6 +371,11 @@ async def _try_all_services(
                 if on_fallback is not None:
                     try:
                         on_fallback(i + 1, exc)
+                    except Exception:
+                        pass
+                if _fallback_notifier is not None:
+                    try:
+                        _fallback_notifier(services[i].model, services[i + 1].model, exc)
                     except Exception:
                         pass
             else:

@@ -546,12 +546,13 @@ class Receptionist:
         Returns None if the response cannot be parsed as a dict.
         Raises on LLM/network errors so callers can handle the fallback path.
 
-        Passes ``wait_on_network_down=False`` so that — if the pool's TCP
-        probe confirms the LLM endpoint is unreachable — the wrapper
-        raises :class:`NetworkUnavailableError` instead of waiting.
-        Receptionist runs on the user-facing hot path; pausing
-        indefinitely would leave the user staring at a frozen cursor.
-        The InteractionManager catches the exception and silent-skips.
+        Uses ``wait_on_network_down=True`` so that a local-network outage
+        triggers the pool's triangular wait loop rather than raising
+        ``NetworkUnavailableError``.  The module-level
+        ``_network_event_notifier`` (wired by the bridge) emits UI events
+        ("network_down" / "network_waiting" / "network_restored") so the
+        user sees the offline banner instead of a fatal error — the
+        Receptionist is not authorised to terminate an in-progress session.
         """
         raw = cast(LLMChatResult, await call_with_fallback(
             self._services,
@@ -560,7 +561,7 @@ class Receptionist:
                 f"Receptionist {log_context} fallback to index {idx}: {e}",
                 component="Receptionist",
             ),
-            wait_on_network_down=False,
+            wait_on_network_down=True,
         ))
         parsed = try_parse_json(raw.content or "")
         return parsed if isinstance(parsed, dict) else None
@@ -576,10 +577,11 @@ class Receptionist:
         chunks to on_response_chunk as they arrive, then returns the full
         parsed JSON dict.
 
-        Like :meth:`_call_and_parse`, opts OUT of pause-and-retry. A
-        ``NetworkUnavailableError`` raised before any chunk arrives
-        propagates to the caller; mid-stream errors fall through to the
-        non-streaming retry path.
+        Like :meth:`_call_and_parse`, uses ``wait_on_network_down=True`` so
+        a local-network outage triggers the pool's wait loop and the
+        module-level ``_network_event_notifier`` emits UI events rather than
+        terminating the session.  Non-network streaming failures fall back to
+        the non-streaming path via :meth:`_call_and_parse`.
         """
         streamer = JsonKeyStreamer("response_to_user")
         accumulated = []
@@ -592,7 +594,7 @@ class Receptionist:
                     f"Receptionist {log_context} stream fallback to index {idx}: {e}",
                     component="Receptionist",
                 ),
-                wait_on_network_down=False,
+                wait_on_network_down=True,
             ):
                 if isinstance(event, StreamTextDeltaEvent):
                     accumulated.append(event.text)
@@ -605,11 +607,6 @@ class Receptionist:
             full_text = "".join(accumulated)
             parsed = try_parse_json(full_text)
             return parsed if isinstance(parsed, dict) else None
-        except NetworkUnavailableError:
-            # Don't degrade to the non-streaming retry — that wrapper is
-            # also network-aware and will hit the same wall. Let the
-            # caller propagate this so InteractionManager can silent-skip.
-            raise
         except Exception as e:
             self.logger.warning(
                 f"Receptionist {log_context} streaming failed: {e} — falling back to non-streaming",

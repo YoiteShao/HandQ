@@ -12,6 +12,7 @@ llm:
   - anthropic::claude-4-5-haiku
   roles:
     planner:
+    - anthropic::claude-4-6-sonnet:1M
     - anthropic::claude-4-6-sonnet
     - anthropic::claude-4-5-sonnet
     - anthropic::claude-4-5-haiku:thinking
@@ -21,6 +22,7 @@ llm:
     - anthropic::claude-4-5-haiku:thinking
     - anthropic::claude-4-5-haiku
     agent:
+    - anthropic::claude-4-6-sonnet:1M
     - anthropic::claude-4-6-sonnet
     - anthropic::claude-4-5-sonnet
     - anthropic::claude-4-5-haiku:thinking
@@ -32,6 +34,7 @@ llm:
 session:
   log_level: INFO
   step_verification_threshold: 0.8
+  workspace_base: .workspace   # session artifacts written here (relative to cwd)
 interaction_switches:
   tool_write:
     auto_approve: true

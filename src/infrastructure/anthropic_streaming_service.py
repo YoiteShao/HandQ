@@ -697,7 +697,7 @@ class AnthropicStreamingService(LLMService):
                     if self.on_server_error is not None:
                         try:
                             self.on_server_error(
-                                self._user_friendly_error(e),
+                                f"[{self.model}] {self._user_friendly_error(e)}",
                                 wait_time,
                                 self.max_retries - attempt - 1,
                             )

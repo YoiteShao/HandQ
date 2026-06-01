@@ -1237,6 +1237,27 @@ class StdioBridge:
         if msg_type == "request":
             try:
                 goal = msg.get("goal", "")
+                # Early API-key guard — only on the first request (before the
+                # FlowController is built). An empty key causes cryptic errors
+                # deep in the LLM stack; surface a clear message here instead.
+                if self._flow is None:
+                    _cfg = self._load_config_dict()
+                    if not (((_cfg.get("llm") or {}).get("API_KEY") or "")):
+                        _emit(
+                            {
+                                "type": "error",
+                                "id": msg_id,
+                                "where": "config",
+                                "message": (
+                                    "API key is not configured. "
+                                    "Please open Settings → LLM Configuration "
+                                    "and enter your API key."
+                                ),
+                                "fatal": False,
+                            },
+                            gen=self._generation,
+                        )
+                        return
                 self._ensure_flow(goal=str(goal))
                 self._im.inject_user_message(str(goal))
                 if self._flow_task is None or self._flow_task.done():
@@ -1667,6 +1688,60 @@ class StdioBridge:
             len(agent_services), len(planner_services),
             len(receptionist_services), len(from_data_services),
         )
+
+        # Wire module-level bridge hooks so llm_pool can emit status events
+        # without touching deep planner/agent/receptionist call paths.
+        from ..infrastructure.llm_pool import (
+            set_fallback_notifier as _set_fn,
+            set_network_event_notifier as _set_net_fn,
+        )
+        _bridge_ref = self
+
+        def _on_llm_fallback(from_model: str, to_model: str, exc: Exception) -> None:
+            _emit(
+                {
+                    "type": "status",
+                    "kind": "llm_fallback",
+                    "from_model": from_model,
+                    "to_model": to_model,
+                    "error": str(exc)[:200],
+                },
+                gen=_bridge_ref._generation,
+            )
+
+        _set_fn(_on_llm_fallback)
+
+        def _on_network_event(state: str, attempt: int, sleep_secs: int) -> None:
+            if state == "down":
+                _emit(
+                    {
+                        "type": "status",
+                        "kind": "network_down",
+                        "message": "网络已中断，LLM 服务暂不可达，等待恢复中…",
+                    },
+                    gen=_bridge_ref._generation,
+                )
+            elif state == "waiting":
+                _emit(
+                    {
+                        "type": "status",
+                        "kind": "network_waiting",
+                        "attempt": attempt,
+                        "retry_in": sleep_secs,
+                    },
+                    gen=_bridge_ref._generation,
+                )
+            elif state == "restored":
+                _emit(
+                    {
+                        "type": "status",
+                        "kind": "network_restored",
+                        "message": "网络已恢复，继续执行",
+                    },
+                    gen=_bridge_ref._generation,
+                )
+
+        _set_net_fn(_on_network_event)
 
     async def _run_flow_session(self, msg_id: Optional[str]) -> None:
         assert self._flow is not None

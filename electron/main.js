@@ -608,6 +608,20 @@ function spawnBridge() {
             message: 'failed to spawn bridge (' + launch.cmd + '): ' + err.message,
             fatal: true,
         });
+        // For spawn errors (ENOENT etc.) the 'exit' event may not fire in all
+        // Electron/Node.js versions, leaving the boot overlay stuck forever.
+        // The IPC message above may also be dropped if the renderer hasn't
+        // registered its listeners yet (race on fast-failing spawns).
+        // Show the native crash dialog immediately — it works regardless of
+        // renderer readiness and gives the user actionable options.
+        if (!isQuitting && !isShuttingDown && !_crashDialogShown) {
+            _crashDialogShown = true;
+            logLine('MAIN', 'bridge spawn error; showing crash dialog',
+                    { elapsed_ms: Date.now() - bridgeStartedAt });
+            showBridgeCrashDialog({
+                code: null, signal: null, elapsed: Date.now() - bridgeStartedAt,
+            });
+        }
     });
 
     child.on('exit', (code, signal) => {

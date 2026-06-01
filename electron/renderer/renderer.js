@@ -2064,6 +2064,25 @@
                 + ' Retrying automatically — please wait.');
             pushActivity('⏳', 'API retry', errSummary);
             setPill('retrying…');
+        } else if (evt.kind === 'llm_fallback') {
+            const fromModel = String(evt.from_model || '?');
+            const toModel   = String(evt.to_model   || '?');
+            const reason    = evt.error ? ' — ' + evt.error : '';
+            addSystemBubble('↪ ' + fromModel + ' failed; trying ' + toModel + reason);
+            pushActivity('↪', 'Model fallback', fromModel + ' → ' + toModel);
+        } else if (evt.kind === 'network_down') {
+            addSystemBubble('📡 ' + (evt.message || '网络中断，等待恢复…')
+                + '\nHandQ will resume automatically once the connection is restored.');
+            pushActivity('📡', 'Network down', 'waiting for LLM endpoint');
+            setPill('offline…', { force: true });
+        } else if (evt.kind === 'network_waiting') {
+            const retryIn = (typeof evt.retry_in === 'number' && evt.retry_in > 0)
+                ? evt.retry_in + 's' : '…';
+            pushActivity('📡', 'Still offline', 'attempt ' + (evt.attempt || '?') + ', next probe in ' + retryIn);
+        } else if (evt.kind === 'network_restored') {
+            addSystemBubble('✅ ' + (evt.message || '网络已恢复，继续执行'));
+            pushActivity('✅', 'Network restored', 'resuming');
+            setPill('working…');
         }
     });
 
