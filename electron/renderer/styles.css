@@ -1486,6 +1486,12 @@ code {
     margin: 0;
 }
 
+.settings-section-header { cursor: pointer; display: flex; align-items: center; justify-content: space-between; user-select: none; }
+.settings-section-header .settings-chevron { transition: transform .2s ease; display: inline-block; }
+.settings-section.collapsed .settings-chevron { transform: rotate(-90deg); }
+.settings-section.collapsed > *:not(legend):not(.settings-section-header) { display: none; }
+.settings-version, .settings-version-centered { text-align: center; }
+
 /* ---------- Scrollbars (slim, glassy) ---------- */
 
 ::-webkit-scrollbar {

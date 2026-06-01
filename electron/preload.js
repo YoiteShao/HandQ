@@ -274,3 +274,10 @@ contextBridge.exposeInMainWorld('handqDialog', {
         return ipcRenderer.invoke('dialog:pickHistoryLog');
     },
 });
+
+contextBridge.exposeInMainWorld('appInfo', {
+    getVersion: () => {
+        preloadLog('app:getVersion');
+        return ipcRenderer.invoke('app:getVersion');
+    },
+});

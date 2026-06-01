@@ -2420,9 +2420,28 @@
 
     // ----- shortcut buttons ------------------------------------------------
 
-    scSettings.addEventListener('click', () => {
+    scSettings.addEventListener('click', async () => {
         openOverlay(overlaySettings);
         loadConfig();
+        const collapsedState = JSON.parse(localStorage.getItem('handq:settings:collapsed') || '{}');
+        overlaySettings.querySelectorAll('.settings-section').forEach(sec => {
+            const title = sec.querySelector('legend, .settings-section-header')?.textContent?.trim() || '';
+            sec.classList.toggle('collapsed', collapsedState[title] === true);
+            const header = sec.querySelector('.settings-section-header');
+            if (header && !header.dataset.collapseBound) {
+                header.dataset.collapseBound = '1';
+                header.addEventListener('click', () => {
+                    sec.classList.toggle('collapsed');
+                    const state = JSON.parse(localStorage.getItem('handq:settings:collapsed') || '{}');
+                    state[title] = sec.classList.contains('collapsed');
+                    localStorage.setItem('handq:settings:collapsed', JSON.stringify(state));
+                });
+            }
+        });
+        try {
+            const result = await window.appInfo.getVersion();
+            document.getElementById('settings-version-number').textContent = result.version;
+        } catch (_err) { /* version footer is non-critical */ }
     });
 
     // Scheduler shortcut: same toggle behaviour as the /schedules slash

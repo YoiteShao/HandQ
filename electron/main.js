@@ -17,6 +17,7 @@
 const { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, globalShortcut, Notification, dialog, shell } = require('electron');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 const { spawn } = require('child_process');
 const readline = require('readline');
 const { checkForUpdates } = require('./updater');
@@ -766,6 +767,75 @@ function resetUserConfig() {
             { from: cfg, to: broken });
 }
 
+function seedUserConfigForVersion() {
+    try {
+        const userCfgDir = path.join(os.homedir(), 'HandQ');
+        const userCfgPath = path.join(userCfgDir, 'handq_config.yaml');
+        const stampPath = path.join(userCfgDir, '.handq_config_version');
+        const currentVersion = app.getVersion();
+
+        let previousVersion = null;
+        try {
+            if (fs.existsSync(stampPath)) {
+                previousVersion = fs.readFileSync(stampPath, 'utf8').trim() || null;
+            }
+        } catch (e) {
+            logLine('MAIN', 'seedUserConfigForVersion: stamp read failed',
+                    { err: e && e.message });
+        }
+
+        const prodBundled = path.join(
+            process.resourcesPath || '', 'bridge_main.dist', 'handq_config.yaml');
+        const devBundled = path.join(
+            __dirname, '..', 'dist', '.nuitka_cache', 'bridge_main.dist',
+            'handq_config.yaml');
+        let bundled = null;
+        if (fs.existsSync(prodBundled)) {
+            bundled = prodBundled;
+        } else if (fs.existsSync(devBundled)) {
+            bundled = devBundled;
+        }
+
+        if (!bundled) {
+            logLine('MAIN', 'seedUserConfigForVersion: no bundled yaml; skip',
+                    { prodBundled, devBundled });
+            return;
+        }
+
+        const userCfgExists = fs.existsSync(userCfgPath);
+        const versionChanged = previousVersion !== currentVersion;
+        if (userCfgExists && !versionChanged) {
+            return;
+        }
+
+        fs.mkdirSync(userCfgDir, { recursive: true });
+
+        if (userCfgExists) {
+            const ts = new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 14);
+            const backup = `${userCfgPath}.prev-${previousVersion || 'unknown'}-${ts}`;
+            try {
+                fs.renameSync(userCfgPath, backup);
+            } catch (e) {
+                try {
+                    fs.copyFileSync(userCfgPath, backup);
+                    fs.unlinkSync(userCfgPath);
+                } catch (_) {}
+            }
+            logLine('MAIN', 'seedUserConfigForVersion: backed up old yaml',
+                    { backup, prevVersion: previousVersion });
+        }
+
+        fs.copyFileSync(bundled, userCfgPath);
+        fs.writeFileSync(stampPath, currentVersion, 'utf8');
+        logLine('MAIN', 'seedUserConfigForVersion: seeded user yaml',
+                { from: bundled, to: userCfgPath, version: currentVersion,
+                  prevVersion: previousVersion });
+    } catch (err) {
+        logLine('MAIN', 'seedUserConfigForVersion failed',
+                { err: err && err.message });
+    }
+}
+
 // Procedurally-built 16x16 tray icon — a white "H" on a tinted-blue square,
 // with the corner pixels chipped to suggest a rounded shape. We build the PNG
 // in-memory (zlib + manual CRC32) so the renderer doesn't need a bundled file
@@ -1151,6 +1221,8 @@ if (!gotLock) {
         currentHotkey = loadHotkeySetting();
         registerHotkey(currentHotkey);
 
+        seedUserConfigForVersion();
+
         pythonChild = spawnBridge();
         ensureTray();
         createWindow();
@@ -1245,6 +1317,10 @@ ipcMain.handle('hotkey:set', (_event, accelerator) => {
     // Restore previous hotkey on failure.
     registerHotkey(currentHotkey);
     return { success: false, hotkey: currentHotkey, error: 'Failed to register shortcut. It may be in use by another application.' };
+});
+
+ipcMain.handle('app:getVersion', () => {
+    return { version: app.getVersion() };
 });
 
 // --- "Load history" file picker for the Templates panel -------------------
