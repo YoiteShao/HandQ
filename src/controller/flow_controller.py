@@ -1393,6 +1393,17 @@ class FlowController:
                     duration_seconds=time.monotonic() - self._task_start_time,
                 )
             return result
+        except asyncio.CancelledError:
+            # Session was cancelled by new_session or shutdown.  Write PLAN_END so
+            # the execution log is always structurally complete and debuggable even
+            # for sessions that were cut short.  success=True if a task already
+            # completed this session (completion_reason was set); False otherwise.
+            if self._execution_recorder:
+                already_completed = bool(
+                    getattr(self._execution_recorder, "completion_reason", None)
+                )
+                self._execution_recorder.write_plan_end(success=already_completed)
+            raise
         except Exception as e:
             self.logger.error(f"Idle session failed: {e}", component="FlowController")
             if self._execution_recorder:
@@ -2089,7 +2100,7 @@ class FlowController:
                     # corrected state.
                     self.logger.warning(
                         f"Planner confidence for last step: "
-                        f"{confidence:.2f} < threshold "
+                        f"{confidence:.2f if confidence is not None else 'N/A'} < threshold "
                         f"{self.step_verification_threshold:.2f} "
                         f"— step committed as FAILED; "
                         f"using corrective next_steps from current plan",

@@ -180,12 +180,13 @@ async function checkForUpdates({ logLine, mainWindow }) {
     try {
         const r = await dialog.showMessageBox(mainWindow, {
             type: 'info',
-            title: 'HandQ 更新',
-            message: `HandQ ${latest.version} 已发布（当前 ${current}）`,
+            title: 'HandQ Update',
+            message: `HandQ ${latest.version} is available (current: ${current})`,
             detail:
-                '点击"打开更新目录并退出"将退出当前 HandQ 并打开共享文件夹，'
-                + '请将安装包复制到本机后双击运行。\n\n如果跳过，下次启动会再次提示。',
-            buttons: ['打开更新目录并退出', '稍后'],
+                'Click "Open Update Folder & Quit" to quit HandQ and open the shared folder. '
+                + 'Copy the installer to your machine and double-click to run it.\n\n'
+                + 'Click "Later" to skip — you will be reminded on next launch.',
+            buttons: ['Open Update Folder & Quit', 'Later'],
             defaultId: 0,
             cancelId: 1,
             noLink: true,

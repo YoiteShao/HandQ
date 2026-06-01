@@ -1415,7 +1415,7 @@ class StdioBridge:
             return {"ok": True, "task": t}
 
         if msg_type == "cron_delete":
-            tid = str(msg.get("id") or "")
+            tid = str(msg.get("task_id") or msg.get("id") or "")
             ok = await scheduler.delete_task(tid)  # type: ignore[union-attr]
             return {"ok": bool(ok)}
 
