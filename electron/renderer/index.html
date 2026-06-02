@@ -1,902 +1,899 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8" />
-    <meta http-equiv="Content-Security-Policy"
-          content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self';" />
-    <title>HandQ</title>
-    <link rel="stylesheet" href="styles.css" />
-    <link rel="stylesheet" href="vendor/xterm.css" />
-</head>
-<body>
-    <div class="app">
-        <!-- ============================================================ -->
-        <!-- Boot overlay — covers the entire window until the bridge      -->
-        <!-- has emitted its first non-boot status event. Visible by       -->
-        <!-- default so first paint is "Starting…" instead of an empty UI. -->
-        <!-- ============================================================ -->
-        <div class="boot-overlay" id="boot-overlay" aria-live="polite">
-            <div class="boot-card">
-                <img class="boot-logo" src="../logo.png" alt="HandQ" />
-                <div class="boot-spinner" aria-hidden="true"></div>
-                <div class="boot-title" id="boot-title">Starting HandQ…</div>
-                <div class="boot-phase" id="boot-phase">launching backend</div>
-                <div class="boot-elapsed" id="boot-elapsed">0.0s</div>
-                <div class="boot-hint hidden" id="boot-hint"></div>
-                <div class="boot-error hidden" id="boot-error"></div>
-            </div>
-        </div>
-
-        <!-- ============================================================ -->
-        <!-- Custom title bar (frameless window, drag region)              -->
-        <!-- Windows-style controls on the right.                          -->
-        <!-- ============================================================ -->
-        <header class="titlebar" id="titlebar">
-            <div class="titlebar-drag">
-                <img class="titlebar-logo" src="../logo.png" alt="" aria-hidden="true" />
-                <span class="titlebar-brand">HandQ</span>
-            </div>
-            <div class="titlebar-controls" aria-label="Window controls">
-                <button class="tb-btn tb-min" id="tb-min" type="button"
-                        aria-label="Minimize" title="Minimize">
-                    <svg viewBox="0 0 12 12" aria-hidden="true">
-                        <line x1="2.5" y1="6" x2="9.5" y2="6"
-                              stroke="currentColor" stroke-width="1.2"
-                              stroke-linecap="round"/>
-                    </svg>
-                </button>
-                <button class="tb-btn tb-max" id="tb-max" type="button"
-                        aria-label="Maximize" title="Maximize">
-                    <svg viewBox="0 0 12 12" aria-hidden="true">
-                        <rect x="2.5" y="2.5" width="7" height="7" rx="1.5"
-                              stroke="currentColor" stroke-width="1.2"
-                              fill="none"/>
-                    </svg>
-                </button>
-                <button class="tb-btn tb-close" id="tb-close" type="button"
-                        aria-label="Hide to tray" title="Hide to tray">
-                    <svg viewBox="0 0 12 12" aria-hidden="true">
-                        <line x1="3" y1="3" x2="9" y2="9"
-                              stroke="currentColor" stroke-width="1.2"
-                              stroke-linecap="round"/>
-                        <line x1="9" y1="3" x2="3" y2="9"
-                              stroke="currentColor" stroke-width="1.2"
-                              stroke-linecap="round"/>
-                    </svg>
-                </button>
-            </div>
-        </header>
-
-        <!-- ============================================================ -->
-        <!-- Main content                                                  -->
-        <!-- ============================================================ -->
-        <main class="main">
-            <!-- Chat: ~90% of remaining height -->
-            <section class="chat-region" id="chat-region">
-                <div class="conversation" id="conversation">
-                    <!-- Message bubbles get appended here by renderer.js -->
-                </div>
-            </section>
-
-            <!-- Composer: ~9% -->
-            <form class="composer" id="composer">
-                <div class="composer-input-wrap">
-                    <textarea id="composer-input"
-                              placeholder="Type a message… (Ctrl+Enter to send)"
-                              rows="2"></textarea>
-                    <button type="submit" id="composer-send" aria-label="Send" title="Ctrl+Enter">
-                        <svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true">
-                            <path d="M10 4 L10 16 M10 4 L5 9 M10 4 L15 9"
-                                  fill="none" stroke="currentColor"
-                                  stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-                        </svg>
-                    </button>
-                </div>
-            </form>
-
-            <!-- Floating expanded editor — shown when input overflows -->
-            <div class="composer-expanded hidden" id="composer-expanded">
-                <header class="composer-expanded-header">
-                    <span>Editing</span>
-                    <button type="button" class="composer-expanded-close"
-                            id="composer-expanded-close" aria-label="Close">×</button>
-                </header>
-                <div class="composer-expanded-body">
-                    <textarea id="composer-expanded-input"
-                              placeholder="Type a message… (Ctrl+Enter to send)"></textarea>
-                    <button type="button" id="composer-expanded-send" aria-label="Send" title="Ctrl+Enter">
-                        <svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true">
-                            <path d="M10 4 L10 16 M10 4 L5 9 M10 4 L15 9"
-                                  fill="none" stroke="currentColor"
-                                  stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-                        </svg>
-                    </button>
-                </div>
-            </div>
-
-            <!-- Shortcut bar: single row -->
-            <nav class="shortcuts" id="shortcuts">
-                <button class="shortcut-btn" id="sc-settings" type="button">
-                    <span class="sc-icon" aria-hidden="true">⚙</span>
-                    <span class="sc-label">Settings</span>
-                </button>
-                <button class="shortcut-btn" id="sc-templates" type="button"
-                        title="Browse saved GEP templates">
-                    <span class="sc-icon" aria-hidden="true">📋</span>
-                    <span class="sc-label">Templates</span>
-                </button>
-                <button class="shortcut-btn" id="sc-scheduler" type="button">
-                    <span class="sc-icon" aria-hidden="true">⏱</span>
-                    <span class="sc-label">Scheduler</span>
-                </button>
-                <button class="shortcut-btn" id="sc-new" type="button">
-                    <span class="sc-icon" aria-hidden="true">＋</span>
-                    <span class="sc-label">New</span>
-                </button>
-                <button class="activity-strip"
-                        id="activity-strip"
-                        type="button"
-                        aria-haspopup="true"
-                        aria-expanded="false"
-                        title="Click to view recent activity">
-                    <span class="activity-gauge" id="activity-gauge" aria-hidden="true">
-                        <span class="ag-bar"></span>
-                        <span class="ag-bar"></span>
-                        <span class="ag-bar"></span>
-                        <span class="ag-bar"></span>
-                        <span class="ag-bar"></span>
-                    </span>
-                    <span class="activity-current" id="activity-current">idle</span>
-                    <span class="activity-chevron" aria-hidden="true">
-                        <svg viewBox="0 0 10 10" aria-hidden="true">
-                            <path d="M2.5 6.5 L5 4 L7.5 6.5"
-                                  stroke="currentColor" stroke-width="1.2"
-                                  stroke-linecap="round" stroke-linejoin="round"
-                                  fill="none"/>
-                        </svg>
-                    </span>
-                </button>
-            </nav>
-        </main>
-
-        <!-- ============================================================ -->
-        <!-- Activity popover — anchored above the activity strip.         -->
-        <!-- Toggled by clicks on the strip; auto-closes on outside click. -->
-        <!-- ============================================================ -->
-        <aside class="activity-popover hidden"
-               id="activity-popover"
-               aria-label="Agent activity feed"
-               aria-hidden="true">
-            <header class="activity-popover-header">
-                <span class="activity-title">Activity</span>
-                <button type="button"
-                        class="activity-close"
-                        id="activity-close"
-                        aria-label="Close activity panel"
-                        title="Close">×</button>
-            </header>
-            <ul class="activity-feed" id="activity-feed"></ul>
-            <div class="activity-resize-handle" id="activity-resize-handle"
-                 title="Drag to resize"></div>
-        </aside>
-
-        <!-- ============================================================ -->
-        <!-- Settings overlay                                              -->
-        <!-- ============================================================ -->
-        <div class="overlay hidden" id="overlay-settings" aria-hidden="true">
-            <div class="overlay-card settings-card">
-                <header class="overlay-header">
-                    <h2>Settings</h2>
-                    <button type="button" class="overlay-close" id="settings-cancel"
-                            aria-label="Close">×</button>
-                </header>
-
-                <div class="settings-toast hidden" id="settings-toast" role="status"></div>
-
-                <form class="settings-form" id="settings-form">
-
-                    <!-- ============================== Hotkey ============================== -->
-                    <fieldset class="settings-section">
-                        <legend class="settings-section-header">Global Shortcut<span class="settings-chevron">▾</span></legend>
-
-                        <label>
-                            <span>Toggle Window Hotkey</span>
-                            <input type="text" id="cfg-hotkey"
-                                   placeholder="Ctrl+Alt+W" readonly />
-                            <small class="help-text">
-                                Click the field and press a key combination to
-                                set the global hotkey for showing/hiding HandQ.
-                                Default: <code>Ctrl+Alt+W</code>.
-                            </small>
-                        </label>
-                    </fieldset>
-
-                    <!-- ============================== Model ============================== -->
-                    <fieldset class="settings-section">
-                        <legend class="settings-section-header">Model<span class="settings-chevron">▾</span></legend>
-
-                        <label>
-                            <span>API_KEY</span>
-                            <div class="input-with-icon">
-                                <input type="password" id="cfg-llm-api-key"
-                                       autocomplete="off" spellcheck="false"
-                                       placeholder="ff6bb18f-…  or  sk-ant-…" />
-                                <button type="button"
-                                        id="cfg-llm-api-key-toggle"
-                                        class="input-eye-btn"
-                                        aria-label="Show API key"
-                                        aria-pressed="false"
-                                        title="Show API key">
-                                    <svg class="eye-icon eye-show" width="18" height="18"
-                                         viewBox="0 0 24 24" fill="none"
-                                         stroke="currentColor" stroke-width="2"
-                                         stroke-linecap="round" stroke-linejoin="round"
-                                         aria-hidden="true">
-                                        <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
-                                        <circle cx="12" cy="12" r="3"/>
-                                    </svg>
-                                    <svg class="eye-icon eye-hide" width="18" height="18"
-                                         viewBox="0 0 24 24" fill="none"
-                                         stroke="currentColor" stroke-width="2"
-                                         stroke-linecap="round" stroke-linejoin="round"
-                                         aria-hidden="true" hidden>
-                                        <path d="M1 12s4 8 11 8 11-8 11-8"/>
-                                        <line x1="6" y1="17" x2="5" y2="19"/>
-                                        <line x1="12" y1="20" x2="12" y2="22"/>
-                                        <line x1="18" y1="17" x2="19" y2="19"/>
-                                    </svg>
-                                </button>
-                            </div>
-                            <small class="help-text">
-                                Your provider API key. Stored as
-                                <code>llm.API_KEY</code> in the local config.
-                                No environment variable required.
-                            </small>
-                        </label>
-
-                        <label>
-                            <span>Max Response Tokens</span>
-                            <input type="number" id="cfg-llm-max-tokens"
-                                   min="1" step="1" placeholder="128000" />
-                            <small class="help-text">
-                                Maximum tokens per reply. Typical range
-                                4096–200000. Leave empty to use the model
-                                default.
-                            </small>
-                        </label>
-
-                        <label>
-                            <span>Models</span>
-                            <div class="role-tabs" role="tablist" id="cfg-llm-role-tabs">
-                                <button type="button" class="role-tab active"
-                                        data-role="planner" role="tab"
-                                        aria-selected="true">Planner</button>
-                                <button type="button" class="role-tab"
-                                        data-role="receptionist" role="tab">Receptionist</button>
-                                <button type="button" class="role-tab"
-                                        data-role="agent" role="tab">Agent</button>
-                                <button type="button" class="role-tab"
-                                        data-role="helper" role="tab">Helper</button>
-                                <button type="button" class="role-tab"
-                                        data-role="available" role="tab">Available</button>
-                            </div>
-                            <div id="cfg-llm-role-pane-planner" class="role-model-list"
-                                 data-role-pane="planner"></div>
-                            <div id="cfg-llm-role-pane-receptionist" class="role-model-list"
-                                 data-role-pane="receptionist" hidden></div>
-                            <div id="cfg-llm-role-pane-agent" class="role-model-list"
-                                 data-role-pane="agent" hidden></div>
-                            <div id="cfg-llm-role-pane-helper" class="role-model-list"
-                                 data-role-pane="helper" hidden></div>
-                            <textarea id="cfg-llm-models" rows="6" spellcheck="false"
-                                      data-role-pane="available" hidden
-                                      placeholder="One model per line, highest priority first.&#10;e.g. anthropic::claude-4-6-sonnet:1M"></textarea>
-                            <small class="help-text">
-                                <b>Available</b>: master pool, one per line, order = priority.
-                                <b>Role tabs</b>: check which models each role uses.
-                            </small>
-                        </label>
-                    </fieldset>
-
-                    <!-- ============================== Session ============================== -->
-                    <fieldset class="settings-section">
-                        <legend class="settings-section-header">Session<span class="settings-chevron">▾</span></legend>
-
-                        <label>
-                            <span>Log Level</span>
-                            <select id="cfg-session-log-level">
-                                <option value="">(default)</option>
-                                <option value="DEBUG">DEBUG</option>
-                                <option value="INFO">INFO</option>
-                                <option value="WARNING">WARNING</option>
-                                <option value="ERROR">ERROR</option>
-                                <option value="CRITICAL">CRITICAL</option>
-                            </select>
-                            <small class="help-text">
-                                Logging verbosity. DEBUG is the most verbose,
-                                CRITICAL the quietest. Default: INFO.
-                            </small>
-                        </label>
-
-                        <label>
-                            <span>Step Verification Threshold</span>
-                            <input type="number" id="cfg-session-step-threshold"
-                                   min="0" max="1" step="0.05"
-                                   placeholder="0.8" />
-                            <small class="help-text">
-                                Confidence below this value triggers a
-                                corrective step. Range 0.0–1.0. Default: 0.8.
-                            </small>
-                        </label>
-
-                        <label>
-                            <span>Python venv Path</span>
-                            <input type="text" id="cfg-session-venv-path"
-                                   placeholder="(optional — leave empty for system Python)" />
-                            <small class="help-text">
-                                Absolute path to a Python virtualenv used by
-                                the bash tool. Leave empty to use the system
-                                Python.
-                            </small>
-                        </label>
-                    </fieldset>
-
-                    <!-- ============================== Interaction Switches ============================== -->
-                    <fieldset class="settings-section">
-                        <legend class="settings-section-header">Interaction Switches<span class="settings-chevron">▾</span></legend>
-
-                        <p class="help-text fieldset-intro">
-                            <strong>Enable</strong> controls whether the tool exists at
-                            all — when off, the tool is hidden from the agent.
-                            <strong>Auto-approve</strong> controls whether calls run
-                            silently — checked = run without asking; unchecked = confirm
-                            first. Tools without an Enable switch are always available.
-                            Paths inside the working directory are always auto-approved
-                            for write/edit regardless of these switches.
-                        </p>
-
-                        <div class="tool-group">
-                            <div class="tool-group-name">Write tool</div>
-                            <label class="checkbox-row tool-sub">
-                                <input type="checkbox" id="cfg-sw-tool-write" />
-                                <span>Auto-approve</span>
-                                <small class="help-text">
-                                    When unchecked, ask before the write tool
-                                    creates or overwrites a file outside the
-                                    working directory.
-                                </small>
-                            </label>
-                        </div>
-
-                        <div class="tool-group">
-                            <div class="tool-group-name">Edit tool</div>
-                            <label class="checkbox-row tool-sub">
-                                <input type="checkbox" id="cfg-sw-tool-edit" />
-                                <span>Auto-approve</span>
-                                <small class="help-text">
-                                    When unchecked, ask before the edit tool
-                                    modifies an existing file outside the working
-                                    directory.
-                                </small>
-                            </label>
-                        </div>
-
-                        <div class="tool-group">
-                            <div class="tool-group-name">Bash tool</div>
-                            <label class="checkbox-row tool-sub">
-                                <input type="checkbox" id="cfg-sw-tool-bash" />
-                                <span>Auto-approve</span>
-                                <small class="help-text">
-                                    When unchecked, ask before any bash command
-                                    runs. The high-risk switch below is checked
-                                    first and takes priority.
-                                </small>
-                            </label>
-                        </div>
-
-                        <div class="tool-group" data-tool="browser">
-                            <div class="tool-group-name">Browser tool</div>
-                            <label class="checkbox-row tool-sub" data-row="auto">
-                                <input type="checkbox" id="cfg-sw-tool-browser-auto" />
-                                <span>Auto-approve</span>
-                                <small class="help-text">
-                                    When unchecked, ask before each browser action
-                                    (navigate, click, type, extract, screenshot, …).
-                                    The browser launches off-screen with a separate
-                                    profile so it does not disturb your main Chrome.
-                                    attach_browser (taking over your running Chrome)
-                                    is gated separately by the high-risk switch and
-                                    always asks regardless of this setting.
-                                </small>
-                            </label>
-                        </div>
-
-                        <div class="tool-group" data-tool="desktop">
-                            <div class="tool-group-name">Desktop tool</div>
-                            <label class="checkbox-row tool-sub" data-row="auto">
-                                <input type="checkbox" id="cfg-sw-tool-desktop-auto" />
-                                <span>Auto-approve</span>
-                                <small class="help-text">
-                                    When unchecked, the agent asks once per task
-                                    before driving your real mouse / keyboard
-                                    (click_at, type_text, drag, scroll, hotkey,
-                                    key_press); a single approval covers every
-                                    desktop action until the task ends. Press
-                                    <code>Ctrl+Shift+C</code> anytime to revoke.
-                                    Read-only actions (screenshot, list_windows,
-                                    find_element) are not gated. Sensitive
-                                    windows (password managers, banking) are
-                                    always refused regardless of this switch.
-                                    Off by default — desktop input affects
-                                    whatever app is focused, not just HandQ's
-                                    own browser.
-                                </small>
-                            </label>
-                        </div>
-
-                        <div class="tool-group" data-tool="web_search">
-                            <div class="tool-group-name">Web search tool</div>
-                            <label class="checkbox-row tool-sub" data-row="auto">
-                                <input type="checkbox" id="cfg-sw-tool-web-search-auto" />
-                                <span>Auto-approve</span>
-                                <small class="help-text">
-                                    When unchecked, ask before each internal web
-                                    search. Read-only — returns titles, URLs,
-                                    and snippets. Uses the authenticated browser
-                                    session.
-                                </small>
-                            </label>
-                        </div>
-
-                        <div class="tool-group" data-tool="email">
-                            <div class="tool-group-name">Email tool</div>
-                            <label class="checkbox-row tool-sub" data-row="auto">
-                                <input type="checkbox" id="cfg-sw-tool-email-auto" />
-                                <span>Auto-approve</span>
-                                <small class="help-text">
-                                    When unchecked, ask before reading email via
-                                    local Outlook COM. Read actions are
-                                    low-risk. Write actions (compose / send)
-                                    will always go through the high-risk gate
-                                    regardless of this switch.
-                                </small>
-                            </label>
-                        </div>
-
-                        <div class="tool-group">
-                            <div class="tool-group-name">High-risk commands</div>
-                            <label class="checkbox-row tool-sub">
-                                <input type="checkbox" id="cfg-sw-high-risk" />
-                                <span>Auto-approve</span>
-                                <small class="help-text">
-                                    When unchecked, ask before any high-risk
-                                    bash command (rm, kill, shutdown, DROP
-                                    TABLE, git push --force, …). Strongly
-                                    recommended: leave unchecked.
-                                </small>
-                            </label>
-                        </div>
-                    </fieldset>
-
-                    <!-- ============================== Email ============================== -->
-                    <fieldset class="settings-section">
-                        <legend class="settings-section-header">Email<span class="settings-chevron">▾</span></legend>
-
-                        <label>
-                            <span>Folder Blacklist</span>
-                            <input type="text" id="cfg-email-folder-blacklist"
-                                   placeholder="Drafts, Junk Email, Deleted Items" />
-                            <small class="help-text">
-                                Comma-separated folder names that the email
-                                tool will never read. Case-insensitive.
-                                Leave empty to read all folders.
-                            </small>
-                        </label>
-                    </fieldset>
-
-                    <!-- ============================== Personalization ============================== -->
-                    <fieldset class="settings-section">
-                        <legend class="settings-section-header">Personalization<span class="settings-chevron">▾</span></legend>
-
-                        <p class="help-text fieldset-intro">
-                            HandQ tailors plans to the tools and conventions you
-                            work with. All learning happens locally. Use the
-                            controls below to limit what HandQ sees and to opt
-                            into commit-driven learning per repository.
-                            <strong>Changes here take effect after the next
-                            HandQ restart.</strong>
-                        </p>
-
-                        <label class="checkbox-row tool-sub">
-                            <input type="checkbox" id="cfg-pers-enabled" />
-                            <span>Enable</span>
-                            <small class="help-text">
-                                When OFF, HandQ stops carrying any
-                                cross-session context. The rest of the agent
-                                still works.
-                            </small>
-                        </label>
-
-                        <label>
-                            <span>Excluded apps (one regex per line)</span>
-                            <textarea id="cfg-pers-excluded-apps" rows="3"
-                                      placeholder="(?i)wechat&#10;(?i)teams"></textarea>
-                            <small class="help-text">
-                                Foreground windows whose titles match any of
-                                these patterns are never consulted. Built-in
-                                safe defaults (password managers, banking,
-                                OTP, private browsing) are always active;
-                                this list adds to them.
-                            </small>
-                        </label>
-
-                        <label>
-                            <span>Learn from commits in (one repo path per line)</span>
-                            <textarea id="cfg-pers-git-hook-repos" rows="3"
-                                      placeholder="C:\Code\HandQ&#10;C:\Code\my-other-project"></textarea>
-                            <small class="help-text">
-                                For each path here, HandQ installs a tiny
-                                <code>post-commit</code> hook so each commit's
-                                message and file list become a learning
-                                signal. Add a path and Save → hook is
-                                installed. Remove a path and Save → hook is
-                                uninstalled (only if it carries our marker).
-                                Hooks you wrote yourself are never overwritten
-                                or deleted.
-                            </small>
-                        </label>
-                    </fieldset>
-
-                    <div class="settings-actions">
-                        <button type="button" id="settings-load">Reload</button>
-                        <button type="submit" id="settings-save">Save</button>
-                        <span class="muted" id="settings-status"></span>
-                    </div>
-                </form>
-                <div class="settings-version settings-version-centered muted">Version <span id="settings-version-number">—</span></div>
-            </div>
-        </div>
-
-        <!-- ============================================================ -->
-        <!-- LTM Admin overlay (hidden; opened via typing /memory in       -->
-        <!-- the composer). Manages long-term memory, knowledge,           -->
-        <!-- triage stats, scheduled tasks, activity monitor state, and    -->
-        <!-- the git post-commit hook. NOT user-facing; the only way to    -->
-        <!-- reach this panel is the special /memory command.              -->
-        <!-- ============================================================ -->
-        <div class="overlay hidden" id="overlay-admin" aria-hidden="true">
-            <div class="overlay-card admin-card" role="dialog" aria-modal="true">
-                <header class="overlay-header">
-                    <h2>Memory Admin</h2>
-                    <button type="button" class="overlay-close" id="admin-close"
-                            aria-label="Close">×</button>
-                </header>
-
-                <nav class="admin-tabs" role="tablist">
-                    <button type="button" class="admin-tab active"
-                            data-admin-tab="memory" role="tab"
-                            aria-selected="true">Memory</button>
-                    <button type="button" class="admin-tab"
-                            data-admin-tab="knowledge" role="tab">Knowledge</button>
-                    <button type="button" class="admin-tab"
-                            data-admin-tab="stats" role="tab">Stats</button>
-                    <button type="button" class="admin-tab"
-                            data-admin-tab="activity" role="tab">Activity</button>
-                    <button type="button" class="admin-tab"
-                            data-admin-tab="tools" role="tab">Tools</button>
-                </nav>
-
-                <div class="admin-toast hidden" id="admin-toast" role="status"></div>
-
-                <div class="admin-body">
-                    <!-- ── Memory tab ──────────────────────────────── -->
-                    <section class="admin-pane" data-admin-pane="memory">
-                        <header class="admin-pane-header">
-                            <select id="admin-mem-dim">
-                                <option value="">All dimensions</option>
-                                <option value="agentic">Agentic</option>
-                                <option value="insight">Insight</option>
-                            </select>
-                            <button type="button" id="admin-mem-refresh">Refresh</button>
-                            <span class="admin-count" id="admin-mem-count"></span>
-                        </header>
-                        <ul class="admin-list" id="admin-mem-list"></ul>
-                    </section>
-
-                    <!-- ── Knowledge tab ───────────────────────────── -->
-                    <section class="admin-pane hidden" data-admin-pane="knowledge">
-                        <header class="admin-pane-header">
-                            <select id="admin-kn-cat">
-                                <option value="">All categories</option>
-                                <option value="domain">Domain</option>
-                                <option value="people">People</option>
-                                <option value="process">Process</option>
-                                <option value="coding">Coding</option>
-                                <option value="other">Other</option>
-                            </select>
-                            <button type="button" id="admin-kn-refresh">Refresh</button>
-                            <span class="admin-count" id="admin-kn-count"></span>
-                        </header>
-                        <ul class="admin-list" id="admin-kn-list"></ul>
-                    </section>
-
-                    <!-- ── Stats tab ───────────────────────────────── -->
-                    <section class="admin-pane hidden" data-admin-pane="stats">
-                        <header class="admin-pane-header">
-                            <button type="button" id="admin-stats-refresh">Refresh</button>
-                            <small class="help-text">
-                                Triage health: per-source candidate flow.
-                                Healthy zone: accepted 5–30%, failed = 0,
-                                pending small + decreasing.
-                            </small>
-                        </header>
-                        <pre class="admin-stats-output" id="admin-stats-output">
-(click Refresh)</pre>
-                    </section>
-
-                    <!-- ── Schedules tab is now in its own overlay,
-                         opened via /schedules. Kept structurally
-                         separate from Memory because the scheduler
-                         doesn't read or write memory.db — it just
-                         runs saved prompts on a cadence. -->
-
-                    <!-- ── Activity tab ────────────────────────────── -->
-                    <section class="admin-pane hidden" data-admin-pane="activity">
-                        <header class="admin-pane-header">
-                            <button type="button" id="admin-act-refresh">Refresh</button>
-                            <button type="button" id="admin-act-pause">Pause</button>
-                            <button type="button" id="admin-act-resume">Resume</button>
-                        </header>
-                        <pre class="admin-stats-output" id="admin-act-output">
-(click Refresh)</pre>
-                    </section>
-
-                    <!-- ── Tools tab ───────────────────────────────── -->
-                    <section class="admin-pane hidden" data-admin-pane="tools">
-                        <div class="admin-tool-block">
-                            <h4>/remember</h4>
-                            <p class="help-text">
-                                Submit a high-trust manual memory candidate. Goes
-                                straight to the dream worker on its next tick;
-                                triage decides create / update / skip per the
-                                same rules as ambient sources.
-                            </p>
-                            <textarea id="admin-remember-text" rows="3"
-                                      placeholder="e.g. Always use uv to create venvs (not conda)"></textarea>
-                            <button type="button" id="admin-remember-btn" class="primary">Remember</button>
-                        </div>
-                    </section>
-                </div>
-            </div>
-        </div>
-
-        <!-- ============================================================ -->
-        <!-- Scheduled-tasks overlay (hidden; opened via /schedules).      -->
-        <!-- Functionally independent from the LTM admin panel — the      -->
-        <!-- scheduler doesn't read/write memory.db, it just fires saved  -->
-        <!-- prompts on a cadence. Same hidden-slash-command pattern so   -->
-        <!-- regular users don't stumble onto either feature.             -->
-        <!-- ============================================================ -->
-        <div class="overlay hidden" id="overlay-schedules" aria-hidden="true">
-            <div class="overlay-card settings-card sched-card" role="dialog" aria-modal="true">
-                <header class="overlay-header">
-                    <h2>Scheduled Tasks</h2>
-                    <button type="button" class="overlay-close" id="sched-close"
-                            aria-label="Close">×</button>
-                </header>
-                <div class="settings-toast hidden" id="sched-toast" role="status"></div>
-                <div class="sched-body">
-                    <!-- List header: Create + Delete sit here as plain buttons.
-                         Auto-refreshes on open + after every mutation + every 5 s. -->
-                    <div class="sched-list-header">
-                        <button type="button" id="sched-create-btn">+ Create task</button>
-                        <button type="button" id="sched-delete-btn"
-                                class="danger" disabled>Delete</button>
-                    </div>
-                    <ul class="sched-list" id="sched-list"></ul>
-                    <!-- Bottom: detail of selected task -->
-                    <section class="sched-detail-pane">
-                        <div class="sched-detail-empty muted" id="sched-detail-empty">
-                            Select a task above to view details, or click Create to add one.
-                        </div>
-                        <div class="sched-detail hidden" id="sched-detail">
-                            <h4 id="sched-detail-name"></h4>
-                            <dl class="sched-detail-fields">
-                                <dt>Schedule</dt><dd id="sched-detail-schedule"></dd>
-                                <dt>Status</dt><dd id="sched-detail-status"></dd>
-                                <dt>Next run</dt><dd id="sched-detail-next"></dd>
-                                <dt>Last run</dt><dd id="sched-detail-last"></dd>
-                                <dt>Runs</dt><dd id="sched-detail-runs"></dd>
-                                <dt>Failures</dt><dd id="sched-detail-failures"></dd>
-                                <dt class="sched-detail-error-row hidden">Last error</dt>
-                                <dd class="sched-detail-error-row hidden"
-                                    id="sched-detail-error"></dd>
-                                <dt>Prompt</dt>
-                                <dd><pre id="sched-detail-prompt"
-                                          class="sched-detail-prompt"></pre></dd>
-                            </dl>
-                            <div class="settings-actions sched-detail-actions">
-                                <button type="button" id="sched-detail-run">Run now</button>
-                                <button type="button" id="sched-detail-toggle">Disable</button>
-                            </div>
-                        </div>
-                    </section>
-                </div>
-            </div>
-        </div>
-
-        <!-- ============================================================ -->
-        <!-- Scheduled-task creation modal — pops over #overlay-schedules. -->
-        <!-- Just Name + Prompt. The schedule string is inferred by an    -->
-        <!-- LLM from the prompt content; user doesn't have to write it.  -->
-        <!-- ============================================================ -->
-        <div class="overlay hidden" id="overlay-sched-form" aria-hidden="true">
-            <div class="overlay-card settings-card sched-form-modal" role="dialog" aria-modal="true">
-                <header class="overlay-header">
-                    <h3>New scheduled task</h3>
-                    <button type="button" class="overlay-close" id="sched-form-close"
-                            aria-label="Close">×</button>
-                </header>
-                <form class="settings-form" id="sched-form-inner">
-                    <label>
-                        <span>Name</span>
-                        <input type="text" id="sched-name"
-                               placeholder="Daily PR digest" autocomplete="off" />
-                    </label>
-                    <label>
-                        <span>Prompt</span>
-                        <textarea id="sched-prompt" rows="5"
-                                  placeholder="Summarise yesterday's commits in repo X."></textarea>
-                        <small class="help-text">
-                            Schedule is inferred automatically from the prompt
-                            (e.g. "summarise yesterday's PRs" → daily 09:00).
-                        </small>
-                    </label>
-                    <div class="settings-actions">
-                        <button type="button" id="sched-cancel">Cancel</button>
-                        <button type="submit" id="sched-create">Create</button>
-                    </div>
-                </form>
-            </div>
-        </div>
-
-        <!-- ============================================================ -->
-        <!-- GEP parameters panel — opens automatically when the Receptionist -->
-        <!-- detects a matching template and the planner enters the GEP    -->
-        <!-- confirmation window.  Lets the user review template steps,    -->
-        <!-- edit per-parameter values, and confirm / skip — with a live   -->
-        <!-- countdown driven by gep_countdown status events.              -->
-        <!-- ============================================================ -->
-        <div class="overlay hidden" id="overlay-gep" aria-hidden="true">
-            <div class="overlay-card gep-card" role="dialog" aria-modal="true">
-                <header class="overlay-header">
-                    <h2>
-                        <span aria-hidden="true">📋</span>
-                        <span id="gep-title">GEP Template</span>
-                    </h2>
-                    <span class="gep-countdown-pill" id="gep-countdown">--s</span>
-                    <button type="button" class="overlay-close" id="gep-close"
-                            aria-label="Close (defer to chat)">×</button>
-                </header>
-
-                <div class="gep-progress">
-                    <div class="gep-progress-bar" id="gep-progress-bar"></div>
-                </div>
-
-                <form class="settings-form gep-form" id="gep-form">
-                    <p class="gep-description help-text" id="gep-description"></p>
-
-                    <fieldset class="gep-section" id="gep-steps-section">
-                        <legend>Steps</legend>
-                        <ol class="gep-steps" id="gep-steps"></ol>
-                    </fieldset>
-
-                    <fieldset class="gep-section" id="gep-key-params-section" hidden>
-                        <legend>Key parameters — please review</legend>
-                        <div class="gep-params" id="gep-key-params"></div>
-                    </fieldset>
-
-                    <fieldset class="gep-section" id="gep-other-params-section" hidden>
-                        <legend>Other parameters</legend>
-                        <div class="gep-params" id="gep-other-params"></div>
-                    </fieldset>
-
-                    <p class="help-text gep-hint">
-                        Edit any parameter above, then click <b>Confirm now</b> —
-                        your values are sent along with the confirmation. Skip GEP
-                        to fall back to normal planning.
-                    </p>
-
-                    <div class="settings-actions gep-actions">
-                        <button type="button" id="gep-skip">Skip GEP</button>
-                        <button type="submit" id="gep-confirm" class="primary">Confirm now</button>
-                    </div>
-                </form>
-            </div>
-        </div>
-
-        <!-- ============================================================ -->
-        <!-- Templates review panel — opened from the Templates shortcut.  -->
-        <!-- Lists every GEP template in the user's templates dir with    -->
-        <!-- a clickable detail view (steps + params + problems).         -->
-        <!-- ============================================================ -->
-        <div class="overlay hidden" id="overlay-templates" aria-hidden="true">
-            <div class="overlay-card settings-card templates-card" role="dialog" aria-modal="true">
-                <header class="overlay-header">
-                    <h2>GEP Templates</h2>
-                    <button type="button" class="overlay-close" id="templates-close"
-                            aria-label="Close">×</button>
-                </header>
-                <div class="settings-toast hidden" id="templates-toast" role="status"></div>
-                <div class="templates-body">
-                    <div class="templates-list-header">
-                        <button type="button" id="templates-refresh">Refresh</button>
-                        <button type="button" id="templates-load-history" class="primary">📂 Load history…</button>
-                        <span class="templates-count muted" id="templates-count"></span>
-                    </div>
-                    <ul class="templates-list" id="templates-list"></ul>
-                    <section class="templates-detail-pane">
-                        <div class="templates-detail-empty muted" id="templates-detail-empty">
-                            Select a template above to view its steps and parameters.
-                        </div>
-                        <div class="templates-detail hidden" id="templates-detail">
-                            <header class="templates-detail-header">
-                                <h3 id="templates-detail-name"></h3>
-                                <span class="templates-detail-version" id="templates-detail-version"></span>
-                            </header>
-                            <p class="templates-detail-desc" id="templates-detail-desc"></p>
-                            <div class="templates-detail-problems hidden"
-                                 id="templates-detail-problems"></div>
-                            <section class="templates-detail-section" id="templates-detail-params-wrap">
-                                <h4>Parameters</h4>
-                                <div class="templates-detail-params" id="templates-detail-params"></div>
-                            </section>
-                            <section class="templates-detail-section" id="templates-detail-steps-wrap">
-                                <h4>Steps</h4>
-                                <ol class="templates-detail-steps" id="templates-detail-steps"></ol>
-                            </section>
-                            <dl class="templates-detail-meta">
-                                <dt>ID</dt><dd id="templates-detail-id"></dd>
-                                <dt>Created</dt><dd id="templates-detail-created"></dd>
-                            </dl>
-                            <div class="settings-actions templates-detail-actions">
-                                <button type="button" id="templates-detail-delete" class="danger">Delete</button>
-                            </div>
-                        </div>
-                    </section>
-                </div>
-            </div>
-        </div>
-
-        <div class="overlay hidden" id="overlay-confirmation" aria-hidden="true">
-            <div class="overlay-card confirmation-card" role="dialog" aria-modal="true">
-                <header class="overlay-header">
-                    <h2 id="confirm-title">Confirm action</h2>
-                </header>
-                <div class="confirmation-body">
-                    <p class="confirmation-description" id="confirm-description"></p>
-                    <div class="confirmation-decision hidden" id="confirm-decision"></div>
-                    <label class="confirmation-secret hidden" id="confirm-secret-wrap">
-                        <span>Input</span>
-                        <input type="password" id="confirm-secret-input"
-                               autocomplete="off" spellcheck="false" />
-                    </label>
-                    <textarea class="confirmation-guidance hidden"
-                              id="confirm-guidance"
-                              placeholder="Provide guidance for the agent instead of yes/no"
-                              rows="3"></textarea>
-                </div>
-                <div class="confirmation-actions">
-                    <button type="button" id="confirm-reject">Reject</button>
-                    <button type="button" id="confirm-guidance-btn">Provide guidance</button>
-                    <button type="button" id="confirm-submit" class="primary">Approve</button>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <script src="vendor/xterm.bundle.js"></script>
-    <script src="renderer.js"></script>
-    <script src="admin-panel.js"></script>
-</body>
-</html>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="Content-Security-Policy"
+          content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self';" />
+    <title>HandQ</title>
+    <link rel="stylesheet" href="styles.css" />
+    <link rel="stylesheet" href="vendor/xterm.css" />
+</head>
+<body>
+    <div class="app">
+        <!-- ============================================================ -->
+        <!-- Boot overlay — covers the entire window until the bridge      -->
+        <!-- has emitted its first non-boot status event. Visible by       -->
+        <!-- default so first paint is "Starting…" instead of an empty UI. -->
+        <!-- ============================================================ -->
+        <div class="boot-overlay" id="boot-overlay" aria-live="polite">
+            <div class="boot-card">
+                <img class="boot-logo" src="../logo.png" alt="HandQ" />
+                <div class="boot-spinner" aria-hidden="true"></div>
+                <div class="boot-title" id="boot-title">Starting HandQ…</div>
+                <div class="boot-phase" id="boot-phase">launching backend</div>
+                <div class="boot-elapsed" id="boot-elapsed">0.0s</div>
+                <div class="boot-hint hidden" id="boot-hint"></div>
+                <div class="boot-error hidden" id="boot-error"></div>
+            </div>
+        </div>
+
+        <!-- ============================================================ -->
+        <!-- Custom title bar (frameless window, drag region)              -->
+        <!-- Windows-style controls on the right.                          -->
+        <!-- ============================================================ -->
+        <header class="titlebar" id="titlebar">
+            <div class="titlebar-drag">
+                <img class="titlebar-logo" src="../logo.png" alt="" aria-hidden="true" />
+                <span class="titlebar-brand">HandQ</span>
+            </div>
+            <div class="titlebar-controls" aria-label="Window controls">
+                <button class="tb-btn tb-min" id="tb-min" type="button"
+                        aria-label="Minimize" title="Minimize">
+                    <svg viewBox="0 0 12 12" aria-hidden="true">
+                        <line x1="2.5" y1="6" x2="9.5" y2="6"
+                              stroke="currentColor" stroke-width="1.2"
+                              stroke-linecap="round"/>
+                    </svg>
+                </button>
+                <button class="tb-btn tb-max" id="tb-max" type="button"
+                        aria-label="Maximize" title="Maximize">
+                    <svg viewBox="0 0 12 12" aria-hidden="true">
+                        <rect x="2.5" y="2.5" width="7" height="7" rx="1.5"
+                              stroke="currentColor" stroke-width="1.2"
+                              fill="none"/>
+                    </svg>
+                </button>
+                <button class="tb-btn tb-close" id="tb-close" type="button"
+                        aria-label="Hide to tray" title="Hide to tray">
+                    <svg viewBox="0 0 12 12" aria-hidden="true">
+                        <line x1="3" y1="3" x2="9" y2="9"
+                              stroke="currentColor" stroke-width="1.2"
+                              stroke-linecap="round"/>
+                        <line x1="9" y1="3" x2="3" y2="9"
+                              stroke="currentColor" stroke-width="1.2"
+                              stroke-linecap="round"/>
+                    </svg>
+                </button>
+            </div>
+        </header>
+
+        <!-- ============================================================ -->
+        <!-- Main content                                                  -->
+        <!-- ============================================================ -->
+        <main class="main">
+            <!-- Chat: ~90% of remaining height -->
+            <section class="chat-region" id="chat-region">
+                <div class="conversation" id="conversation">
+                    <!-- Message bubbles get appended here by renderer.js -->
+                </div>
+            </section>
+
+            <!-- Composer: ~9% -->
+            <form class="composer" id="composer">
+                <div class="composer-input-wrap">
+                    <textarea id="composer-input"
+                              placeholder="Type a message… (Ctrl+Enter to send)"
+                              rows="2"></textarea>
+                    <button type="submit" id="composer-send" aria-label="Send" title="Ctrl+Enter">
+                        <svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true">
+                            <path d="M10 4 L10 16 M10 4 L5 9 M10 4 L15 9"
+                                  fill="none" stroke="currentColor"
+                                  stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                        </svg>
+                    </button>
+                </div>
+            </form>
+
+            <!-- Floating expanded editor — shown when input overflows -->
+            <div class="composer-expanded hidden" id="composer-expanded">
+                <header class="composer-expanded-header">
+                    <span>Editing</span>
+                    <button type="button" class="composer-expanded-close"
+                            id="composer-expanded-close" aria-label="Close">×</button>
+                </header>
+                <div class="composer-expanded-body">
+                    <textarea id="composer-expanded-input"
+                              placeholder="Type a message… (Ctrl+Enter to send)"></textarea>
+                    <button type="button" id="composer-expanded-send" aria-label="Send" title="Ctrl+Enter">
+                        <svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true">
+                            <path d="M10 4 L10 16 M10 4 L5 9 M10 4 L15 9"
+                                  fill="none" stroke="currentColor"
+                                  stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+                        </svg>
+                    </button>
+                </div>
+            </div>
+
+            <!-- Shortcut bar: single row -->
+            <nav class="shortcuts" id="shortcuts">
+                <button class="shortcut-btn" id="sc-settings" type="button">
+                    <span class="sc-icon" aria-hidden="true">⚙</span>
+                    <span class="sc-label">Settings</span>
+                </button>
+                <button class="shortcut-btn" id="sc-templates" type="button"
+                        title="Browse saved GEP templates">
+                    <span class="sc-icon" aria-hidden="true">📋</span>
+                    <span class="sc-label">Templates</span>
+                </button>
+                <button class="shortcut-btn" id="sc-scheduler" type="button">
+                    <span class="sc-icon" aria-hidden="true">⏱</span>
+                    <span class="sc-label">Scheduler</span>
+                </button>
+                <button class="shortcut-btn" id="sc-new" type="button">
+                    <span class="sc-icon" aria-hidden="true">＋</span>
+                    <span class="sc-label">New</span>
+                </button>
+                <button class="activity-strip"
+                        id="activity-strip"
+                        type="button"
+                        aria-haspopup="true"
+                        aria-expanded="false"
+                        title="Click to view recent activity">
+                    <span class="activity-gauge" id="activity-gauge" aria-hidden="true">
+                        <span class="ag-spark" id="ag-spark"></span>
+                        <span class="ag-num" id="ag-num"></span>
+                    </span>
+                    <span class="activity-current" id="activity-current">idle</span>
+                    <span class="activity-chevron" aria-hidden="true">
+                        <svg viewBox="0 0 10 10" aria-hidden="true">
+                            <path d="M2.5 6.5 L5 4 L7.5 6.5"
+                                  stroke="currentColor" stroke-width="1.2"
+                                  stroke-linecap="round" stroke-linejoin="round"
+                                  fill="none"/>
+                        </svg>
+                    </span>
+                </button>
+            </nav>
+        </main>
+
+        <!-- ============================================================ -->
+        <!-- Activity popover — anchored above the activity strip.         -->
+        <!-- Toggled by clicks on the strip; auto-closes on outside click. -->
+        <!-- ============================================================ -->
+        <aside class="activity-popover hidden"
+               id="activity-popover"
+               aria-label="Agent activity feed"
+               aria-hidden="true">
+            <header class="activity-popover-header">
+                <span class="activity-title">Activity</span>
+                <button type="button"
+                        class="activity-close"
+                        id="activity-close"
+                        aria-label="Close activity panel"
+                        title="Close">×</button>
+            </header>
+            <ul class="activity-feed" id="activity-feed"></ul>
+            <div class="activity-resize-handle" id="activity-resize-handle"
+                 title="Drag to resize"></div>
+        </aside>
+
+        <!-- ============================================================ -->
+        <!-- Settings overlay                                              -->
+        <!-- ============================================================ -->
+        <div class="overlay hidden" id="overlay-settings" aria-hidden="true">
+            <div class="overlay-card settings-card">
+                <header class="overlay-header">
+                    <h2>Settings</h2>
+                    <button type="button" class="overlay-close" id="settings-cancel"
+                            aria-label="Close">×</button>
+                </header>
+
+                <div class="settings-toast hidden" id="settings-toast" role="status"></div>
+
+                <form class="settings-form" id="settings-form">
+
+                    <!-- ============================== Hotkey ============================== -->
+                    <fieldset class="settings-section">
+                        <legend class="settings-section-header">Global Shortcut<span class="settings-chevron">▾</span></legend>
+
+                        <label>
+                            <span>Toggle Window Hotkey</span>
+                            <input type="text" id="cfg-hotkey"
+                                   placeholder="Ctrl+Alt+W" readonly />
+                            <small class="help-text">
+                                Click the field and press a key combination to
+                                set the global hotkey for showing/hiding HandQ.
+                                Default: <code>Ctrl+Alt+W</code>.
+                            </small>
+                        </label>
+                    </fieldset>
+
+                    <!-- ============================== Model ============================== -->
+                    <fieldset class="settings-section">
+                        <legend class="settings-section-header">Model<span class="settings-chevron">▾</span></legend>
+
+                        <label>
+                            <span>API_KEY</span>
+                            <div class="input-with-icon">
+                                <input type="password" id="cfg-llm-api-key"
+                                       autocomplete="off" spellcheck="false"
+                                       placeholder="ff6bb18f-…  or  sk-ant-…" />
+                                <button type="button"
+                                        id="cfg-llm-api-key-toggle"
+                                        class="input-eye-btn"
+                                        aria-label="Show API key"
+                                        aria-pressed="false"
+                                        title="Show API key">
+                                    <svg class="eye-icon eye-show" width="18" height="18"
+                                         viewBox="0 0 24 24" fill="none"
+                                         stroke="currentColor" stroke-width="2"
+                                         stroke-linecap="round" stroke-linejoin="round"
+                                         aria-hidden="true">
+                                        <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
+                                        <circle cx="12" cy="12" r="3"/>
+                                    </svg>
+                                    <svg class="eye-icon eye-hide" width="18" height="18"
+                                         viewBox="0 0 24 24" fill="none"
+                                         stroke="currentColor" stroke-width="2"
+                                         stroke-linecap="round" stroke-linejoin="round"
+                                         aria-hidden="true" hidden>
+                                        <path d="M1 12s4 8 11 8 11-8 11-8"/>
+                                        <line x1="6" y1="17" x2="5" y2="19"/>
+                                        <line x1="12" y1="20" x2="12" y2="22"/>
+                                        <line x1="18" y1="17" x2="19" y2="19"/>
+                                    </svg>
+                                </button>
+                            </div>
+                            <small class="help-text">
+                                Your provider API key. Stored as
+                                <code>llm.API_KEY</code> in the local config.
+                                No environment variable required.
+                            </small>
+                        </label>
+
+                        <label>
+                            <span>Max Response Tokens</span>
+                            <input type="number" id="cfg-llm-max-tokens"
+                                   min="1" step="1" placeholder="128000" />
+                            <small class="help-text">
+                                Maximum tokens per reply. Typical range
+                                4096–200000. Leave empty to use the model
+                                default.
+                            </small>
+                        </label>
+
+                        <label>
+                            <span>Models</span>
+                            <div class="role-tabs" role="tablist" id="cfg-llm-role-tabs">
+                                <button type="button" class="role-tab active"
+                                        data-role="planner" role="tab"
+                                        aria-selected="true">Planner</button>
+                                <button type="button" class="role-tab"
+                                        data-role="receptionist" role="tab">Receptionist</button>
+                                <button type="button" class="role-tab"
+                                        data-role="agent" role="tab">Agent</button>
+                                <button type="button" class="role-tab"
+                                        data-role="helper" role="tab">Helper</button>
+                                <button type="button" class="role-tab"
+                                        data-role="available" role="tab">Available</button>
+                            </div>
+                            <div id="cfg-llm-role-pane-planner" class="role-model-list"
+                                 data-role-pane="planner"></div>
+                            <div id="cfg-llm-role-pane-receptionist" class="role-model-list"
+                                 data-role-pane="receptionist" hidden></div>
+                            <div id="cfg-llm-role-pane-agent" class="role-model-list"
+                                 data-role-pane="agent" hidden></div>
+                            <div id="cfg-llm-role-pane-helper" class="role-model-list"
+                                 data-role-pane="helper" hidden></div>
+                            <textarea id="cfg-llm-models" rows="6" spellcheck="false"
+                                      data-role-pane="available" hidden
+                                      placeholder="One model per line, highest priority first.&#10;e.g. anthropic::claude-4-6-sonnet:1M"></textarea>
+                            <small class="help-text">
+                                <b>Available</b>: master pool, one per line, order = priority.
+                                <b>Role tabs</b>: check which models each role uses.
+                            </small>
+                        </label>
+                    </fieldset>
+
+                    <!-- ============================== Session ============================== -->
+                    <fieldset class="settings-section">
+                        <legend class="settings-section-header">Session<span class="settings-chevron">▾</span></legend>
+
+                        <label>
+                            <span>Log Level</span>
+                            <select id="cfg-session-log-level">
+                                <option value="">(default)</option>
+                                <option value="DEBUG">DEBUG</option>
+                                <option value="INFO">INFO</option>
+                                <option value="WARNING">WARNING</option>
+                                <option value="ERROR">ERROR</option>
+                                <option value="CRITICAL">CRITICAL</option>
+                            </select>
+                            <small class="help-text">
+                                Logging verbosity. DEBUG is the most verbose,
+                                CRITICAL the quietest. Default: INFO.
+                            </small>
+                        </label>
+
+                        <label>
+                            <span>Step Verification Threshold</span>
+                            <input type="number" id="cfg-session-step-threshold"
+                                   min="0" max="1" step="0.05"
+                                   placeholder="0.8" />
+                            <small class="help-text">
+                                Confidence below this value triggers a
+                                corrective step. Range 0.0–1.0. Default: 0.8.
+                            </small>
+                        </label>
+
+                        <label>
+                            <span>Python venv Path</span>
+                            <input type="text" id="cfg-session-venv-path"
+                                   placeholder="(optional — leave empty for system Python)" />
+                            <small class="help-text">
+                                Absolute path to a Python virtualenv used by
+                                the bash tool. Leave empty to use the system
+                                Python.
+                            </small>
+                        </label>
+                    </fieldset>
+
+                    <!-- ============================== Interaction Switches ============================== -->
+                    <fieldset class="settings-section">
+                        <legend class="settings-section-header">Interaction Switches<span class="settings-chevron">▾</span></legend>
+
+                        <p class="help-text fieldset-intro">
+                            <strong>Enable</strong> controls whether the tool exists at
+                            all — when off, the tool is hidden from the agent.
+                            <strong>Auto-approve</strong> controls whether calls run
+                            silently — checked = run without asking; unchecked = confirm
+                            first. Tools without an Enable switch are always available.
+                            Paths inside the working directory are always auto-approved
+                            for write/edit regardless of these switches.
+                        </p>
+
+                        <div class="tool-group">
+                            <div class="tool-group-name">Write tool</div>
+                            <label class="checkbox-row tool-sub">
+                                <input type="checkbox" id="cfg-sw-tool-write" />
+                                <span>Auto-approve</span>
+                                <small class="help-text">
+                                    When unchecked, ask before the write tool
+                                    creates or overwrites a file outside the
+                                    working directory.
+                                </small>
+                            </label>
+                        </div>
+
+                        <div class="tool-group">
+                            <div class="tool-group-name">Edit tool</div>
+                            <label class="checkbox-row tool-sub">
+                                <input type="checkbox" id="cfg-sw-tool-edit" />
+                                <span>Auto-approve</span>
+                                <small class="help-text">
+                                    When unchecked, ask before the edit tool
+                                    modifies an existing file outside the working
+                                    directory.
+                                </small>
+                            </label>
+                        </div>
+
+                        <div class="tool-group">
+                            <div class="tool-group-name">Bash tool</div>
+                            <label class="checkbox-row tool-sub">
+                                <input type="checkbox" id="cfg-sw-tool-bash" />
+                                <span>Auto-approve</span>
+                                <small class="help-text">
+                                    When unchecked, ask before any bash command
+                                    runs. The high-risk switch below is checked
+                                    first and takes priority.
+                                </small>
+                            </label>
+                        </div>
+
+                        <div class="tool-group" data-tool="browser">
+                            <div class="tool-group-name">Browser tool</div>
+                            <label class="checkbox-row tool-sub" data-row="auto">
+                                <input type="checkbox" id="cfg-sw-tool-browser-auto" />
+                                <span>Auto-approve</span>
+                                <small class="help-text">
+                                    When unchecked, ask before each browser action
+                                    (navigate, click, type, extract, screenshot, …).
+                                    The browser launches off-screen with a separate
+                                    profile so it does not disturb your main Chrome.
+                                    attach_browser (taking over your running Chrome)
+                                    is gated separately by the high-risk switch and
+                                    always asks regardless of this setting.
+                                </small>
+                            </label>
+                        </div>
+
+                        <div class="tool-group" data-tool="desktop">
+                            <div class="tool-group-name">Desktop tool</div>
+                            <label class="checkbox-row tool-sub" data-row="auto">
+                                <input type="checkbox" id="cfg-sw-tool-desktop-auto" />
+                                <span>Auto-approve</span>
+                                <small class="help-text">
+                                    When unchecked, the agent asks once per task
+                                    before driving your real mouse / keyboard
+                                    (click_at, type_text, drag, scroll, hotkey,
+                                    key_press); a single approval covers every
+                                    desktop action until the task ends. Press
+                                    <code>Ctrl+Shift+C</code> anytime to revoke.
+                                    Read-only actions (screenshot, list_windows,
+                                    find_element) are not gated. Sensitive
+                                    windows (password managers, banking) are
+                                    always refused regardless of this switch.
+                                    Off by default — desktop input affects
+                                    whatever app is focused, not just HandQ's
+                                    own browser.
+                                </small>
+                            </label>
+                        </div>
+
+                        <div class="tool-group" data-tool="web_search">
+                            <div class="tool-group-name">Web search tool</div>
+                            <label class="checkbox-row tool-sub" data-row="auto">
+                                <input type="checkbox" id="cfg-sw-tool-web-search-auto" />
+                                <span>Auto-approve</span>
+                                <small class="help-text">
+                                    When unchecked, ask before each internal web
+                                    search. Read-only — returns titles, URLs,
+                                    and snippets. Uses the authenticated browser
+                                    session.
+                                </small>
+                            </label>
+                        </div>
+
+                        <div class="tool-group" data-tool="email">
+                            <div class="tool-group-name">Email tool</div>
+                            <label class="checkbox-row tool-sub" data-row="auto">
+                                <input type="checkbox" id="cfg-sw-tool-email-auto" />
+                                <span>Auto-approve</span>
+                                <small class="help-text">
+                                    When unchecked, ask before reading email via
+                                    local Outlook COM. Read actions are
+                                    low-risk. Write actions (compose / send)
+                                    will always go through the high-risk gate
+                                    regardless of this switch.
+                                </small>
+                            </label>
+                        </div>
+
+                        <div class="tool-group">
+                            <div class="tool-group-name">High-risk commands</div>
+                            <label class="checkbox-row tool-sub">
+                                <input type="checkbox" id="cfg-sw-high-risk" />
+                                <span>Auto-approve</span>
+                                <small class="help-text">
+                                    When unchecked, ask before any high-risk
+                                    bash command (rm, kill, shutdown, DROP
+                                    TABLE, git push --force, …). Strongly
+                                    recommended: leave unchecked.
+                                </small>
+                            </label>
+                        </div>
+                    </fieldset>
+
+                    <!-- ============================== Email ============================== -->
+                    <fieldset class="settings-section">
+                        <legend class="settings-section-header">Email<span class="settings-chevron">▾</span></legend>
+
+                        <label>
+                            <span>Folder Blacklist</span>
+                            <input type="text" id="cfg-email-folder-blacklist"
+                                   placeholder="Drafts, Junk Email, Deleted Items" />
+                            <small class="help-text">
+                                Comma-separated folder names that the email
+                                tool will never read. Case-insensitive.
+                                Leave empty to read all folders.
+                            </small>
+                        </label>
+                    </fieldset>
+
+                    <!-- ============================== Personalization ============================== -->
+                    <fieldset class="settings-section">
+                        <legend class="settings-section-header">Personalization<span class="settings-chevron">▾</span></legend>
+
+                        <p class="help-text fieldset-intro">
+                            HandQ tailors plans to the tools and conventions you
+                            work with. All learning happens locally. Use the
+                            controls below to limit what HandQ sees and to opt
+                            into commit-driven learning per repository.
+                            <strong>Changes here take effect after the next
+                            HandQ restart.</strong>
+                        </p>
+
+                        <label class="checkbox-row tool-sub">
+                            <input type="checkbox" id="cfg-pers-enabled" />
+                            <span>Enable</span>
+                            <small class="help-text">
+                                When OFF, HandQ stops carrying any
+                                cross-session context. The rest of the agent
+                                still works.
+                            </small>
+                        </label>
+
+                        <label>
+                            <span>Excluded apps (one regex per line)</span>
+                            <textarea id="cfg-pers-excluded-apps" rows="3"
+                                      placeholder="(?i)wechat&#10;(?i)teams"></textarea>
+                            <small class="help-text">
+                                Foreground windows whose titles match any of
+                                these patterns are never consulted. Built-in
+                                safe defaults (password managers, banking,
+                                OTP, private browsing) are always active;
+                                this list adds to them.
+                            </small>
+                        </label>
+
+                        <label>
+                            <span>Learn from commits in (one repo path per line)</span>
+                            <textarea id="cfg-pers-git-hook-repos" rows="3"
+                                      placeholder="C:\Code\HandQ&#10;C:\Code\my-other-project"></textarea>
+                            <small class="help-text">
+                                For each path here, HandQ installs a tiny
+                                <code>post-commit</code> hook so each commit's
+                                message and file list become a learning
+                                signal. Add a path and Save → hook is
+                                installed. Remove a path and Save → hook is
+                                uninstalled (only if it carries our marker).
+                                Hooks you wrote yourself are never overwritten
+                                or deleted.
+                            </small>
+                        </label>
+                    </fieldset>
+
+                    <div class="settings-actions">
+                        <button type="button" id="settings-load">Reload</button>
+                        <button type="submit" id="settings-save">Save</button>
+                        <span class="muted" id="settings-status"></span>
+                    </div>
+                </form>
+                <div class="settings-version settings-version-centered muted">Version <span id="settings-version-number">—</span></div>
+            </div>
+        </div>
+
+        <!-- ============================================================ -->
+        <!-- LTM Admin overlay (hidden; opened via typing /memory in       -->
+        <!-- the composer). Manages long-term memory, knowledge,           -->
+        <!-- triage stats, scheduled tasks, activity monitor state, and    -->
+        <!-- the git post-commit hook. NOT user-facing; the only way to    -->
+        <!-- reach this panel is the special /memory command.              -->
+        <!-- ============================================================ -->
+        <div class="overlay hidden" id="overlay-admin" aria-hidden="true">
+            <div class="overlay-card admin-card" role="dialog" aria-modal="true">
+                <header class="overlay-header">
+                    <h2>Memory Admin</h2>
+                    <button type="button" class="overlay-close" id="admin-close"
+                            aria-label="Close">×</button>
+                </header>
+
+                <nav class="admin-tabs" role="tablist">
+                    <button type="button" class="admin-tab active"
+                            data-admin-tab="memory" role="tab"
+                            aria-selected="true">Memory</button>
+                    <button type="button" class="admin-tab"
+                            data-admin-tab="knowledge" role="tab">Knowledge</button>
+                    <button type="button" class="admin-tab"
+                            data-admin-tab="stats" role="tab">Stats</button>
+                    <button type="button" class="admin-tab"
+                            data-admin-tab="activity" role="tab">Activity</button>
+                    <button type="button" class="admin-tab"
+                            data-admin-tab="tools" role="tab">Tools</button>
+                </nav>
+
+                <div class="admin-toast hidden" id="admin-toast" role="status"></div>
+
+                <div class="admin-body">
+                    <!-- ── Memory tab ──────────────────────────────── -->
+                    <section class="admin-pane" data-admin-pane="memory">
+                        <header class="admin-pane-header">
+                            <select id="admin-mem-dim">
+                                <option value="">All dimensions</option>
+                                <option value="agentic">Agentic</option>
+                                <option value="insight">Insight</option>
+                            </select>
+                            <button type="button" id="admin-mem-refresh">Refresh</button>
+                            <span class="admin-count" id="admin-mem-count"></span>
+                        </header>
+                        <ul class="admin-list" id="admin-mem-list"></ul>
+                    </section>
+
+                    <!-- ── Knowledge tab ───────────────────────────── -->
+                    <section class="admin-pane hidden" data-admin-pane="knowledge">
+                        <header class="admin-pane-header">
+                            <select id="admin-kn-cat">
+                                <option value="">All categories</option>
+                                <option value="domain">Domain</option>
+                                <option value="people">People</option>
+                                <option value="process">Process</option>
+                                <option value="coding">Coding</option>
+                                <option value="other">Other</option>
+                            </select>
+                            <button type="button" id="admin-kn-refresh">Refresh</button>
+                            <span class="admin-count" id="admin-kn-count"></span>
+                        </header>
+                        <ul class="admin-list" id="admin-kn-list"></ul>
+                    </section>
+
+                    <!-- ── Stats tab ───────────────────────────────── -->
+                    <section class="admin-pane hidden" data-admin-pane="stats">
+                        <header class="admin-pane-header">
+                            <button type="button" id="admin-stats-refresh">Refresh</button>
+                            <small class="help-text">
+                                Triage health: per-source candidate flow.
+                                Healthy zone: accepted 5–30%, failed = 0,
+                                pending small + decreasing.
+                            </small>
+                        </header>
+                        <pre class="admin-stats-output" id="admin-stats-output">
+(click Refresh)</pre>
+                    </section>
+
+                    <!-- ── Schedules tab is now in its own overlay,
+                         opened via /schedules. Kept structurally
+                         separate from Memory because the scheduler
+                         doesn't read or write memory.db — it just
+                         runs saved prompts on a cadence. -->
+
+                    <!-- ── Activity tab ────────────────────────────── -->
+                    <section class="admin-pane hidden" data-admin-pane="activity">
+                        <header class="admin-pane-header">
+                            <button type="button" id="admin-act-refresh">Refresh</button>
+                            <button type="button" id="admin-act-pause">Pause</button>
+                            <button type="button" id="admin-act-resume">Resume</button>
+                        </header>
+                        <pre class="admin-stats-output" id="admin-act-output">
+(click Refresh)</pre>
+                    </section>
+
+                    <!-- ── Tools tab ───────────────────────────────── -->
+                    <section class="admin-pane hidden" data-admin-pane="tools">
+                        <div class="admin-tool-block">
+                            <h4>/remember</h4>
+                            <p class="help-text">
+                                Submit a high-trust manual memory candidate. Goes
+                                straight to the dream worker on its next tick;
+                                triage decides create / update / skip per the
+                                same rules as ambient sources.
+                            </p>
+                            <textarea id="admin-remember-text" rows="3"
+                                      placeholder="e.g. Always use uv to create venvs (not conda)"></textarea>
+                            <button type="button" id="admin-remember-btn" class="primary">Remember</button>
+                        </div>
+                    </section>
+                </div>
+            </div>
+        </div>
+
+        <!-- ============================================================ -->
+        <!-- Scheduled-tasks overlay (hidden; opened via /schedules).      -->
+        <!-- Functionally independent from the LTM admin panel — the      -->
+        <!-- scheduler doesn't read/write memory.db, it just fires saved  -->
+        <!-- prompts on a cadence. Same hidden-slash-command pattern so   -->
+        <!-- regular users don't stumble onto either feature.             -->
+        <!-- ============================================================ -->
+        <div class="overlay hidden" id="overlay-schedules" aria-hidden="true">
+            <div class="overlay-card settings-card sched-card" role="dialog" aria-modal="true">
+                <header class="overlay-header">
+                    <h2>Scheduled Tasks</h2>
+                    <button type="button" class="overlay-close" id="sched-close"
+                            aria-label="Close">×</button>
+                </header>
+                <div class="settings-toast hidden" id="sched-toast" role="status"></div>
+                <div class="sched-body">
+                    <!-- List header: Create + Delete sit here as plain buttons.
+                         Auto-refreshes on open + after every mutation + every 5 s. -->
+                    <div class="sched-list-header">
+                        <button type="button" id="sched-create-btn">+ Create task</button>
+                        <button type="button" id="sched-delete-btn"
+                                class="danger" disabled>Delete</button>
+                    </div>
+                    <ul class="sched-list" id="sched-list"></ul>
+                    <!-- Bottom: detail of selected task -->
+                    <section class="sched-detail-pane">
+                        <div class="sched-detail-empty muted" id="sched-detail-empty">
+                            Select a task above to view details, or click Create to add one.
+                        </div>
+                        <div class="sched-detail hidden" id="sched-detail">
+                            <h4 id="sched-detail-name"></h4>
+                            <dl class="sched-detail-fields">
+                                <dt>Schedule</dt><dd id="sched-detail-schedule"></dd>
+                                <dt>Status</dt><dd id="sched-detail-status"></dd>
+                                <dt>Next run</dt><dd id="sched-detail-next"></dd>
+                                <dt>Last run</dt><dd id="sched-detail-last"></dd>
+                                <dt>Runs</dt><dd id="sched-detail-runs"></dd>
+                                <dt>Failures</dt><dd id="sched-detail-failures"></dd>
+                                <dt class="sched-detail-error-row hidden">Last error</dt>
+                                <dd class="sched-detail-error-row hidden"
+                                    id="sched-detail-error"></dd>
+                                <dt>Prompt</dt>
+                                <dd><pre id="sched-detail-prompt"
+                                          class="sched-detail-prompt"></pre></dd>
+                            </dl>
+                            <div class="settings-actions sched-detail-actions">
+                                <button type="button" id="sched-detail-run">Run now</button>
+                                <button type="button" id="sched-detail-toggle">Disable</button>
+                            </div>
+                        </div>
+                    </section>
+                </div>
+            </div>
+        </div>
+
+        <!-- ============================================================ -->
+        <!-- Scheduled-task creation modal — pops over #overlay-schedules. -->
+        <!-- Just Name + Prompt. The schedule string is inferred by an    -->
+        <!-- LLM from the prompt content; user doesn't have to write it.  -->
+        <!-- ============================================================ -->
+        <div class="overlay hidden" id="overlay-sched-form" aria-hidden="true">
+            <div class="overlay-card settings-card sched-form-modal" role="dialog" aria-modal="true">
+                <header class="overlay-header">
+                    <h3>New scheduled task</h3>
+                    <button type="button" class="overlay-close" id="sched-form-close"
+                            aria-label="Close">×</button>
+                </header>
+                <form class="settings-form" id="sched-form-inner">
+                    <label>
+                        <span>Name</span>
+                        <input type="text" id="sched-name"
+                               placeholder="Daily PR digest" autocomplete="off" />
+                    </label>
+                    <label>
+                        <span>Prompt</span>
+                        <textarea id="sched-prompt" rows="5"
+                                  placeholder="Summarise yesterday's commits in repo X."></textarea>
+                        <small class="help-text">
+                            Schedule is inferred automatically from the prompt
+                            (e.g. "summarise yesterday's PRs" → daily 09:00).
+                        </small>
+                    </label>
+                    <div class="settings-actions">
+                        <button type="button" id="sched-cancel">Cancel</button>
+                        <button type="submit" id="sched-create">Create</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+
+        <!-- ============================================================ -->
+        <!-- GEP parameters panel — opens automatically when the Receptionist -->
+        <!-- detects a matching template and the planner enters the GEP    -->
+        <!-- confirmation window.  Lets the user review template steps,    -->
+        <!-- edit per-parameter values, and confirm / skip — with a live   -->
+        <!-- countdown driven by gep_countdown status events.              -->
+        <!-- ============================================================ -->
+        <div class="overlay hidden" id="overlay-gep" aria-hidden="true">
+            <div class="overlay-card gep-card" role="dialog" aria-modal="true">
+                <header class="overlay-header">
+                    <h2>
+                        <span aria-hidden="true">📋</span>
+                        <span id="gep-title">GEP Template</span>
+                    </h2>
+                    <span class="gep-countdown-pill" id="gep-countdown">--s</span>
+                    <button type="button" class="overlay-close" id="gep-close"
+                            aria-label="Close (defer to chat)">×</button>
+                </header>
+
+                <div class="gep-progress">
+                    <div class="gep-progress-bar" id="gep-progress-bar"></div>
+                </div>
+
+                <form class="settings-form gep-form" id="gep-form">
+                    <p class="gep-description help-text" id="gep-description"></p>
+
+                    <fieldset class="gep-section" id="gep-steps-section">
+                        <legend>Steps</legend>
+                        <ol class="gep-steps" id="gep-steps"></ol>
+                    </fieldset>
+
+                    <fieldset class="gep-section" id="gep-key-params-section" hidden>
+                        <legend>Key parameters — please review</legend>
+                        <div class="gep-params" id="gep-key-params"></div>
+                    </fieldset>
+
+                    <fieldset class="gep-section" id="gep-other-params-section" hidden>
+                        <legend>Other parameters</legend>
+                        <div class="gep-params" id="gep-other-params"></div>
+                    </fieldset>
+
+                    <p class="help-text gep-hint">
+                        Edit any parameter above, then click <b>Confirm now</b> —
+                        your values are sent along with the confirmation. Skip GEP
+                        to fall back to normal planning.
+                    </p>
+
+                    <div class="settings-actions gep-actions">
+                        <button type="button" id="gep-skip">Skip GEP</button>
+                        <button type="submit" id="gep-confirm" class="primary">Confirm now</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+
+        <!-- ============================================================ -->
+        <!-- Templates review panel — opened from the Templates shortcut.  -->
+        <!-- Lists every GEP template in the user's templates dir with    -->
+        <!-- a clickable detail view (steps + params + problems).         -->
+        <!-- ============================================================ -->
+        <div class="overlay hidden" id="overlay-templates" aria-hidden="true">
+            <div class="overlay-card settings-card templates-card" role="dialog" aria-modal="true">
+                <header class="overlay-header">
+                    <h2>GEP Templates</h2>
+                    <button type="button" class="overlay-close" id="templates-close"
+                            aria-label="Close">×</button>
+                </header>
+                <div class="settings-toast hidden" id="templates-toast" role="status"></div>
+                <div class="templates-body">
+                    <div class="templates-list-header">
+                        <button type="button" id="templates-refresh">Refresh</button>
+                        <button type="button" id="templates-load-history" class="primary">📂 Load history…</button>
+                        <span class="templates-count muted" id="templates-count"></span>
+                    </div>
+                    <ul class="templates-list" id="templates-list"></ul>
+                    <section class="templates-detail-pane">
+                        <div class="templates-detail-empty muted" id="templates-detail-empty">
+                            Select a template above to view its steps and parameters.
+                        </div>
+                        <div class="templates-detail hidden" id="templates-detail">
+                            <header class="templates-detail-header">
+                                <h3 id="templates-detail-name"></h3>
+                                <span class="templates-detail-version" id="templates-detail-version"></span>
+                            </header>
+                            <p class="templates-detail-desc" id="templates-detail-desc"></p>
+                            <div class="templates-detail-problems hidden"
+                                 id="templates-detail-problems"></div>
+                            <section class="templates-detail-section" id="templates-detail-params-wrap">
+                                <h4>Parameters</h4>
+                                <div class="templates-detail-params" id="templates-detail-params"></div>
+                            </section>
+                            <section class="templates-detail-section" id="templates-detail-steps-wrap">
+                                <h4>Steps</h4>
+                                <ol class="templates-detail-steps" id="templates-detail-steps"></ol>
+                            </section>
+                            <dl class="templates-detail-meta">
+                                <dt>ID</dt><dd id="templates-detail-id"></dd>
+                                <dt>Created</dt><dd id="templates-detail-created"></dd>
+                            </dl>
+                            <div class="settings-actions templates-detail-actions">
+                                <button type="button" id="templates-detail-delete" class="danger">Delete</button>
+                            </div>
+                        </div>
+                    </section>
+                </div>
+            </div>
+        </div>
+
+        <div class="overlay hidden" id="overlay-confirmation" aria-hidden="true">
+            <div class="overlay-card confirmation-card" role="dialog" aria-modal="true">
+                <header class="overlay-header">
+                    <h2 id="confirm-title">Confirm action</h2>
+                </header>
+                <div class="confirmation-body">
+                    <p class="confirmation-description" id="confirm-description"></p>
+                    <div class="confirmation-decision hidden" id="confirm-decision"></div>
+                    <label class="confirmation-secret hidden" id="confirm-secret-wrap">
+                        <span>Input</span>
+                        <input type="password" id="confirm-secret-input"
+                               autocomplete="off" spellcheck="false" />
+                    </label>
+                    <textarea class="confirmation-guidance hidden"
+                              id="confirm-guidance"
+                              placeholder="Provide guidance for the agent instead of yes/no"
+                              rows="3"></textarea>
+                </div>
+                <div class="confirmation-actions">
+                    <button type="button" id="confirm-reject">Reject</button>
+                    <button type="button" id="confirm-guidance-btn">Provide guidance</button>
+                    <button type="button" id="confirm-submit" class="primary">Approve</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script src="vendor/xterm.bundle.js"></script>
+    <script src="renderer.js"></script>
+    <script src="admin-panel.js"></script>
+</body>
+</html>

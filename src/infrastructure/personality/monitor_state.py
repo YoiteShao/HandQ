@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import List, Optional
 
@@ -48,6 +49,16 @@ class MonitorState:
     last_demotion_candidate_ts: float = 0.0
     last_hash: Optional[int] = None
     last_text: str = ""
+    # Ring of recently-accepted OCR texts. The single ``last_text`` field
+    # above is insufficient for dedup when the user briefly alt-tabs
+    # away — a single foreign window OCR overwrites it, then the
+    # original screen looks "novel" again on its next capture and gets
+    # re-forwarded. Keep ACTIVITY_TEXT_HISTORY_SIZE most-recent accepted
+    # texts so the Jaccard check looks at the whole recent window. The
+    # deque's maxlen handles eviction automatically.
+    recent_texts: deque = field(
+        default_factory=lambda: deque(maxlen=C.ACTIVITY_TEXT_HISTORY_SIZE)
+    )
     buffer: List[ActivitySample] = field(default_factory=list)
     buffer_started_ts: float = 0.0
 

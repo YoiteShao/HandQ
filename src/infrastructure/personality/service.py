@@ -535,11 +535,21 @@ class PersonalityMonitor:
             text = (ocr_result.full_text or "").strip()
             if len(text) < C.ACTIVITY_OCR_MIN_CHARS:
                 return
-            jacc = text_jaccard(text, m.last_text) if m.last_text else 0.0
+            # Dedup against the ring of recently-forwarded texts on this
+            # monitor, not just the single last_text. Without the ring,
+            # a brief alt-tab pattern (VSCode → Slack → VSCode) accepts
+            # the second VSCode capture as "novel" because last_text is
+            # the Slack window. Take the MAX Jaccard across the ring so
+            # any sufficiently-similar prior screen blocks acceptance.
+            jaccards = [text_jaccard(text, prev) for prev in m.recent_texts] \
+                if m.recent_texts else []
+            if m.last_text:
+                jaccards.append(text_jaccard(text, m.last_text))
+            jacc = max(jaccards) if jaccards else 0.0
             if jacc >= C.ACTIVITY_OCR_TEXT_JACCARD_BAR:
                 _logger.debug(
-                    "monitor %d text near-duplicate (jacc=%.2f)",
-                    m.info.index, jacc,
+                    "monitor %d text near-duplicate (max jacc=%.2f over %d prior)",
+                    m.info.index, jacc, len(jaccards),
                 )
                 # Update the hash so we don't keep re-OCRing the same screen,
                 # but don't forward.
@@ -557,6 +567,10 @@ class PersonalityMonitor:
             )
             m.last_hash = ph if ph is not None else m.last_hash
             m.last_text = text[: C.ACTIVITY_OCR_EXCERPT_MAX_CHARS * 4]
+            # Push into the ring AFTER acceptance so we never compare the
+            # incoming text against itself. Truncate to the same max as
+            # last_text so the per-text memory cost stays bounded.
+            m.recent_texts.append(text[: C.ACTIVITY_OCR_EXCERPT_MAX_CHARS * 4])
             m.append_sample(sample, now)
             self._daily_buffer.append(sample)
             # Ring-buffer guard: if the user closes the laptop right

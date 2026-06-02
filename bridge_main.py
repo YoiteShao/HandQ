@@ -204,9 +204,14 @@ _emit_boot_progress(
 # Invariant: NO StreamHandler may target sys.stdout. stdout is the JSON IPC
 # channel. We attach exactly two handlers:
 #   - StreamHandler(sys.stderr) at INFO   — human-readable diagnostics
-#   - RotatingFileHandler(<log_dir>/handq-bridge.log) at DEBUG — full trace
-# Root level is DEBUG so the file handler can see every record; the stderr
-# handler filters to INFO+ on its own.
+#   - RotatingFileHandler(<log_dir>/handq-bridge.log) at INFO  — bridge log
+# Root level is DEBUG so the diag handler (attached below to handq.ltm /
+# personality / scheduler trees) can write full trace into .dia/
+# internal-trace.log without affecting the main handq-bridge.log. The
+# main file handler filters to INFO+ to keep handq-bridge.log readable —
+# DEBUG from PIL chunk dumps, httpcore wire trace, and Anthropic /
+# OpenAI request bodies (which contain plaintext user activity text)
+# would otherwise produce hundreds of KB / minute of noise.
 #
 # Log directory selection:
 #   - If HANDQ_LOG_DIR is set in the environment (Electron passes the
@@ -336,7 +341,7 @@ _file_handler = RotatingFileHandler(
     backupCount=3,
     encoding="utf-8",
 )
-_file_handler.setLevel(logging.DEBUG)
+_file_handler.setLevel(logging.INFO)
 _file_handler.setFormatter(_formatter)
 
 logging.basicConfig(
@@ -345,6 +350,15 @@ logging.basicConfig(
     format=_LOG_FMT,
     handlers=[_stderr_handler, _file_handler],
 )
+
+# Quiet noisy 3rd-party loggers. Without this they inherit root=DEBUG and
+# dump full request bodies (openai/anthropic), connect tracebacks
+# (httpx/httpcore), and per-PNG chunk dumps (PIL) into the diag log
+# (and the main log if file_handler is ever lowered to DEBUG). The
+# request bodies actually contain user memory text in plaintext.
+# WARNING is enough to still see real failures.
+for _noisy in ("openai", "anthropic", "httpx", "httpcore", "PIL", "asyncio"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 _emit_boot_progress("logging_ready", log_dir=str(_LOG_DIR))
 

@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from ..long_term_memory.models import ScheduledTask, SchedulerTaskStatus
-from .schedule import next_fire, parse_schedule
+from .schedule import is_one_shot, next_fire, parse_schedule
 
 _logger = logging.getLogger("handq.scheduler.store")
 
@@ -120,6 +120,7 @@ class ScheduleStore:
         name: str,
         prompt: str,
         schedule: str,
+        dispatch_prompt: str = "",
     ) -> ScheduledTask:
         # Validate the schedule first so the parse error surfaces in
         # the IPC response instead of a rejected create that left a
@@ -134,6 +135,7 @@ class ScheduleStore:
                 enabled=True,
                 last_run_at=0,
                 next_run_at=next_fire(schedule, last_run_at=0),
+                dispatch_prompt=dispatch_prompt or "",
             )
             self._tasks[t.id] = t
             await self._flush_locked()
@@ -218,7 +220,13 @@ class ScheduleStore:
             base = t.next_run_at if t.next_run_at else now
             t.last_status = SchedulerTaskStatus.RUNNING
             t.last_run_at = now
-            t.next_run_at = next_fire(t.schedule, last_run_at=base)
+            if is_one_shot(t.schedule):
+                # One-shot: no future fire. Leaving a stale next_run_at
+                # in the past would re-fire on every wakeup until
+                # mark_finished arrives — clear it.
+                t.next_run_at = 0
+            else:
+                t.next_run_at = next_fire(t.schedule, last_run_at=base)
             t.updated_at = now
             await self._flush_locked()
 
@@ -277,5 +285,11 @@ class ScheduleStore:
                         task_id, t.failure_count,
                     )
             t.updated_at = now
+            if is_one_shot(t.schedule):
+                # Disable one-shot tasks after they fire, regardless of
+                # outcome. Re-enabling via the UI re-fires immediately
+                # (set_enabled recomputes next_run_at from the same
+                # absolute timestamp, which is now in the past).
+                t.enabled = False
             await self._flush_locked()
         return t

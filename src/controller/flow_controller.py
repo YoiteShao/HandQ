@@ -2098,9 +2098,10 @@ class FlowController:
                     # the same corrective-replan path; the next is_complete
                     # cycle will re-run synthesize_acceptance() against the
                     # corrected state.
+                    conf_str = f"{confidence:.2f}" if confidence is not None else "N/A"
                     self.logger.warning(
                         f"Planner confidence for last step: "
-                        f"{confidence:.2f if confidence is not None else 'N/A'} < threshold "
+                        f"{conf_str} < threshold "
                         f"{self.step_verification_threshold:.2f} "
                         f"— step committed as FAILED; "
                         f"using corrective next_steps from current plan",

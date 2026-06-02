@@ -53,6 +53,7 @@ from typing import Dict, List, Optional, Tuple
 from . import _constants as C
 from .embedding import EmbeddingProvider, cosine, vec_from_bytes, vec_to_bytes
 from .models import Entry, EntryKind, KnowledgeCategory, MemoryDimension
+from .recall_logger import RecallLogger
 from .reranker import Reranker
 
 _logger = logging.getLogger("handq.ltm.recall")
@@ -101,7 +102,14 @@ async def recall_memory_impl(
     # roundtrip (it doesn't need that much precision per message).
     if rerank and reranker.available:
         rows = await _ml_rerank(reranker, query, rows)
-    return [_row_to_memory_entry(r) for r in rows[:k]]
+    entries = [_row_to_memory_entry(r) for r in rows[:k]]
+    # Record the final-tier hits (after rerank) so the retriage pipeline
+    # has signal about what the user is actually using. Only top-k makes
+    # the log — over-fetched intermediate rows are noise.
+    RecallLogger.get().record(
+        [e.id for e in entries], kind=EntryKind.MEMORY.value,
+    )
+    return entries
 
 
 async def recall_knowledge_impl(
@@ -126,7 +134,11 @@ async def recall_knowledge_impl(
         return []
     if rerank and reranker.available:
         rows = await _ml_rerank(reranker, query, rows)
-    return [_row_to_knowledge_entry(r) for r in rows[:k]]
+    entries = [_row_to_knowledge_entry(r) for r in rows[:k]]
+    RecallLogger.get().record(
+        [e.id for e in entries], kind=EntryKind.KNOWLEDGE.value,
+    )
+    return entries
 
 
 def format_memory_block(entries: List[Entry]) -> str:

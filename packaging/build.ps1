@@ -273,8 +273,13 @@ if (-not $ElectronOnly) {
         #
         # openai.cli  — standalone CLI script, never imported by the SDK core.
         '--nofollow-import-to=openai.cli',
-        # openai._extras — all guarded with try/except ImportError in the SDK.
-        '--nofollow-import-to=openai._extras',
+        # openai._extras — DO NOT exclude. The comment used to claim it
+        # was "all guarded with try/except in the SDK", but
+        # ``openai.resources.embeddings`` does an unguarded top-level
+        # import that resolves through _extras at module load. Excluding
+        # it makes embeddings.create() raise ImportError on every call
+        # (LTM warmup + retriage worker both fail silently to logs).
+        # Keeping it costs ~tens of KB and makes the embedding path work.
         # playwright: async_api and sync_api are independent; we only use async.
         '--nofollow-import-to=playwright.sync_api',
 

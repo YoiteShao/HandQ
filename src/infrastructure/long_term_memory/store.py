@@ -24,9 +24,13 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 from .models import (
+    ArchiveReason,
     Candidate,
     CandidateStatus,
     Chunk,
+    CorrectionKind,
+    CorrectionProposal,
+    CorrectionStatus,
     Entry,
     EntryKind,
     KnowledgeCategory,
@@ -395,6 +399,27 @@ class SQLiteStore:
         await self._execute(
             "UPDATE memory_files SET archived=1, archived_reason=?, updated_at=? WHERE id=?",
             (reason, _now(), entry_id),
+        )
+
+    async def set_superseded_by(
+        self, *, kind: str, entry_id: str, superseded_by_id: str,
+    ) -> None:
+        """Stamp the FK that links an archived entry to whatever replaced it.
+
+        Used by L2/L3 dream synthesis to mark each source entry with the
+        synthesis entry that subsumed it. ``entry_id`` is the entry being
+        retired; ``superseded_by_id`` is the new synthesis entry. The
+        column already exists in the schema (memory_files / knowledge_files).
+        """
+        if kind == EntryKind.MEMORY.value:
+            table = "memory_files"
+        elif kind == EntryKind.KNOWLEDGE.value:
+            table = "knowledge_files"
+        else:
+            raise ValueError(f"unknown kind: {kind!r}")
+        await self._execute(
+            f"UPDATE {table} SET superseded_by=?, updated_at=? WHERE id=?",
+            (superseded_by_id, _now(), entry_id),
         )
 
     async def list_memory_entries(
@@ -1086,6 +1111,215 @@ class SQLiteStore:
             (level, kind),
         )
 
+    async def list_in_flight_dream_run_sources(self) -> List[str]:
+        """Entry ids that an actively-running L2/L3 synthesis is touching.
+
+        Used by RetriageWorker to skip entries that the dream worker is
+        about to consume (or just consumed). Without this, retriage might
+        archive a source mid-way through synthesis and leave the new
+        synthesis entry pointing at an already-archived source. A short
+        list — at most ``DREAM_L2_MAX_CLUSTERS_PER_RUN * cluster_size``
+        ids during a worst-case run.
+        """
+        rows = await self._fetchall(
+            "SELECT source_entry_ids FROM memory_files WHERE source LIKE 'dream_l%' "
+            "AND archived=0 AND source_entry_ids IS NOT NULL",
+        )
+        rows += await self._fetchall(
+            "SELECT source_entry_ids FROM knowledge_files WHERE source LIKE 'dream_l%' "
+            "AND archived=0 AND source_entry_ids IS NOT NULL",
+        )
+        out: List[str] = []
+        for (raw,) in rows:
+            if not raw:
+                continue
+            try:
+                ids = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(ids, list):
+                out.extend(str(x) for x in ids if x)
+        return out
+
+    # ── Correction proposals (v4) ───────────────────────────────────────────
+
+    async def insert_correction_proposal(
+        self,
+        *,
+        kind: CorrectionKind,
+        target_kind: EntryKind,
+        target_entry_id: str,
+        target_version: int,
+        target_archived: bool,
+        payload: Optional[dict],
+        confidence: Optional[float],
+        rule_version: int,
+        parent_run_id: Optional[str],
+        rationale: str,
+        rationale_pii_scrubbed: bool,
+    ) -> str:
+        pid = str(uuid.uuid4())
+        payload_json = json.dumps(payload, ensure_ascii=False) if payload else None
+        await self._execute(
+            "INSERT INTO correction_proposals "
+            "(id, kind, target_kind, target_entry_id, target_version, target_archived, "
+            " payload, confidence, rule_version, parent_run_id, rationale, "
+            " rationale_pii_scrubbed, status, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
+            (pid, kind.value, target_kind.value, target_entry_id,
+             int(target_version), 1 if target_archived else 0,
+             payload_json, confidence, int(rule_version), parent_run_id,
+             rationale[:2000], 1 if rationale_pii_scrubbed else 0,
+             _now()),
+        )
+        return pid
+
+    async def get_correction_proposal(
+        self, pid: str,
+    ) -> Optional[CorrectionProposal]:
+        """Single proposal lookup. Used by ``apply_archive_correction`` to
+        re-fetch the proposal under the write lock for staleness check.
+        """
+        row = await self._fetchone(
+            "SELECT id, kind, target_kind, target_entry_id, target_version, "
+            "       target_archived, payload, confidence, rule_version, parent_run_id, "
+            "       rationale, rationale_pii_scrubbed, status, created_at, "
+            "       resolved_at, resolved_by "
+            "FROM correction_proposals WHERE id=?",
+            (pid,),
+        )
+        return _row_to_correction_proposal(row) if row else None
+
+    # ── Apply corrections (transactional, with staleness check) ─────────────
+
+    async def apply_archive_correction(
+        self, pid: str, *, resolved_by: str,
+    ) -> bool:
+        """Apply an ``archive`` proposal: archive target with a correction
+        reason; if payload carries ``superseded_by_id`` set the FK.
+
+        Returns False (and marks the proposal ``stale``) if the target's
+        ``version`` or ``archived`` drifted from the snapshot —
+        DreamWorker may have already changed the entry.
+        """
+        prop = await self.get_correction_proposal(pid)
+        if prop is None or prop.kind != CorrectionKind.ARCHIVE:
+            return False
+        if prop.status != CorrectionStatus.PENDING:
+            return False
+        if prop.target_kind == EntryKind.MEMORY:
+            files_table = "memory_files"
+        elif prop.target_kind == EntryKind.KNOWLEDGE:
+            files_table = "knowledge_files"
+        else:
+            return False
+
+        reason = f"correction_v{prop.rule_version}_{prop.kind.value}"
+        superseded_by_id = (
+            (prop.payload or {}).get("superseded_by_id") if prop.payload else None
+        )
+
+        async with self._write_lock:
+            try:
+                cur = await asyncio.to_thread(
+                    self._raw.execute,
+                    f"SELECT version, archived FROM {files_table} WHERE id=?",
+                    (prop.target_entry_id,),
+                )
+                row = await asyncio.to_thread(cur.fetchone)
+                await asyncio.to_thread(cur.close)
+                if not row:
+                    await asyncio.to_thread(
+                        self._raw.execute,
+                        "UPDATE correction_proposals SET status='stale', "
+                        "resolved_at=?, resolved_by=? WHERE id=?",
+                        (_now(), resolved_by[:80], pid),
+                    )
+                    await asyncio.to_thread(self._raw.commit)
+                    return False
+                cur_version, cur_archived = int(row[0]), bool(row[1])
+                if cur_version != prop.target_version or cur_archived != prop.target_archived:
+                    await asyncio.to_thread(
+                        self._raw.execute,
+                        "UPDATE correction_proposals SET status='stale', "
+                        "resolved_at=?, resolved_by=? WHERE id=?",
+                        (_now(), resolved_by[:80], pid),
+                    )
+                    await asyncio.to_thread(self._raw.commit)
+                    return False
+
+                if not cur_archived:
+                    sets = ["archived=1", "archived_reason=?", "updated_at=?"]
+                    params = [reason, _now()]
+                    if superseded_by_id:
+                        sets.append("superseded_by=?")
+                        params.append(superseded_by_id)
+                    params.append(prop.target_entry_id)
+                    await asyncio.to_thread(
+                        self._raw.execute,
+                        f"UPDATE {files_table} SET {', '.join(sets)} WHERE id=?",
+                        tuple(params),
+                    )
+                await asyncio.to_thread(
+                    self._raw.execute,
+                    "UPDATE correction_proposals SET status='applied', "
+                    "resolved_at=?, resolved_by=? WHERE id=?",
+                    (_now(), resolved_by[:80], pid),
+                )
+                await asyncio.to_thread(self._raw.commit)
+                return True
+            except Exception:
+                await asyncio.to_thread(self._raw.rollback)
+                raise
+
+    # ── Recall log (v4) ─────────────────────────────────────────────────────
+
+    async def insert_recall_log_batch(
+        self, rows: List[Tuple[str, str, int]],
+    ) -> None:
+        """Bulk insert (entry_id, kind, recalled_at) rows. ``executemany``
+        for one prepared statement → many params, much cheaper than N
+        separate writes.
+        """
+        if not rows:
+            return
+        async with self._write_lock:
+            await asyncio.to_thread(
+                self._raw.executemany,
+                "INSERT INTO recall_log (entry_id, kind, recalled_at) VALUES (?, ?, ?)",
+                rows,
+            )
+            await asyncio.to_thread(self._raw.commit)
+
+    async def count_recent_recalls(
+        self, *, entry_id: str, kind: str, since_seconds: int,
+    ) -> int:
+        cutoff = _now() - int(since_seconds)
+        row = await self._fetchone(
+            "SELECT COUNT(*) FROM recall_log "
+            "WHERE entry_id=? AND kind=? AND recalled_at >= ?",
+            (entry_id, kind, cutoff),
+        )
+        return int(row[0]) if row else 0
+
+    # ── Retriage progress (resumable migration scans) ───────────────────────
+
+    async def get_retriage_progress(self, rule_version: int) -> Optional[str]:
+        return await self.get_meta(f"retriage_progress_v{int(rule_version)}")
+
+    async def set_retriage_progress(
+        self, rule_version: int, last_entry_id: str,
+    ) -> None:
+        await self.set_meta(
+            f"retriage_progress_v{int(rule_version)}", last_entry_id,
+        )
+
+    async def clear_retriage_progress(self, rule_version: int) -> None:
+        await self._execute(
+            "DELETE FROM memory_meta WHERE key=?",
+            (f"retriage_progress_v{int(rule_version)}",),
+        )
+
 
 # ── Row mapping helpers ─────────────────────────────────────────────────────
 
@@ -1126,4 +1360,50 @@ def _row_to_knowledge_entry(r: Tuple) -> Entry:
         archived_reason=r[7],
         created_at=int(r[8]),
         updated_at=int(r[9]),
+    )
+
+
+def _row_to_correction_proposal(r: Tuple) -> CorrectionProposal:
+    """Map a 16-column SELECT row into the dataclass.
+
+    Column order MUST match the SELECT in ``list_correction_proposals`` /
+    ``get_correction_proposal`` — change one, change both.
+    """
+    try:
+        kind = CorrectionKind(r[1])
+    except ValueError:
+        kind = CorrectionKind.ARCHIVE  # safest fallback
+    try:
+        target_kind = EntryKind(r[2])
+    except ValueError:
+        target_kind = EntryKind.MEMORY
+    try:
+        status = CorrectionStatus(r[12])
+    except ValueError:
+        status = CorrectionStatus.PENDING
+    payload: Optional[dict] = None
+    if r[6]:
+        try:
+            payload = json.loads(r[6])
+            if not isinstance(payload, dict):
+                payload = None
+        except json.JSONDecodeError:
+            payload = None
+    return CorrectionProposal(
+        id=r[0],
+        kind=kind,
+        target_kind=target_kind,
+        target_entry_id=r[3],
+        target_version=int(r[4]),
+        target_archived=bool(r[5]),
+        payload=payload,
+        confidence=float(r[7]) if r[7] is not None else None,
+        rule_version=int(r[8]),
+        parent_run_id=r[9],
+        rationale=r[10] or "",
+        rationale_pii_scrubbed=bool(r[11]),
+        status=status,
+        created_at=int(r[13]),
+        resolved_at=int(r[14]) if r[14] is not None else None,
+        resolved_by=r[15],
     )

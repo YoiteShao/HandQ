@@ -1434,15 +1434,28 @@ class StdioBridge:
                 # an explicit schedule, we honour it without inference.
                 schedule_str = (msg.get("schedule") or "").strip()
                 prompt_str = str(msg.get("prompt", ""))
+                dispatch_prompt = ""
                 if not schedule_str:
                     from src.infrastructure.scheduler.inferer import infer_schedule
                     # Single-use LLM service built from current config —
                     # see inferer.py module docstring for rationale.
                     config = self._load_config_dict()
-                    schedule_str = await infer_schedule(prompt_str, config)
+                    result = await infer_schedule(prompt_str, config)
+                    schedule_str = result.schedule
+                    # Empty dispatch_prompt = "use prompt verbatim at fire
+                    # time"; honour that by leaving the field blank on the
+                    # task. Avoids storing a redundant duplicate when the
+                    # LLM had nothing to strip.
+                    if result.prompt and result.prompt.strip() != prompt_str.strip():
+                        dispatch_prompt = result.prompt
+                # Normalise relative one-shot ("once in 1 minute") into
+                # absolute ("once at <abs>"). Idempotent on other forms.
+                from src.infrastructure.scheduler.schedule import normalize_schedule
+                schedule_str = normalize_schedule(schedule_str)
                 t = await scheduler.create_task(  # type: ignore[union-attr]
                     name=str(msg.get("name", "")),
                     prompt=prompt_str,
+                    dispatch_prompt=dispatch_prompt,
                     schedule=schedule_str,
                 )
             except ScheduleSyntaxError as exc:
@@ -1455,14 +1468,14 @@ class StdioBridge:
             return {"ok": bool(ok)}
 
         if msg_type == "cron_set_enabled":
-            tid = str(msg.get("id") or "")
+            tid = str(msg.get("task_id") or msg.get("id") or "")
             t = await scheduler.set_enabled(  # type: ignore[union-attr]
                 tid, bool(msg.get("enabled", False)),
             )
             return {"ok": bool(t), "task": t}
 
         if msg_type == "cron_run_now":
-            tid = str(msg.get("id") or "")
+            tid = str(msg.get("task_id") or msg.get("id") or "")
             t = await scheduler.run_now(tid)  # type: ignore[union-attr]
             return {"ok": bool(t), "task": t}
 
@@ -1509,10 +1522,14 @@ class StdioBridge:
         # Stamp the message id with a marker the renderer can match
         # against the scheduled_task_started toast.
         msg_id = f"sched-{task.id}-{int(time.time())}"
+        # `dispatch_prompt`, when present, is the agent-facing variant
+        # with relative-time language ("一分钟后…") stripped — see
+        # ScheduledTask docstring. Empty means "use prompt verbatim".
+        goal_text = task.dispatch_prompt or task.prompt
         synthetic = {
             "type": "request",
             "id": msg_id,
-            "goal": task.prompt,
+            "goal": goal_text,
             "scheduled": True,
             "scheduled_task_id": task.id,
         }

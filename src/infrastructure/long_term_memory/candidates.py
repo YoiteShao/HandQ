@@ -17,6 +17,27 @@ from .models import CandidateSource
 _logger = logging.getLogger("handq.ltm.candidates")
 
 
+# ── Receptionist pre-filter knobs ──────────────────────────────────────────
+#
+# Tuned against real-world data: ~50% receptionist_turn acceptance
+# (against a "default skip" prompt) was driven by short clarifying /
+# acknowledgement messages slipping past the LLM. A length floor + an
+# imperative-keyword OR catches the obvious noise without burning
+# triage budget on it. The keyword lists are deliberately narrow —
+# false-rejecting a real preference is fine because the user can
+# /remember it explicitly.
+_MIN_RECEPTIONIST_CHARS: int = 20
+_IMPERATIVE_KEYWORDS_EN = (
+    "always", "never", "prefer", "from now on", "stop ", "use ",
+    "don't ", "dont ", "do not", "instead of", "switch to", "remember",
+)
+_IMPERATIVE_KEYWORDS_ZH = (
+    "总是", "永远", "永不", "不要", "别", "改用", "改成", "以后",
+    "记住", "记一下", "习惯", "我喜欢", "我希望", "我想要",
+    "替换为", "切换到",
+)
+
+
 def _is_trivial_session(*, last_steps) -> Optional[str]:
     """Multi-signal heuristic for session_complete: return a reason
     string if this session is too trivial to be worth triaging, else
@@ -185,6 +206,28 @@ async def submit_user_turn(
     user_message: str,
     current_goal: Optional[str] = None,
 ) -> str:
+    # Pre-filter trivial chatter before paying for an LLM triage call.
+    # Receptionist captures EVERY user message, so most are noise (small
+    # talk, clarifying questions, error pastes). Default-skip in the
+    # prompt isn't enough — the LLM still accepted ~50% in practice.
+    # Drop here when BOTH:
+    #   1. the message is short (< MIN_RECEPTIONIST_CHARS), AND
+    #   2. it contains no imperative / preference keyword (en + zh)
+    # Either condition alone is too strict (a long error paste IS noise;
+    # a short "always lint" IS a preference). Both together robustly
+    # catch the noisy short-message bucket without dropping real signal.
+    text = (user_message or "").strip()
+    if (
+        len(text) < _MIN_RECEPTIONIST_CHARS
+        and not any(kw in text.lower() for kw in _IMPERATIVE_KEYWORDS_EN)
+        and not any(kw in text for kw in _IMPERATIVE_KEYWORDS_ZH)
+    ):
+        _logger.info(
+            "receptionist_turn pre-filtered as trivial: len=%d msg=%r",
+            len(text), text[:60],
+        )
+        return ""
+
     parts = [f"# User message\n[SELF] {user_message}"]
     if current_goal:
         parts.append(f"# Current goal context\n{current_goal[:300]}")

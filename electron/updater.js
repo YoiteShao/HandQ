@@ -8,8 +8,11 @@
 // HandQ.exe / handq-bridge.exe.
 //
 // Publish workflow (developer): drop `HandQ Setup x.y.z.exe` into the
-// share path. No version.json, no SHA file, no script. The installer
-// filename IS the metadata; we read the highest semver in the folder.
+// share path. Optionally drop a sibling `HandQ Setup x.y.z.notes.txt`
+// alongside it — its contents are shown verbatim in the update dialog
+// as the "What's new" section. No version.json, no SHA file, no script.
+// The installer filename IS the metadata; we read the highest semver
+// in the folder.
 //
 // Update workflow (user): on next launch the dialog appears; clicking
 // the primary button opens the share in Explorer (independent process)
@@ -35,6 +38,12 @@ const DEFAULT_UPDATE_BASE = '\\\\wine\\APTAuto\\ADAS\\fengxuan\\HandQ';
 // budget we give a flaky / VPN-routed share before giving up. Failure is
 // silent (logged only) — the user just doesn't see a dialog this launch.
 const SCAN_TIMEOUT_MS = 5000;
+
+// Cap on the release-notes payload we're willing to read off the share and
+// drop into a native dialog. 16 KB is plenty for a bullet list and keeps
+// the message box from blowing past Windows' usable size.
+const NOTES_MAX_BYTES = 16 * 1024;
+const NOTES_READ_TIMEOUT_MS = 3000;
 
 // Matches electron-builder's default NSIS artifact name:
 //   `${productName} Setup ${version}.${ext}`
@@ -137,6 +146,49 @@ async function scanLatestVersion(updateBase) {
     return best;
 }
 
+// Sibling release-notes file: `HandQ Setup x.y.z.exe` → `HandQ Setup x.y.z.notes.txt`.
+// Optional — missing or unreadable notes are not an error; we just don't
+// show a What's-new section in the dialog.
+async function readReleaseNotes(updateBase, installerFilename, logLine) {
+    const notesName = installerFilename.replace(/\.exe$/i, '.notes.txt');
+    const notesPath = path.join(updateBase, notesName);
+    try {
+        const stat = await Promise.race([
+            fsp.stat(notesPath),
+            new Promise((_, reject) => setTimeout(
+                () => reject(new Error(`notes stat timeout >${NOTES_READ_TIMEOUT_MS}ms`)),
+                NOTES_READ_TIMEOUT_MS,
+            )),
+        ]);
+        if (!stat.isFile() || stat.size === 0) return null;
+
+        const readBytes = Math.min(stat.size, NOTES_MAX_BYTES);
+        const fh = await fsp.open(notesPath, 'r');
+        let text;
+        try {
+            const buf = Buffer.alloc(readBytes);
+            await fh.read(buf, 0, readBytes, 0);
+            text = buf.toString('utf8');
+        } finally {
+            await fh.close();
+        }
+        // Strip a UTF-8 BOM if the user saved the file as "UTF-8 with BOM".
+        if (text.charCodeAt(0) === 0xfeff) text = text.slice(1);
+        text = text.trim();
+        if (!text) return null;
+        if (stat.size > NOTES_MAX_BYTES) text += '\n…(truncated)';
+        logLine('UPDATER', 'release notes loaded',
+                { path: notesPath, bytes: stat.size });
+        return text;
+    } catch (e) {
+        if (e && e.code !== 'ENOENT') {
+            logLine('UPDATER', 'release notes read failed',
+                    { path: notesPath, err: e.message });
+        }
+        return null;
+    }
+}
+
 async function checkForUpdates({ logLine, mainWindow }) {
     if (_ranOnce) return;
     _ranOnce = true;
@@ -176,16 +228,26 @@ async function checkForUpdates({ logLine, mainWindow }) {
         installer: latest.filename,
     });
 
+    const notesText = await readReleaseNotes(updateBase, latest.filename, logLine);
+    const detailParts = [];
+    if (notesText) {
+        detailParts.push("── What's new in " + latest.version + " ──");
+        detailParts.push(notesText);
+        detailParts.push('');
+    }
+    detailParts.push(
+        'Click "Open Update Folder & Quit" to quit HandQ and open the shared folder. '
+        + 'Copy the installer to your machine and double-click to run it.\n\n'
+        + 'Click "Later" to skip — you will be reminded on next launch.'
+    );
+
     let response;
     try {
         const r = await dialog.showMessageBox(mainWindow, {
             type: 'info',
             title: 'HandQ Update',
             message: `HandQ ${latest.version} is available (current: ${current})`,
-            detail:
-                'Click "Open Update Folder & Quit" to quit HandQ and open the shared folder. '
-                + 'Copy the installer to your machine and double-click to run it.\n\n'
-                + 'Click "Later" to skip — you will be reminded on next launch.',
+            detail: detailParts.join('\n'),
             buttons: ['Open Update Folder & Quit', 'Later'],
             defaultId: 0,
             cancelId: 1,

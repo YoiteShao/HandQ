@@ -231,7 +231,11 @@ class HandQLogger:
                 encoding='utf-8'
             )
             file_handler.setFormatter(formatter_with_line)
-            file_handler.setLevel(logging.DEBUG)
+            # Respect the configured level. Hardcoding DEBUG here used to leak
+            # full third-party DEBUG payloads (openai request bodies, httpx
+            # tracebacks, PIL chunk dumps) into the log file even when the
+            # user set log_level=INFO in handq_config.yaml.
+            file_handler.setLevel(getattr(logging, level.value))
             self.logger.addHandler(file_handler)
 
     def debug(self, message: str, component: str = "") -> None:

@@ -20,6 +20,12 @@ import asyncio
 import logging
 from typing import Any, List, Optional
 
+try:
+    from httpx import ConnectError
+except ImportError:  # httpx is a hard dep of openai; this is just defence
+    class ConnectError(Exception):  # type: ignore[no-redef]
+        pass
+
 from .base import EmbeddingProvider
 
 _logger = logging.getLogger("handq.ltm.embedding.http")
@@ -94,27 +100,72 @@ class HttpApiEmbedder(EmbeddingProvider):
         return out[0] if out else []
 
     async def _call(self, texts: List[str]) -> List[List[float]]:
-        """Single HTTP roundtrip — shared by embed / embed_query."""
+        """Single HTTP roundtrip — shared by embed / embed_query.
+
+        Retry policy: 3 attempts with 2/4/8s exponential backoff. Without
+        this, a transient QGenie failure (cold-start past timeout, brief
+        gateway 5xx) caused the warmup callsite in DreamWorker to swallow
+        the exception and never re-attempt — leaving the chunk permanently
+        missing an embedding until backfill happened to retry. Backfill
+        runs at most every cycle, but it also has no retry, so persistent
+        outages would still leak chunks. Retrying here gives every layer
+        above us a much higher chance of seeing a successful embed.
+        """
         self._ensure_client()
         if self._init_failed or self._client is None:
             raise RuntimeError("HttpApiEmbedder client failed to initialise")
-        try:
-            resp = await self._client.embeddings.create(
-                model=self._model,
-                input=texts,
-            )
-        except Exception:
-            _logger.exception(
-                "embeddings.create failed (model=%s, n=%d)",
-                self._model, len(texts),
-            )
-            raise
-        out = [list(item.embedding) for item in resp.data]
-        if len(out) != len(texts):
-            raise RuntimeError(
-                f"embedding count mismatch: requested {len(texts)}, got {len(out)}"
-            )
-        return out
+        last_exc: Optional[Exception] = None
+        for attempt in range(3):
+            try:
+                resp = await self._client.embeddings.create(
+                    model=self._model,
+                    input=texts,
+                )
+                out = [list(item.embedding) for item in resp.data]
+                if len(out) != len(texts):
+                    raise RuntimeError(
+                        f"embedding count mismatch: requested {len(texts)}, got {len(out)}"
+                    )
+                return out
+            except Exception as exc:
+                last_exc = exc
+                if attempt == 2:
+                    # ConnectError on the final attempt is almost always
+                    # cold-boot network-not-ready (VPN/proxy/DNS still
+                    # warming up — recovers on its own within a few minutes).
+                    # Log as WARNING so it doesn't pollute the ERROR stream;
+                    # recall has already fallen back to BM25 for this query
+                    # and the next dream tick will retry naturally.
+                    is_connect_err = (
+                        isinstance(exc, ConnectError)
+                        or exc.__class__.__name__ in {"ConnectError", "APIConnectionError"}
+                    )
+                    if is_connect_err:
+                        _logger.warning(
+                            "embeddings.create unreachable after %d attempts "
+                            "(model=%s, n=%d): %s — likely cold-boot network "
+                            "not ready; will retry on next tick",
+                            attempt + 1, self._model, len(texts), exc,
+                        )
+                    else:
+                        _logger.exception(
+                            "embeddings.create failed after %d attempts (model=%s, n=%d)",
+                            attempt + 1, self._model, len(texts),
+                        )
+                    raise
+                # 2s, 4s, (no third sleep). Bounded total wait ~6s, still
+                # well under the dream worker's 60s tick.
+                backoff = 2.0 * (2 ** attempt)
+                _logger.warning(
+                    "embeddings.create attempt %d/3 failed (model=%s, n=%d): %s; "
+                    "retrying in %.1fs",
+                    attempt + 1, self._model, len(texts), exc, backoff,
+                )
+                await asyncio.sleep(backoff)
+        # Unreachable: the loop either returns or re-raises.
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("embeddings.create exited retry loop without result")
 
     # ── Lazy SDK init ───────────────────────────────────────────────────────
 
@@ -149,6 +200,12 @@ class HttpApiEmbedder(EmbeddingProvider):
                 base_url=self._endpoint,
                 http_client=self._http,
                 timeout=self._timeout,
+                # AsyncOpenAI defaults to max_retries=2 (3 SDK attempts).
+                # We already wrap _call in our own 3-attempt retry loop, so
+                # without this the real attempt count is 3*3 = 9 per embed
+                # — turning a transient ConnectError into a ~3.5min storm
+                # before bubbling up. Keep retry policy in one layer.
+                max_retries=0,
             )
         except Exception:
             _logger.exception(

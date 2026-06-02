@@ -89,9 +89,11 @@ class Scheduler:
         name: str,
         prompt: str,
         schedule: str,
+        dispatch_prompt: str = "",
     ) -> Dict:
         t = await self._store.create(
             name=name, prompt=prompt, schedule=schedule,
+            dispatch_prompt=dispatch_prompt,
         )
         self._wakeup.set()
         return t.to_dict()

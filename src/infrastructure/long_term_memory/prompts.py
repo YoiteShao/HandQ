@@ -38,17 +38,19 @@ Output a SINGLE JSON object with the schema below. No prose, no markdown fences.
   "worth_memory":     <bool>,
   "worth_knowledge":  <bool>,
 
-  "memory_action":      "create" | "update" | "skip",
+  "memory_action":      "create" | "update" | "archive" | "skip",
   "memory_dimension":   "agentic" | "insight" | null,
   "memory_summary":     "<single line, max 120 chars>",
   "memory_content":     "<markdown body, <=600 chars>",
   "memory_update_id":   "<existing entry id when action=update>" | null,
+  "memory_archive_id":  "<existing entry id when action=archive>" | null,
 
-  "knowledge_action":     "create" | "update" | "skip",
+  "knowledge_action":     "create" | "update" | "archive" | "skip",
   "knowledge_category":   "domain" | "people" | "process" | "coding" | "other" | null,
   "knowledge_summary":    "<single line, max 120 chars>",
   "knowledge_content":    "<markdown body, <=800 chars>",
   "knowledge_update_id":  "<existing entry id when action=update>" | null,
+  "knowledge_archive_id": "<existing entry id when action=archive>" | null,
 
   "reason": "<short reason for both verdicts, max 100 chars>"
 }
@@ -190,18 +192,46 @@ these per-source rules BEFORE the generic KEEP/REJECT logic:
   apply normal KEEP/REJECT logic. Default is reject; promote only when
   there is clear, sustained, or explicit signal.
 
-## Update vs create vs skip
+## Update vs create vs archive vs skip
 
-Three states for each action:
-- "create": Genuinely new content not covered by existing entries.
-- "update": Relates to an existing entry but adds or refines details.
-            Set the corresponding *_update_id to the existing entry's id
-            (visible as [id=xxx] in the existing_* blocks).
-            *_content must be the COMPLETE merged content, not a delta.
-- "skip"  : Pure duplicate, no new information.
+Four states for each action:
+- "create":  Genuinely new content not covered by existing entries.
+- "update":  Relates to an existing entry but adds or refines details.
+             Set the corresponding *_update_id to the existing entry's id
+             (visible as [id=xxx] in the existing_* blocks).
+             *_content must be the COMPLETE merged content, not a delta.
+             This bumps the entry's version — repeated updates mark it
+             as a strongly-held user preference.
+- "archive": The user EXPLICITLY contradicted an existing entry —
+             they said the prior fact is now wrong, no longer applies,
+             or should be removed. Set *_archive_id to the existing
+             entry's id. *_content / *_summary should be empty. This
+             soft-deletes the entry.
+- "skip":    Pure duplicate, no new information.
 
-The corresponding worth_* must be true when action is "create" or "update",
-and false when action is "skip".
+The corresponding worth_* must be true when action is "create",
+"update", or "archive"; false when action is "skip".
+
+### When to use ARCHIVE (strict)
+
+ARCHIVE is reserved for EXPLICIT, UNAMBIGUOUS contradiction with strong
+referential intent. The user must be saying "the existing memory is
+wrong" — not just complaining, not just preferring something else once.
+
+Strong-archive patterns (KEEP archive):
+- "I don't use X anymore" / "stop saying I use X"
+- "我不再用 X 了" / "X 错了，应该是 Y" / "之前那条 X 偏好删了吧"
+- "from now on it's Y, not X" with reference to existing X
+
+Reject-archive patterns (do NOT archive — at most action=skip):
+- "X 这次跑挂了" / "X is broken right now"  — single-incident complaint
+- "X 不太好用" / "X is annoying"            — vague dissatisfaction
+- "考虑下 Y" / "thinking about Y"           — exploration, not commitment
+- "actually let's try Y this time"          — one-off task choice
+
+If the existing_memory / existing_knowledge block doesn't contain a
+candidate for *_archive_id, NEVER fabricate one. ARCHIVE without a
+matching existing id is a parse error → fall back to skip.
 
 ## Style rules for content
 
@@ -426,6 +456,82 @@ Output:
  "knowledge_action": "skip", "knowledge_category": null,
  "knowledge_summary": "", "knowledge_content": "", "knowledge_update_id": null,
  "reason": "one-off task; no reusable convention or fact"}
+
+### Example 11 — activity_observer, observed path is NOT durable signal, REJECT
+
+Source: activity_observer
+Input raw_text:
+  # Activity observation
+  Monitor 1 (Display 1 (1920x1200, primary))
+  Samples: 4
+  ## 14:32 [hot] Code.exe
+  window: HandQ - presentation_v2.html - Visual Studio Code
+  text excerpt:
+  C:\\CodeProject\\HandQ\\presentation\\handq_presentation_v2.html
+  ...HTML markup...
+
+Output:
+{"worth_memory": false, "worth_knowledge": false,
+ "memory_action": "skip", "memory_dimension": null,
+ "memory_summary": "", "memory_content": "", "memory_update_id": null,
+ "knowledge_action": "skip", "knowledge_category": null,
+ "knowledge_summary": "", "knowledge_content": "", "knowledge_update_id": null,
+ "reason": "passive path observation; not a durable preference or reusable fact"}
+
+Reasoning: Seeing a path on screen is NOT evidence of a stable environment
+fact. The user happens to have a file open. Repeated observations of the
+same path across many activity_observer candidates would compound into
+N near-duplicate INSIGHT entries. Reject path-inventory summaries even
+when they look factual — only KEEP when there is a behaviour verb
+("uses pytest -xvs", "runs build via Nuitka") or an explicit preference.
+
+### Example 12 — explicit user contradiction, ARCHIVE existing memory
+
+Input raw_text:
+  [SELF] 我不再用 ruff 了，改用 pyflakes
+
+<existing_memory>
+- [id=abc123] (agentic) prefer ruff over flake8 for linting
+</existing_memory>
+
+Output:
+{"worth_memory": true, "worth_knowledge": false,
+ "memory_action": "archive", "memory_dimension": null,
+ "memory_summary": "", "memory_content": "",
+ "memory_update_id": null, "memory_archive_id": "abc123",
+ "knowledge_action": "skip", "knowledge_category": null,
+ "knowledge_summary": "", "knowledge_content": "", "knowledge_update_id": null,
+ "reason": "explicit contradiction of existing entry; user switched away from ruff"}
+
+Reasoning: The user explicitly stated they no longer use the tool the
+existing entry captures. ARCHIVE removes the now-stale memory; if the
+user later mentions pyflakes as a preference, a fresh CREATE will
+emit on that turn. Don't UPDATE the entry to "prefers pyflakes" — the
+memory's identity is about ruff; the right move is to retire it and
+let a clean new entry form.
+
+### Example 13 — vague dissatisfaction, NOT archive (skip)
+
+Input raw_text:
+  [SELF] ruff 这次跑挂了，烦死了
+
+<existing_memory>
+- [id=abc123] (agentic) prefer ruff over flake8 for linting
+</existing_memory>
+
+Output:
+{"worth_memory": false, "worth_knowledge": false,
+ "memory_action": "skip", "memory_dimension": null,
+ "memory_summary": "", "memory_content": "", "memory_update_id": null,
+ "memory_archive_id": null,
+ "knowledge_action": "skip", "knowledge_category": null,
+ "knowledge_summary": "", "knowledge_content": "", "knowledge_update_id": null,
+ "reason": "single incident complaint, not a preference change"}
+
+Reasoning: Frustration about a single failure is NOT a preference
+contradiction. The user might still prefer ruff overall — they're
+just venting about today's run. ARCHIVE only when the user explicitly
+states the prior preference no longer applies.
 """
 
 
@@ -496,16 +602,18 @@ _VERDICT_EXPECTED_KEYS: List[str] = [
 _VERDICT_SCHEMA = """{
   "worth_memory":     <boolean>,
   "worth_knowledge":  <boolean>,
-  "memory_action":      "create" | "update" | "skip",
+  "memory_action":      "create" | "update" | "archive" | "skip",
   "memory_dimension":   "agentic" | "insight" | null,
   "memory_summary":     "<single line, max 120 chars>",
   "memory_content":     "<markdown body, <=600 chars>",
   "memory_update_id":   "<existing entry id when action=update>" | null,
-  "knowledge_action":     "create" | "update" | "skip",
+  "memory_archive_id":  "<existing entry id when action=archive>" | null,
+  "knowledge_action":     "create" | "update" | "archive" | "skip",
   "knowledge_category":   "domain" | "people" | "process" | "coding" | "other" | null,
   "knowledge_summary":    "<single line, max 120 chars>",
   "knowledge_content":    "<markdown body, <=800 chars>",
   "knowledge_update_id":  "<existing entry id when action=update>" | null,
+  "knowledge_archive_id": "<existing entry id when action=archive>" | null,
   "reason": "<short reason for both verdicts, max 100 chars>"
 }"""
 
@@ -552,11 +660,29 @@ def _coerce_dict_to_verdict(d: dict) -> TriageVerdict:
     k_summary = (d.get("knowledge_summary") or "").strip()
     m_content = (d.get("memory_content") or "").strip()
     k_content = (d.get("knowledge_content") or "").strip()
+    m_archive_id = (d.get("memory_archive_id") or None)
+    k_archive_id = (d.get("knowledge_archive_id") or None)
 
-    if worth_m and not (m_summary and m_content):
+    # ARCHIVE has different validity rules than CREATE/UPDATE:
+    # - summary/content are intentionally empty (we are removing, not writing)
+    # - archive_id MUST be present (we need a target to archive)
+    # - dimension/category may be absent (we don't need to classify a
+    #   removal — we're operating on an existing classified entry)
+    if m_action == VerdictAction.ARCHIVE.value:
+        if not m_archive_id:
+            # LLM emitted archive without a target — fall back to skip
+            # rather than silently corrupt state.
+            m_action = VerdictAction.SKIP.value
+            worth_m = False
+    elif worth_m and not (m_summary and m_content):
         worth_m = False
         m_action = VerdictAction.SKIP.value
-    if worth_k and not (k_summary and k_content):
+
+    if k_action == VerdictAction.ARCHIVE.value:
+        if not k_archive_id:
+            k_action = VerdictAction.SKIP.value
+            worth_k = False
+    elif worth_k and not (k_summary and k_content):
         worth_k = False
         k_action = VerdictAction.SKIP.value
 
@@ -568,11 +694,13 @@ def _coerce_dict_to_verdict(d: dict) -> TriageVerdict:
         memory_summary=m_summary[:120],
         memory_content=m_content[:1200],
         memory_update_id=(d.get("memory_update_id") or None),
+        memory_archive_id=m_archive_id,
         knowledge_action=k_action,
         knowledge_category=k_cat,
         knowledge_summary=k_summary[:120],
         knowledge_content=k_content[:2000],
         knowledge_update_id=(d.get("knowledge_update_id") or None),
+        knowledge_archive_id=k_archive_id,
         reason=(d.get("reason") or "")[:200],
     )
 

@@ -328,10 +328,91 @@ async def _migration_v3(conn) -> None:
             raise
 
 
+# ── v4 ─ correction_proposals + recall_log ──────────────────────────────────
+#
+# correction_proposals generalises ``merge_proposals`` to four kinds:
+# 'archive' / 'rewrite' / 'merge' / 'synthesis'. Produced by the
+# RetriageWorker when a rule_migration audits the existing corpus against
+# the current TRIAGE_SYSTEM. Default behaviour is propose-only — the
+# RetriageWorker auto-applies only the deterministic kinds (e.g. archiving
+# L2-orphan source entries that the synthesis row already supersedes).
+#
+# Staleness: ``target_version`` + ``target_archived`` snapshot the entry's
+# state at proposal time. Apply path re-checks both inside a transaction;
+# if either drifted (DreamWorker updated/archived it concurrently) the
+# proposal flips to status='stale' instead of overwriting.
+#
+# recall_log is a thin append-only ledger of recall hits. Used by the
+# LLM retriage prompt as a priority signal — entries the user actually
+# recalled get their proposals surfaced more prominently rather than
+# auto-suppressed (yansu philosophy: never silently drop user-relevant
+# data; surface it for review).
+_V4_STATEMENTS: List[str] = [
+    """CREATE TABLE IF NOT EXISTS correction_proposals (
+        id              TEXT PRIMARY KEY,
+        kind            TEXT NOT NULL,
+            -- 'archive' | 'rewrite' | 'merge' | 'synthesis'
+        target_kind     TEXT NOT NULL,             -- 'memory' | 'knowledge'
+        target_entry_id TEXT NOT NULL,
+        target_version  INTEGER NOT NULL,          -- staleness snapshot
+        target_archived INTEGER NOT NULL,          -- staleness snapshot
+        payload         TEXT,
+            -- JSON: {new_summary, new_content_md} for rewrite,
+            --       {superseded_by_id} for archive,
+            --       {keep_id} for merge, etc.
+        confidence      REAL,                       -- 0..1, LLM-emitted
+        rule_version    INTEGER NOT NULL,          -- which migration produced this
+        parent_run_id   TEXT,                       -- ties to one RetriageWorker run
+        rationale       TEXT,                       -- PII-scrubbed
+        rationale_pii_scrubbed INTEGER NOT NULL DEFAULT 0,
+        status          TEXT NOT NULL DEFAULT 'pending',
+            -- pending | applied | dismissed | superseded | stale
+        created_at      INTEGER NOT NULL,
+        resolved_at     INTEGER,
+        resolved_by     TEXT
+            -- 'user' | 'auto_deterministic' | 'cli' | 'rule_migration_vN'
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_corr_pending "
+    "ON correction_proposals(status, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_corr_target "
+    "ON correction_proposals(target_kind, target_entry_id, status)",
+    "CREATE INDEX IF NOT EXISTS idx_corr_run "
+    "ON correction_proposals(parent_run_id)",
+    "CREATE INDEX IF NOT EXISTS idx_corr_rule_version "
+    "ON correction_proposals(rule_version, status)",
+
+    # recall_log is intentionally narrow — three columns, two indexes.
+    # Append-only; no FK to entries because the entry may be archived
+    # later and we still want the recall history. Pruning policy lives
+    # in the dream worker (TODO future: drop rows older than 90 days).
+    """CREATE TABLE IF NOT EXISTS recall_log (
+        entry_id    TEXT NOT NULL,
+        kind        TEXT NOT NULL,         -- 'memory' | 'knowledge'
+        recalled_at INTEGER NOT NULL
+    )""",
+    "CREATE INDEX IF NOT EXISTS idx_recall_entry "
+    "ON recall_log(entry_id, recalled_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_recall_time "
+    "ON recall_log(recalled_at DESC)",
+]
+
+
+async def _migration_v4(conn) -> None:
+    """v4: correction_proposals (generalised merge_proposals) + recall_log.
+
+    merge_proposals is preserved as-is for one release cycle so existing
+    scan history isn't lost; future migration will copy 'merge' kind
+    rows in and deprecate the old table.
+    """
+    for stmt in _V4_STATEMENTS:
+        await conn.execute(stmt)
+
+
 # Ordered list — index N -> migration_v(N+1). New migrations append; never edit
 # in place once shipped (would silently desync existing user databases).
 MIGRATIONS: List[Callable[[object], Awaitable[None]]] = [
     _migration_v1,
     _migration_v2,
     _migration_v3,
+    _migration_v4,
 ]

@@ -768,56 +768,33 @@ html, body {
 .activity-strip .activity-gauge {
     flex: 0 0 auto;
     display: inline-flex;
-    align-items: flex-end;
-    gap: 1.5px;
-    height: 14px;
-    width: 18px;
-    /* Soft white halo preserved from the previous dot so the gauge sits
-       cleanly on the strip's neutral background regardless of theme. */
-    padding: 0 1px;
+    align-items: baseline;
+    gap: 4px;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    line-height: 1;
+    /* Block characters look chunky/pixelated by intent. Disable smoothing
+       and ligatures so the sparkline reads as discrete cells. */
+    -webkit-font-smoothing: none;
+    -moz-osx-font-smoothing: grayscale;
+    font-feature-settings: 'liga' 0, 'calt' 0;
+    color: #4a4f58;
 }
-.activity-strip .ag-bar {
-    width: 2px;
-    background: #c9cdd5;
-    border-radius: 1px;
-    transition: background 200ms ease, height 160ms ease, opacity 160ms ease;
-    opacity: 0.55;
-    height: 0;
+/* Sparkline of the last 5 confidence values, encoded as ▁..█. Reserve
+   5ch so the strip doesn't shift width as the rolling history fills. */
+.activity-strip .ag-spark {
+    display: inline-block;
+    min-width: 5ch;
+    letter-spacing: 0;
+    white-space: pre;
 }
-/* Bars without a corresponding step in the history are fully hidden but
-   keep their layout slot so the rolling history slides in from the right. */
-.activity-strip .ag-bar:not(.ag-on) {
-    visibility: hidden;
-}
-
-/* Coloring is per-bar — each bar reflects its own step's confidence.
-     low  (≤0.4)         → red
-     mid  (≤confThr)     → amber
-     high (>confThr)     → green
-   Tier classes are set by JS in _renderGauge() each time a step_confidence
-   event arrives. */
-.activity-strip .ag-bar.ag-on {
-    opacity: 1;
-    visibility: visible;
-}
-.activity-strip .ag-bar.ag-tier-low  { background: #d97a7a; }
-.activity-strip .ag-bar.ag-tier-mid  { background: #9aa0ad; }
-.activity-strip .ag-bar.ag-tier-high { background: #9b87d4; }
-/* Default fallback — neutral blue if a bar is .ag-on but somehow has no
-   tier class (defensive only). */
-.activity-strip .ag-bar.ag-on:not(.ag-tier-low):not(.ag-tier-mid):not(.ag-tier-high) {
-    background: #9b87d4;
-}
-
-/* Live pulse on the brightest lit bar — single-bar pulse beats the
-   old whole-dot pulse: cheaper and stays out of the gauge's way. */
-.activity-strip.live .ag-bar.ag-on:last-of-type {
-    animation: gauge-pulse 1.6s ease-out infinite;
-}
-@keyframes gauge-pulse {
-    0%   { box-shadow: 0 0 0 0 rgba(155, 130, 200, 0.55); }
-    70%  { box-shadow: 0 0 0 4px rgba(155, 130, 200, 0); }
-    100% { box-shadow: 0 0 0 0 rgba(155, 130, 200, 0); }
+/* Latest confidence as 0–100 integer, monospaced for stable width. */
+.activity-strip .ag-num {
+    display: inline-block;
+    min-width: 2ch;
+    text-align: right;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
 }
 
 .activity-strip .activity-current {
@@ -851,9 +828,9 @@ html, body {
     border-color: rgba(0, 0, 0, 0.10);
     font-weight: 600;
 }
-/* When the task completes the strip turns green, but each bar keeps its
-   own per-step tier color — the gauge is meant to be a *history* of
-   confidences, not a "task succeeded" stamp. */
+/* When the task completes the strip turns slightly darker, but the gauge
+   itself stays grayscale — the sparkline is a *history* of confidences,
+   not a "task succeeded" stamp. */
 
 /* ---------- Activity popover — opaque neutral white ---------- */
 

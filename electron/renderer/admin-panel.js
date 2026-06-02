@@ -45,7 +45,10 @@
             }, 30000);
             pending.get(id)._tmr = tmr;
             try {
-                window.handq.sendRequest(Object.assign({ type, id }, payload || {}));
+                // Merge envelope fields LAST so a caller's payload can never
+                // shadow `type`/`id` — clobbering `id` strands the response
+                // (bridge replies under the wrong correlation key, RPC times out).
+                window.handq.sendRequest(Object.assign({}, payload || {}, { type, id }));
             } catch (err) {
                 clearTimeout(tmr);
                 pending.delete(id);
@@ -354,6 +357,24 @@
             .toISOString().slice(0, 19).replace('T', ' ');
     }
 
+    // Schedule strings starting with "once" are one-shot. After they
+    // fire the store flips `enabled` to false — but "(disabled)" reads
+    // like the user disabled it, while really the task ran and is done.
+    // Render "(completed)" / "(failed)" instead so users aren't
+    // confused about whether to re-enable.
+    function isOneShotSchedule(schedule) {
+        return typeof schedule === 'string'
+            && schedule.trim().toLowerCase().startsWith('once');
+    }
+    function nameSuffix(t) {
+        if (t.enabled) return '';
+        if (isOneShotSchedule(t.schedule)) {
+            if (t.last_status === 'ok') return ' (completed)';
+            if (t.last_status === 'failed') return ' (failed)';
+        }
+        return ' (disabled)';
+    }
+
     function renderScheduleList(tasks) {
         schedList.innerHTML = '';
         if (!tasks.length) {
@@ -374,7 +395,7 @@
             head.className = 'sched-list-row';
             const nameSpan = document.createElement('span');
             nameSpan.className = 'sched-list-name';
-            nameSpan.textContent = t.name + (t.enabled ? '' : ' (disabled)');
+            nameSpan.textContent = t.name + nameSuffix(t);
             const scheduleSpan = document.createElement('span');
             scheduleSpan.className = 'sched-list-schedule';
             scheduleSpan.textContent = t.schedule;
@@ -410,8 +431,7 @@
         schedDeleteBtn.disabled = false;
         schedDetailEmpty.classList.add('hidden');
         schedDetail.classList.remove('hidden');
-        schedDetailName.textContent =
-            t.name + (t.enabled ? '' : ' (disabled)');
+        schedDetailName.textContent = t.name + nameSuffix(t);
         schedDetailSchedule.textContent = t.schedule;
         const statusInfo = mapSchedStatus(t.last_status);
         schedDetailStatus.textContent = statusInfo.label;
@@ -444,31 +464,94 @@
         deleteSched(selectedTaskId);
     });
 
+    // Action buttons stay enabled while the RPC is in flight by
+    // default — but the bridge can take a few hundred ms (and longer
+    // if it's mid-flow), during which the row visibly didn't change.
+    // We use this helper to grey out the trio so the user sees that
+    // their click registered and isn't tempted to click again.
+    function setSchedActionsBusy(busy) {
+        const disabled = !!busy;
+        schedDetailRun.disabled = disabled;
+        schedDetailToggle.disabled = disabled;
+        // Delete button is also disabled-when-no-selection; only flip
+        // it if a selection exists, so we don't accidentally enable it
+        // during a busy state with no selected task.
+        if (selectedTaskId) schedDeleteBtn.disabled = disabled;
+    }
+
     async function runSchedNow(id) {
+        setSchedActionsBusy(true);
+        // Optimistic: flip the local row to running so the user sees
+        // their click land before the next cron_list refresh.
+        const local = allTasks.find(x => x.id === id);
+        if (local) {
+            local.last_status = 'running';
+            renderScheduleList(allTasks);
+            renderSelectedDetail();
+        }
         try {
-            await rpc('cron_run_now', { id });
+            await rpc('cron_run_now', { task_id: id });
             showSchedToast('triggered');
-            refreshSchedules();
         } catch (err) {
             showSchedToast('run failed: ' + err.message, 'error');
+        } finally {
+            setSchedActionsBusy(false);
+            // Pull truth — restores correct state if the optimistic
+            // flip was wrong (e.g. bridge was busy and refused).
+            refreshSchedules();
         }
     }
     async function setSchedEnabled(id, enabled) {
+        setSchedActionsBusy(true);
+        // Optimistic flip so the toggle button label and "(disabled)"
+        // suffix update immediately, not after the round-trip.
+        const local = allTasks.find(x => x.id === id);
+        const previousEnabled = local ? local.enabled : null;
+        if (local) {
+            local.enabled = enabled;
+            renderScheduleList(allTasks);
+            renderSelectedDetail();
+        }
         try {
-            await rpc('cron_set_enabled', { id, enabled });
-            refreshSchedules();
+            await rpc('cron_set_enabled', { task_id: id, enabled });
+            showSchedToast(enabled ? 'enabled' : 'disabled');
         } catch (err) {
+            // Rollback the optimistic flip — refreshSchedules below
+            // will overwrite anyway, but rolling back synchronously
+            // keeps the UI consistent if the refresh is slow too.
+            if (local && previousEnabled !== null) {
+                local.enabled = previousEnabled;
+                renderScheduleList(allTasks);
+                renderSelectedDetail();
+            }
             showSchedToast('toggle failed: ' + err.message, 'error');
+        } finally {
+            setSchedActionsBusy(false);
+            refreshSchedules();
         }
     }
     async function deleteSched(id) {
         if (!confirm('Delete this scheduled task?')) return;
+        setSchedActionsBusy(true);
+        // Optimistic remove. If the RPC fails, refreshSchedules below
+        // re-pulls and the row reappears.
+        const previousTasks = allTasks;
+        allTasks = allTasks.filter(x => x.id !== id);
+        if (id === selectedTaskId) selectedTaskId = null;
+        renderScheduleList(allTasks);
+        renderSelectedDetail();
         try {
-            await rpc('cron_delete', { id });
-            if (id === selectedTaskId) selectedTaskId = null;
-            refreshSchedules();
+            await rpc('cron_delete', { task_id: id });
+            showSchedToast('deleted');
         } catch (err) {
+            // Rollback so the row reappears immediately.
+            allTasks = previousTasks;
+            renderScheduleList(allTasks);
+            renderSelectedDetail();
             showSchedToast('delete failed: ' + err.message, 'error');
+        } finally {
+            setSchedActionsBusy(false);
+            refreshSchedules();
         }
     }
 

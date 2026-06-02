@@ -81,6 +81,15 @@ DREAM_BATCH_SIZE: int = 8
 DREAM_MAX_RETRY: int = 5
 DREAM_STUCK_SECONDS: int = 300
 
+# How many batched candidates the dream worker triages concurrently per
+# cycle. Each _triage_one is a helper-LLM round-trip + a few SQLite
+# writes; serially that's ~5-30s per candidate, so a bursty 8-candidate
+# batch could tie up the worker for minutes. Capping concurrent fan-out
+# at 3 cuts batch time without overwhelming the helper LLM's per-key
+# rate limit (most receptionist-tier providers tolerate single-digit
+# concurrency comfortably).
+DREAM_TRIAGE_CONCURRENCY: int = 3
+
 # Adaptive idle backoff. The worker's loop interval doubles on every
 # empty cycle (no pending candidates) up to ``DREAM_INTERVAL_MAX_SEC``,
 # and snaps back to ``DREAM_INTERVAL_MIN_SEC`` the moment work appears.
@@ -102,12 +111,25 @@ DREAM_INTERVAL_MAX_SEC: float = 3600.0
 # How many missing-embedding chunks the dream worker backfills:
 #   - DREAM_BACKFILL_STARTUP : on first loop iteration (catch up legacy data)
 #   - DREAM_BACKFILL_CYCLE   : on every subsequent cycle (steady-state trickle)
+#
+# CYCLE was 10 originally; raised to 50 after a real-world incident where
+# a multi-hour QGenie outage left ~30% of new chunks without embeddings,
+# and 10/cycle could not catch up before the worker backed off to long
+# idle intervals. 50 still fits in one /v1/embeddings batch round-trip.
 DREAM_BACKFILL_STARTUP: int = 50
-DREAM_BACKFILL_CYCLE: int = 10
+DREAM_BACKFILL_CYCLE: int = 50
 
 # Sleep-on-error before resuming the main loop. Higher than the normal
 # interval so a persistent failure doesn't spam logs.
 DREAM_ERROR_SLEEP_SECONDS: int = 30
+
+# Delay between bridge boot and the first embedding warmup. On a cold-
+# booted laptop the corporate VPN / proxy / DNS often need 30-60s to
+# come up; firing the warmup batch at boot+2s used to burn ~3.5min of
+# retries against ConnectError before the network was reachable. A short
+# upfront sleep gives the network a quiet window and turns "every cold
+# boot logs an ERROR" into "first tick succeeds cleanly".
+DREAM_STARTUP_DELAY_SECONDS: int = 30
 
 # ── Merge / exact-group scanner ──────────────────────────────────────────
 #
@@ -126,9 +148,9 @@ DREAM_ERROR_SLEEP_SECONDS: int = 30
 #   - EXACT  (>= MERGE_EXACT_THRESHOLD)   : auto-merge, archive older
 #   - PROPOSE(>= MERGE_PROPOSE_THRESHOLD) : write to merge_proposals,
 #                                            surface to user for review
-MERGE_SCAN_EVERY_N_CYCLES: int = 60         # 60 × 60s = once per hour
-MERGE_EXACT_THRESHOLD: float = 0.95          # auto-merge bar
-MERGE_PROPOSE_THRESHOLD: float = 0.85        # propose bar (< exact)
+MERGE_SCAN_EVERY_N_CYCLES: int = 15         # 15 × 60s = once per 15min
+MERGE_EXACT_THRESHOLD: float = 0.90          # auto-merge bar
+MERGE_PROPOSE_THRESHOLD: float = 0.78        # propose bar (< exact)
 MERGE_MIN_PAIR_AGE_SECONDS: int = 300        # don't dedup same-batch entries
 
 
@@ -435,6 +457,14 @@ ACTIVITY_OCR_EXCERPT_MAX_CHARS: int = 600    # how much OCR text we keep
 ACTIVITY_BUFFER_FLUSH_AFTER_N: int = 8
 ACTIVITY_BUFFER_FLUSH_AFTER_SEC: int = 600   # 10 min
 
+# Per-monitor history of accepted OCR texts. Used by the dedup gate so a
+# brief alt-tab to a different window doesn't make the original screen
+# look "novel" again on its next capture (which would re-forward an
+# already-known window into LTM as a fresh activity_observer candidate).
+# Set to 8 so a typical Mon→Tue alt-tab pattern stays inside the ring;
+# bigger values suppress legitimate context shifts.
+ACTIVITY_TEXT_HISTORY_SIZE: int = 8
+
 # ── Daily-summary cadence ──────────────────────────────────────────────────
 #
 # Once per day we emit a single ACTIVITY_OBSERVER candidate that summarises
@@ -516,3 +546,59 @@ SCHEDULER_TASK_TIMEOUT_SEC: int = 1800
 # We hard-code "skip" as the only safe default; "kill" would require
 # explicit user opt-in per task.
 SCHEDULER_BUSY_POLICY: str = "skip"
+
+
+# ── 13. Correction pipeline (retroactive memory hygiene) ────────────────────
+#
+# When a triage rule changes between releases, existing entries that were
+# accepted under the OLD rule won't get re-evaluated unless we ship a
+# data-hygiene migration. The :class:`RetriageWorker` runs once per
+# rule_version bump and produces ``correction_proposals`` rows; only the
+# DETERMINISTIC subset is auto-applied — judgment calls accumulate as
+# proposals for explicit review (yansu philosophy: "automatic capture is
+# one-sided, automatic forgetting needs mutual consent").
+#
+# Tier semantics:
+#   - DETERMINISTIC : math says it; no judgment. Auto-apply.
+#                     (e.g. archive an L2 source whose synthesis row already
+#                      cites it; archive an exact-hash duplicate)
+#   - HIGH_CONF     : LLM emitted confidence ≥ 0.95. Off by default —
+#                     opt-in for users who trust the audit pipeline.
+#   - PROPOSAL_ONLY : everything else. Surfaced via IPC, applied only on
+#                     explicit user / admin action.
+CORRECTION_TIER_DETERMINISTIC: str = "deterministic"
+CORRECTION_TIER_HIGH_CONF: str = "high_conf"
+CORRECTION_TIER_PROPOSAL_ONLY: str = "proposal_only"
+
+# Default policy: auto-apply both deterministic AND high-confidence LLM
+# proposals. Tightening to PROPOSAL_ONLY restores the strict "every
+# correction needs review" mode; loosening to a lower CORRECTION_HIGH_CONF_FLOOR
+# (e.g. 0.80) trades more silent cleanup for more potential mis-archives —
+# both are recoverable via 'correction restore --reason-prefix correction_v*_'.
+CORRECTION_AUTO_APPLY_TIER: str = CORRECTION_TIER_HIGH_CONF
+
+# Confidence floor for HIGH_CONF tier auto-apply. 0.80 is empirically
+# calibrated against the v3 LLM audit: LLM judgments on clear-cut path
+# inventory entries cluster at 0.82, so 0.85 was just-too-strict and
+# left nearly all "obviously deletable" proposals stranded. 0.80 catches
+# the natural cluster while still excluding LLM uncertainty (most
+# judgment-call entries land 0.65–0.75). Mis-archive remains recoverable
+# via 'correction restore --reason-prefix correction_v*_'.
+CORRECTION_HIGH_CONF_FLOOR: float = 0.80
+
+# How many entries the LLM-retriage path commits progress every N entries.
+# Smaller = more SQLite writes but tighter resume granularity after crash.
+CORRECTION_RETRIAGE_CHECKPOINT_EVERY: int = 20
+
+# Recall priority window: entries recalled within this many days are
+# tagged "actively used" in the LLM retriage prompt. Yansu philosophy
+# inversion — frequently-used entries are NOT silently protected from
+# archive; instead their proposals get a "high-priority review" badge so
+# the user actively decides. Default 30d covers a normal sprint cadence.
+CORRECTION_RECALL_PRIORITY_DAYS: int = 30
+
+# Which LLM tier the RetriageWorker uses for the LLM-based audit migration.
+# User asked for the strongest model regardless of cost — agent tier hits
+# the same pool the planner uses, which is the highest-quality tier
+# available to the bridge.
+CORRECTION_RETRIAGE_LLM_TIER: str = "agent"

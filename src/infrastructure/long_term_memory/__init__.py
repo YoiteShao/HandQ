@@ -66,7 +66,9 @@ from .recall import (
     recall_knowledge_impl,
     recall_memory_impl,
 )
+from .recall_logger import RecallLogger
 from .reranker import Reranker, from_config as _reranker_from_config
+from .retriage_worker import RetriageWorker
 from .store import SQLiteStore
 from .triage import DreamWorker
 
@@ -109,6 +111,7 @@ class LongTermMemory:
         self._pii = pii_filter
         self._config = config
         self._dream_task: Optional[asyncio.Task] = None
+        self._retriage_task: Optional[asyncio.Task] = None
 
     # ── Lifecycle ───────────────────────────────────────────────────────────
 
@@ -150,6 +153,22 @@ class LongTermMemory:
         )
         ltm._dream_task = asyncio.create_task(worker.run(), name="ltm-dream")
 
+        # Spawn the one-shot RetriageWorker. It exits as soon as
+        # triage_rules_version reaches the head of RULE_MIGRATIONS, so
+        # there's no long-lived task to manage on the steady-state path.
+        # We share the dream worker's helper LLM pool resolution by
+        # constructing it lazily on first run (see RetriageWorker).
+        retriage_helper_services = await _resolve_retriage_helpers(cfg)
+        retriage = RetriageWorker(
+            store=store,
+            llm_services=retriage_helper_services,
+            pii_filter=pii,
+            config=cfg,
+        )
+        ltm._retriage_task = asyncio.create_task(
+            retriage.run(), name="ltm-retriage",
+        )
+
         cls._instance = ltm
         _logger.info(
             "LongTermMemory initialised: db=%s embedder=%s reranker=%s",
@@ -188,6 +207,32 @@ class LongTermMemory:
                 )
             except Exception:
                 _logger.exception("dream task shutdown error")
+        if self._retriage_task and not self._retriage_task.done():
+            # RetriageWorker is one-shot but may still be mid-LLM call
+            # at shutdown time. Cancel + bounded wait, same envelope as
+            # the dream task. Pending proposals it already wrote stay
+            # in the DB (committed); on next startup the migration
+            # picks up where it left off via retriage_progress_v{N}.
+            self._retriage_task.cancel()
+            try:
+                await asyncio.wait_for(self._retriage_task, timeout=5.0)
+            except asyncio.CancelledError:
+                pass
+            except asyncio.TimeoutError:
+                _logger.warning(
+                    "retriage task did not finish within 5s of cancel; "
+                    "leaving as background"
+                )
+            except Exception:
+                _logger.exception("retriage task shutdown error")
+        # Final flush of recall_log buffer so the very last few hits
+        # (between the dream tick and shutdown) aren't lost.
+        try:
+            n = await RecallLogger.get().flush(self._store)
+            if n:
+                _logger.info("shutdown: flushed %d recall_log rows", n)
+        except Exception:
+            _logger.exception("recall_log final flush error")
         # If the embedder holds an open httpx client (HttpApiEmbedder),
         # close it so the bridge exits cleanly. Other providers ignore.
         aclose = getattr(self._embedder, "aclose", None)
@@ -463,3 +508,42 @@ def _load_config(path: Path) -> dict:
     except Exception:
         _logger.exception("failed to read config %s; LTM running with defaults", path)
         return {}
+
+
+async def _resolve_retriage_helpers(cfg: dict) -> List:
+    """Build the LLM service list for the RetriageWorker.
+
+    Independent of DreamWorker's helper pool because the two have
+    different quality bars: DreamWorker's triage is per-candidate noise
+    classification (receptionist-tier OK), while retriage re-judges
+    durable entries that the user has been living with — we want the
+    strongest model the bridge has.
+
+    Tier choice driven by ``CORRECTION_RETRIAGE_LLM_TIER`` (defaults to
+    "agent"). Returns ``[]`` on missing API_KEY / config so the worker's
+    LLM-based migrations halt the chain rather than silently no-op.
+    """
+    try:
+        from src.infrastructure.role_resolver import resolve_role_models
+        from src.infrastructure.anthropic_streaming_service import (
+            AnthropicStreamingService,
+        )
+    except Exception:
+        _logger.exception("retriage: failed to import LLM stack")
+        return []
+    llm_cfg = cfg.get("llm") or {}
+    api_key = llm_cfg.get("API_KEY")
+    if not api_key:
+        _logger.warning("retriage: llm.API_KEY missing; LLM migrations will halt")
+        return []
+    roles = resolve_role_models(llm_cfg)
+    models = list(roles.get(C.CORRECTION_RETRIAGE_LLM_TIER) or [])
+    if not models:
+        _logger.warning(
+            "retriage: tier=%s has no models; LLM migrations will halt",
+            C.CORRECTION_RETRIAGE_LLM_TIER,
+        )
+        return []
+    return [
+        AnthropicStreamingService(model=m, api_key=api_key) for m in models
+    ]

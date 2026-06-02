@@ -103,6 +103,54 @@ def _looks_structured(text: str) -> bool:
     return False
 
 
+# Path-fragment regex used by the activity_observer guard. Catches the
+# common "I saw VSCode showing C:\foo\bar" type summaries that the LLM
+# kept proposing as INSIGHT memory. Matches: drive-letter Windows paths,
+# /Local/... POSIX-ish paths, and any backslash-heavy fragment.
+import re as _re  # local import to keep top-of-file imports unchanged
+_PATH_FRAGMENT_RE = _re.compile(
+    r"(?:[A-Za-z]:[\\/][\w./\\\-]+|/[Ll]ocal/[\w./\\\-]+|[\w\-]+[\\/][\w\-]+[\\/][\w\-]+)"
+)
+# A summary is "path inventory" when path tokens cover most of its
+# characters AND no preference / behaviour verb is present. Tuned
+# against real data — see the rejected entries listed in the v1.0 LTM
+# postmortem ("HandQ project at C:\CodeProject\HandQ" etc.).
+_PATH_COVERAGE_BAR: float = 0.35
+_BEHAVIOUR_VERBS_EN = (
+    "use", "uses", "prefer", "prefers", "always", "never",
+    "lint", "test", "deploy", "run", "skip", "switch",
+)
+
+
+def _is_path_inventory(summary: str) -> bool:
+    """True iff *summary* is mostly file-path tokens with no behaviour signal.
+
+    Activity_observer keeps producing entries like
+    ``"HandQ project at C:\\CodeProject\\HandQ"`` — the LLM saw a path,
+    decided it was an "insight", but a passively-observed path is not a
+    durable signal (the user just had VSCode open). Guard rejects the
+    entry rather than letting it pollute injection context.
+
+    Behaviour verbs ("uses ... for X", "always run Y") earn the entry
+    a pass even if it also names a path — those carry real preference
+    signal beyond the path itself.
+    """
+    s = (summary or "").strip()
+    if not s:
+        return False
+    matches = _PATH_FRAGMENT_RE.findall(s)
+    if not matches:
+        return False
+    covered = sum(len(m) for m in matches)
+    coverage = covered / max(len(s), 1)
+    if coverage < _PATH_COVERAGE_BAR:
+        return False
+    lower = s.lower()
+    if any(v in lower for v in _BEHAVIOUR_VERBS_EN):
+        return False
+    return True
+
+
 def _user_handq_root() -> Path:
     """Mirror of bridge_main._user_handq_root (kept private here so the
     triage module doesn't import from bridge_main)."""
@@ -212,6 +260,16 @@ class DreamWorker:
             self._loop_interval, self._batch_size, self._max_retry,
         )
 
+        # Cold-boot network-not-ready window. On a freshly-booted laptop
+        # the corporate VPN / proxy / DNS commonly need 30-60s before
+        # qgenie-api.qualcomm.com becomes reachable. Without this delay
+        # the first warmup ran at boot+2s and ate the full embedder retry
+        # budget (~3.5min of ConnectError) before the network came up.
+        try:
+            await asyncio.sleep(C.DREAM_STARTUP_DELAY_SECONDS)
+        except asyncio.CancelledError:
+            return
+
         # Startup: backfill embeddings for any chunks that lack them.
         # Recovers from old dbs (entries inserted before P2 / when the
         # embedder was unavailable) and from inline warmup failures. Bounded
@@ -231,11 +289,23 @@ class DreamWorker:
                 if resetn:
                     _logger.info("reset %d stuck triaging candidates", resetn)
                 cands = await self._store.next_pending_candidates(self._batch_size)
-                for c in cands:
-                    try:
-                        await self._triage_one(c)
-                    except Exception:
-                        _logger.exception("triage failed cid=%s", c.id)
+                if cands:
+                    # Process the batch concurrently with a small semaphore so
+                    # we don't slam the helper LLM. Bounded fanout (3) keeps
+                    # the LLM-side load tame while still cutting total batch
+                    # time roughly 3x vs the previous strict serial loop —
+                    # which was a real bottleneck when activity_observer
+                    # produced bursts faster than 1 candidate / 5-30s.
+                    sem = asyncio.Semaphore(C.DREAM_TRIAGE_CONCURRENCY)
+
+                    async def _guarded(cand):
+                        async with sem:
+                            try:
+                                await self._triage_one(cand)
+                            except Exception:
+                                _logger.exception("triage failed cid=%s", cand.id)
+
+                    await asyncio.gather(*(_guarded(c) for c in cands))
                 # Adaptive interval update: snap back to MIN whenever we
                 # found work; otherwise grow geometrically up to MAX.
                 if cands:
@@ -260,6 +330,15 @@ class DreamWorker:
                 # trickle of new entries with failed inline warmup get
                 # caught up without spiking helper-LLM cost.
                 await self._backfill_embeddings(max_per_kind=C.DREAM_BACKFILL_CYCLE)
+                # Drain the recall_log in-memory deque on the same tick.
+                # We hold the write lock anyway during this cycle's other
+                # writes, so flushing here costs nothing extra and keeps
+                # the recall hot path lock-free.
+                try:
+                    from .recall_logger import RecallLogger
+                    await RecallLogger.get().flush(self._store)
+                except Exception:
+                    _logger.exception("recall_log flush failed; will retry next cycle")
                 # Periodic post-hoc dedup. Every Nth cycle so the scan cost
                 # is amortised; the dedup itself is cheap (pairwise cosine
                 # over cached embeddings — no LLM calls).
@@ -419,6 +498,50 @@ class DreamWorker:
                 verdict.reason + " | guard:activity_no_agentic_memory"
             )[:200]
 
+        # Defensive guard: ACTIVITY_OBSERVER INSIGHT memories that are just
+        # path inventories ("HandQ project at C:\\CodeProject\\HandQ") are
+        # not durable signals — they're "the user happens to have VSCode
+        # open right now". Rejecting them keeps INSIGHT memory focused on
+        # actual environment facts ("primary OS is Windows 11", "uses ssh
+        # for remote") rather than a transient set of opened folders.
+        if (
+            c.source == CandidateSource.ACTIVITY_OBSERVER.value
+            and verdict.worth_memory
+            and verdict.memory_dimension == MemoryDimension.INSIGHT
+            and _is_path_inventory(verdict.memory_summary)
+        ):
+            verdict.worth_memory = False
+            verdict.memory_action = VerdictAction.SKIP.value
+            verdict.memory_dimension = None
+            verdict.reason = (
+                verdict.reason + " | guard:activity_path_inventory"
+            )[:200]
+
+        # Defensive guard: ARCHIVE is destructive. Only direct user channels
+        # may archive existing entries — observation / batched derivations
+        # are NOT consent. Without this guard, an activity_observer OCR
+        # capture that happens to contain "stopped using X" prose would
+        # archive a real preference based on environmental noise.
+        _archive_allowed = c.source in (
+            CandidateSource.RECEPTIONIST_TURN.value,
+            CandidateSource.MANUAL_REMEMBER.value,
+        )
+        if not _archive_allowed:
+            if verdict.memory_action == VerdictAction.ARCHIVE.value:
+                verdict.memory_action = VerdictAction.SKIP.value
+                verdict.memory_archive_id = None
+                verdict.worth_memory = False
+                verdict.reason = (
+                    verdict.reason + " | guard:archive_only_from_user_channels"
+                )[:200]
+            if verdict.knowledge_action == VerdictAction.ARCHIVE.value:
+                verdict.knowledge_action = VerdictAction.SKIP.value
+                verdict.knowledge_archive_id = None
+                verdict.worth_knowledge = False
+                verdict.reason = (
+                    verdict.reason + " | guard:archive_only_from_user_channels"
+                )[:200]
+
         wrote_mem = wrote_kn = False
         if verdict.worth_memory:
             try:
@@ -446,15 +569,49 @@ class DreamWorker:
         )
 
     async def _apply_memory(self, c: Candidate, v: TriageVerdict) -> None:
+        # ARCHIVE: user explicitly contradicted an existing memory entry.
+        # Soft-archive with a reason that the retroactive correction CLI
+        # can target (`correction_v0_user_contradicted` — v0 because this
+        # is live triage, not a rule_migration). No content to write.
+        if v.memory_action == VerdictAction.ARCHIVE.value and v.memory_archive_id:
+            try:
+                await self._store.archive_memory_entry(
+                    v.memory_archive_id,
+                    reason="user_contradicted",
+                )
+                _logger.info(
+                    "triage archived memory cid=%s entry=%s reason=user_contradicted",
+                    c.id[:8], v.memory_archive_id[:8],
+                )
+            except Exception:
+                _logger.exception(
+                    "archive_memory_entry failed cid=%s entry=%s",
+                    c.id, v.memory_archive_id,
+                )
+                raise
+            return
         if not v.memory_dimension:
             return
+        # UPDATE with a hallucinated id is a real failure mode: the LLM
+        # sometimes invents a UUID that looks like one of the existing
+        # ids in the prompt. Validate the id exists before committing;
+        # if it doesn't, fall back to CREATE so we don't lose the
+        # extracted signal. The candidate's content is already in
+        # v.memory_content, so a CREATE keeps the user's preference.
         if v.memory_action == VerdictAction.UPDATE.value and v.memory_update_id:
-            await self._store.update_memory_entry(
-                v.memory_update_id,
-                new_summary=v.memory_summary,
-                new_content=v.memory_content,
+            existing = await self._store.get_memory_entry_full(v.memory_update_id)
+            if existing is not None:
+                await self._store.update_memory_entry(
+                    v.memory_update_id,
+                    new_summary=v.memory_summary,
+                    new_content=v.memory_content,
+                )
+                return
+            _logger.info(
+                "triage memory UPDATE id=%s not found; falling back to CREATE cid=%s",
+                v.memory_update_id[:8], c.id[:8],
             )
-            return
+            # fall through to insert path
         entry_id = await self._store.insert_memory_entry(
             dimension=v.memory_dimension,
             summary=v.memory_summary,
@@ -539,15 +696,43 @@ class DreamWorker:
         )
 
     async def _apply_knowledge(self, c: Candidate, v: TriageVerdict) -> None:
+        # ARCHIVE: user explicitly contradicted an existing knowledge entry.
+        if v.knowledge_action == VerdictAction.ARCHIVE.value and v.knowledge_archive_id:
+            try:
+                await self._store.archive_knowledge_entry(
+                    v.knowledge_archive_id,
+                    reason="user_contradicted",
+                )
+                _logger.info(
+                    "triage archived knowledge cid=%s entry=%s reason=user_contradicted",
+                    c.id[:8], v.knowledge_archive_id[:8],
+                )
+            except Exception:
+                _logger.exception(
+                    "archive_knowledge_entry failed cid=%s entry=%s",
+                    c.id, v.knowledge_archive_id,
+                )
+                raise
+            return
         if not v.knowledge_category:
             return
+        # UPDATE-with-hallucinated-id fallback (see _apply_memory for
+        # rationale). Validate the target exists; if not, CREATE instead
+        # so the LLM's extracted signal isn't dropped.
         if v.knowledge_action == VerdictAction.UPDATE.value and v.knowledge_update_id:
-            await self._store.update_knowledge_entry(
-                v.knowledge_update_id,
-                new_summary=v.knowledge_summary,
-                new_content=v.knowledge_content,
+            existing = await self._store.get_knowledge_entry_full(v.knowledge_update_id)
+            if existing is not None:
+                await self._store.update_knowledge_entry(
+                    v.knowledge_update_id,
+                    new_summary=v.knowledge_summary,
+                    new_content=v.knowledge_content,
+                )
+                return
+            _logger.info(
+                "triage knowledge UPDATE id=%s not found; falling back to CREATE cid=%s",
+                v.knowledge_update_id[:8], c.id[:8],
             )
-            return
+            # fall through to insert path
         entry_id = await self._store.insert_knowledge_entry(
             category=v.knowledge_category,
             summary=v.knowledge_summary,
@@ -1241,7 +1426,7 @@ class DreamWorker:
             )
             return False
 
-        await self._store.insert_synthesis_entry(
+        synth_id = await self._store.insert_synthesis_entry(
             kind=kind,
             target_facet=facet,
             summary=verdict["summary"],
@@ -1250,6 +1435,33 @@ class DreamWorker:
             source_entry_ids=[it["id"] for it in cluster],
             source_run_id=run_id,
         )
+        # Archive the source entries that the synthesis subsumed.
+        # Without this, recall returns BOTH the cluster originals AND the
+        # synthesis entry, polluting context with N+1 near-duplicates.
+        # We archive (not delete) so the audit trail survives and a future
+        # "restore" UI can reverse the synthesis.
+        for src_id in (it["id"] for it in cluster):
+            try:
+                if kind == EntryKind.MEMORY.value:
+                    await self._store.archive_memory_entry(
+                        src_id,
+                        reason=ArchiveReason.SUPERSEDED_BY_SYNTHESIS.value,
+                    )
+                else:
+                    await self._store.archive_knowledge_entry(
+                        src_id,
+                        reason=ArchiveReason.SUPERSEDED_BY_SYNTHESIS.value,
+                    )
+                await self._store.set_superseded_by(
+                    kind=kind,
+                    entry_id=src_id,
+                    superseded_by_id=synth_id,
+                )
+            except Exception:
+                _logger.exception(
+                    "L%d/%s: archive source %s after synth failed",
+                    level, kind, src_id[:8],
+                )
         # Embed the new synthesis entry so it shows up in dense recall
         # immediately (no need to wait for backfill).
         # We need to find the new entry's chunk_id; simplest path is to
