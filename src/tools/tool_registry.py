@@ -18,6 +18,7 @@ from .browser_tool import BrowserTool
 from .desktop_tool import DesktopTool
 from .web_search_tool import WebSearchTool
 from .email_tool import EmailTool
+from .teams_tool import TeamsTool
 from .ask_human_tool import AskHumanTool
 
 _IS_WINDOWS = sys.platform == "win32"
@@ -79,6 +80,7 @@ class ToolRegistry:
     DESKTOP = "desktop"
     WEB_SEARCH = "web_search"
     EMAIL = "email"
+    TEAMS = "teams"
     ASK_HUMAN = "ask_human"
 
     _tools: Dict[str, ToolMetadata] = {}
@@ -96,56 +98,97 @@ class ToolRegistry:
 When to Use:
   - Examine file contents you haven't seen yet in this session
   - Read directory structure to understand project layout
-  - Read multiple related files together (pass as array) to understand context
+  - Read a small set of related files together (pass as array) AFTER you have
+    located them via 'glob' / 'grep'
 
 When NOT to Use:
+  - Discovery: do NOT pre-read N candidate files to figure out which is relevant.
+    Use 'glob' to locate files by name/path and 'grep' to search content first;
+    then 'read' only the specific file(s) you confirmed are interesting.
   - When you already have the file content from a previous read in this session
     (re-reading the same unchanged file wastes context budget)
-  - When you only need to check if a file exists (use bash: if exist "path" echo yes)
-  - When you need to search for a pattern across files (use bash: findstr /s "pattern" *.py)
-  - Files > 100 KB: use bash (type with findstr, or powershell Get-Content/Select-String)
-    to extract relevant sections
+  - When you only need to check if a file exists (use 'glob' or shell)
+  - When you need to search for a pattern across files (use 'grep')
+
+Pagination (single path):
+  - Default: returns the first 2000 lines. If the file is larger, the result
+    has truncated=True plus a notice telling you the next offset to pass.
+  - 'offset' (1-based first line) and 'limit' (line count) page through large
+    files explicitly. Prefer these over reading the whole file.
+  - 'start_line' / 'end_line' are legacy aliases for offset/limit; do not mix
+    them with offset/limit in the same call (the call will be rejected).
+
+Multi-path mode (path is an array):
+  - Each file is read with the default 2000-line cap; offset/limit/start_line/
+    end_line are NOT accepted (ambiguous across files).
+  - The total rendered content is soft-capped — once exceeded, remaining paths
+    are returned as 'file_skipped' stubs with a re-read instruction.
+  - Use this for batch reads of a SHORT list (≤5) of files you already know
+    you need. For wider scans, prefer 'grep'/'glob' or read paths individually.
 
 Strategy:
-  - Batch related reads: pass an array of paths to read multiple files in one call
-  - For large files, read targeted sections with bash rather than the full file
-  - Context budget: each read result is appended to your conversation history and
-    cannot be removed. Read what you need — avoid reading files you won't act on.
-  - Prefer reading the most specific file first; broaden only if needed
+  - Locate first (glob/grep), then read the specific match
+  - Context budget: each read result is appended to your conversation history
+    and cannot be removed. Read what you need — avoid reading files you won't act on.
+  - For huge files, page with offset/limit instead of asking for the whole thing
 
 Examples:
-  GOOD: {"path": ["src/main.py", "src/utils.py"]}  — batch read, one call
-  GOOD: {"path": "config/settings.yaml"}            — single targeted read
+  GOOD: {"path": "src/auth/login.py"}                          — single targeted read
+  GOOD: {"path": "src/main.py", "offset": 1, "limit": 200}     — first 200 lines
+  GOOD: {"path": "src/main.py", "offset": 2001, "limit": 500}  — page 2 of a big file
+  GOOD: glob '**/*config.yaml' → read the one match
+  BAD:  {"paths": ["src/a.py", "src/b.py", ..., "src/z.py"]}   — too many; grep first
   BAD:  Read the same file twice without changes in between
-  BAD:  Read an entire 2000-line file when you only need one function
-        → use bash: findstr /n "def target_function" file.py, then read specific lines"""
+  BAD:  Read an entire 5000-line file when you only need one function
+        → grep -n "def target" file.py to find the line, then read with offset/limit"""
         else:
             _read_usage_guide = """\
 When to Use:
   - Examine file contents you haven't seen yet in this session
   - Read directory structure to understand project layout
-  - Read multiple related files together (pass as array) to understand context
+  - Read a small set of related files together (pass as array) AFTER you have
+    located them via 'glob' / 'grep'
 
 When NOT to Use:
+  - Discovery: do NOT pre-read N candidate files to figure out which is relevant.
+    Use 'glob' to locate files by name/path and 'grep' to search content first;
+    then 'read' only the specific file(s) you confirmed are interesting.
   - When you already have the file content from a previous read in this session
     (re-reading the same unchanged file wastes context budget)
-  - When you only need to check if a file exists (use bash: test -f <path>)
-  - When you need to search for a pattern across files (use bash: grep -r)
-  - Files > 100 KB: use bash (head/tail/sed/grep) to extract relevant sections
+  - When you only need to check if a file exists (use 'glob' or shell: test -f)
+  - When you need to search for a pattern across files (use 'grep')
+
+Pagination (single path):
+  - Default: returns the first 2000 lines. If the file is larger, the result
+    has truncated=True plus a notice telling you the next offset to pass.
+  - 'offset' (1-based first line) and 'limit' (line count) page through large
+    files explicitly. Prefer these over reading the whole file.
+  - 'start_line' / 'end_line' are legacy aliases for offset/limit; do not mix
+    them with offset/limit in the same call (the call will be rejected).
+
+Multi-path mode (path is an array):
+  - Each file is read with the default 2000-line cap; offset/limit/start_line/
+    end_line are NOT accepted (ambiguous across files).
+  - The total rendered content is soft-capped — once exceeded, remaining paths
+    are returned as 'file_skipped' stubs with a re-read instruction.
+  - Use this for batch reads of a SHORT list (≤5) of files you already know
+    you need. For wider scans, prefer 'grep'/'glob' or read paths individually.
 
 Strategy:
-  - Batch related reads: pass an array of paths to read multiple files in one call
-  - For large files, read targeted sections with bash rather than the full file
-  - Context budget: each read result is appended to your conversation history and
-    cannot be removed. Read what you need — avoid reading files you won't act on.
-  - Prefer reading the most specific file first; broaden only if needed
+  - Locate first (glob/grep), then read the specific match
+  - Context budget: each read result is appended to your conversation history
+    and cannot be removed. Read what you need — avoid reading files you won't act on.
+  - For huge files, page with offset/limit instead of asking for the whole thing
 
 Examples:
-  GOOD: {"path": ["src/main.py", "src/utils.py"]}  — batch read, one call
-  GOOD: {"path": "config/settings.yaml"}            — single targeted read
+  GOOD: {"path": "src/auth/login.py"}                          — single targeted read
+  GOOD: {"path": "src/main.py", "offset": 1, "limit": 200}     — first 200 lines
+  GOOD: {"path": "src/main.py", "offset": 2001, "limit": 500}  — page 2 of a big file
+  GOOD: glob '**/*config.yaml' → read the one match
+  BAD:  {"paths": ["src/a.py", "src/b.py", ..., "src/z.py"]}   — too many; grep first
   BAD:  Read the same file twice without changes in between
-  BAD:  Read an entire 2000-line file when you only need one function
-        → use bash: grep -n "def target_function" file.py, then read specific lines"""
+  BAD:  Read an entire 5000-line file when you only need one function
+        → grep -n "def target" file.py to find the line, then read with offset/limit"""
 
         cls._tools[cls.READ] = ToolMetadata(
             name=cls.READ,
@@ -155,7 +198,9 @@ Examples:
                 "For a single path the result is returned directly; "
                 "for multiple paths a summary with per-path results is returned. "
                 "Supports PDF files (requires PyPDF2, pdfplumber, or pymupdf). "
-                "Files larger than 100 KB cannot be read directly."
+                "Single-path reads default to the first 2000 lines; pass offset/limit "
+                "to page through larger files. Multi-path reads have a per-file 2000-line "
+                "cap and a soft total-content cap (remaining paths return file_skipped stubs)."
             ),
             usage_guide=_read_usage_guide,
             parameter_schema={
@@ -186,13 +231,28 @@ Examples:
                             "Can be used together with 'path'; duplicates are ignored."
                         )
                     },
+                    "offset": {
+                        "type": "integer",
+                        "description": (
+                            "1-based line number to start reading from (inclusive). "
+                            "Default 1. Single-path only."
+                        )
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": (
+                            "Number of lines to return starting at offset. "
+                            "Default 2000. Single-path only. Prefer this over reading "
+                            "an entire large file in one call."
+                        )
+                    },
                     "start_line": {
                         "type": "integer",
-                        "description": "1-based line number to start reading from (inclusive)"
+                        "description": "Legacy alias for offset (1-based, inclusive). Prefer offset."
                     },
                     "end_line": {
                         "type": "integer",
-                        "description": "1-based line number to stop reading at (inclusive)"
+                        "description": "Legacy alias used together with start_line (1-based, inclusive). Prefer offset+limit."
                     },
                     "pages": {
                         "type": "string",
@@ -1700,6 +1760,82 @@ EXAMPLES
   BAD:  include_full_body=true on 50 messages — context overflow""",
                 parameter_schema=EmailTool.parameter_schema,
                 tool_class=EmailTool,
+                on_demand=True,
+            )
+
+        # Register TEAMS tool. Windows-only — registered alongside email so
+        # the Linux planner never sees it (consistent with the desktop /
+        # browser / email pattern). on_demand=True; activated via
+        # TeamsContextProvider when the planner declares "teams". Depends on
+        # httpx + playwright (both already required); missing deps surface a
+        # clear "install X" message via TeamsContextProvider.prepare().
+        if _IS_WINDOWS:
+            cls._tools[cls.TEAMS] = ToolMetadata(
+                name=cls.TEAMS,
+                description=(
+                    "Microsoft Teams via Graph + Teams internal API. "
+                    "Calendar / meetings, chats, channels, presence, "
+                    "people, OneDrive files, Microsoft To Do — all "
+                    "silent (does not steal mouse/keyboard or open the "
+                    "Teams UI). First use harvests an access token from "
+                    "the user's already-signed-in teams.microsoft.com "
+                    "session via a brief Edge popup; thereafter every "
+                    "call uses the cached token. Actions: "
+                    "list_calendar_events, get_event, create_meeting, "
+                    "respond_event, find_meeting_times, list_chats, "
+                    "read_chat, send_chat, list_teams, list_channels, "
+                    "read_channel, send_channel, find_person, "
+                    "search_files, list_recent_files, list_tasks, "
+                    "create_task, get_presence."
+                ),
+                usage_guide="""\
+WHEN TO USE
+  - Calendar: "today's meetings", "next meeting", "schedule with X"
+  - Chats:    "list my chats", "read messages from X", "send X a message"
+  - Channels: "list teams", "list channels in T", "post to #general"
+  - People:   "find Zhang San", "Alice's email/title"
+  - Presence: "am I shown busy", "is Bob online"
+  - Files:    "find that PPT", "my recent files" (OneDrive backing Teams)
+  - Tasks:    "what's due today", "add a task"
+
+WHEN NOT TO USE / WHEN TO FALL BACK
+  Set status / DND / status message  → browser (teams.microsoft.com avatar)
+  Join an active meeting             → browser (use join_url from list_calendar_events)
+  Watch a meeting recording          → browser (event web_link)
+  Change Teams settings / theme      → tell user to do it in Teams Settings
+  Live audio/video calling           → not supported (no API)
+  Read local Outlook mail            → email tool (COM)
+  Drive Teams desktop app via mouse  → desktop tool steals input; use browser
+
+WORKFLOW
+  Always discover identifiers BEFORE send / create operations:
+    list_chats   → chat_id        → send_chat
+    list_teams   → team_id        → list_channels → channel_id → send_channel
+    find_person  → emails[] / id  → create_meeting attendees / send_chat
+    list_calendar_events → event_id → respond_event / get_event
+
+KEY INVARIANTS
+  - top capped at 50 per call; paginate for older history
+  - message_html: HTML or plain text, 32 KB cap per message
+  - send_* / create_meeting / respond_event NOT undoable
+  - 401 mid-task triggers automatic re-bootstrap (3-5s when cookie warm)
+  - Bootstrap requires browser_profile to be free; close any running
+    browser_tool action first if 'profile_locked' is reported
+  - Do NOT shell-search the token cache file; the tool owns it
+
+EXAMPLES
+  GOOD: action='list_calendar_events', top=10
+  GOOD: action='create_meeting', subject='Spec review',
+        start='2026-06-05T15:00:00', end='2026-06-05T15:30:00',
+        time_zone='China Standard Time',
+        attendees=[{"email":"alice@x.com","name":"Alice"}]
+  GOOD: action='respond_event', event_id='AAMkAG...', response='accept'
+  GOOD: action='find_person', query='zhang san'
+  GOOD: action='list_chats', top=20  →  pick chat_id  →  read_chat
+  BAD:  send_chat without first running list_chats — chat_id is opaque
+  BAD:  Driving teams.microsoft.com via browser when teams tool covers it""",
+                parameter_schema=TeamsTool.parameter_schema,
+                tool_class=TeamsTool,
                 on_demand=True,
             )
 

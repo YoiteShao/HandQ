@@ -1,10 +1,9 @@
-version: '1.1.1'
+version: '1.2.0'
 llm:
   API_KEY: 
   models:
+  - anthropic::claude-4-8-opus
   - anthropic::claude-4-7-opus
-  - anthropic::claude-4-6-opus:1M
-  - anthropic::claude-4-6-opus
   - anthropic::claude-4-6-sonnet:1M
   - anthropic::claude-4-6-sonnet
   - anthropic::claude-4-5-sonnet
@@ -57,18 +56,6 @@ interaction_switches:
       Auto-approve is OFF by default because input actions affect any focused
       application, not just the agent's own browser. Sensitive windows
       (password managers, banking) are always refused regardless of these switches.
-  tool_web_search:
-    auto_approve: true
-    description: Internal web search (Confluence / Jira / SharePoint / orbit) via
-      the authenticated browser session. Auto-approve controls per-call prompts.
-      Read-only — returns title/url/snippet lists. Cookies and SSO are reused
-      from the persistent browser profile.
-  tool_email:
-    auto_approve: true
-    description: Email read via local Outlook COM (win32com). Auto-approve controls
-      per-call prompts. Read actions are low-risk. Write actions (compose_draft /
-      send) — when added — will go through the high_risk gate plus a
-      recipient_domain_allowlist check.
   high_risk:
     auto_approve: true
     description: Control high-risk operation auto-execution
@@ -77,6 +64,18 @@ browser:
   cdp_port: 9222
   cdp_url: ''
   prefer_attach: false
+teams:
+  # Token cache directory. Blank → %USERPROFILE%\HandQ\teams_cache\.
+  # The cache stores ACCESS tokens harvested from your already-signed-in
+  # Teams Web session (NOT refresh tokens — Microsoft caps SPA refresh
+  # tokens at 24 h and refuses to extend them via the OAuth endpoint).
+  # Tokens are short-lived (~1 h); the tool re-bootstraps via Playwright
+  # against teams.microsoft.com when the cache expires. Treat the file
+  # like a credential.
+  # client_id / tenant_id are NOT configurable: the tool rides on
+  # Microsoft Teams Web's own MSAL session (client 5e3ce6c0-...,
+  # which every tenant that allows Teams must, by definition, allow).
+  cache_dir: ''
 high_risk_commands:
   always_dangerous_keywords:
   - shutdown

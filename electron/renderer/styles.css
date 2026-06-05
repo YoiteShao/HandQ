@@ -994,6 +994,32 @@ html, body {
     overflow: visible;
 }
 
+/* Threaded result line: rendered inside the same <li> as the matching
+   pre-exec entry so the user can see what each Executing produced. */
+.activity-item .ai-result {
+    display: -webkit-box;
+    margin-top: 4px;
+    padding-left: 10px;
+    color: var(--fg-soft);
+    font-family: var(--mono);
+    font-size: 11px;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    word-break: break-word;
+    -webkit-line-clamp: 4;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    border-left: 2px solid rgba(0, 0, 0, 0.08);
+}
+.activity-item.expanded .ai-result {
+    -webkit-line-clamp: unset;
+    overflow: visible;
+}
+.activity-item .ai-result.ai-json {
+    white-space: normal;
+    display: block;
+}
+
 /* JSON visualization inside activity items */
 .activity-item .ai-content.ai-json {
     white-space: normal;

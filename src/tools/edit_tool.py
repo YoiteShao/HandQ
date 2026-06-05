@@ -61,7 +61,7 @@ def _swap_file_contents(parent_dir: Path, target_basename: str,
     )
     fd_closed = False
     try:
-        with os.fdopen(temp_fd, 'w', encoding='utf-8') as temp_file:
+        with os.fdopen(temp_fd, 'w', encoding='utf-8', newline='') as temp_file:
             fd_closed = True  # os.fdopen takes ownership
             temp_file.write(content)
         os.replace(temp_path, target_path)
@@ -82,7 +82,7 @@ def _swap_file_contents(parent_dir: Path, target_basename: str,
 def _read_text_safe(path: Path) -> "Optional[str]":
     """Read text content, returning None on any I/O error. Sync — runs in executor."""
     try:
-        with open(path, 'r', encoding='utf-8') as f:
+        with open(path, 'r', encoding='utf-8', newline='') as f:
             return f.read()
     except OSError:
         return None

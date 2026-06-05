@@ -59,6 +59,56 @@ def system_idle_seconds() -> Optional[float]:
         return None
 
 
+# ── Session lock state ─────────────────────────────────────────────────────
+
+
+def is_session_locked() -> bool:
+    """Return True iff the current session is locked (Win+L, auto-lock,
+    or screensaver-with-password). Used by the OCR-drain gate as the
+    strongest "user is gone" signal — when locked, OCR can run flat-out
+    without competing with anything the user is doing.
+
+    Implementation: read the input desktop's name. When the session is
+    unlocked the input desktop is "Default"; when locked Windows switches
+    to "Winlogon" or "Screen-saver". This avoids the
+    WTSRegisterSessionNotification path (which needs a hidden window +
+    message pump) — a single ~50 µs ctypes call suffices and we already
+    poll on every personality tick.
+
+    Returns False on non-Windows. Returns True on any failure path that
+    suggests we cannot read the input desktop (e.g. running in session 0
+    as a service) — false positives here are harmless: they unlock the
+    OCR gate marginally earlier, but our other gate conditions (input
+    idle + screen quiet) still apply via the AND in the soft-idle path,
+    so a stuck "True" here cannot cause OCR during user activity.
+    """
+    if sys.platform != "win32":
+        return False
+    try:
+        user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+        # OpenInputDesktop(flags=0, fInherit=False, dwDesiredAccess=DESKTOP_READOBJECTS=0x0001)
+        hdesk = user32.OpenInputDesktop(0, False, 0x0001)
+        if not hdesk:
+            # Cannot open the input desktop — typical when the session is
+            # locked or we're running outside an interactive session.
+            return True
+        try:
+            # GetUserObjectInformationW(hObj, UOI_NAME=2, pvInfo, nLength, pnLengthNeeded)
+            buf = ctypes.create_unicode_buffer(256)
+            length_needed = wintypes.DWORD()
+            ok = user32.GetUserObjectInformationW(
+                hdesk, 2, buf, ctypes.sizeof(buf), ctypes.byref(length_needed),
+            )
+            if not ok:
+                return True
+            return buf.value != "Default"
+        finally:
+            user32.CloseDesktop(hdesk)
+    except Exception:  # pragma: no cover — defensive
+        _logger.exception("is_session_locked failed")
+        return False
+
+
 # ── Cursor location (which monitor is the user pointing at?) ────────────────
 
 

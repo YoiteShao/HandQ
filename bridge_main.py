@@ -186,7 +186,186 @@ def _ensure_user_config_present() -> None:
         pass
 
 
+# ---------------------------------------------------------------------------
+# Upgrade-time config merge.
+#
+# `_ensure_user_config_present()` only seeds the user file on first run.
+# Once it exists, plain copying would either clobber user secrets (API_KEY,
+# tweaked thresholds, custom whitelists) or silently leave deprecated fields
+# (e.g. retired model names) festering in the user yaml.
+#
+# Strategy: when the user yaml's top-level `version:` is older than the
+# shipped yaml's, merge them with two policies:
+#
+#   - PRESERVE — user value wins on leaves; ship's dict structure is still
+#                authoritative on which keys exist (so user-only keys are
+#                dropped, ship-only keys appear with ship defaults).
+#   - OVERRIDE (default) — ship value wins entirely. Used for everything
+#                outside the explicit PRESERVE list.
+#
+# `_PRESERVE_PATHS` is the single source of truth. To preserve a whole
+# subtree, list the parent path; to preserve a specific leaf inside an
+# otherwise OVERRIDE section (e.g. `web_search.default_limit`), list the
+# leaf path. The merge walks ship's key set at every dict level — that's
+# how user-only keys get dropped and ship-only keys get added uniformly,
+# under both policies.
+# ---------------------------------------------------------------------------
+
+_PRESERVE_PATHS = frozenset({
+    "llm.API_KEY",
+    "session",
+    "interaction_switches",
+    "teams",
+    "high_risk_commands.whitelist",
+    "high_risk_commands.custom_patterns",
+    "desktop.sensitive_window_patterns",
+    "web_search.default_limit",
+    "web_search.max_limit",
+    "web_search.snippet_max_chars",
+    "personalization",
+})
+
+
+def _parse_version(s: object) -> tuple:
+    """Parse '1.2.0' → (1, 2, 0). Returns () on any failure (None, non-string,
+    non-numeric components). The empty tuple compares as smaller than any
+    non-empty tuple, but the merge call site explicitly skips when either
+    side fails to parse, so that's a defensive nicety, not load-bearing."""
+    if not isinstance(s, str):
+        return ()
+    parts = s.strip().split(".")
+    try:
+        return tuple(int(p) for p in parts)
+    except ValueError:
+        return ()
+
+
+def _is_preserve(path: str) -> bool:
+    """True if *path* itself is in the preserve list, or any preserve entry
+    is a prefix of it (so 'session.log_level' inherits PRESERVE from 'session').
+    """
+    if not path:
+        return False
+    if path in _PRESERVE_PATHS:
+        return True
+    for p in _PRESERVE_PATHS:
+        if path.startswith(p + "."):
+            return True
+    return False
+
+
+def _merge_config(ship, user, path: str = ""):
+    """Recursive PRESERVE/OVERRIDE merge. See block comment above for
+    semantics. Pure function: does no IO, returns a new dict/list/scalar.
+    """
+    preserve = _is_preserve(path)
+
+    if isinstance(ship, dict):
+        # User value must be a dict for us to harvest anything from it.
+        # A PRESERVE node where the user's side is missing/wrong-type
+        # falls back to ship's whole subtree (gives them defaults).
+        if not isinstance(user, dict):
+            if preserve:
+                return ship
+            user = {}
+        # Walk ship's keys at every level: this is what makes user-only
+        # keys get dropped (they're never visited) and ship-only keys
+        # appear with defaults (user.get returns None → recurse handles it).
+        result = {}
+        for key, ship_val in ship.items():
+            child_path = f"{path}.{key}" if path else key
+            result[key] = _merge_config(ship_val, user.get(key), child_path)
+        return result
+
+    # Leaf (list / scalar / None).
+    if preserve and _leaf_compatible(user, ship):
+        return user
+    return ship
+
+
+def _leaf_compatible(user, ship) -> bool:
+    """Decide whether to take *user* as-is for a PRESERVE leaf.
+
+    True iff:
+      * user is not None, AND
+      * ship is None (placeholder being filled — e.g. shipped API_KEY: '' → None,
+        user filled in their key), OR same Python type, OR both are number-like.
+    bool is intentionally NOT treated as int even though it's a subclass.
+    """
+    if user is None:
+        return False
+    if ship is None:
+        return True
+    if type(user) is type(ship):
+        return True
+    def _is_num(x):
+        return isinstance(x, (int, float)) and not isinstance(x, bool)
+    return _is_num(user) and _is_num(ship)
+
+
+def _merge_user_config_with_seed() -> None:
+    """Run after `_ensure_user_config_present()` on every Windows boot.
+
+    Compares the user yaml's `version:` field against the shipped
+    `<install_dir>/handq_config.yaml`. If the shipped version is newer:
+      1. backs the user yaml up to ``handq_config.yaml.bak`` (single
+         rolling backup — overwritten on every upgrade so the user dir
+         never accumulates per-version snapshots)
+      2. produces a merged dict via `_merge_config`
+      3. forces `version` to the shipped version (defensive — already
+         covered by OVERRIDE default, but explicit avoids surprise if
+         someone later moves `version` into the PRESERVE list)
+      4. atomically replaces the user yaml
+
+    All failure paths are swallowed and reported via boot_progress; the
+    backup from step 1 means the user's data is recoverable even if a
+    later step crashes mid-write.
+    """
+    if sys.platform != "win32":
+        return
+    user_root = _user_handq_root()
+    user_cfg = os.path.join(user_root, "handq_config.yaml")
+    install_cfg = os.path.join(_INSTALL_DIR, "handq_config.yaml")
+    if not os.path.exists(user_cfg) or not os.path.exists(install_cfg):
+        return
+    try:
+        import yaml  # local import keeps the boot path lean if unused
+        with open(install_cfg, "r", encoding="utf-8") as f:
+            ship_dict = yaml.safe_load(f) or {}
+        with open(user_cfg, "r", encoding="utf-8") as f:
+            user_dict = yaml.safe_load(f) or {}
+        if not isinstance(ship_dict, dict) or not isinstance(user_dict, dict):
+            return
+        ship_v = _parse_version(ship_dict.get("version"))
+        user_v = _parse_version(user_dict.get("version"))
+        if not ship_v or not user_v or user_v >= ship_v:
+            return
+        old_version_str = str(user_dict.get("version", "unknown"))
+        new_version_str = str(ship_dict.get("version"))
+        # Single rolling backup: always overwrite the same file so the user
+        # directory doesn't accumulate one ``.pre-<version>`` per upgrade.
+        # Only the most recent pre-merge yaml is recoverable.
+        backup = os.path.join(user_root, "handq_config.yaml.bak")
+        import shutil
+        shutil.copy2(user_cfg, backup)
+        merged = _merge_config(ship_dict, user_dict)
+        merged["version"] = new_version_str  # explicit; OVERRIDE default already does this
+        tmp_path = user_cfg + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            yaml.safe_dump(merged, f, allow_unicode=True, sort_keys=False)
+        os.replace(tmp_path, user_cfg)
+        _emit_boot_progress(
+            "config_merged",
+            from_version=old_version_str,
+            to_version=new_version_str,
+            backup_path=backup,
+        )
+    except Exception as exc:
+        _emit_boot_progress("config_merge_failed", error=str(exc))
+
+
 _ensure_user_config_present()
+_merge_user_config_with_seed()
 _HANDQ_CONFIG = _resolve_config_path()
 os.environ["HANDQ_CONFIG"] = _HANDQ_CONFIG
 _emit_boot_progress(

@@ -109,12 +109,13 @@ _MODEL_MAX_OUTPUT_TOKENS: list[tuple[str, int]] = [
     (":1m",                  128000),
     ("[1m]",                 128000),
 
-    # ── Native 1M Opus (4.7) ─────────────────────────────────────────────
+    # ── Native 1M Opus (4.7+) ────────────────────────────────────────────
+    ("claude-4-8-opus",      128000),
+    ("claude-opus-4-8",      128000),  # legacy Anthropic naming
     ("claude-4-7-opus",      128000),
     ("claude-opus-4-7",      128000),  # legacy Anthropic naming
 
     # ── Opus 4.x → 32K output ────────────────────────────────────────────
-    ("claude-4-6-opus",       32000),
     ("claude-4-5-opus",       32000),
     ("claude-4-opus",         32000),
     ("claude-opus-4",         32000),  # legacy Anthropic naming
@@ -144,8 +145,13 @@ _MODEL_CONTEXT_WINDOW: list[tuple[str, int]] = [
     (":1M",              1_000_000),
     ("[1m]",             1_000_000),
     ("[1M]",             1_000_000),
-    # claude-4-7-opus has native 1M context window
+    # claude-4-7-opus and claude-4-8-opus have native 1M context window.
+    # The legacy "claude-opus-4-N" variants must be matched BEFORE the
+    # generic "claude-opus-4" rule below (200K) to avoid mis-resolution.
+    ("claude-4-8-opus",  1_000_000),
+    ("claude-opus-4-8",  1_000_000),
     ("claude-4-7-opus",  1_000_000),
+    ("claude-opus-4-7",  1_000_000),
     # claude-4 series
     ("claude-opus-4",      200_000),
     ("claude-sonnet-4",    200_000),

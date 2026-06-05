@@ -18,6 +18,18 @@ _MAX_FILE_CHARS = 100_000
 _TRUNCATE_LINES = 200
 _MAX_PDF_PAGES_PER_REQUEST = 20
 
+# Default page size when neither offset/limit nor start_line/end_line is given.
+# The caller paginates by passing offset/limit explicitly when a wider window
+# is needed. Mirrors the Claude Code Read-tool defaults.
+_DEFAULT_LIMIT = 2000
+
+# Multi-path aggregate cap: when a single read() call returns several files,
+# we soft-cap the total rendered content. The file that crosses the threshold
+# is included in full; every subsequent path is returned as a `file_skipped`
+# stub (path + size only, no I/O). The agent can re-read interesting paths
+# individually for full content.
+_MAX_MULTI_TOTAL_CHARS = 60_000
+
 # Known binary file extensions — checked before reading
 _BINARY_EXTENSIONS = frozenset([
     ".exe", ".bin", ".so", ".dylib", ".dll", ".obj", ".o", ".a",
@@ -63,6 +75,32 @@ def _format_dir_listing(path_obj: Path) -> str:
 def _read_bytes_sample(path_obj: Path, n: int = 512) -> bytes:
     with open(path_obj, "rb") as f:
         return f.read(n)
+
+
+def _make_skipped_stub(path_str: str) -> dict:
+    """Return a `file_skipped` stub for the multi-path aggregate-cap path.
+
+    No content is read — just stat() for size if reachable. Used to keep the
+    aggregate response bounded while still telling the agent which paths were
+    requested but not rendered.
+    """
+    path_obj = Path(path_str)
+    size: Optional[int] = None
+    try:
+        if path_obj.exists():
+            size = path_obj.stat().st_size
+    except OSError:
+        pass
+    return {
+        "type": "file_skipped",
+        "path": str(path_obj.absolute()),
+        "size": size,
+        "skipped_for_aggregate": True,
+        "notice": (
+            "Skipped: aggregate cap reached for this multi-path read. "
+            "Re-read this path individually for full content."
+        ),
+    }
 
 
 def _is_binary(path_obj: Path) -> bool:
@@ -261,11 +299,19 @@ class ReadTool(BaseTool):
     def _read_single_path(
         self,
         path: str,
+        offset: Optional[int] = None,
+        limit: Optional[int] = None,
         start_line: Optional[int] = None,
         end_line: Optional[int] = None,
         pages: Optional[str] = None,
     ) -> dict:
-        """Read a single file or directory; return a result dict."""
+        """Read a single file or directory; return a result dict.
+
+        Pagination semantics for files (priority order):
+          1. Explicit offset/limit                — preferred
+          2. Legacy start_line/end_line aliases   — kept for backward-compat
+          3. Default                              — offset=1, limit=_DEFAULT_LIMIT
+        """
         path_obj = Path(path)
 
         if not path_obj.exists():
@@ -371,75 +417,79 @@ class ReadTool(BaseTool):
         all_lines = content.splitlines(keepends=True)
         total_lines = len(all_lines)
 
-        # --- Line range selection ---
-        if start_line is not None or end_line is not None:
-            sl = (start_line - 1) if start_line is not None and start_line >= 1 else 0
-            el = end_line if end_line else total_lines
-            selected = all_lines[sl:el]
-            numbered = _add_line_numbers(selected, start=sl + 1)
-            with open(path_obj, "rb") as _fh:
-                _raw = _fh.read()
-            FileState.get_instance().record_read(path, hashlib.sha256(_raw).hexdigest())
-            return {
-                "success": True,
-                "output": {
-                    "type": "file",
-                    "path": str(path_obj.absolute()),
-                    "content": numbered,
-                    "size": file_size,
-                    "total_lines": total_lines,
-                    "start_line": sl + 1,
-                    "end_line": min(el, total_lines),
-                    "encoding": encoding_used,
-                }
-            }
+        # --- Resolve effective (offset, limit) ---
+        if offset is not None or limit is not None:
+            eff_offset = offset if (offset is not None and offset >= 1) else 1
+            eff_limit = limit if (limit is not None and limit >= 1) else _DEFAULT_LIMIT
+        elif start_line is not None or end_line is not None:
+            eff_offset = start_line if (start_line is not None and start_line >= 1) else 1
+            eff_end = end_line if (end_line is not None and end_line >= eff_offset) else total_lines
+            eff_limit = max(1, eff_end - eff_offset + 1)
+        else:
+            eff_offset = 1
+            eff_limit = _DEFAULT_LIMIT
 
-        # --- Large file truncation ---
-        if len(content) > _MAX_FILE_CHARS:
-            first_200 = all_lines[:_TRUNCATE_LINES]
-            numbered = _add_line_numbers(first_200, start=1)
-            notice = (
-                f"File truncated: showing lines 1-{len(first_200)} of {total_lines} total lines. "
-                f"Use start_line/end_line to read other sections."
-            )
-            with open(path_obj, "rb") as _fh:
-                _raw = _fh.read()
-            FileState.get_instance().record_read(path, hashlib.sha256(_raw).hexdigest())
-            return {
-                "success": True,
-                "output": {
-                    "type": "file",
-                    "path": str(path_obj.absolute()),
-                    "content": numbered,
-                    "size": file_size,
-                    "total_lines": total_lines,
-                    "truncated": True,
-                    "notice": notice,
-                    "encoding": encoding_used,
-                }
-            }
+        sl = eff_offset - 1                  # 0-based start
+        el = sl + eff_limit                  # exclusive end
+        selected = all_lines[sl:el]
 
-        # --- Normal full read ---
-        numbered = _add_line_numbers(all_lines, start=1)
+        # --- Char safety cap on selected range ---
+        # Even with a small line limit, pathologically long lines can blow up
+        # the response. Trim further to fit _MAX_FILE_CHARS and flag it.
+        char_truncated = False
+        if sum(len(l) for l in selected) > _MAX_FILE_CHARS:
+            char_truncated = True
+            running = 0
+            cut_at = 0
+            for i, line in enumerate(selected):
+                if running + len(line) > _MAX_FILE_CHARS:
+                    cut_at = i
+                    break
+                running += len(line)
+            selected = selected[:cut_at]
+
+        lines_returned = len(selected)
+        last_returned = sl + lines_returned  # 1-based last line index actually returned
+        more_after = last_returned < total_lines or char_truncated
+
+        numbered = _add_line_numbers(selected, start=sl + 1)
         with open(path_obj, "rb") as _fh:
             _raw = _fh.read()
         FileState.get_instance().record_read(path, hashlib.sha256(_raw).hexdigest())
-        return {
-            "success": True,
-            "output": {
-                "type": "file",
-                "path": str(path_obj.absolute()),
-                "content": numbered,
-                "size": file_size,
-                "total_lines": total_lines,
-                "encoding": encoding_used,
-            }
+
+        output: dict = {
+            "type": "file",
+            "path": str(path_obj.absolute()),
+            "content": numbered,
+            "size": file_size,
+            "total_lines": total_lines,
+            "offset": eff_offset,
+            "limit": eff_limit,
+            "lines_returned": lines_returned,
+            "encoding": encoding_used,
         }
+        if more_after:
+            output["truncated"] = True
+            if char_truncated:
+                output["notice"] = (
+                    f"Range exceeded {_MAX_FILE_CHARS}-char safety cap: returned lines "
+                    f"{eff_offset}-{last_returned} of {total_lines} total. "
+                    f"Pass a smaller `limit` or a different `offset` to read more."
+                )
+            else:
+                next_offset = last_returned + 1
+                output["notice"] = (
+                    f"Showing lines {eff_offset}-{last_returned} of {total_lines} total. "
+                    f"Pass offset={next_offset} (with same or different limit) to read the next chunk."
+                )
+        return {"success": True, "output": output}
 
     async def execute(
         self,
         path: Union[str, List[str], None] = None,
         paths: Union[List[str], None] = None,
+        offset: Optional[int] = None,
+        limit: Optional[int] = None,
         start_line: Optional[int] = None,
         end_line: Optional[int] = None,
         pages: Optional[str] = None,
@@ -451,8 +501,12 @@ class ReadTool(BaseTool):
         Args:
             path:       A single path (str) or list of paths; combined with *paths*.
             paths:      Additional list of paths; duplicates across *path* and *paths* are ignored.
-            start_line: Optional 1-indexed first line to return (inclusive).
-            end_line:   Optional 1-indexed last line to return (inclusive).
+            offset:     1-indexed first line to return (inclusive). Default 1.
+            limit:      Number of lines to return starting at *offset*. Default
+                        _DEFAULT_LIMIT (2000); pass a larger limit explicitly to
+                        get more, or paginate with offset+limit.
+            start_line: Legacy alias — first line (inclusive). Prefer `offset`.
+            end_line:   Legacy alias — last line (inclusive). Prefer `limit`.
             pages:      For PDF files: page range (e.g., "1-5", "3", "10-20").
                         Required for PDFs with more than 20 pages.
 
@@ -463,8 +517,27 @@ class ReadTool(BaseTool):
                   {"results": [...], "total": n, "succeeded": n, "failed": n}
         """
         start_time = time.time()
+        tp = {
+            "path": path, "paths": paths,
+            "offset": offset, "limit": limit,
+            "start_line": start_line, "end_line": end_line,
+        }
 
         try:
+            # Reject mixing the new and legacy parameter pairs in the same call —
+            # otherwise their priority rule becomes hidden state for the caller.
+            if (offset is not None or limit is not None) and (
+                start_line is not None or end_line is not None
+            ):
+                return ToolResult(
+                    success=False,
+                    output=None,
+                    error="Use either offset/limit OR start_line/end_line, not both.",
+                    execution_time=time.time() - start_time,
+                    tool_name=self.name,
+                    tool_parameters=tp,
+                )
+
             # Collect all paths from both 'path' and 'paths', deduplicating while preserving order
             all_paths: List[str] = []
             seen = set()
@@ -492,7 +565,7 @@ class ReadTool(BaseTool):
                     error="No path provided. Please supply 'path' or 'paths'.",
                     execution_time=time.time() - start_time,
                     tool_name=self.name,
-                    tool_parameters={"path": path, "paths": paths, "start_line": start_line, "end_line": end_line}
+                    tool_parameters=tp,
                 )
 
             # Single path: return result directly
@@ -501,7 +574,9 @@ class ReadTool(BaseTool):
                 result = await loop.run_in_executor(
                     None,
                     lambda: self._read_single_path(
-                        all_paths[0], start_line=start_line, end_line=end_line,
+                        all_paths[0],
+                        offset=offset, limit=limit,
+                        start_line=start_line, end_line=end_line,
                         pages=pages,
                     ),
                 )
@@ -511,7 +586,7 @@ class ReadTool(BaseTool):
                         output=result["output"],
                         execution_time=time.time() - start_time,
                         tool_name=self.name,
-                        tool_parameters={"path": path, "paths": paths, "start_line": start_line, "end_line": end_line}
+                        tool_parameters=tp,
                     )
                 else:
                     return ToolResult(
@@ -520,36 +595,58 @@ class ReadTool(BaseTool):
                         error=result["error"],
                         execution_time=time.time() - start_time,
                         tool_name=self.name,
-                        tool_parameters={"path": path, "paths": paths, "start_line": start_line, "end_line": end_line}
+                        tool_parameters=tp,
                     )
 
-            # Multiple paths: start_line/end_line are not supported (ambiguous across files)
-            if start_line is not None or end_line is not None:
+            # Multiple paths: explicit ranges are ambiguous across files, reject them.
+            # Each file still gets the default _DEFAULT_LIMIT cap inside _read_single_path.
+            if (
+                offset is not None or limit is not None
+                or start_line is not None or end_line is not None
+            ):
                 return ToolResult(
                     success=False,
                     output=None,
-                    error="start_line/end_line are not supported for multi-path reads. Read each file individually.",
+                    error="offset/limit/start_line/end_line are not supported for multi-path reads. Read each file individually.",
                     execution_time=time.time() - start_time,
                     tool_name=self.name,
-                    tool_parameters={"path": path, "paths": paths, "start_line": start_line, "end_line": end_line}
+                    tool_parameters=tp,
                 )
 
             loop = asyncio.get_event_loop()
             results = []
-            for p in all_paths:
-                r = await loop.run_in_executor(
-                    None,
-                    lambda p=p: self._read_single_path(
-                        p, start_line=start_line, end_line=end_line,
-                        pages=pages,
-                    ),
-                )
-                if r["success"]:
+            running_total = 0
+            aggregate_cap_hit_at: Optional[int] = None  # 1-based file index where cap kicked in
+            for idx, p in enumerate(all_paths):
+                # Once the cap has been crossed on a previous iteration, skip
+                # the I/O entirely and return a stub for the remaining paths.
+                if aggregate_cap_hit_at is not None:
                     results.append({
                         "path": p,
                         "success": True,
-                        "data": r["output"]
+                        "data": _make_skipped_stub(p),
                     })
+                    continue
+
+                r = await loop.run_in_executor(
+                    None,
+                    lambda p=p: self._read_single_path(p, pages=pages),
+                )
+                if r["success"]:
+                    data = r["output"]
+                    results.append({
+                        "path": p,
+                        "success": True,
+                        "data": data,
+                    })
+                    if isinstance(data, dict):
+                        # `content` (file/pdf) and `listing` (directory) are the
+                        # main contributors to message-history weight.
+                        running_total += len(data.get("content") or "")
+                        running_total += len(data.get("listing") or "")
+                    if running_total > _MAX_MULTI_TOTAL_CHARS:
+                        # Mark cap hit; the NEXT file (idx + 1, 1-based: idx + 2) is the first skipped.
+                        aggregate_cap_hit_at = idx + 2
                 else:
                     results.append({
                         "path": p,
@@ -560,18 +657,30 @@ class ReadTool(BaseTool):
             succeeded = sum(1 for r in results if r["success"])
             failed = len(results) - succeeded
 
+            output_payload: dict = {
+                "results": results,
+                "total": len(results),
+                "succeeded": succeeded,
+                "failed": failed,
+            }
+            if aggregate_cap_hit_at is not None and aggregate_cap_hit_at <= len(all_paths):
+                skipped = len(all_paths) - aggregate_cap_hit_at + 1
+                output_payload["aggregate_truncated"] = True
+                output_payload["aggregate_truncation_start"] = aggregate_cap_hit_at
+                output_payload["notice"] = (
+                    f"Multi-path aggregate cap reached: total content exceeded "
+                    f"{_MAX_MULTI_TOTAL_CHARS} chars after file #{aggregate_cap_hit_at - 1}. "
+                    f"{skipped} remaining path(s) were skipped (file_skipped stubs). "
+                    f"Re-read individual paths for full content."
+                )
+
             return ToolResult(
                 success=failed == 0,  # True only if all paths succeeded
-                output={
-                    "results": results,
-                    "total": len(results),
-                    "succeeded": succeeded,
-                    "failed": failed
-                },
+                output=output_payload,
                 error=None if failed == 0 else f"{failed} path(s) failed to read",
                 execution_time=time.time() - start_time,
                 tool_name=self.name,
-                tool_parameters={"path": path, "paths": paths, "start_line": start_line, "end_line": end_line}
+                tool_parameters=tp,
             )
 
         except Exception as e:
@@ -581,5 +690,5 @@ class ReadTool(BaseTool):
                 error=f"Read fail: {str(e)}",
                 execution_time=time.time() - start_time,
                 tool_name=self.name,
-                tool_parameters={"path": path, "paths": paths, "start_line": start_line, "end_line": end_line}
+                tool_parameters=tp,
             )

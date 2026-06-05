@@ -25,22 +25,45 @@ except ImportError:  # pragma: no cover
 from .llm_pool import call_with_fallback
 
 
+def _strip_markdown_fence(content: str) -> str:
+    """Strip a leading ``` ... ``` (optionally ```json) wrapper if present.
+
+    Claude routinely wraps JSON output in a markdown code fence.  ``json_repair``
+    handles fenced JSON natively, but ``json.loads`` does not — so we strip the
+    fence here before the stdlib attempt.  Returns *content* unchanged when no
+    fence is detected.
+    """
+    s = content.strip()
+    if not s.startswith("```"):
+        return content
+    first_nl = s.find("\n")
+    if first_nl == -1:
+        return content
+    inner = s[first_nl + 1:]
+    # Remove a trailing fence if present (might have trailing whitespace or
+    # newline characters after the ```).
+    inner = inner.rstrip()
+    if inner.endswith("```"):
+        inner = inner[:-3].rstrip()
+    return inner
+
+
 def try_parse_json(content: str) -> Union[dict, str]:
     """
     Attempt to parse *content* as JSON.
 
-    Uses json_repair to handle the vast majority of LLM output quirks:
-    - JSON embedded in prose or markdown code blocks
-    - Truncated responses (missing closing braces / brackets)
-    - Trailing commas, single-quoted keys, unquoted keys
-
-    Multiple-JSON handling:
-        When the LLM returns multiple JSON objects in one response (e.g. due
-        to consecutive user messages confusing the model into generating one
-        response per message), json_repair returns a list.  In that case we
-        take the **first** dict — it is the model's initial, unambiguous
-        decision before any repetition began.  Callers that need to detect
-        this anomaly should call ``count_json_objects()`` separately.
+    Order of attempts:
+      1. **stdlib ``json.loads``** (after stripping a markdown code fence).
+         When the LLM produced well-formed JSON this preserves every escape
+         sequence exactly as written — critical for paths and other strings
+         that contain backslashes (e.g. Windows UNC paths ``\\\\server\\share``).
+         ``json_repair`` has been observed to over-repair valid ``\\\\``
+         escapes by collapsing them, silently corrupting the parsed value.
+      2. **json_repair fallback** for everything stdlib cannot handle:
+         - JSON embedded in surrounding prose
+         - Truncated responses (missing closing braces / brackets)
+         - Trailing commas, single-quoted keys, unquoted keys
+         - Multiple JSON objects in one response (returns first dict)
 
     Returns:
         dict  -- if parsing succeeded and the top-level value is a dict
@@ -50,7 +73,17 @@ def try_parse_json(content: str) -> Union[dict, str]:
     if not content or not content.strip():
         return content
 
-    # Primary: json_repair (return_objects=True gives us the Python object directly)
+    # Step 1: stdlib json on the (de-fenced) content.
+    inner = _strip_markdown_fence(content).strip()
+    if inner:
+        try:
+            parsed = json.loads(inner)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+
+    # Step 2: json_repair fallback for malformed / fenced / multi-object cases.
     if _JSON_REPAIR_AVAILABLE and _json_repair is not None:
         try:
             parsed = _json_repair.repair_json(content, return_objects=True)
@@ -67,14 +100,6 @@ def try_parse_json(content: str) -> Union[dict, str]:
                         return item
         except Exception:
             pass
-
-    # Fallback when json_repair is not installed: standard json.loads
-    try:
-        parsed = json.loads(content.strip())
-        if isinstance(parsed, dict):
-            return parsed
-    except Exception:
-        pass
 
     return content
 

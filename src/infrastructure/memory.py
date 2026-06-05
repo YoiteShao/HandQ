@@ -76,6 +76,10 @@ class Memory:
         # _browser_contexts and _desktop_contexts but kept separate so all
         # three providers can be cleared independently.
         self._email_contexts: Dict[str, Dict[str, Any]] = {}
+        # Teams provider progressive-disclosure cache. Same shape / purpose as
+        # _email_contexts; kept separate so the Teams first-touch hint flag
+        # cannot collide with email's on key="default".
+        self._teams_contexts: Dict[str, Dict[str, Any]] = {}
         # Remote HandQ delegation cache — keyed by hostname, stores
         # credentials_file path + discovered HANDQ_DIR on the remote host.
         self._remote_handq_contexts: Dict[str, Dict[str, Any]] = {}
@@ -187,6 +191,21 @@ class Memory:
     def clear_email_contexts(self) -> None:
         """Drop every cached email context entry."""
         self._email_contexts.clear()
+
+    # ── Teams context ─────────────────────────────────────────────────────────
+    # Same shape / lifecycle as the email-context methods above.
+
+    def set_teams_context(self, key: str, value: Dict[str, Any]) -> None:
+        """Store Teams-related context (first-touch hint flag, etc.)."""
+        self._teams_contexts[key] = dict(value)
+
+    def get_teams_context(self, key: str) -> Optional[Dict[str, Any]]:
+        """Return the stored Teams context for *key*, or None."""
+        return self._teams_contexts.get(key)
+
+    def clear_teams_contexts(self) -> None:
+        """Drop every cached Teams context entry."""
+        self._teams_contexts.clear()
 
     def add_step(self, step: Step) -> None:
         """Record a completed step and accumulate its structured findings.

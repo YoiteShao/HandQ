@@ -51,8 +51,9 @@ INSTALL_DIR =
     memory.db-shm                      WAL 共享索引
     memory_notes\                      长 /remember 的 .md 镜像
       <id>.md                          (frontmatter + 用户原文)
-    ephemeral\                         PersonalityMonitor 的瞬时截图
-      frame_m<i>.png                   每显示器 1 张，OCR 后立刻 unlink
+    spillover\                         PersonalityMonitor 的 ring 溢出兜底
+      m<idx>_<ts>_<seq>.jpg            JPEG 字节（quality=85，~300KB/帧）
+      m<idx>_<ts>_<seq>.meta.json      元数据（title/app/tier/recent_texts 快照）
   browser_profile\screenshots\       browser_tool 截图（vision §1.6）
   desktop_shots\                     desktop_tool 截图（vision §1.6）
   email_attachments\                 email_tool 附件沙箱
@@ -85,13 +86,13 @@ INSTALL_DIR =
 
 | 数据 | 路径 | 漫游？ | 用户可见？ | 生命周期 |
 |---|---|---|---|---|
-| 用户配置 | `%USERPROFILE%\HandQ\handq_config.yaml` | 是 | 是 | 跨升级 |
+| 用户配置 | `%USERPROFILE%\HandQ\handq_config.yaml` | 是 | 是 | 跨升级；按 PRESERVE/OVERRIDE 策略与 ship-default 合并（见下） |
 | GEP 模板 | `%USERPROFILE%\HandQ\gep_templates\<uuid>.json` | 否 | 是 | 跨升级；Templates 面板可 Delete |
 | Session 历史 | `%USERPROFILE%\HandQ\History\<id>\` | 否 | 是 | 跨升级，可手动清理 |
 | Per-session engine log | `%USERPROFILE%\HandQ\History\<id>\handq-engine.log` | 否 | 是 | 跟随 session |
 | LTM SQLite | `%USERPROFILE%\HandQ\personality\memory.db` | 否 | 是 | 跨升级；详见 LTM 设计文档 |
 | 长 /remember 镜像 | `%USERPROFILE%\HandQ\personality\memory_notes\<id>.md` | 否 | 是 | 跨升级；用户可编辑器打开 |
-| 活动截图（瞬时） | `%USERPROFILE%\HandQ\personality\ephemeral\` | 否 | 是 | 子秒级（OCR 后立删） |
+| Ring 溢出 buffer | `%USERPROFILE%\HandQ\personality\spillover\` | 否 | 是 | RAM ring 满 / 监视器断开时落盘；OCR 完立删；启动时清理 >24h 残留 |
 | 定时任务 | `%USERPROFILE%\HandQ\scheduled_tasks.json` | 否 | 是 | 跨升级；JSON 可手编 |
 | 框架日志 | `%USERPROFILE%\HandQ\logs\<launch>\` | 否 | 是 | 自动 prune（保留最近 30 个 launch） |
 | 内部排障日志 | `%USERPROFILE%\HandQ\logs\.dia\internal-trace.log` | 否 | 默认隐藏 | RotatingFileHandler 1MB×5 自封顶 |
@@ -104,7 +105,24 @@ INSTALL_DIR =
 - **`logs\.dia\internal-trace.log`**：单文件，`RotatingFileHandler(maxBytes=1MB, backupCount=5)` 自封顶 5MB，跨 launch 持续累积以便交叉关联。Prune 不动它。
 - **隐藏机制**：dot 前缀（`.dia`）只在 Linux 风格生效，Windows Explorer 默认会显示。`bridge_main._set_hidden_on_windows()` 通过 `ctypes.windll.kernel32.SetFileAttributesW(FILE_ATTRIBUTE_HIDDEN)` 设置 NTFS HIDDEN 属性，让目录在默认浏览视图下消失（"显示隐藏文件"勾上仍能看到——刻意只拦"无意路过的用户"，不防备主动排查者）。
 
+PersonalityMonitor spillover 策略：
+
+- **常态行为（无落盘）**：capture 拿到的 frame 走 ndarray → perceptual_hash → JPEG 入 RAM ring(maxlen=128) per monitor，OCR 推迟到 idle/锁屏 gate 解锁后由 drain worker 串行消化。**正常用户日常 0 次磁盘写入**，与原"每 8s 落一次 PNG 再 unlink"的旧路径相比消除了 AV 扫描互动。
+- **溢出兜底（写 `personality\spillover\`）**：仅两种边界条件触发：
+  1. ring 满（用户连续高强度切屏 4h+）→ 把最旧的帧 spill 到磁盘等下一次 drain
+  2. 监视器中途断开（用户拔外接屏）→ 该 monitor 的 ring 全部 spill，避免数据丢失
+- **drain worker** ring 空时回头吃 spillover 目录里 timestamp 最早的一对文件（`.jpg` + `.meta.json`），OCR 完立刻 unlink 两个文件。`.meta.json` 携带 monitor_index、tier、title、app、capture 时刻的 `recent_texts` 快照——后者让"orphan 帧"（监视器已不在）也能正常做 Jaccard 文本去重。
+- **启动清理**：`PersonalityMonitor.start()` 扫一遍 `spillover\`，删除 mtime 超过 24h 的残留对（防止旧版本 schema、磁盘满等异常导致永久积压），并 cap 在 `ACTIVITY_SPILL_MAX_FILES`（256 对 = ≤51 MB）以内。
+- **路径选择理由**：放 `personality\` 下而非 `%LOCALAPPDATA%`：(1) 与 `memory.db` / `memory_notes` 同根，符合 §1.5 "HandQ 学到的关于我"统一原则；(2) NSIS 卸载器一并清理（`%LOCALAPPDATA%` 不被卸载器清）；(3) AV 扫描行为与 `%LOCALAPPDATA%` 等价，且自定义子目录默认不被 OneDrive 漫游；(4) 触发频率极低，把它和别的活动数据放一起更便于排障。
+
 > Session 根目录强制为 `%USERPROFILE%\HandQ\History\`，不可由 yaml 配置。GUI 模式下用户没有"我在哪个工作目录"的心智，所有任务的中间产物都自动留存在各自的 session 目录里，agent 的 `working_directory` 与 `storage_directory` 都指向该目录（在 `stdio_bridge._allocate_session_dir` 里分配）。
+
+升级时的配置合并：`bridge_main._merge_user_config_with_seed()` 在 boot 早期跑（`_ensure_user_config_present` 之后），按 yaml 顶部 `version:` 字段判断 user 是否落后 ship；如果是，按两套策略合并：
+
+- **PRESERVE**——用户的个性化与凭据由 user 决定。清单（硬编码于 `bridge_main._PRESERVE_PATHS`）：`llm.API_KEY`、`session`、`interaction_switches`、`teams`、`high_risk_commands.whitelist`、`high_risk_commands.custom_patterns`、`desktop.sensitive_window_patterns`、`web_search.default_limit`、`web_search.max_limit`、`web_search.snippet_max_chars`、`personalization`。
+- **OVERRIDE**（默认）——其余字段一律以 ship 为准。这是 `llm.models` / `llm.roles.*`（已下线的模型自动剔除）、`vision`、`screenshots`、`browser`、`email`、`update`、以及 `high_risk_commands` 三类危险规则（ship 能向老用户推送新安全规则）的处理路径。
+
+每层 dict 都按 ship 的 key set 走：user-only 的 key 自动丢弃（ship 是 schema 权威），ship-only 的 key 取 ship 默认值（新功能配置项自动出现）。合并前在同目录写一份 `handq_config.yaml.pre-<old_version>` 备份；写入用 `os.replace` 原子重命名，失败路径全异常捕获 + emit boot_progress `config_merge_failed`，bridge 仍能起。
 
 ---
 
@@ -258,6 +276,7 @@ HandQ/                              ← 仓库根，也是直接运行时的 INS
 | Bridge 安装目录探测 | `bridge_main.py` | `_INSTALL_DIR`、`_resolve_config_path` |
 | 用户根目录 | `bridge_main.py` | `_user_handq_root` |
 | Bridge 配置 env 注入 | `bridge_main.py` | `os.environ["HANDQ_CONFIG"]` |
+| 升级合并（PRESERVE/OVERRIDE） | `bridge_main.py` | `_PRESERVE_PATHS`、`_merge_config`、`_merge_user_config_with_seed` |
 | Electron bridge 启动 | `electron/main.js` | `resolveBridgeLaunch()` |
 | Electron 日志目录路由 | `electron/main.js` | `LOG_BASE`、`platformLogBase()` |
 | Electron 更新检查 | `electron/updater.js` | `checkForUpdates()` |
@@ -320,6 +339,9 @@ git switch master && git pull
 
 # 2. bump 版本号（electron/package.json 是唯一权威）
 # 手动编辑 electron/package.json 的 "version" 字段，例如 0.1.0 → 0.2.0
+# 同步把 handq_config.example.yaml:1 的 `version:` 字段改为相同值——
+#   这是 bridge_main._merge_user_config_with_seed 触发升级合并的依据，
+#   不改的话老用户那份 yaml 不会被合并到新结构。
 
 # 3. 一键构建
 .\packaging\build.ps1

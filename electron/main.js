@@ -928,30 +928,8 @@ function buildHandqIconPng() {
 }
 
 // Alert variant: orange background with a white "!" for attention.
-function buildHandqAlertIconPng() {
-    const zlib = require('zlib');
-    const SIZE = 16;
-    const PATTERN = [
-        '..BBBBBBBBBBBB..',
-        '.BBBBBBBBBBBBBB.',
-        'BBBBBBBFFBBBBBBB',
-        'BBBBBBBFFBBBBBBB',
-        'BBBBBBBFFBBBBBBB',
-        'BBBBBBBFFBBBBBBB',
-        'BBBBBBBFFBBBBBBB',
-        'BBBBBBBFFBBBBBBB',
-        'BBBBBBBBBBBBBBBB',
-        'BBBBBBBBBBBBBBBB',
-        'BBBBBBBFFBBBBBBB',
-        'BBBBBBBFFBBBBBBB',
-        'BBBBBBBBBBBBBBBB',
-        'BBBBBBBBBBBBBBBB',
-        '.BBBBBBBBBBBBBB.',
-        '..BBBBBBBBBBBB..',
-    ];
-    const TINT = [220, 100, 20, 255];   // amber/orange
-    return _buildIconPng(zlib, SIZE, PATTERN, TINT);
-}
+// Removed: tray flash now blinks the normal logo on/off rather than
+// alternating with a separate alert icon.
 
 function _buildIconPng(zlib, SIZE, PATTERN, TINT) {
     const FORE = [255, 255, 255, 255];
@@ -1018,33 +996,23 @@ function buildTrayIcon() {
     return nativeImage.createEmpty();
 }
 
-// Lazily-built alert icon (orange "!"). Built once, reused for every flash.
-let _alertTrayIcon = null;
-function getAlertTrayIcon() {
-    if (_alertTrayIcon) return _alertTrayIcon;
-    try {
-        const png = buildHandqAlertIconPng();
-        const img = nativeImage.createFromBuffer(png);
-        if (img && !img.isEmpty()) { _alertTrayIcon = img; return img; }
-    } catch (err) {
-        logLine('TRAY', 'alert PNG synthesis failed', { err: err && err.message });
-    }
-    return nativeImage.createEmpty();
-}
+// Lazily-built alert icon (orange "!"). Removed — tray flash now blinks
+// the normal logo on/off, no separate alert image needed.
 
-// Flash the tray icon between normal and alert states at ~600 ms intervals.
-// Stops automatically when the user focuses the window.
+// Flash the tray icon by alternating between the normal logo and an
+// empty image at ~600 ms intervals — a clean blink with no separate
+// alert badge. Stops automatically when the user focuses the window.
 function startTrayFlash() {
     if (_trayFlashTimer) return; // already flashing
     if (!tray) return;
-    let alertVisible = false;
+    let visible = true;
     const normalIcon = buildTrayIcon();
-    const alertIcon  = getAlertTrayIcon();
+    const blankIcon  = nativeImage.createEmpty();
     _trayFlashTimer = setInterval(() => {
         if (!tray) { stopTrayFlash(); return; }
-        alertVisible = !alertVisible;
+        visible = !visible;
         try {
-            tray.setImage(alertVisible ? alertIcon : normalIcon);
+            tray.setImage(visible ? normalIcon : blankIcon);
         } catch (_) { /* ignore */ }
     }, 600);
     logLine('TRAY', 'flash started');

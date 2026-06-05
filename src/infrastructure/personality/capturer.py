@@ -1,23 +1,20 @@
 """Per-monitor screenshot capture wrapping :mod:`mss`.
 
-The capture path writes to a single rotating filename per monitor —
-``activity_m<index>.png`` under the activity tier of
-:class:`vision.storage.ScreenshotStore`. Each capture overwrites the
-previous file, and the activity service unlinks it the moment OCR
-returns. There is therefore at most ONE PNG per monitor on disk at any
-moment, and that file's lifetime is sub-second on modern hardware.
+Returns the captured frame as a numpy ndarray (RGB, H×W×3, contiguous).
+The caller is responsible for any subsequent encoding or persistence —
+the activity service keeps captured frames in memory (per-monitor ring
+buffer of JPEG bytes) and never writes raw PNGs to disk, so we don't
+flush to %USERPROFILE% and don't churn AV scanners.
 
-Why a fixed filename rather than timestamped: it makes "is the disk
-accumulating screenshots?" a trivial check (the answer must be no), and
-removes the need for a periodic GC pass. The :class:`ScreenshotStore`
-retention sweep stays in place as a backstop.
+The legacy "write PNG to ephemeral/ then unlink after OCR" path was
+removed in favour of in-memory ndarray transport — see plan
+robust-gathering-shannon.md §5 for context.
 """
 from __future__ import annotations
 
 import logging
-import os
 import threading
-from typing import Optional
+from typing import Any, Optional
 
 from ..long_term_memory.models import MonitorInfo
 
@@ -50,16 +47,16 @@ class MonitorCapturer:
             self._tls.mss = c
         return c
 
-    def capture(self, info: MonitorInfo, out_path: str) -> Optional[str]:
-        """Grab the monitor described by *info* and write a PNG to
-        *out_path*. Returns the path on success, None on failure.
+    def capture(self, info: MonitorInfo) -> Optional[Any]:
+        """Grab the monitor described by *info* and return an RGB ndarray
+        (H, W, 3, dtype=uint8, C-contiguous). Returns None on failure.
 
         Failure modes (logged at debug):
           - mss raised (display switched, RDP disconnect, GPU hung)
-          - PIL save raised (unwritable path, disk full)
+          - numpy is missing (degenerate dev environment)
 
-        We never raise to the caller — a missed frame is recoverable
-        on the next tick; raising would crash the loop.
+        We never raise to the caller — a missed frame is recoverable on
+        the next tick; raising would crash the loop.
         """
         try:
             c = self._client()
@@ -67,14 +64,20 @@ class MonitorCapturer:
             _logger.warning("activity capture: mss client init failed: %s", exc)
             return None
         try:
-            os.makedirs(os.path.dirname(out_path), exist_ok=True)
+            import numpy as np
             l, t, r, b = info.bbox
             region = {"left": l, "top": t, "width": r - l, "height": b - t}
             shot = c.grab(region)
-            from PIL import Image
-            img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
-            img.save(out_path, format="PNG", optimize=False, compress_level=1)
-            return out_path
+            # mss returns BGRA bytes; reshape into a numpy view, then
+            # swap channels to RGB and drop the alpha. ascontiguousarray
+            # is required because RapidOCR / PIL JPEG encode want a
+            # contiguous buffer (numpy fancy indexing returns a copy
+            # that's already contiguous, but be explicit to document
+            # the invariant).
+            w, h = shot.size
+            arr = np.frombuffer(shot.bgra, dtype=np.uint8).reshape(h, w, 4)
+            rgb = np.ascontiguousarray(arr[..., [2, 1, 0]])
+            return rgb
         except Exception:
             _logger.debug("activity capture failed for monitor %d",
                           info.index, exc_info=True)

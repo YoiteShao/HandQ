@@ -76,6 +76,14 @@ const finalListeners = [];
 const errorListeners = [];
 const statusListeners = [];
 
+// Bridge emits its boot_progress status burst within ~1.5s of spawn, which
+// can land before the renderer has finished parsing renderer.js and called
+// onStatus(). Without this backlog the boot overlay stays stuck because the
+// `stdio_loop_ready` event is dropped on the floor. Drained exactly once,
+// when the first onStatus listener registers.
+const statusBacklog = [];
+let statusReplayed = false;
+
 // One-shot id-correlated waiters for getConfig / setConfig responses, which
 // the bridge delivers as `final` envelopes (porting_design.md §(2.7), §(2.8)).
 const pendingByid = new Map();
@@ -90,8 +98,12 @@ ipcRenderer.on('handq:event', (_evt, evt) => {
             try { cb(evt); } catch (_) { /* swallow */ }
         }
     } else if (t === 'status') {
-        for (const cb of statusListeners) {
-            try { cb(evt); } catch (_) { /* swallow */ }
+        if (!statusReplayed && statusListeners.length === 0) {
+            statusBacklog.push(evt);
+        } else {
+            for (const cb of statusListeners) {
+                try { cb(evt); } catch (_) { /* swallow */ }
+            }
         }
     } else if (t === 'final') {
         if (evt.id && pendingByid.has(evt.id)) {
@@ -160,8 +172,19 @@ contextBridge.exposeInMainWorld('handq', {
      * onStatus(cb) — cb receives every {type:"status", kind, ...} envelope.
      */
     onStatus: (cb) => {
-        preloadLog('onStatus', { registered: typeof cb === 'function' });
-        if (typeof cb === 'function') statusListeners.push(cb);
+        preloadLog('onStatus', {
+            registered: typeof cb === 'function',
+            backlog: statusBacklog.length,
+        });
+        if (typeof cb !== 'function') return;
+        statusListeners.push(cb);
+        if (!statusReplayed) {
+            statusReplayed = true;
+            const drained = statusBacklog.splice(0, statusBacklog.length);
+            for (const evt of drained) {
+                try { cb(evt); } catch (_) { /* swallow */ }
+            }
+        }
     },
 
     /**

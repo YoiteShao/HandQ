@@ -656,12 +656,159 @@ def _is_sensitive_window(title: str, process_name: str = "") -> bool:
 
 # ── Screen capture ───────────────────────────────────────────────────────────
 
+def _screenshot_hwnd_via_print_window(
+    out_path: str, hwnd: int,
+) -> Tuple[Tuple[int, int, int, int], int, bool]:
+    """Capture a SPECIFIC window by hwnd via PrintWindow, regardless of foreground state.
+
+    Returns ((x1, y1, x2, y2), bytes_written, looked_black).
+
+    ``looked_black`` is True when the captured bitmap appears to be a fully
+    black rectangle — common for hardware-accelerated targets (Chromium,
+    DirectX surfaces) where PrintWindow cannot read the GPU-composed output.
+    Caller should fall back to a foreground-based capture in that case.
+
+    Uses PW_RENDERFULLCONTENT (0x2) so DWM-composed and partially obscured
+    windows still capture properly. mstsc (Remote Desktop Connection) works
+    reliably with this flag.
+
+    Implementation note: deliberately uses ctypes directly rather than
+    win32ui to keep the dependency surface aligned with the rest of the
+    module (win32gui only). Resources are released even on exception via
+    try/finally.
+    """
+    if not _WIN32_AVAILABLE:
+        raise RuntimeError("hwnd capture requires pywin32 (win32gui).")
+    _ensure_dpi_aware()
+
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    gdi32 = ctypes.windll.gdi32
+
+    rect = win32gui.GetWindowRect(hwnd)
+    x1, y1, x2, y2 = rect
+    width = x2 - x1
+    height = y2 - y1
+    if width <= 0 or height <= 0:
+        raise RuntimeError(
+            f"hwnd {hwnd} has invalid rect {rect}. Window may be minimised."
+        )
+
+    # ── BITMAPINFO struct for GetDIBits ──────────────────────────────────────
+    class BITMAPINFOHEADER(ctypes.Structure):
+        _fields_ = [
+            ("biSize", wintypes.DWORD),
+            ("biWidth", ctypes.c_long),
+            ("biHeight", ctypes.c_long),
+            ("biPlanes", wintypes.WORD),
+            ("biBitCount", wintypes.WORD),
+            ("biCompression", wintypes.DWORD),
+            ("biSizeImage", wintypes.DWORD),
+            ("biXPelsPerMeter", ctypes.c_long),
+            ("biYPelsPerMeter", ctypes.c_long),
+            ("biClrUsed", wintypes.DWORD),
+            ("biClrImportant", wintypes.DWORD),
+        ]
+
+    class BITMAPINFO(ctypes.Structure):
+        _fields_ = [("bmiHeader", BITMAPINFOHEADER), ("bmiColors", wintypes.DWORD * 3)]
+
+    PW_RENDERFULLCONTENT = 0x00000002
+    BI_RGB = 0
+    DIB_RGB_COLORS = 0
+
+    hdc_window = user32.GetWindowDC(hwnd)
+    if not hdc_window:
+        raise RuntimeError(f"GetWindowDC failed for hwnd {hwnd}")
+    hdc_mem = gdi32.CreateCompatibleDC(hdc_window)
+    hbitmap = gdi32.CreateCompatibleBitmap(hdc_window, width, height)
+    old_obj = gdi32.SelectObject(hdc_mem, hbitmap)
+
+    try:
+        # PrintWindow returns BOOL (non-zero on success).
+        ok = user32.PrintWindow(
+            wintypes.HWND(hwnd), wintypes.HDC(hdc_mem), ctypes.c_uint(PW_RENDERFULLCONTENT),
+        )
+        if not ok:
+            raise RuntimeError(
+                f"PrintWindow returned 0 for hwnd {hwnd}. Window may be "
+                "elevated/protected or hwnd is invalid."
+            )
+
+        # Read pixels back via GetDIBits — top-down 32-bit BGRA.
+        bmi = BITMAPINFO()
+        bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+        bmi.bmiHeader.biWidth = width
+        bmi.bmiHeader.biHeight = -height          # top-down
+        bmi.bmiHeader.biPlanes = 1
+        bmi.bmiHeader.biBitCount = 32
+        bmi.bmiHeader.biCompression = BI_RGB
+        bmi.bmiHeader.biSizeImage = 0
+
+        buf_size = width * height * 4
+        buf = (ctypes.c_ubyte * buf_size)()
+
+        scanlines = gdi32.GetDIBits(
+            wintypes.HDC(hdc_mem),
+            wintypes.HBITMAP(hbitmap),
+            ctypes.c_uint(0),
+            ctypes.c_uint(height),
+            buf,
+            ctypes.byref(bmi),
+            ctypes.c_uint(DIB_RGB_COLORS),
+        )
+        if scanlines == 0:
+            raise RuntimeError(f"GetDIBits returned 0 for hwnd {hwnd}")
+
+        try:
+            from PIL import Image
+        except ImportError as exc:
+            raise RuntimeError(
+                "Pillow is required for desktop screenshot encoding. "
+                f"Run: pip install pillow ({exc})"
+            )
+
+        # BGRA bytes → RGB image; ignore alpha (mstsc / most win32 windows
+        # return alpha=0 which would look fully transparent if preserved).
+        img = Image.frombytes("RGB", (width, height), bytes(buf), "raw", "BGRX")
+        img.save(out_path, "PNG", optimize=True)
+
+        # Black-frame heuristic — sample at most ~512 evenly-spaced pixels
+        # from the buffer; if every sampled (B, G, R) byte is 0, treat as
+        # PrintWindow GPU miss and signal caller to fall back.
+        sample_step = max(1, buf_size // (512 * 4)) * 4
+        looked_black = True
+        for i in range(0, buf_size, sample_step):
+            if buf[i] != 0 or buf[i + 1] != 0 or buf[i + 2] != 0:
+                looked_black = False
+                break
+    finally:
+        gdi32.SelectObject(hdc_mem, old_obj)
+        gdi32.DeleteObject(hbitmap)
+        gdi32.DeleteDC(hdc_mem)
+        user32.ReleaseDC(hwnd, hdc_window)
+
+    try:
+        size = os.path.getsize(out_path)
+    except OSError:
+        size = 0
+    return (x1, y1, x2, y2), size, looked_black
+
+
 def _screenshot_region(out_path: str, region: str = "foreground",
-                       monitor: int = 0) -> Tuple[Tuple[int, int, int, int], int]:
+                       monitor: int = 0,
+                       hwnd: Optional[int] = None,
+                       ) -> Tuple[Tuple[int, int, int, int], int]:
     """Capture *region* to *out_path* as PNG.
 
     Returns ((x1, y1, x2, y2), bytes_written).
 
+      hwnd=<int>           target a specific window via PrintWindow,
+                           bypassing foreground state. Falls back to mss
+                           capture of the window's rect if PrintWindow
+                           returns a black frame (GPU-accelerated targets).
       region="foreground"  current foreground window's bounding rect
       region="fullscreen"  whole virtual screen (or specific monitor index)
 
@@ -677,8 +824,47 @@ def _screenshot_region(out_path: str, region: str = "foreground",
             "pip install will not take effect until restart."
         )
     _ensure_dpi_aware()
-    rect: Tuple[int, int, int, int]
-    if region == "foreground":
+
+    # ── hwnd path (PrintWindow with mss fallback) ────────────────────────────
+    if hwnd:
+        try:
+            rect, size, looked_black = _screenshot_hwnd_via_print_window(out_path, int(hwnd))
+        except Exception as exc:
+            # PrintWindow refused outright (elevated process, invalid hwnd) —
+            # fall through to the mss path which will at least capture
+            # whatever pixels are visible at the rect.
+            looked_black = True
+            rect = None
+            _logger = get_logger()
+            _logger.warning(
+                f"PrintWindow capture failed for hwnd={hwnd}: {exc}; "
+                f"falling back to rect-based mss capture",
+                component="DesktopTool",
+            )
+
+        if not looked_black and rect is not None:
+            return rect, size
+
+        # Fallback: capture the hwnd's rect via mss (no foreground change).
+        # The rect may show whatever is on top at that screen location, but
+        # at least it's deterministic about coordinates — better than the
+        # current foreground guesswork.
+        if _WIN32_AVAILABLE:
+            r = win32gui.GetWindowRect(int(hwnd))
+            if r[2] - r[0] > 0 and r[3] - r[1] > 0:
+                rect = (r[0], r[1], r[2], r[3])
+        if rect is None:
+            raise RuntimeError(
+                f"hwnd {hwnd} capture failed and rect could not be resolved."
+            )
+        # fall through to mss capture path below using the resolved rect.
+    else:
+        rect = None  # populated by region branch below
+
+    rect_resolved: Tuple[int, int, int, int]
+    if rect is not None:
+        rect_resolved = rect
+    elif region == "foreground":
         info = _foreground_window_info()
         if not info or not info.get("rect"):
             raise RuntimeError(
@@ -692,21 +878,22 @@ def _screenshot_region(out_path: str, region: str = "foreground",
                 f"Foreground window has invalid rect {info['rect']}. "
                 "It may be minimised — restore it before screenshotting."
             )
-        rect = (x1, y1, x2, y2)
+        rect_resolved = (x1, y1, x2, y2)
     elif region == "fullscreen":
         # mss monitor[0] = "all monitors" virtual rect; 1+ = each monitor.
         with mss.mss() as sct:
             mon = sct.monitors[monitor if monitor < len(sct.monitors) else 0]
-        rect = (mon["left"], mon["top"],
-                mon["left"] + mon["width"], mon["top"] + mon["height"])
+        rect_resolved = (mon["left"], mon["top"],
+                         mon["left"] + mon["width"], mon["top"] + mon["height"])
     else:
         raise RuntimeError(
             f"unknown region {region!r}. Use 'foreground' or 'fullscreen'."
         )
 
     with mss.mss() as sct:
-        bbox = {"left": rect[0], "top": rect[1],
-                "width": rect[2] - rect[0], "height": rect[3] - rect[1]}
+        bbox = {"left": rect_resolved[0], "top": rect_resolved[1],
+                "width": rect_resolved[2] - rect_resolved[0],
+                "height": rect_resolved[3] - rect_resolved[1]}
         raw = sct.grab(bbox)
         # mss returns a `ScreenShot` object; convert to PNG via PIL so we
         # share the encoder with the rest of the pipeline (vision_client
@@ -724,7 +911,7 @@ def _screenshot_region(out_path: str, region: str = "foreground",
         size = os.path.getsize(out_path)
     except OSError:
         size = 0
-    return rect, size
+    return rect_resolved, size
 
 
 # ── UIA accessibility-tree enumeration ───────────────────────────────────────
@@ -914,6 +1101,64 @@ def _format_snapshot_summary(
     return "\n".join(lines)
 
 
+# ── UIA pattern helpers ──────────────────────────────────────────────────────
+#
+# Called synchronously via run_in_executor. Return None on success, an error
+# string on any failure so callers fall back to pyautogui without raising.
+
+def _uia_invoke_at_point(x: int, y: int) -> Optional[str]:
+    """Try UIA InvokePattern / TogglePattern / SelectionItemPattern at (x, y).
+
+    Walks all three patterns so buttons (Invoke), checkboxes (Toggle), and
+    list/tab/tree items (SelectionItem) are covered without the caller needing
+    to know the control type in advance.
+    """
+    try:
+        from pywinauto import Desktop  # type: ignore[import-not-found]
+    except ImportError:
+        return "pywinauto not installed"
+    try:
+        elem = Desktop(backend="uia").from_point(x, y)
+    except Exception as exc:
+        return f"UIA from_point: {exc}"
+    if elem is None:
+        return "no UIA element at coordinate"
+    errors: List[str] = []
+    for method in ("invoke", "toggle", "select"):
+        try:
+            getattr(elem, method)()
+            return None  # success
+        except Exception as exc:
+            errors.append(f"{method}: {exc}")
+    ctrl_type = ""
+    try:
+        ctrl_type = elem.element_info.control_type or ""
+    except Exception:
+        pass
+    return f"UIA patterns exhausted for {ctrl_type!r}: {'; '.join(errors)}"
+
+
+def _uia_set_focused_value(text: str) -> Optional[str]:
+    """Set the focused edit control's value via ValuePattern.SetValue.
+
+    Replaces the entire field content — semantically different from
+    pyautogui.typewrite (which appends). Callers surface this distinction
+    via the 'input_source' key in ToolResult.output.
+    """
+    try:
+        from pywinauto import Desktop  # type: ignore[import-not-found]
+    except ImportError:
+        return "pywinauto not installed"
+    try:
+        elem = Desktop(backend="uia").get_focus()
+        if elem is None:
+            return "no focused element"
+        elem.set_edit_text(text)
+        return None
+    except Exception as exc:
+        return f"UIA set_edit_text: {exc}"
+
+
 # ── DesktopTool ──────────────────────────────────────────────────────────────
 
 
@@ -964,6 +1209,18 @@ class DesktopTool(BaseTool):
                 "description": (
                     "[screenshot region='fullscreen'] 0 = all monitors "
                     "stitched (default); 1..N = a specific monitor."
+                ),
+            },
+            "hwnd": {
+                "type": "integer",
+                "description": (
+                    "[screenshot] Target a specific window by hwnd, "
+                    "regardless of foreground state. Captures via "
+                    "PrintWindow under the hood — eliminates the focus-"
+                    "thrashing class of failures (Teams / VSCode stealing "
+                    "focus mid-screenshot). Falls back to a rect-based mss "
+                    "capture if PrintWindow returns black (some hardware-"
+                    "accelerated targets). Get hwnd from list_windows."
                 ),
             },
             "with_ocr": {
@@ -1111,6 +1368,18 @@ class DesktopTool(BaseTool):
                     "'f5', 'pagedown'."
                 ),
             },
+            "use_uia_pattern": {
+                "type": "boolean",
+                "description": (
+                    "[click_at / type_text / find_and_click] Try UIA "
+                    "InvokePattern / ValuePattern before falling back to "
+                    "pyautogui mouse/keyboard simulation. Default true. "
+                    "Ignored for right/middle clicks, double-clicks, drag, "
+                    "scroll, hotkey, key_press — those always use pyautogui. "
+                    "Set false for apps that don't expose UIA (custom-rendered "
+                    "apps, games) or when you need exact coordinate-level input."
+                ),
+            },
         },
         "required": ["action"],
         "additionalProperties": False,
@@ -1188,9 +1457,36 @@ class DesktopTool(BaseTool):
         monitor = int(kwargs.get("monitor") or 0)
         path_arg: Optional[str] = kwargs.get("path")
         with_ocr = bool(kwargs.get("with_ocr", False))
+        try:
+            hwnd_arg = int(kwargs["hwnd"]) if kwargs.get("hwnd") else None
+        except (TypeError, ValueError):
+            hwnd_arg = None
 
-        # Sensitive window guard for foreground capture.
-        if region == "foreground":
+        # Sensitive window guard.
+        # - hwnd path: check the title of the SPECIFIC target hwnd, not the
+        #   foreground; capturing a non-foreground sensitive window is just
+        #   as much of a leak as foregrounding it.
+        # - foreground path: legacy behaviour — check current foreground.
+        if hwnd_arg:
+            if _WIN32_AVAILABLE:
+                try:
+                    target_title = win32gui.GetWindowText(hwnd_arg) or ""
+                    try:
+                        _, target_pid = win32process.GetWindowThreadProcessId(hwnd_arg)
+                    except Exception:
+                        target_pid = 0
+                    target_proc = _process_name_for_pid(target_pid)
+                    if _is_sensitive_window(target_title, target_proc):
+                        return self._error(
+                            params, start,
+                            f"REFUSED: target hwnd {hwnd_arg} ({target_title!r}) "
+                            "matches the sensitive_window_patterns list. Capture "
+                            "of password managers / banking apps is blocked even "
+                            "when not foregrounded.",
+                        )
+                except Exception:
+                    pass
+        elif region == "foreground":
             info = _foreground_window_info()
             if info and _is_sensitive_window(info.get("title", ""), info.get("process_name", "")):
                 return self._error(
@@ -1216,7 +1512,7 @@ class DesktopTool(BaseTool):
 
         try:
             rect, size = await asyncio.get_event_loop().run_in_executor(
-                None, _screenshot_region, out_path, region, monitor,
+                None, _screenshot_region, out_path, region, monitor, hwnd_arg,
             )
         except Exception as exc:
             return self._error(params, start, f"screenshot: {exc}")
@@ -1226,10 +1522,12 @@ class DesktopTool(BaseTool):
 
         output: Dict[str, Any] = {
             "path": out_path,
-            "region": region,
+            "region": region if not hwnd_arg else "hwnd",
             "rect": list(rect),
             "bytes": size,
         }
+        if hwnd_arg:
+            output["hwnd"] = hwnd_arg
 
         # Optional OCR pass. The big win is letting one screenshot replace
         # several find_element round-trips on text-heavy UIs — the agent
@@ -1813,6 +2111,7 @@ class DesktopTool(BaseTool):
                 params, start, f"find_and_click: invalid button {button!r}"
             )
         double = bool(kwargs.get("double", False))
+        use_uia = bool(kwargs.get("use_uia_pattern", True))
 
         # Delegate the find half to the existing handler so OCR pre-warm,
         # vision fallback, threshold handling, and the screenshot lifecycle
@@ -1841,19 +2140,46 @@ class DesktopTool(BaseTool):
 
         _ensure_dpi_aware()
         state_before = _capture_state_before()
-        try:
-            await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: pyautogui.click(
-                    x=x, y=y, button=button, clicks=2 if double else 1,
-                ),
+
+        # UIA path: only for left single-clicks (mirrors click_at logic).
+        input_source: str
+        if use_uia and button == "left" and not double:
+            uia_err = await asyncio.get_event_loop().run_in_executor(
+                None, _uia_invoke_at_point, x, y,
             )
-        except pyautogui.FailSafeException:
-            return self._error(
-                params, start,
-                "find_and_click: PyAutoGUI failsafe triggered (mouse hit "
-                "corner). Move the mouse away from screen corners and retry.",
-            )
+            if uia_err is None:
+                input_source = "uia_pattern"
+            else:
+                try:
+                    await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: pyautogui.click(
+                            x=x, y=y, button="left", clicks=1,
+                        ),
+                    )
+                except pyautogui.FailSafeException:
+                    return self._error(
+                        params, start,
+                        "find_and_click: PyAutoGUI failsafe triggered (mouse hit "
+                        "corner). Move the mouse away from screen corners and retry.",
+                    )
+                input_source = "mouse"
+        else:
+            try:
+                await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: pyautogui.click(
+                        x=x, y=y, button=button, clicks=2 if double else 1,
+                    ),
+                )
+            except pyautogui.FailSafeException:
+                return self._error(
+                    params, start,
+                    "find_and_click: PyAutoGUI failsafe triggered (mouse hit "
+                    "corner). Move the mouse away from screen corners and retry.",
+                )
+            input_source = "mouse"
+
         await asyncio.sleep(0.1)
         state_after = _capture_state_after(state_before)
         _invalidate_snapshot_cache_on_state_change(state_after)
@@ -1866,6 +2192,7 @@ class DesktopTool(BaseTool):
             "confidence": out.get("confidence"),
             "matched_text": out.get("matched_text"),
             "screenshot": out.get("screenshot"),
+            "input_source": input_source,
             "state_after": state_after,
         }
         return ToolResult(
@@ -1895,32 +2222,58 @@ class DesktopTool(BaseTool):
         if button not in ("left", "right", "middle"):
             return self._error(params, start, f"click_at: invalid button {button!r}")
         double = bool(kwargs.get("double", False))
+        use_uia = bool(kwargs.get("use_uia_pattern", True))
 
         _ensure_dpi_aware()
         state_before = _capture_state_before()
-        try:
-            await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: pyautogui.click(x=x, y=y, button=button, clicks=2 if double else 1),
+        output: Dict[str, Any] = {"x": x, "y": y, "button": button, "double": double}
+
+        # UIA path: only for left single-clicks (right/middle/double have no
+        # UIA equivalent and must always use pyautogui).
+        if use_uia and button == "left" and not double:
+            uia_err = await asyncio.get_event_loop().run_in_executor(
+                None, _uia_invoke_at_point, x, y,
             )
-        except pyautogui.FailSafeException:
-            return self._error(
-                params, start,
-                "click_at: PyAutoGUI failsafe triggered (mouse hit corner). "
-                "Move the mouse away from screen corners and retry.",
-            )
+            if uia_err is None:
+                output["input_source"] = "uia_pattern"
+            else:
+                output["uia_fallback_reason"] = uia_err
+                try:
+                    await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: pyautogui.click(x=x, y=y, button="left", clicks=1),
+                    )
+                except pyautogui.FailSafeException:
+                    return self._error(
+                        params, start,
+                        "click_at: PyAutoGUI failsafe triggered (mouse hit corner). "
+                        "Move the mouse away from screen corners and retry.",
+                    )
+                output["input_source"] = "mouse"
+        else:
+            try:
+                await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: pyautogui.click(x=x, y=y, button=button, clicks=2 if double else 1),
+                )
+            except pyautogui.FailSafeException:
+                return self._error(
+                    params, start,
+                    "click_at: PyAutoGUI failsafe triggered (mouse hit corner). "
+                    "Move the mouse away from screen corners and retry.",
+                )
+            output["input_source"] = "mouse"
+
         # Brief settle so Windows has time to react before we probe state.
         # 100 ms is enough for the typical click → dialog / focus shift,
         # while staying well below the user-visible threshold.
         await asyncio.sleep(0.1)
         state_after = _capture_state_after(state_before)
         _invalidate_snapshot_cache_on_state_change(state_after)
+        output["state_after"] = state_after
         return ToolResult(
             success=True,
-            output={
-                "x": x, "y": y, "button": button, "double": double,
-                "state_after": state_after,
-            },
+            output=output,
             tool_name=self.name,
             tool_parameters=params,
             execution_time=time.time() - start,
@@ -1952,25 +2305,46 @@ class DesktopTool(BaseTool):
             interval = float(kwargs.get("interval") or _DEFAULT_TYPE_INTERVAL)
         except (TypeError, ValueError):
             interval = _DEFAULT_TYPE_INTERVAL
+        use_uia = bool(kwargs.get("use_uia_pattern", True))
 
         _ensure_dpi_aware()
         state_before = _capture_state_before()
-        try:
-            await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: pyautogui.typewrite(text, interval=interval),
+        output: Dict[str, Any] = {"chars": len(text), "interval": interval}
+
+        if use_uia:
+            uia_err = await asyncio.get_event_loop().run_in_executor(
+                None, _uia_set_focused_value, text,
             )
-        except Exception as exc:
-            return self._error(params, start, f"type_text: {exc}")
+            if uia_err is None:
+                # ValuePattern.SetValue replaces the entire field content.
+                output["input_source"] = "uia_value_pattern"
+            else:
+                output["uia_fallback_reason"] = uia_err
+                try:
+                    await asyncio.get_event_loop().run_in_executor(
+                        None,
+                        lambda: pyautogui.typewrite(text, interval=interval),
+                    )
+                except Exception as exc:
+                    return self._error(params, start, f"type_text: {exc}")
+                output["input_source"] = "keyboard"
+        else:
+            try:
+                await asyncio.get_event_loop().run_in_executor(
+                    None,
+                    lambda: pyautogui.typewrite(text, interval=interval),
+                )
+            except Exception as exc:
+                return self._error(params, start, f"type_text: {exc}")
+            output["input_source"] = "keyboard"
+
         await asyncio.sleep(0.1)
         state_after = _capture_state_after(state_before)
         _invalidate_snapshot_cache_on_state_change(state_after)
+        output["state_after"] = state_after
         return ToolResult(
             success=True,
-            output={
-                "chars": len(text), "interval": interval,
-                "state_after": state_after,
-            },
+            output=output,
             tool_name=self.name,
             tool_parameters=params,
             execution_time=time.time() - start,

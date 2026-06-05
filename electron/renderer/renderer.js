@@ -356,8 +356,6 @@
     const cfgSwToolBash  = document.getElementById('cfg-sw-tool-bash');
     const cfgSwToolBrowserAuto    = document.getElementById('cfg-sw-tool-browser-auto');
     const cfgSwToolDesktopAuto    = document.getElementById('cfg-sw-tool-desktop-auto');
-    const cfgSwToolWebSearchAuto    = document.getElementById('cfg-sw-tool-web-search-auto');
-    const cfgSwToolEmailAuto    = document.getElementById('cfg-sw-tool-email-auto');
     const cfgSwHighRisk  = document.getElementById('cfg-sw-high-risk');
     const cfgEmailFolderBlacklist = document.getElementById('cfg-email-folder-blacklist');
     // Personalization fields — surface for git-hook learning + privacy
@@ -705,7 +703,7 @@
     // opens the popover above it with the full ring-buffer feed.
 
     const ACTIVITY_RING  = 30;
-    const ACTIVITY_TRUNC = 600;
+    const ACTIVITY_TRUNC = 2000;
     const activityItems  = [];
     let   activityLiveTimer = null;
     let   popoverOpen = false;
@@ -799,15 +797,15 @@
         var obj = params;
         if (typeof obj === 'string') {
             if (obj === 'None' || obj === 'null') return '';
-            try { obj = JSON.parse(obj); } catch (_) { return truncate(obj, 240); }
+            try { obj = JSON.parse(obj); } catch (_) { return truncate(obj, 2000); }
         }
-        if (typeof obj !== 'object' || obj === null) return truncate(String(params), 240);
+        if (typeof obj !== 'object' || obj === null) return truncate(String(params), 2000);
         var key = (tool === 'browser') ? 'url' :
                   (tool === 'bash' || tool === 'shell') ? 'command' :
                   (tool === 'write' || tool === 'edit' || tool === 'read') ? 'path' :
                   Object.keys(obj)[0] || '';
         var val = key ? String(obj[key] || '') : '';
-        return truncate(val, 240);
+        return truncate(val, 2000);
     }
 
     function formatResultReadable(tool, output) {
@@ -815,11 +813,11 @@
         var obj = output;
         if (typeof obj === 'string') {
             try { obj = JSON.parse(obj); } catch (_) {
-                return truncate(stripAnsi(obj).replace(/\s+/g, ' ').trim(), 400);
+                return truncate(stripAnsi(obj).replace(/\s+/g, ' ').trim(), 2000);
             }
         }
         if (typeof obj !== 'object' || obj === null) {
-            return truncate(stripAnsi(String(output)).replace(/\s+/g, ' ').trim(), 400);
+            return truncate(stripAnsi(String(output)).replace(/\s+/g, ' ').trim(), 2000);
         }
         // For bash/shell results: show stdout (cleaned) or stderr if failed
         if ('stdout' in obj || 'exit_code' in obj || 'returncode' in obj) {
@@ -827,17 +825,17 @@
             var out = stripAnsi(String(obj.stdout || '')).replace(/\s+/g, ' ').trim();
             var err = stripAnsi(String(obj.stderr || '')).replace(/\s+/g, ' ').trim();
             if (String(code) !== '0' && err) {
-                return '✗ ' + truncate(err, 380);
+                return '✗ ' + truncate(err, 2000);
             }
-            if (out) return truncate(out, 400);
-            if (err) return truncate(err, 400);
+            if (out) return truncate(out, 2000);
+            if (err) return truncate(err, 2000);
             return code === '0' || code === 0 ? 'done' : '✗ exit ' + code;
         }
         // For common tools, pick the most informative field
-        if (obj.output) return truncate(stripAnsi(String(obj.output)).replace(/\s+/g, ' ').trim(), 400);
-        if (obj.result) return truncate(String(obj.result).replace(/\s+/g, ' ').trim(), 400);
-        if (obj.content) return truncate(String(obj.content).replace(/\s+/g, ' ').trim(), 400);
-        if (obj.text) return truncate(String(obj.text).replace(/\s+/g, ' ').trim(), 400);
+        if (obj.output) return truncate(stripAnsi(String(obj.output)).replace(/\s+/g, ' ').trim(), 2000);
+        if (obj.result) return truncate(String(obj.result).replace(/\s+/g, ' ').trim(), 2000);
+        if (obj.content) return truncate(String(obj.content).replace(/\s+/g, ' ').trim(), 2000);
+        if (obj.text) return truncate(String(obj.text).replace(/\s+/g, ' ').trim(), 2000);
         if (obj.status) return String(obj.status);
         // Fallback: show first few key=value pairs, skipping noise
         var skipKeys = new Set(['cwd_used', 'shell', 'venv', 'cwd', 'truncated']);
@@ -848,7 +846,7 @@
             if (skipKeys.has(k)) continue;
             var v = obj[k];
             if (v === 'None' || v === null || v === '' || v === 'null') continue;
-            parts.push(k + ': ' + truncate(stripAnsi(String(v)), 100));
+            parts.push(k + ': ' + truncate(stripAnsi(String(v)), 500));
         }
         return parts.join(' | ') || 'done';
     }
@@ -864,14 +862,22 @@
         setPill(text);
     }
 
-    function pushActivity(icon, label, content) {
-        if (!activityStrip) return;
+    function pushActivity(icon, label, content, opts) {
+        if (!activityStrip) return null;
         const time = new Date().toLocaleTimeString([], { hour12: false });
         const entry = {
             icon: icon || '·',
             label: label || '',
             content: content == null ? '' : String(content),
             time: time,
+            // Optional pairing tags — set by the tool_execution_started pre
+            // branch so the matching post event can find this entry and
+            // attach a result instead of pushing a separate Done item.
+            iter: opts && opts.iter != null ? String(opts.iter) : null,
+            tool: opts && opts.tool ? String(opts.tool) : null,
+            pending: !!(opts && opts.pending),
+            resultIcon: null,
+            resultContent: null,
         };
         activityItems.push(entry);
         if (activityItems.length > ACTIVITY_RING) activityItems.shift();
@@ -879,6 +885,42 @@
         // Refresh the strip text with a one-line preview of the latest entry.
         const preview = entry.icon + ' ' + entry.label +
             (entry.content ? ' · ' + truncate(entry.content.replace(/\s+/g, ' '), 120) : '');
+        setPill(preview);
+        pulseActivityLive();
+        return entry;
+    }
+
+    // Find the oldest pending entry matching (iter, tool) and attach a
+    // result to it — folding the post-execution event into the same
+    // activity item that announced the pre-execution. Falls back to a
+    // fresh activity entry if no matching pending entry is found (e.g.
+    // it was evicted from the ring buffer).
+    function updateActivityResult(iter, tool, resultIcon, headLabel, resultContent) {
+        var iterStr = iter == null ? null : String(iter);
+        var match = null;
+        for (var i = 0; i < activityItems.length; i++) {
+            var e = activityItems[i];
+            if (!e.pending) continue;
+            if (iterStr != null && e.iter !== iterStr) continue;
+            if (tool && e.tool && e.tool !== tool) continue;
+            match = e;
+            break;
+        }
+        if (!match) {
+            // Pending entry already evicted (or never recorded). Degrade to
+            // the legacy behaviour so the result is still surfaced.
+            pushActivity(resultIcon || '✓', (tool || 'tool') + ' done', resultContent || '');
+            return;
+        }
+        match.icon = resultIcon || '✓';
+        match.label = headLabel || match.tool || match.label;
+        match.resultIcon = resultIcon || '✓';
+        match.resultContent = resultContent == null ? '' : String(resultContent);
+        match.pending = false;
+        renderActivityFeed();
+        // Refresh the strip text so the most recent completion is visible.
+        const preview = match.icon + ' ' + match.label +
+            (match.resultContent ? ' · ' + truncate(match.resultContent.replace(/\s+/g, ' '), 120) : '');
         setPill(preview);
         pulseActivityLive();
     }
@@ -908,14 +950,37 @@
                 li.appendChild(content);
                 li.title = contentIsJson ? '' : entry.content;
             }
+
+            // Threaded result line: when a pending exec entry has been
+            // sealed by its post-event, render the result inside the same
+            // <li> with a leading "↳" so it's clearly tied to the command
+            // above. Collapsed by default; expands with the parent click.
+            if (entry.resultContent) {
+                const resultIsJson = isJsonString(entry.resultContent);
+                const resultEl = el('div', 'ai-result' + (resultIsJson ? ' ai-json' : ''));
+                if (resultIsJson) {
+                    resultEl.appendChild(document.createTextNode('↳ '));
+                    resultEl.appendChild(renderJsonContent(entry.resultContent));
+                } else {
+                    resultEl.textContent = '↳ ' + truncate(entry.resultContent, ACTIVITY_TRUNC);
+                }
+                li.appendChild(resultEl);
+            }
+
             li.addEventListener('click', () => {
                 li.classList.toggle('expanded');
                 const c = li.querySelector('.ai-content');
-                if (!c) return;
-                if (c.classList.contains('ai-json')) return;
-                c.textContent = li.classList.contains('expanded')
-                    ? entry.content
-                    : truncate(entry.content, ACTIVITY_TRUNC);
+                if (c && !c.classList.contains('ai-json')) {
+                    c.textContent = li.classList.contains('expanded')
+                        ? entry.content
+                        : truncate(entry.content, ACTIVITY_TRUNC);
+                }
+                const r = li.querySelector('.ai-result');
+                if (r && !r.classList.contains('ai-json')) {
+                    r.textContent = '↳ ' + (li.classList.contains('expanded')
+                        ? entry.resultContent
+                        : truncate(entry.resultContent, ACTIVITY_TRUNC));
+                }
             });
 
             activityFeed.appendChild(li);
@@ -1937,8 +2002,8 @@
         } else if (evt.kind === 'progress') {
             const cur = evt.current || 0;
             const tot = evt.total || 0;
-            const text = 'progress ' + cur + '/' + tot;
-            setPill(text);
+            setPill('progress ' + cur + '/' + tot);
+            addStepBubble('•', 'Progress ' + cur + '/' + tot);
         } else if (evt.kind === 'step_started') {
             const stepId = String(evt.step_id || args[0] || '');
             const desc = String(evt.desc || args[1] || '');
@@ -1954,7 +2019,7 @@
         } else if (evt.kind === 'step_confidence') {
             const conf = parseFloat(args[0]);
             if (!Number.isNaN(conf)) {
-                pushActivity('◎', 'Step confidence', conf.toFixed(2));
+                pushActivity('◎', 'Step confidence', Math.round(conf * 100) + '%');
                 setConfidenceGauge(conf);
             }
         } else if (evt.kind === 'decision_made') {
@@ -1967,29 +2032,36 @@
             var rawTool  = args[1] || '';
             const params = args[2];
             const output = args[3];
-            // Backend sends "None" (string) for tool/params in post-execution events
+            // Backend now sends tool_name in BOTH pre and post events; the
+            // pre/post discriminator is the output field (null for pre,
+            // populated for post). The "None"/"null" guards stay in place
+            // for backwards-compatible payloads.
             var tool = (rawTool && rawTool !== 'None' && rawTool !== 'null') ? rawTool : '';
             var isPre = output === undefined || output === null
                         || output === 'None' || output === 'null';
             if (isPre && tool) lastCalledTool = tool;
             var effectiveTool = tool || lastCalledTool || 'action';
-            const tag    = isPre ? '⊙' : '✓';
             const paramText = formatToolParams(params);
             if (isPre) {
                 activeExecCount++;
                 var ctx = briefToolContext(effectiveTool, params);
                 var preLabel = 'Executing ' + effectiveTool;
                 var preContent = ctx || paramText;
-                pushActivity(tag, preLabel, preContent);
+                pushActivity('⊙', preLabel, preContent, {
+                    iter: iter, tool: effectiveTool, pending: true,
+                });
                 setWorking('⊙ ' + effectiveTool + (ctx ? ' · ' + ctx : ''));
             } else {
                 activeExecCount = Math.max(0, activeExecCount - 1);
                 var readable = formatResultReadable(effectiveTool, output);
-                var postLabel = effectiveTool + ' done';
-                pushActivity(tag, postLabel, readable || String(output));
+                var resultText = readable || (output == null ? '' : String(output));
+                var resultIcon = (resultText && resultText.charAt(0) === '✗') ? '✗' : '✓';
+                updateActivityResult(iter, effectiveTool, resultIcon,
+                                     effectiveTool, resultText);
                 if (activeExecCount === 0) {
                     clearWorking();
-                    setPill('✓ ' + effectiveTool + (readable ? ' · ' + readable : ''));
+                    setPill(resultIcon + ' ' + effectiveTool +
+                            (readable ? ' · ' + readable : ''));
                 }
             }
         } else if (evt.kind === 'task_completed') {
@@ -3284,8 +3356,6 @@
         cfgSwToolBash.checked  = readSwitch('tool_bash',  'auto_approve');
         cfgSwToolBrowserAuto.checked    = readSwitch('tool_browser', 'auto_approve');
         cfgSwToolDesktopAuto.checked    = readSwitch('tool_desktop', 'auto_approve');
-        cfgSwToolWebSearchAuto.checked    = readSwitch('tool_web_search', 'auto_approve');
-        cfgSwToolEmailAuto.checked    = readSwitch('tool_email', 'auto_approve');
         cfgSwHighRisk.checked  = readSwitch('high_risk', 'auto_approve');
 
         const blacklist = emailCfg.folder_blacklist;
@@ -3362,8 +3432,6 @@
         writeSwitch('tool_bash',  'auto_approve', cfgSwToolBash.checked);
         writeSwitch('tool_browser', 'auto_approve', cfgSwToolBrowserAuto.checked);
         writeSwitch('tool_desktop', 'auto_approve', cfgSwToolDesktopAuto.checked);
-        writeSwitch('tool_web_search', 'auto_approve', cfgSwToolWebSearchAuto.checked);
-        writeSwitch('tool_email', 'auto_approve', cfgSwToolEmailAuto.checked);
         writeSwitch('high_risk',  'auto_approve', cfgSwHighRisk.checked);
 
         const rawBlacklist = cfgEmailFolderBlacklist.value;

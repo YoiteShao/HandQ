@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any, List, Optional, Tuple
+from typing import Any, List, Optional, Tuple, Union
 
 from ..logger import get_logger
 
@@ -98,10 +98,20 @@ class LocalOCR:
         self._engine = RapidOCR()
         return None
 
-    def recognize(self, image_path: str) -> OCRResult:
-        """Run OCR on a PNG/JPEG file path. Returns OCRResult with boxes
+    def recognize(self, image: Union[str, bytes, Any]) -> OCRResult:
+        """Run OCR on the supplied image. Returns OCRResult with boxes
         and a newline-joined full_text. Catches its own exceptions —
         callers don't need to wrap.
+
+        ``image`` accepts any input that RapidOCR's ``__call__`` accepts:
+          * ``str`` / ``Path`` — file path on disk (PNG / JPEG)
+          * ``bytes`` — raw encoded image bytes (PNG / JPEG / etc.)
+            Used by PersonalityMonitor's deferred-OCR drain to feed
+            JPEG bytes from its in-memory ring without round-tripping
+            through disk.
+          * ``numpy.ndarray`` — pre-decoded RGB array (H, W, 3 uint8).
+            Used by desktop_tool / activity_monitor when the frame is
+            already in memory as a numpy array.
         """
         err = self._ensure_engine()
         if err is not None:
@@ -111,7 +121,7 @@ class LocalOCR:
             # RapidOCR returns (results, elapse_seconds) where each
             # result is [polygon_points, text, score]. Older versions
             # used a different ordering; we defensively unpack.
-            result, _elapse = self._engine(image_path)
+            result, _elapse = self._engine(image)
         except Exception as exc:
             return OCRResult("", error=f"recognize failed: {exc}",
                              elapsed_ms=int((time.time() - t0) * 1000))

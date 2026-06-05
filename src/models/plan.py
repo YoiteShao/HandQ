@@ -288,6 +288,10 @@ class Plan:
     interrupt_current_step: bool = False           # True = abort running step now
     # Required when next_steps is empty: one-sentence explanation of why the task
     # ended — either what was accomplished (success) or why it is infeasible.
+    # User-stop convention: when the user has asked to stop the task, the planner
+    # emits next_steps=[] AND interrupt_current_step=True together; this
+    # completion_reason should quote or paraphrase the user's request so the LTM
+    # dream worker can mine the cause.
     completion_reason: Optional[str] = None
     # LLM's free-text explanation for the last_step_confidence score.
     # Empty string if the LLM did not output it (backward-compatible default).
@@ -457,7 +461,7 @@ class Plan:
   "interrupt_current_step": <boolean: true = abort the currently running agent step immediately; false = let it finish>,
   "last_step_confidence": <number 0.0-1.0 | null: confidence that the last completed step achieved its goal; omit or set empty next_steps to signal task completion>,
   "confidence_rationale": "<string | null: one sentence explaining why this confidence score was assigned, referencing specific evidence from tool outputs>",
-  "completion_reason": "<string | null: required when next_steps is empty — one sentence explaining what was accomplished or why the task is infeasible>",
+  "completion_reason": "<string | null: required when next_steps is empty — one sentence explaining what was accomplished or why the task is infeasible. For user-stop (interrupt_current_step=true with next_steps=[]), quote or paraphrase the user's stop request>",
   "skills_to_activate": ["<string: name of an Available Skill the planner wants added to the session-level active set; activated for the rest of the session and shown in full on the next cycle>"],
   "next_steps": [
     {

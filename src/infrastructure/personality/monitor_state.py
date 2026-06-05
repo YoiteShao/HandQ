@@ -49,6 +49,12 @@ class MonitorState:
     last_demotion_candidate_ts: float = 0.0
     last_hash: Optional[int] = None
     last_text: str = ""
+    # Wall-clock timestamp of the last frame whose perceptual_hash was
+    # accepted as "novel" (i.e. pushed into the ring buffer). Read by the
+    # OCR-drain gate to decide whether the monitor has been visually quiet
+    # long enough for OCR to run without competing with on-screen
+    # animation / video. 0.0 means "never seen a novel frame yet".
+    last_screen_change_ts: float = 0.0
     # Ring of recently-accepted OCR texts. The single ``last_text`` field
     # above is insufficient for dedup when the user briefly alt-tabs
     # away — a single foreign window OCR overwrites it, then the

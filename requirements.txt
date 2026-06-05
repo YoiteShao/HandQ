@@ -103,3 +103,10 @@ rapidfuzz>=3.0.0
 # but the tool still works. Imported lazily inside try/except so the agent
 # runs without it.
 psutil>=5.9.0
+
+# ── Teams tool dependencies (Windows-only) ────────────────────────────────────
+# teams_tool talks to Microsoft Graph REST API. Auth is bootstrapped from the
+# user's already-signed-in Teams Web session (read via Playwright against the
+# shared HandQ browser_profile), so we don't need msal here. httpx (already
+# above) handles the OAuth refresh-token exchange and Graph requests; playwright
+# (already above for browser_tool) handles the one-time bootstrap.

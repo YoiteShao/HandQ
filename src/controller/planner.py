@@ -96,12 +96,16 @@ class AcceptanceVerdict:
     def from_dict(cls, data: dict) -> 'AcceptanceVerdict':
         """Create an AcceptanceVerdict from a parsed LLM response dict.
 
-        Defensive parsing: unknown verdicts coerce to PASS (fail-open) so a
-        malformed LLM response does not block task completion indefinitely.
+        Defensive parsing: unknown verdicts coerce to PARTIAL (fail-CLOSED) so
+        a malformed LLM response forces the FlowController to inject a goal-
+        verification corrective step rather than silently completing the task.
+        Historically this defaulted to PASS (fail-open), which let acceptance
+        synthesis silently bless wrong-target work — see the 2026-06-03 RDP
+        post-mortem.
         """
         verdict_raw = (data.get('verdict') or '').strip().upper()
         if verdict_raw not in ('PASS', 'PARTIAL', 'FAIL'):
-            verdict_raw = 'PASS'
+            verdict_raw = 'PARTIAL'
 
         def _build_step(node: Any) -> Optional[Step]:
             if not isinstance(node, dict):
@@ -142,13 +146,18 @@ class AcceptanceVerdict:
     async def from_data(cls, raw_content: str) -> 'AcceptanceVerdict':
         """Parse a raw LLM response string into an AcceptanceVerdict.
 
-        Returns a default PASS instance if parsing fails so a malformed LLM
-        response does not stall the task (fail-open).
+        Returns a fail-CLOSED PARTIAL verdict if parsing fails, so the
+        FlowController injects a goal-verification corrective step instead
+        of silently completing on a malformed response.
         """
         parsed = try_parse_json(raw_content)
         if isinstance(parsed, dict):
             return cls.from_dict(parsed)
-        return cls()
+        return cls(
+            verdict='PARTIAL',
+            gap_summary='Acceptance response could not be parsed; verification did not run.',
+            fallback=True,
+        )
 
 
 # ── Planner ───────────────────────────────────────────────────────────────────
@@ -900,7 +909,15 @@ class Planner:
             # last_step_confidence must be explicitly set and >= threshold.
             # If the LLM omitted it or set it too low, inject a corrective step
             # rather than silently completing with unverified confidence.
-            if not plan.next_steps:
+            #
+            # Exception: when the planner ALSO sets interrupt_current_step=True
+            # alongside empty next_steps, that combination uniquely signals
+            # "user requested stop" (no other legitimate scenario combines an
+            # interrupt with no further work). Skip the guard so the user's
+            # stop request is honoured rather than silently revived by a
+            # corrective step. FlowController's is_complete branch detects the
+            # same convention and routes the task through a clean abort path.
+            if not plan.next_steps and not plan.interrupt_current_step:
                 conf = plan.last_step_confidence
                 if conf is None or conf < self.step_verification_threshold:
                     self.logger.warning(
@@ -917,12 +934,25 @@ class Planner:
                             "The planner signalled task completion but did not provide "
                             f"sufficient confidence (got {conf!r}, need >= "
                             f"{self.step_verification_threshold}). "
-                            "Re-read the key artifacts produced so far, verify they "
-                            "satisfy the original goal, and report your findings."
+                            "VERIFICATION OBLIGATION: extract every named entity from "
+                            "the ORIGINAL goal (hostnames, machine names, file paths, "
+                            "function names, IDs, URLs, ticket numbers) and confirm "
+                            "each one appears verbatim in the produced artifacts. "
+                            "If ANY goal entity is absent from artifact content, the "
+                            "work is INCOMPLETE — say so explicitly in your "
+                            "factual_outcome / issues; do NOT synthesize a closing "
+                            "report from data targeting a different entity. Otherwise, "
+                            "re-read the artifacts and report whether they truly "
+                            "answer the user's original question."
                         ),
                         expected_outcomes=[
-                            "Key artifacts exist and are non-empty",
-                            "Artifacts satisfy the original goal requirements",
+                            "Every named entity from the original goal verifiably "
+                            "appears in at least one produced artifact",
+                            "If a goal entity is missing from artifacts, "
+                            "factual_outcome explicitly reports the gap rather than "
+                            "fabricating closure with substitute data",
+                            "Artifacts contain factual answers to the user's "
+                            "original question, not data from a different target",
                         ],
                         risk_assessment="Low risk — read-only re-evaluation step",
                         required_context_keys=[],
@@ -1108,10 +1138,15 @@ class Planner:
         except Exception as e:
             self.logger.warning(
                 f'synthesize_acceptance failed ({type(e).__name__}): {e}; '
-                f'falling back to PASS to avoid blocking task completion.',
+                f'returning fail-CLOSED PARTIAL so the FlowController injects '
+                f'a goal-verification corrective step.',
                 component='Planner',
             )
-            return AcceptanceVerdict(verdict='PASS', fallback=True)
+            return AcceptanceVerdict(
+                verdict='PARTIAL',
+                gap_summary='Acceptance synthesis failed; goal-level verification did not run.',
+                fallback=True,
+            )
 
     def _detect_loops(self, completed_steps: List[Step]) -> str:
         """
@@ -1199,9 +1234,15 @@ class Planner:
 
         import re
 
-        # Heuristic patterns for external-world entity references in natural language
-        # Each pattern targets a different claim type.
+        # Heuristic patterns for external-world entity references in natural language.
+        # Order matters — broader compound tokens (hostnames, FQDNs) come first so
+        # narrower patterns (env-var fragments) cannot fragment them. Span-tracking
+        # below also skips matches that fall fully inside an already-claimed range.
         patterns = [
+            # Hostname / server name: A1-B2-C3 含连字符的全大写 token (e.g. APT-LV-SH186)
+            (r'\b[A-Z][A-Z0-9]+(?:-[A-Z0-9]+){2,}\b', 'hostname or server name'),
+            # FQDN / domain: a.b.c (at least 2 dots, lowercase)
+            (r'\b(?:[a-z0-9][\w\-]*\.){2,}[a-z]{2,}\b', 'domain or FQDN'),
             # File/directory paths: sequences with / or \ and .ext
             (r'[\w./\-]+/[\w./\-]+', 'file/directory path'),
             (r'[\w.\\\-]+\\[\w.\\\-]+', 'file/directory path'),  # Windows backslash paths
@@ -1215,12 +1256,20 @@ class Planner:
 
         assumed_claims = []
         seen = set()
+        covered_spans: List[tuple] = []
         for pattern, claim_type in patterns:
             for match in re.finditer(pattern, goal):
+                start, end = match.span()
+                # Skip fragments fully contained in an earlier (broader) match —
+                # otherwise 'APT-LV-SH186' (hostname) also yields 'APT' and
+                # 'SH186' as env-var fragments, polluting the inventory.
+                if any(s <= start and end <= e for s, e in covered_spans):
+                    continue
                 entity = match.group(0)
                 if entity in seen:
                     continue
                 seen.add(entity)
+                covered_spans.append((start, end))
                 assumed_claims.append((entity, claim_type))
 
         if not assumed_claims:

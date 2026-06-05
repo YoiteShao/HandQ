@@ -34,7 +34,7 @@ def _atomic_write(path: Path, content: str) -> None:
     parent = path.parent
     temp_fd, temp_path = tempfile.mkstemp(dir=parent, prefix=f".{path.name}.", suffix=".tmp")
     try:
-        with os.fdopen(temp_fd, 'w', encoding='utf-8') as f:
+        with os.fdopen(temp_fd, 'w', encoding='utf-8', newline='') as f:
             f.write(content)
         os.replace(temp_path, path)
     except Exception:
@@ -126,7 +126,7 @@ class WriteTool(BaseTool):
             if file_exists and not append:
                 def _read_old() -> "Optional[str]":
                     try:
-                        with open(path_obj, 'r', encoding='utf-8') as f:
+                        with open(path_obj, 'r', encoding='utf-8', newline='') as f:
                             return f.read()
                     except Exception:
                         return None

@@ -354,12 +354,6 @@ PERSONALITY_DATA_DIR: str = "personality"
 # reserved for a future "managed notes folder" feature.
 MANUAL_REMEMBER_MIRROR_DIR: str = "memory_notes"
 
-# Subdirectory name (inside the personality root) for the
-# PersonalityMonitor's transient screenshot files. Kept literally
-# "ephemeral" because that matches the user-facing description of
-# how those frames behave: written, OCR'd, immediately deleted.
-PERSONALITY_FRAMES_SUBDIR: str = "ephemeral"
-
 # Strict indexing criteria for verbatim path. We only allow long
 # /remember to bypass the LLM and become a permanent injectable entry
 # when the content looks structured enough to benefit from the
@@ -491,6 +485,76 @@ ACTIVITY_DAILY_SUMMARY_MAX_SAMPLES: int = 80  # cap prompt size
 ACTIVITY_KEEP_FRAME_FILES: bool = False
 ACTIVITY_SCREENSHOT_MAX_FILES: int = 100
 ACTIVITY_SCREENSHOT_MAX_AGE_DAYS: float = 1.0
+
+# ── §11.7 OCR deferral (defer-when-busy) ──────────────────────────────────
+#
+# Inline OCR was the dominant cause of "HandQ makes my whole machine slow":
+# RapidOCR burns ~7-8 cores for ~2.5s per call, and on multi-monitor setups
+# concurrent OCR pegged all cores + spiked RSS to ~1.4 GB. The fix is to
+# capture into a per-monitor in-memory ring during user activity and only
+# fire OCR when a global "user idle" gate opens.
+#
+# Gate opens on EITHER:
+#   1. Session locked (Win+L / auto-lock / screensaver).
+#   2. Keyboard/mouse idle ≥ ACTIVITY_OCR_GATE_INPUT_IDLE_SEC AND every
+#      monitor has been visually quiet ≥ ACTIVITY_OCR_GATE_SCREEN_QUIET_SEC.
+# Two-signal soft-idle path so we don't OCR while a video plays unattended
+# (input idle but screen still changing — would compete with hardware
+# decode and stutter playback).
+
+ACTIVITY_OCR_GATE_INPUT_IDLE_SEC: float = 60.0
+ACTIVITY_OCR_GATE_SCREEN_QUIET_SEC: float = 30.0
+
+# Per-monitor in-memory ring buffer for deferred frames. Stores JPEG-encoded
+# bytes (~300 KB / frame at quality=85) so the worst-case ceiling stays
+# bounded. 128 × 300 KB × 3 monitors ≈ 115 MB ceiling; typical busy-period
+# occupation is single-digit MB because perceptual_hash dedup drops most
+# captures before they reach the ring. Quality=85 chosen over 70 to keep
+# OCR accuracy close to lossless on small UI text — the extra ~100 KB / frame
+# is paid in encode time (~12 ms vs 10 ms) and disk write speed (negligible
+# on SSD); files stay AV-friendly (well below 1 MB).
+ACTIVITY_RING_MAXLEN: int = 128
+ACTIVITY_RING_JPEG_QUALITY: int = 85
+
+# Drain worker poll cadence. While the gate is closed (user busy) the worker
+# wakes every ACTIVITY_OCR_DRAIN_POLL_SEC to re-check; while open it pulls
+# entries as fast as OCR completes (Semaphore(1) caps at one OCR at a time).
+ACTIVITY_OCR_DRAIN_POLL_SEC: float = 1.0
+
+# ── §11.7.1 Spillover (ring-overflow + monitor-disconnect bounded fallback) ──
+#
+# Two boundary cases require a small disk-backed safety net so we don't
+# silently lose frames the user genuinely captured:
+#
+#   1. Ring full (deque(maxlen) overflow). A user who is actively
+#      switching screens for 4h+ without an idle window will eventually
+#      fill 128 slots per monitor. Without spillover the oldest novel
+#      frames are dropped silently, biasing LTM toward "what user did
+#      most recently" only.
+#   2. Monitor disconnect. When the user unplugs an external display
+#      _reconcile_monitors detects the vanished corner; the in-memory
+#      ring for that monitor is then unreachable. Without spillover its
+#      contents are lost.
+#
+# Spillover writes one (jpeg, meta.json) pair per frame into
+# %USERPROFILE%\HandQ\personality\spillover\ — co-located with memory.db
+# under the user's "what HandQ has learned about me" root (see
+# ARCHITECTURE.md §1.5). The drain worker reads them after the in-memory
+# rings are empty, OCRs them serially, and unlinks both files.
+#
+# The file count cap is the disk-side equivalent of the ring's maxlen:
+# once exceeded, the OLDEST spilled pair is dropped (FIFO). The age cap
+# is a backstop that purges anything left behind by a previous run that
+# never came back to drain it (e.g. user uninstalls then reinstalls).
+
+PERSONALITY_SPILLOVER_SUBDIR: str = "spillover"
+ACTIVITY_SPILL_MAX_FILES: int = 256       # pairs (.jpg + .meta.json)
+ACTIVITY_SPILL_MAX_AGE_HOURS: float = 24.0
+# Truncation for the recent_texts snapshot we ship inside meta.json so
+# orphan frames (monitor gone) can still run the Jaccard text dedup. We
+# keep at most TEXT_HISTORY_SIZE entries × this many chars each — bounded
+# at ~6 KB per meta.json even in the worst case.
+ACTIVITY_SPILL_RECENT_TEXT_MAX_CHARS: int = 800
 
 # Sensitive-window patterns for the activity monitor's foreground-app probe.
 # These complement the desktop_tool list (handq_config.yaml :: desktop ::

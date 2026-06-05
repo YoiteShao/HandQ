@@ -68,6 +68,50 @@ from .receptionist_prompts import (
 _SKILL_MENTION_RE = re.compile(r"(?<![\w/.])@([a-zA-Z0-9_\-]{1,64})")
 
 
+# ── @-mention UNC path normalization ──────────────────────────────────────────
+# Windows UNC paths begin with ``\\<host>\<share>``.  The leading double
+# backslash is fragile when the path passes through any LLM hop that emits
+# JSON: under-escaping (4 chars in source where 8 are needed) or a
+# ``json_repair`` fallback can collapse ``\\\\`` → ``\\`` → ``\``, after which
+# Windows resolves ``\host\share`` as drive-relative (→ ``C:\host\share``).
+# The bench at tests/planner_unc_bench.py confirms the parser-side fix
+# (stdlib-first ``try_parse_json``) is necessary but not sufficient: Claude
+# still emits the mangled form in the raw bytes for some prompts.
+#
+# Forward-slash UNC ``//host/share/path`` is functionally equivalent on
+# Windows (accepted by Win32 API, ``pathlib.PureWindowsPath``, ``open()``,
+# Git Bash / MSYS shells) and contains no backslash, so it survives every
+# JSON serialization unchanged across every downstream LLM hop.
+#
+# We rewrite ONLY when the path is preceded by an explicit ``@`` — that is
+# the user signaling "this is a path", which gives us license to transform.
+# Bare ``\\host\share`` elsewhere in the message could be a regex example or
+# escape-sequence demo; without the ``@`` marker we leave it alone.
+_AT_UNC_RE = re.compile(
+    r"(?<![\w/.])"                              # same lookbehind as skill mention
+    r"(@)"                                      # the @ marker (kept in output)
+    r"\\\\"                                     # UNC double-backslash prefix
+    r"([A-Za-z][A-Za-z0-9.\-]{0,62})"           # hostname
+    r"\\"                                       # separator before share
+    r"([A-Za-z0-9_$][^\s,;<>\"'\)\]|]*)"        # share + remainder, stop at boundary
+)
+
+
+def _normalize_at_unc(text: str) -> str:
+    """Rewrite ``@\\\\host\\share\\path`` → ``@//host/share/path``.
+
+    Only @-prefixed UNC paths are touched.  Drive-letter paths (``C:\\...``),
+    forward-slash paths, long-path UNC (``\\\\?\\UNC\\...``), and bare
+    ``\\\\...`` without the ``@`` marker are all left alone.  See
+    ``_AT_UNC_RE`` for the rationale.
+    """
+    def _sub(m: "re.Match[str]") -> str:
+        host = m.group(2)
+        rest = m.group(3).replace("\\", "/")
+        return f"{m.group(1)}//{host}/{rest}"
+    return _AT_UNC_RE.sub(_sub, text)
+
+
 # ── User-message intent types ─────────────────────────────────────────────────
 
 class UserMessageIntent(Enum):
@@ -77,11 +121,13 @@ class UserMessageIntent(Enum):
     RESPOND_ONLY   — query or chat; respond immediately, task continues uninterrupted.
     REPLAN         — any plan change (including stop/cancel requests);
                      triggers observe_and_plan which decides whether to
-                     adjust the lookahead, pivot, or set should_terminate.
+                     adjust the lookahead, pivot, or stop the task.
 
     Note: termination is NOT decided here.  observe_and_plan has full
-    execution context and is the sole authority on whether to stop via
-    Plan.should_terminate.
+    execution context and is the sole authority on whether to stop the
+    task. The user-stop convention is to emit interrupt_current_step=True
+    together with empty next_steps — FlowController detects this
+    combination and routes the task through a clean abort path.
 
     Note: there is intentionally no NETWORK_ERROR intent. When the LLM
     is unreachable the receptionist's evaluate_* methods raise
@@ -740,6 +786,8 @@ class Receptionist:
 
         Falls back to REPLAN (task) on any LLM failure.
         """
+        user_input = _normalize_at_unc(user_input)
+
         # FR-3: record user turn
         self.conversation_history.append({"role": "user", "content": user_input})
 
@@ -824,6 +872,8 @@ class Receptionist:
         auto-declines based on a failed call; the timeout handles the
         no-response case.
         """
+        user_input = _normalize_at_unc(user_input)
+
         self.conversation_history.append({"role": "user", "content": user_input})
         self._submit_user_turn_candidate(user_input)
 
@@ -906,6 +956,8 @@ class Receptionist:
         Supports intents: respond_only | replan.
         GEP intents (gep_confirm / gep_decline) are not available mid-task.
         """
+        message = _normalize_at_unc(message)
+
         # FR-3: record user turn
         self.conversation_history.append({"role": "user", "content": message})
         self._submit_user_turn_candidate(message, current_goal=goal)

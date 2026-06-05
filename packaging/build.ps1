@@ -147,14 +147,16 @@ if (-not $ElectronOnly) {
     }
     Ok "Nuitka: $nuitkaVer"
 
-    # clcache (optional, dramatically speeds up incremental MSVC builds)
-    $clcacheFlag = ''
-    if (Get-Command clcache -ErrorAction SilentlyContinue) {
-        $clcacheFlag = '--clcache'
-        Ok 'clcache: found (compiler cache enabled)'
+    # Compiler cache: Nuitka auto-downloads a ccache build with MSVC support
+    # on first run (cached under %LOCALAPPDATA%\Nuitka\Nuitka\Cache\downloads\ccache).
+    # We don't pass --clcache anymore — clcache is unmaintained and broken on
+    # Python 3.12. If you want to override the bundled ccache, install ccache
+    # 4.6+ via `choco install ccache` and Nuitka will pick it up from PATH.
+    if (Get-Command ccache -ErrorAction SilentlyContinue) {
+        $ccVer = (& ccache --version 2>&1 | Select-Object -First 1)
+        Ok "ccache (PATH): $ccVer"
     } else {
-        Warn 'clcache not found — every build recompiles all C files.'
-        Warn 'Install once with: pip install clcache'
+        Ok 'ccache: will use Nuitka''s bundled copy (auto-downloaded on first build)'
     }
 }
 
@@ -356,7 +358,6 @@ if (-not $ElectronOnly) {
         "--report=$NUITKA_CACHE\nuitka-bridge-report.xml"
     )
 
-    if ($clcacheFlag) { $nuitkaArgs += $clcacheFlag }
     $nuitkaArgs += $verboseFlags
 
     # Must run from repo root so relative paths (bridge_main.py, src/, config) resolve.

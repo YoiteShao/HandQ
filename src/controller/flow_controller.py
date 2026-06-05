@@ -979,6 +979,14 @@ class FlowController:
                 component="FlowController",
             )
         try:
+            from ..infrastructure.teams_setup import TeamsContextProvider
+            self.register_step_context_provider(TeamsContextProvider())
+        except ImportError:
+            self.logger.debug(
+                "TeamsContextProvider not registered (httpx/playwright missing)",
+                component="FlowController",
+            )
+        try:
             from ..infrastructure.desktop_setup import DesktopContextProvider
             self.register_step_context_provider(DesktopContextProvider())
         except ImportError:
@@ -2185,6 +2193,49 @@ class FlowController:
                         or not step_result_received
                     )
                     if is_complete:
+                        # ── User-stop convention ──────────────────────────────
+                        # interrupt_current_step=True together with empty
+                        # next_steps uniquely signals "user requested stop".
+                        # No other legitimate scenario combines an interrupt
+                        # with no further work — every other interrupt case
+                        # carries non-empty next_steps (redirect, premise
+                        # invalidated, loop pivot). Skip acceptance synthesis,
+                        # kill any in-flight step, and route through
+                        # _complete_task with success=False so metrics + LTM
+                        # tag this run as user-cancelled.
+                        if self.current_plan.interrupt_current_step:
+                            self.logger.info(
+                                "User-stop convention detected (interrupt + empty next_steps) — bypassing acceptance synthesis",
+                                component="FlowController",
+                            )
+                            if in_flight_batch is not None:
+                                self._interrupt_event.set()
+                                await self._agent_idle_event.wait()
+                                self._interrupt_event.clear()
+                                if self._completed_step is not None:
+                                    interrupted_step = self._completed_step
+                                    self._completed_step = None
+                                    if interrupted_step.agent_runtime_reasoning == "PLANNER_INTERRUPT":
+                                        interrupted_step.agent_runtime_reasoning = (
+                                            "[Step was interrupted because the user requested stop]"
+                                        )
+                                    self.memory.add_step(interrupted_step)
+                                    self._write_session_state(self.memory.get_completed_steps())
+                                in_flight_batch = None
+                            stop_reason = (
+                                self.current_plan.completion_reason
+                                or "Task stopped at user request."
+                            )
+                            await self._complete_task(
+                                goal=goal,
+                                user_facing_reason=f"⏹ Stopped at user request.\n\n{stop_reason}",
+                                candidate_summary=stop_reason,
+                                log_message="Task stopped by user (UI mode) — continuing loop for follow-up",
+                                success=False,
+                            )
+                            next_steps_list = []
+                            continue
+
                         # ── Goal-level acceptance synthesis ───────────────────
                         # Replaces the prior independent verification-agent
                         # step.  Per-step confidence has already passed for
@@ -2251,12 +2302,62 @@ class FlowController:
                             else:
                                 # PARTIAL / FAIL
                                 if verdict.corrective_step is None:
+                                    # Synthesise a default goal-verification step so a
+                                    # PARTIAL verdict (incl. fail-CLOSED fallback when
+                                    # synthesis itself errored) cannot silently complete
+                                    # the task. The agent re-reads artifacts and confirms
+                                    # every named goal entity is present, or reports a gap.
                                     self.logger.warning(
                                         f'Acceptance verdict={verdict.verdict} but no '
-                                        f'corrective_step — completing anyway',
+                                        f'corrective_step — synthesizing default goal-'
+                                        f'verification step',
                                         component='FlowController',
                                     )
-                                    _do_complete = True
+                                    from ..models.plan import Step as _Step
+                                    default_corrective = _Step.from_planner(
+                                        step_id='acceptance_default_recheck',
+                                        description='[Default goal-verification re-check]',
+                                        goal=(
+                                            "The acceptance check returned "
+                                            f"{verdict.verdict} but did not provide a "
+                                            "corrective step. VERIFICATION OBLIGATION: "
+                                            "extract every named entity from the "
+                                            "ORIGINAL goal (hostnames, machine names, "
+                                            "file paths, function names, IDs, URLs, "
+                                            "ticket numbers) and confirm each one "
+                                            "appears verbatim in the produced "
+                                            "artifacts. If ANY goal entity is absent, "
+                                            "the work is INCOMPLETE — say so explicitly "
+                                            "in your factual_outcome / issues; do NOT "
+                                            "synthesize a closing report from data "
+                                            "targeting a different entity."
+                                        ),
+                                        expected_outcomes=[
+                                            "Every named entity from the original goal "
+                                            "verifiably appears in at least one artifact",
+                                            "If a goal entity is missing, "
+                                            "factual_outcome explicitly reports the "
+                                            "gap rather than fabricating closure",
+                                            "Artifacts contain factual answers to the "
+                                            "user's original question, not data from a "
+                                            "different target",
+                                        ],
+                                        risk_assessment=(
+                                            "Low risk — read-only re-verification step"
+                                        ),
+                                        required_context_keys=[],
+                                    )
+                                    corrective = self._dedup_step_id(
+                                        default_corrective, completed_steps
+                                    )
+                                    self.logger.info(
+                                        f"Acceptance {verdict.verdict} (no corrective "
+                                        f"from planner) — injecting default recheck: "
+                                        f"{corrective.step_id}",
+                                        component='FlowController',
+                                    )
+                                    next_steps_list = [corrective]
+                                    continue
                                 else:
                                     corrective = self._dedup_step_id(
                                         verdict.corrective_step, completed_steps
@@ -3239,6 +3340,7 @@ class FlowController:
         user_facing_reason: str,
         candidate_summary: str,
         log_message: str,
+        success: bool = True,
     ) -> None:
         """Centralise the bookkeeping shared by every completion site.
 
@@ -3253,18 +3355,23 @@ class FlowController:
         line). candidate_summary is what LTM triage sees — always the pristine
         planner summary; verifier criticism is not a durable preference and
         must not leak into the candidate stream.
+
+        success controls metrics + LTM bookkeeping: True for natural completion
+        (default — preserves all existing call sites) and False for user-stop
+        (the dream worker should mine the cause, not record this run as a
+        durable success pattern).
         """
         self._transition_state(SystemState.COMPLETED)
         if self._execution_recorder:
             self._execution_recorder.completion_reason = user_facing_reason
         if self._current_plan_id:
             self._metrics_collector.record_task_end(
-                self._current_plan_id, success=True,
+                self._current_plan_id, success=success,
                 duration_seconds=time.monotonic() - self._task_start_time,
             )
         self._report_metrics()
         self._submit_session_complete_candidate(
-            goal=goal, summary=candidate_summary, success=True,
+            goal=goal, summary=candidate_summary, success=success,
         )
         await self._finalize_task()
         self.interaction_manager.notify_task_completed(user_facing_reason)

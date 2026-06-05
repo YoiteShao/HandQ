@@ -18,14 +18,16 @@ Public API
 from __future__ import annotations
 
 import asyncio
+import io
+import json
 import logging
-import os
 import re
 import sys
 import time
+from collections import deque
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional
 
 import yaml
 
@@ -37,14 +39,34 @@ from ..long_term_memory.models import (
 from ..vision.ocr import LocalOCR, get_local_ocr
 from ..vision.storage import ScreenshotStore
 from .capturer import MonitorCapturer
-from .frame_diff import excerpt, hamming, perceptual_hash, text_jaccard
+from .frame_diff import (
+    excerpt, hamming, perceptual_hash_array, text_jaccard,
+)
 from .input_idle import (
     cursor_in_monitor, cursor_pos, enumerate_monitors,
-    foreground_app_name, foreground_window_title, system_idle_seconds,
+    foreground_app_name, foreground_window_title,
+    is_session_locked, system_idle_seconds,
 )
 from .monitor_state import MonitorState
 
 _logger = logging.getLogger("handq.personality")
+
+
+def _encode_jpeg(rgb: Any) -> bytes:
+    """Encode an RGB ndarray as JPEG bytes at the configured quality.
+
+    Lives at module level (not as a method) so we can hand it directly
+    to ``run_in_executor`` without binding ``self``. PIL is imported
+    lazily because :mod:`mss` already pulls it in transitively but we
+    don't want to make this module's top-level import sensitive to
+    Pillow's presence on dev machines without it.
+    """
+    from PIL import Image
+    img = Image.fromarray(rgb, mode="RGB")
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=C.ACTIVITY_RING_JPEG_QUALITY,
+             optimize=False)
+    return buf.getvalue()
 
 
 # Hard cap on ``_daily_buffer`` length so a 24h+ uptime can't accumulate
@@ -125,6 +147,32 @@ class PersonalityMonitor:
         self._task: Optional[asyncio.Task] = None
         self._paused: bool = False
         self._monitors: List[MonitorState] = []
+
+        # ── Deferred-OCR plumbing ─────────────────────────────────────
+        # Per-monitor in-memory ring of (jpeg_bytes, ts, title, app, ...).
+        # Capture pushes here; the OCR drain worker pops and runs OCR
+        # only when the global gate is open (session locked, or input
+        # idle ≥ N AND every monitor visually quiet ≥ M). Storing JPEG
+        # bytes (not raw ndarrays) keeps the worst-case ceiling at
+        # ~76 MB for 3 monitors @ maxlen=128 — see _constants §11.7.
+        self._rings: Dict[int, Deque[Dict[str, Any]]] = {}
+        self._ocr_semaphore: asyncio.Semaphore = asyncio.Semaphore(1)
+        self._drain_task: Optional[asyncio.Task] = None
+        # Diagnostic counters for personality_status IPC.
+        self._gate_open_now: bool = False
+        self._ocr_drained_total: int = 0
+
+        # ── Spillover (disk-backed bounded fallback) ─────────────────
+        # See _constants §11.7.1. Triggers on ring overflow and on
+        # monitor disconnect. Frame pair (jpeg + meta.json) lands under
+        # screenshot_root/spillover/. Drain worker reads from here when
+        # all in-memory rings are empty.
+        self._spill_dir: Path = Path(screenshot_root) / C.PERSONALITY_SPILLOVER_SUBDIR
+        # Monotonic counter avoids filename collisions when many frames
+        # share the same wall-clock millisecond.
+        self._spill_seq: int = 0
+        self._spilled_total: int = 0           # diagnostics
+        self._spill_recovered_total: int = 0   # diagnostics
         # ── User-facing personalization knobs ─────────────────────────
         # Two settings live in handq_config.yaml's ``personalization:``
         # section — both expressed as user agency over their own data:
@@ -221,9 +269,44 @@ class PersonalityMonitor:
             self._ocr = get_local_ocr()
         except Exception:
             _logger.exception("PersonalityMonitor: OCR init failed; will retry on first frame")
+        # Per-monitor rings (initialised here so vanished/added monitors
+        # are reconciled in _reconcile_monitors).
+        self._rings = {
+            m.info.index: deque(maxlen=C.ACTIVITY_RING_MAXLEN)
+            for m in self._monitors
+        }
+        # Spillover directory: lazy-created here, then we sweep stale
+        # entries from previous runs (best-effort — failures swallowed
+        # so a perms / disk problem can't block boot).
+        try:
+            self._spill_dir.mkdir(parents=True, exist_ok=True)
+            await asyncio.get_running_loop().run_in_executor(
+                None, self._purge_stale_spills,
+            )
+        except Exception:
+            _logger.exception(
+                "spillover: dir init / stale purge failed (continuing without spillover)"
+            )
         self._task = asyncio.create_task(self._run(), name="activity-monitor")
+        self._drain_task = asyncio.create_task(
+            self._ocr_drain_loop(), name="activity-ocr-drain",
+        )
 
     async def shutdown(self) -> None:
+        # Drain task first — it captures _paused / _gate_open_now and
+        # shouldn't continue OCRing after the main loop is gone.
+        if self._drain_task and not self._drain_task.done():
+            self._drain_task.cancel()
+            try:
+                await asyncio.wait_for(self._drain_task, timeout=5.0)
+            except asyncio.CancelledError:
+                pass
+            except asyncio.TimeoutError:
+                _logger.warning(
+                    "PersonalityMonitor drain task did not finish within 5s of cancel"
+                )
+            except Exception:
+                _logger.exception("PersonalityMonitor drain task crashed during shutdown")
         if self._task and not self._task.done():
             self._task.cancel()
             try:
@@ -241,6 +324,21 @@ class PersonalityMonitor:
                 )
             except Exception:
                 _logger.exception("PersonalityMonitor task crashed during shutdown")
+        # Spill any unprocessed ring frames to disk so a graceful close
+        # doesn't drop them. The next bridge launch will see them in
+        # spillover/ and the drain worker will pick them up on the
+        # first idle window. Covers user-initiated close (menu exit /
+        # Ctrl+C / `/clear` restart / Windows logoff with grace) but
+        # NOT hard kills (OOM, power loss) which never reach this path.
+        try:
+            spilled_on_close = await self._spill_rings_on_shutdown()
+            if spilled_on_close:
+                _logger.info(
+                    "shutdown: spilled %d unprocessed ring frames for next-launch drain",
+                    spilled_on_close,
+                )
+        except Exception:
+            _logger.exception("shutdown: ring spill failed (frames lost)")
         # Final best-effort flush so any tail of the day isn't lost.
         try:
             await self._final_flush()
@@ -250,7 +348,11 @@ class PersonalityMonitor:
             self._capturer.close()
         except Exception:
             pass
-        _logger.info("PersonalityMonitor shut down")
+        _logger.info(
+            "PersonalityMonitor shut down (drained=%d, rings_left=%d)",
+            self._ocr_drained_total,
+            sum(len(r) for r in self._rings.values()),
+        )
 
     def pause(self) -> None:
         self._paused = True
@@ -270,11 +372,19 @@ class PersonalityMonitor:
                     "bbox": list(m.info.bbox),
                     "tier": m.tier.value,
                     "buffer_size": len(m.buffer),
+                    "ring_size": len(self._rings.get(m.info.index, ())),
                     "last_capture_ts": int(m.last_capture_ts),
                     "last_activity_ts": int(m.last_activity_ts),
+                    "last_screen_change_ts": int(m.last_screen_change_ts),
                 }
                 for m in self._monitors
             ],
+            "ring_size_total": sum(len(r) for r in self._rings.values()),
+            "ocr_gate_open": bool(self._gate_open_now),
+            "ocr_drained_total": int(self._ocr_drained_total),
+            "spilled_total": int(self._spilled_total),
+            "spill_recovered_total": int(self._spill_recovered_total),
+            "spill_files_now": self._spill_count(),
             "daily_buffered": len(self._daily_buffer),
             "last_daily_date": self._last_daily_date,
         }
@@ -409,6 +519,29 @@ class PersonalityMonitor:
                         "monitor reconcile: flush failed for monitor %d",
                         m.info.index,
                     )
+            # Spill any unprocessed JPEG frames to disk before dropping
+            # the monitor's state. The drain worker will pick them up on
+            # the next idle window — see _ocr_one's orphan path. The
+            # snapshot of recent_texts goes with each pair so Jaccard
+            # dedup still works once the MonitorState is gone.
+            ring = self._rings.pop(m.info.index, None)
+            if ring:
+                snapshot = list(m.recent_texts)
+                loop = asyncio.get_running_loop()
+                for entry in list(ring):
+                    spilled = await loop.run_in_executor(
+                        None, self._spill_to_disk, entry, snapshot,
+                    )
+                    if not spilled:
+                        # disk full / cap reached — stop trying so we
+                        # don't busy-loop on an immutable failure.
+                        _logger.warning(
+                            "monitor reconcile: spillover full while saving "
+                            "orphan ring for monitor %d (%d frames lost)",
+                            m.info.index, len(ring),
+                        )
+                        break
+                ring.clear()
         self._monitors = kept
 
         # In-place updates on stable corners (resolution / label flip).
@@ -440,6 +573,9 @@ class PersonalityMonitor:
                 info.index, info.bbox, info.label,
             )
             self._monitors.append(MonitorState(info=info))
+            # New monitors get a fresh empty ring; capture path will
+            # populate it on the next due-tick.
+            self._rings[info.index] = deque(maxlen=C.ACTIVITY_RING_MAXLEN)
 
         if topology_changed:
             try:
@@ -490,105 +626,534 @@ class PersonalityMonitor:
         app: str,
         now: float,
     ) -> None:
-        out_path = os.path.join(
-            # ScreenshotStore.subdir("ephemeral") gives us
-            # %USERPROFILE%\HandQ\personality\ephemeral\ — the only
-            # directory the personality monitor ever writes to.
-            # Filename is fixed per monitor so each capture overwrites
-            # the previous one; we unlink it immediately after OCR
-            # so disk usage stays at < N small files (N = monitor count).
-            self._store.subdir(C.PERSONALITY_FRAMES_SUBDIR),
-            f"frame_m{m.info.index}.png",
-        )
-        # Capture is sync I/O; offload so the loop stays responsive.
+        """Capture the monitor, decide if the frame is novel, and push it
+        into the per-monitor ring buffer for later OCR.
+
+        OCR is intentionally NOT run here — it's deferred to
+        :meth:`_ocr_drain_loop` so it doesn't compete with the user's
+        CPU during active work. See plan robust-gathering-shannon.md
+        for the design rationale + bench numbers.
+        """
         loop = asyncio.get_running_loop()
-        captured = await loop.run_in_executor(
-            None, self._capturer.capture, m.info, out_path,
-        )
-        if not captured:
+        # 1. Capture → ndarray (no disk I/O)
+        rgb = await loop.run_in_executor(None, self._capturer.capture, m.info)
+        if rgb is None:
             return
+        # 2. Cheap visual novelty gate: perceptual_hash on the ndarray.
+        #    Frames that match the prior accepted frame within the
+        #    Hamming threshold are dropped before we pay the JPEG
+        #    encode cost or queue any memory.
+        ph = await loop.run_in_executor(None, perceptual_hash_array, rgb)
+        if ph is not None and m.last_hash is not None:
+            if hamming(ph, m.last_hash) <= C.ACTIVITY_FRAME_HASH_DELTA_THRESHOLD:
+                _logger.debug(
+                    "monitor %d frame deduped (hamming<=%d)",
+                    m.info.index, C.ACTIVITY_FRAME_HASH_DELTA_THRESHOLD,
+                )
+                return
+        # 3. Novel frame: stamp the screen-change timestamp (read by
+        #    _gate_open) and update the last-hash for the next compare.
+        m.last_screen_change_ts = now
+        if ph is not None:
+            m.last_hash = ph
+        # 4. Encode JPEG bytes (~10 ms; quality=70 keeps frames around
+        #    200 KB) and push into the per-monitor ring. The ring's
+        #    deque(maxlen) silently drops the oldest entry on overflow,
+        #    bounding RSS at ACTIVITY_RING_MAXLEN × ~200 KB regardless
+        #    of how long the user is busy.
         try:
-            # Image-hash de-dup BEFORE OCR — cheapest gate.
-            ph = await loop.run_in_executor(None, perceptual_hash, captured)
-            if ph is not None and m.last_hash is not None:
-                if hamming(ph, m.last_hash) <= C.ACTIVITY_FRAME_HASH_DELTA_THRESHOLD:
-                    _logger.debug(
-                        "monitor %d frame deduped (hamming<=%d)",
-                        m.info.index, C.ACTIVITY_FRAME_HASH_DELTA_THRESHOLD,
-                    )
-                    return
-            # OCR.
-            if self._ocr is None:
+            jpeg = await loop.run_in_executor(None, _encode_jpeg, rgb)
+        except Exception:
+            _logger.exception("monitor %d JPEG encode failed", m.info.index)
+            return
+        ring = self._rings.setdefault(
+            m.info.index, deque(maxlen=C.ACTIVITY_RING_MAXLEN),
+        )
+        # 5. Spillover guard: if the ring is at maxlen, peek the oldest
+        #    entry and try to spill it to disk before the deque silently
+        #    drops it on append. On spill failure (disk full / perms /
+        #    cap reached) we let deque do its default thing — the user
+        #    still gets the most recent 128 frames, no worse than before
+        #    spillover existed.
+        if len(ring) == ring.maxlen:
+            oldest = ring[0]
+            spilled = await loop.run_in_executor(
+                None, self._spill_to_disk, oldest, list(m.recent_texts),
+            )
+            if spilled:
+                ring.popleft()
+        ring.append({
+            "jpeg": jpeg,
+            "ts": now,
+            "title": title,
+            "app": app,
+            "tier": m.tier,
+            "monitor_index": m.info.index,
+        })
+
+    # ── Spillover (disk-backed bounded fallback) ────────────────────────────
+    #
+    # Helpers for §11.7.1: write a single ring entry to disk, read the
+    # oldest spilled entry back, and purge stale leftovers. The drain
+    # worker treats spillover as "tier-2 storage" — only consulted when
+    # all in-memory rings are empty.
+
+    def _spill_count(self) -> int:
+        """Count of spilled .jpg files currently on disk. Best-effort —
+        returns 0 if the dir is missing / unreadable."""
+        try:
+            return sum(
+                1 for p in self._spill_dir.iterdir()
+                if p.suffix == ".jpg" and p.is_file()
+            )
+        except OSError:
+            return 0
+
+    def _purge_stale_spills(self) -> None:
+        """Clean up spill files older than ``ACTIVITY_SPILL_MAX_AGE_HOURS``
+        and enforce the ``ACTIVITY_SPILL_MAX_FILES`` cap (oldest first).
+
+        Runs once at start() before the drain task spins up. Sync — the
+        caller offloads it to the executor. Best-effort: any OSError is
+        swallowed.
+        """
+        if not self._spill_dir.is_dir():
+            return
+        cutoff = time.time() - (C.ACTIVITY_SPILL_MAX_AGE_HOURS * 3600.0)
+        pairs: List[Path] = []
+        try:
+            for jpg in sorted(self._spill_dir.iterdir()):
+                if jpg.suffix != ".jpg" or not jpg.is_file():
+                    continue
                 try:
-                    self._ocr = get_local_ocr()
-                except Exception:
-                    _logger.exception("OCR init failed; dropping frame")
-                    return
-            ocr_result = await loop.run_in_executor(
-                None, self._ocr.recognize, captured,
-            )
-            if not ocr_result.ok:
-                _logger.debug(
-                    "monitor %d ocr error: %s", m.info.index, ocr_result.error,
-                )
-                return
-            text = (ocr_result.full_text or "").strip()
-            if len(text) < C.ACTIVITY_OCR_MIN_CHARS:
-                return
-            # Dedup against the ring of recently-forwarded texts on this
-            # monitor, not just the single last_text. Without the ring,
-            # a brief alt-tab pattern (VSCode → Slack → VSCode) accepts
-            # the second VSCode capture as "novel" because last_text is
-            # the Slack window. Take the MAX Jaccard across the ring so
-            # any sufficiently-similar prior screen blocks acceptance.
-            jaccards = [text_jaccard(text, prev) for prev in m.recent_texts] \
-                if m.recent_texts else []
-            if m.last_text:
-                jaccards.append(text_jaccard(text, m.last_text))
-            jacc = max(jaccards) if jaccards else 0.0
-            if jacc >= C.ACTIVITY_OCR_TEXT_JACCARD_BAR:
-                _logger.debug(
-                    "monitor %d text near-duplicate (max jacc=%.2f over %d prior)",
-                    m.info.index, jacc, len(jaccards),
-                )
-                # Update the hash so we don't keep re-OCRing the same screen,
-                # but don't forward.
-                m.last_hash = ph if ph is not None else m.last_hash
-                return
-            # Accept.
-            sample = ActivitySample(
-                monitor_index=m.info.index,
-                timestamp=int(now),
-                foreground_window=title[:160],
-                foreground_app=app[:80],
-                text_excerpt=excerpt(text, C.ACTIVITY_OCR_EXCERPT_MAX_CHARS),
-                tier=m.tier,
-                novelty=1.0 - jacc,
-            )
-            m.last_hash = ph if ph is not None else m.last_hash
-            m.last_text = text[: C.ACTIVITY_OCR_EXCERPT_MAX_CHARS * 4]
-            # Push into the ring AFTER acceptance so we never compare the
-            # incoming text against itself. Truncate to the same max as
-            # last_text so the per-text memory cost stays bounded.
-            m.recent_texts.append(text[: C.ACTIVITY_OCR_EXCERPT_MAX_CHARS * 4])
-            m.append_sample(sample, now)
-            self._daily_buffer.append(sample)
-            # Ring-buffer guard: if the user closes the laptop right
-            # before 22:00 every day, the daily-summary hour never
-            # arrives and the buffer would otherwise grow without
-            # bound. Trim oldest entries above the hard cap.
-            if len(self._daily_buffer) > _DAILY_BUFFER_HARD_CAP:
-                drop = len(self._daily_buffer) - _DAILY_BUFFER_HARD_CAP
-                self._daily_buffer = self._daily_buffer[drop:]
-        finally:
-            # ALWAYS unlink the PNG. Privacy + zero-disk-accumulation
-            # invariant. Wrapped in try because the file may already be
-            # gone (Windows AV scanners occasionally race us).
+                    mtime = jpg.stat().st_mtime
+                except OSError:
+                    continue
+                if mtime < cutoff:
+                    self._unlink_spill_pair(jpg)
+                else:
+                    pairs.append(jpg)
+        except OSError:
+            return
+        # Cap by count: drop oldest excess.
+        if len(pairs) > C.ACTIVITY_SPILL_MAX_FILES:
+            pairs.sort(key=lambda p: p.name)  # filename embeds ts → FIFO
+            for stale in pairs[: len(pairs) - C.ACTIVITY_SPILL_MAX_FILES]:
+                self._unlink_spill_pair(stale)
+
+    def _unlink_spill_pair(self, jpg_path: Path) -> None:
+        """Delete a spill .jpg and its sibling .meta.json. Either may be
+        missing (partial write, prior unlink) — both attempts swallowed."""
+        for p in (jpg_path, jpg_path.with_suffix(".meta.json")):
             try:
-                if not C.ACTIVITY_KEEP_FRAME_FILES:
-                    os.unlink(captured)
+                p.unlink()
             except OSError:
                 pass
+
+    def _spill_to_disk(
+        self,
+        entry: Dict[str, Any],
+        recent_texts_snapshot: List[str],
+    ) -> bool:
+        """Persist a single ring entry as `<stem>.jpg` + `<stem>.meta.json`.
+
+        Returns True on success. Returns False on any failure (disk full,
+        perms, cap reached) so the caller can fall back to the deque's
+        natural drop-oldest behaviour. SYNCHRONOUS — caller MUST offload
+        to the executor.
+        """
+        if not self._spill_dir.is_dir():
+            try:
+                self._spill_dir.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                return False
+        # Cap guard: refuse to write a new pair if we already hit the
+        # file limit. The caller's deque will drop the in-RAM entry
+        # naturally; we don't try to evict an even older spill here
+        # because that would require I/O on the hot path.
+        if self._spill_count() >= C.ACTIVITY_SPILL_MAX_FILES:
+            return False
+        idx = int(entry.get("monitor_index", 0))
+        ts = float(entry.get("ts", time.time()))
+        self._spill_seq += 1
+        stem = f"m{idx}_{ts:.3f}_{self._spill_seq:06d}"
+        jpg_path = self._spill_dir / f"{stem}.jpg"
+        meta_path = self._spill_dir / f"{stem}.meta.json"
+        # Truncate each recent_texts entry so meta.json stays small.
+        max_chars = C.ACTIVITY_SPILL_RECENT_TEXT_MAX_CHARS
+        truncated_history = [
+            (t[:max_chars] if isinstance(t, str) else "")
+            for t in (recent_texts_snapshot or [])
+        ]
+        tier_value = entry.get("tier")
+        if isinstance(tier_value, MonitorTier):
+            tier_str = tier_value.value
+        elif tier_value is None:
+            tier_str = ""
+        else:
+            tier_str = str(tier_value)
+        meta = {
+            "monitor_index": idx,
+            "ts": ts,
+            "title": str(entry.get("title", ""))[:160],
+            "app": str(entry.get("app", ""))[:80],
+            "tier": tier_str,
+            "recent_texts_snapshot": truncated_history,
+        }
+        try:
+            with open(jpg_path, "wb") as f:
+                f.write(entry["jpeg"])
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(meta, f, ensure_ascii=False)
+        except OSError:
+            # Half-written pair — best-effort cleanup so a re-try
+            # doesn't see an orphan .jpg without its .meta.json.
+            self._unlink_spill_pair(jpg_path)
+            return False
+        self._spilled_total += 1
+        return True
+
+    async def _spill_rings_on_shutdown(self) -> int:
+        """Persist every in-memory ring entry to disk on graceful close.
+
+        Called from :meth:`shutdown` AFTER the capture and drain tasks
+        have been cancelled. Uses the standard :meth:`_spill_to_disk`
+        path, so the next bridge launch sees the same shape of files
+        and the drain worker recovers them via the orphan path (the
+        spilled meta.json carries each monitor's ``recent_texts``
+        snapshot for Jaccard dedup).
+
+        Returns the count of frames successfully spilled. Stops early
+        if :meth:`_spill_to_disk` returns False (disk full / cap
+        reached) — partial recovery is better than refusing to close.
+        """
+        if not self._rings:
+            return 0
+        loop = asyncio.get_running_loop()
+        spilled = 0
+        # Iterate over a copy because _spill_to_disk does no mutation
+        # but we want to be defensive.
+        for monitor_idx, ring in list(self._rings.items()):
+            if not ring:
+                continue
+            m = next(
+                (mm for mm in self._monitors if mm.info.index == monitor_idx),
+                None,
+            )
+            snapshot = list(m.recent_texts) if m is not None else []
+            for entry in list(ring):
+                ok = await loop.run_in_executor(
+                    None, self._spill_to_disk, entry, snapshot,
+                )
+                if not ok:
+                    _logger.warning(
+                        "shutdown spill: stopped at monitor %d (disk full or cap reached); "
+                        "%d frames spilled, %d may be lost",
+                        monitor_idx, spilled, len(ring) - spilled,
+                    )
+                    return spilled
+                spilled += 1
+            ring.clear()
+        return spilled
+
+    def _load_oldest_spill(self) -> Optional[Dict[str, Any]]:
+        """Read the oldest spilled pair (by filename = ts) and return an
+        entry-shaped dict augmented with ``recent_texts_snapshot`` for
+        orphan-frame Jaccard. Removes the pair from disk only AFTER the
+        OCR worker has accepted/rejected it — that's the caller's job
+        via :meth:`_unlink_spill_pair` once OCR finishes.
+
+        SYNCHRONOUS — caller offloads via run_in_executor. Returns None
+        when the dir is empty or unreadable.
+        """
+        if not self._spill_dir.is_dir():
+            return None
+        try:
+            jpgs = sorted(
+                p for p in self._spill_dir.iterdir()
+                if p.suffix == ".jpg" and p.is_file()
+            )
+        except OSError:
+            return None
+        if not jpgs:
+            return None
+        jpg_path = jpgs[0]
+        meta_path = jpg_path.with_suffix(".meta.json")
+        try:
+            with open(jpg_path, "rb") as f:
+                jpeg = f.read()
+            try:
+                with open(meta_path, "r", encoding="utf-8") as f:
+                    meta = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                # Missing / corrupt meta — proceed with stub metadata so
+                # we still get OCR'd text into LTM. Drop the pair after
+                # OCR.
+                meta = {
+                    "monitor_index": -1, "ts": jpg_path.stat().st_mtime,
+                    "title": "", "app": "", "tier": "",
+                    "recent_texts_snapshot": [],
+                }
+        except OSError:
+            return None
+        return {
+            "jpeg": jpeg,
+            "ts": float(meta.get("ts", time.time())),
+            "title": str(meta.get("title", "")),
+            "app": str(meta.get("app", "")),
+            "tier": meta.get("tier", ""),
+            "monitor_index": int(meta.get("monitor_index", -1)),
+            "recent_texts_snapshot": list(meta.get("recent_texts_snapshot", [])),
+            "_spill_jpg_path": jpg_path,
+        }
+
+    # ── OCR drain worker (deferred OCR) ────────────────────────────────────
+
+    async def _ocr_drain_loop(self) -> None:
+        """Run OCR on queued frames whenever the global gate is open.
+
+        Drain order:
+          1. In-memory rings — pop the oldest entry across all monitors
+             (round-robin by frame timestamp).
+          2. Spillover on disk — when all rings are empty, fall back to
+             reading spilled pairs in FIFO order. Frames may be orphaned
+             (the originating monitor disappeared since capture), so
+             ``_ocr_one`` knows how to handle a missing MonitorState.
+
+        Gate semantics — see :meth:`_gate_open`. While the gate is
+        closed (user busy / video playing) the loop sleeps. When open
+        it pulls the next entry and OCRs it under
+        :attr:`_ocr_semaphore` so we never run more than one OCR
+        concurrently — which keeps RSS bounded (a single OCR call
+        peaks at ~565 MB working memory) and prevents multi-core
+        contention even when many frames are queued.
+        """
+        loop = asyncio.get_running_loop()
+        try:
+            while True:
+                if self._paused:
+                    self._gate_open_now = False
+                    await asyncio.sleep(C.ACTIVITY_OCR_DRAIN_POLL_SEC)
+                    continue
+                gate = self._gate_open()
+                self._gate_open_now = gate
+                if not gate:
+                    await asyncio.sleep(C.ACTIVITY_OCR_DRAIN_POLL_SEC)
+                    continue
+                entry = self._pop_round_robin()
+                if entry is None:
+                    # Rings empty — try spillover. Disk read is offloaded
+                    # so the loop stays responsive.
+                    entry = await loop.run_in_executor(
+                        None, self._load_oldest_spill,
+                    )
+                    if entry is not None:
+                        self._spill_recovered_total += 1
+                if entry is None:
+                    # Both ring and spillover empty — sleep before next
+                    # poll so we don't spin.
+                    await asyncio.sleep(C.ACTIVITY_OCR_DRAIN_POLL_SEC)
+                    continue
+                async with self._ocr_semaphore:
+                    try:
+                        await self._ocr_one(entry)
+                    except Exception:
+                        _logger.exception(
+                            "OCR drain failed for monitor %d frame ts=%s",
+                            entry.get("monitor_index"), entry.get("ts"),
+                        )
+                # If this entry came from disk, unlink the pair AFTER
+                # OCR finished (success OR failure — we don't keep
+                # retrying the same frame indefinitely).
+                spill_path = entry.get("_spill_jpg_path")
+                if spill_path is not None:
+                    await loop.run_in_executor(
+                        None, self._unlink_spill_pair, spill_path,
+                    )
+        except asyncio.CancelledError:
+            _logger.info("OCR drain loop cancelled")
+            return
+
+    def _gate_open(self) -> bool:
+        """Return True iff OCR is allowed to run now.
+
+        The gate opens on either:
+          1. **Session locked** — strongest "user is gone" signal. If
+             the input desktop is anything other than ``Default`` (i.e.
+             Win+L, auto-lock, screensaver-with-password) we know
+             nobody's at the machine, so OCR can run flat-out without
+             competing.
+          2. **Soft idle** — keyboard/mouse silent for
+             ACTIVITY_OCR_GATE_INPUT_IDLE_SEC AND every monitor has
+             been visually quiet for ACTIVITY_OCR_GATE_SCREEN_QUIET_SEC.
+             Both signals together so we don't OCR while a video plays
+             unattended (input-idle but screen still changing — would
+             compete with hardware decode).
+        """
+        if is_session_locked():
+            return True
+        idle = system_idle_seconds() or 0.0
+        if idle < C.ACTIVITY_OCR_GATE_INPUT_IDLE_SEC:
+            return False
+        now = time.time()
+        for m in self._monitors:
+            ts = m.last_screen_change_ts
+            if ts and (now - ts) < C.ACTIVITY_OCR_GATE_SCREEN_QUIET_SEC:
+                return False
+        return True
+
+    def _pop_round_robin(self) -> Optional[Dict[str, Any]]:
+        """Pop the OLDEST entry across every non-empty ring.
+
+        Choosing oldest-first across monitors (rather than e.g.
+        round-robin by index) keeps draining fair when a chatty
+        monitor has many queued frames AND a quiet monitor has a few
+        very old ones — we want to avoid starving the quiet monitor's
+        old context behind the chatty one's recent flood.
+        """
+        candidates: List[tuple[int, float]] = [
+            (idx, ring[0]["ts"])
+            for idx, ring in self._rings.items()
+            if ring
+        ]
+        if not candidates:
+            return None
+        candidates.sort(key=lambda kv: kv[1])
+        return self._rings[candidates[0][0]].popleft()
+
+    async def _ocr_one(self, entry: Dict[str, Any]) -> None:
+        """Run OCR on a single ring (or spillover) entry, then run the
+        text-similarity dedup and (if accepted) push an
+        ``ActivitySample`` through the existing buffer/flush flow.
+
+        Two paths:
+          * **Live monitor** — the originating ``MonitorState`` is still
+            present. Use its ``recent_texts`` / ``last_text`` for the
+            Jaccard dedup and route the sample through
+            ``m.append_sample`` so the buffer/flush logic owns it.
+          * **Orphan** — the monitor disconnected between capture and
+            drain (frame survived via spillover). Fall back to the
+            ``recent_texts_snapshot`` shipped inside the spilled
+            meta.json for dedup, and submit the sample directly to
+            LTM as a one-shot candidate (we have no buffer to put it
+            into and no future monitor will own the in-flight sample).
+        """
+        loop = asyncio.get_running_loop()
+        if self._ocr is None:
+            try:
+                self._ocr = get_local_ocr()
+            except Exception:
+                _logger.exception("OCR drain: engine init failed; dropping frame")
+                return
+        monitor_index = int(entry.get("monitor_index", -1))
+        m = next(
+            (mm for mm in self._monitors if mm.info.index == monitor_index),
+            None,
+        )
+        jpeg: bytes = entry["jpeg"]
+        ts: float = float(entry["ts"])
+        title: str = str(entry.get("title", ""))
+        app: str = str(entry.get("app", ""))
+        tier_value = entry.get("tier", m.tier if m is not None else None)
+        # RapidOCR.recognize accepts bytes (image bytes are auto-decoded).
+        ocr_result = await loop.run_in_executor(
+            None, self._ocr.recognize, jpeg,
+        )
+        self._ocr_drained_total += 1
+        if not ocr_result.ok:
+            _logger.debug(
+                "monitor %d ocr error: %s", monitor_index, ocr_result.error,
+            )
+            return
+        text = (ocr_result.full_text or "").strip()
+        if len(text) < C.ACTIVITY_OCR_MIN_CHARS:
+            return
+        # Pick the right history source for Jaccard dedup.
+        if m is not None:
+            history: List[str] = list(m.recent_texts)
+            if m.last_text:
+                history.append(m.last_text)
+        else:
+            history = list(entry.get("recent_texts_snapshot") or [])
+        jaccards = [text_jaccard(text, prev) for prev in history] if history else []
+        jacc = max(jaccards) if jaccards else 0.0
+        if jacc >= C.ACTIVITY_OCR_TEXT_JACCARD_BAR:
+            _logger.debug(
+                "monitor %d text near-duplicate (max jacc=%.2f over %d prior, orphan=%s)",
+                monitor_index, jacc, len(jaccards), m is None,
+            )
+            return
+        # Build the sample. For orphan frames we still fill in the
+        # tier (best-effort: spilled meta.json carried it as a string;
+        # we look up the enum here so the final ActivitySample matches
+        # the in-band shape).
+        if isinstance(tier_value, MonitorTier):
+            tier = tier_value
+        else:
+            try:
+                tier = MonitorTier(str(tier_value))
+            except Exception:
+                tier = MonitorTier.WARM
+        sample = ActivitySample(
+            monitor_index=monitor_index,
+            timestamp=int(ts),
+            foreground_window=title[:160],
+            foreground_app=app[:80],
+            text_excerpt=excerpt(text, C.ACTIVITY_OCR_EXCERPT_MAX_CHARS),
+            tier=tier,
+            novelty=1.0 - jacc,
+        )
+        if m is not None:
+            # Live-monitor path — feed the standard buffer/flush flow.
+            m.last_text = text[: C.ACTIVITY_OCR_EXCERPT_MAX_CHARS * 4]
+            m.recent_texts.append(text[: C.ACTIVITY_OCR_EXCERPT_MAX_CHARS * 4])
+            m.append_sample(sample, time.time())
+        else:
+            # Orphan path — submit directly as a one-shot LTM candidate.
+            # No m means no buffer to append to; we also skip
+            # _emit_candidate's per-monitor preamble and render a
+            # standalone block ourselves so the dream worker still has
+            # readable context.
+            try:
+                raw = self._render_orphan_sample(sample)
+                await submit_activity_observer(
+                    ltm=self._ltm,
+                    raw_text=raw,
+                    source_ref=f"activity:m{monitor_index}:orphan:{int(ts)}",
+                    daily_summary=False,
+                    monitor_index=monitor_index,
+                    sample_count=1,
+                )
+                _logger.info(
+                    "orphan activity sample submitted monitor=%d ts=%s",
+                    monitor_index, int(ts),
+                )
+            except Exception:
+                _logger.exception("submit_activity_observer (orphan) failed")
+        self._daily_buffer.append(sample)
+        if len(self._daily_buffer) > _DAILY_BUFFER_HARD_CAP:
+            drop = len(self._daily_buffer) - _DAILY_BUFFER_HARD_CAP
+            self._daily_buffer = self._daily_buffer[drop:]
+
+    def _render_orphan_sample(self, s: ActivitySample) -> str:
+        """Render a one-shot ActivitySample as a tiny markdown block,
+        matching the per-monitor preamble produced by
+        :meth:`_render_samples` so dream-worker prompts see the same
+        structure regardless of whether the source monitor is alive."""
+        ts = datetime.fromtimestamp(s.timestamp).strftime("%Y-%m-%d %H:%M:%S")
+        lines = [
+            f"# Activity observation (orphan — monitor disconnected)",
+            f"Monitor {s.monitor_index} (no longer attached)",
+            f"Samples: 1",
+            "",
+            f"## {ts} [{s.tier.value}] {s.foreground_app or '?'}",
+        ]
+        if s.foreground_window:
+            lines.append(f"window: {s.foreground_window}")
+        if s.text_excerpt:
+            lines.append("text excerpt:")
+            lines.append(s.text_excerpt)
+        return "\n".join(lines)
 
     # ── Candidate emission ─────────────────────────────────────────────────
 
@@ -637,16 +1202,74 @@ class PersonalityMonitor:
     # ── Daily summary ──────────────────────────────────────────────────────
 
     async def _maybe_emit_daily_summary(self) -> None:
+        """Emit at most one daily-summary candidate per local calendar
+        date. Called from the main tick loop (every ~1 s).
+
+        Two interactions with the deferred-OCR pipeline make the naive
+        "fire once at 22:00 if buffer non-empty" wrong:
+
+        1. **Buffer-empty at 22:00 due to defer-OCR**: when the user
+           works straight through 22:00 with no idle break, every
+           captured frame is still sitting in the ring waiting for
+           drain, so ``_daily_buffer`` (populated only AFTER OCR) is
+           empty at the trigger moment. We must NOT mark
+           ``_last_daily_date = today`` in that case — that would
+           burn the whole 22:00–23:00 window even though drain may
+           catch up later.
+
+        2. **Drain mid-flight at 22:00**: if the user goes idle at
+           21:55 and drain starts processing the day's ring, by 22:00
+           only a fraction of frames have been OCR'd. Emitting then
+           captures only that fraction; the rest fill the buffer
+           AFTER the date_key was set and never enter today's summary.
+
+        Strategy: stay live across the whole 22:00–22:59 window;
+        in the first 30 minutes prefer to wait if drain is actively
+        consuming pending work; from 22:30 onwards send what we have;
+        at 23:00 (one-hour fallback) close the books even on an empty
+        buffer so we don't cycle into tomorrow.
+        """
         now_dt = datetime.now()
-        # Only fire during the configured hour and only once per day.
-        if now_dt.hour != C.ACTIVITY_DAILY_SUMMARY_HOUR_LOCAL:
-            return
         date_key = now_dt.strftime("%Y-%m-%d")
         if self._last_daily_date == date_key:
-            return
+            return  # already settled for today
+
+        summary_hour = C.ACTIVITY_DAILY_SUMMARY_HOUR_LOCAL
+        in_window = (now_dt.hour == summary_hour)
+        past_deadline = (now_dt.hour == summary_hour + 1)
+        if not (in_window or past_deadline):
+            return  # off-window — wait for tomorrow's 22:00
+
         if not self._daily_buffer:
-            self._last_daily_date = date_key
+            # Bug fix: do NOT mark date_key as done just because buffer
+            # is empty mid-window. Drain may catch up later in the
+            # 22:00 hour. Only at the deadline (23:00) do we accept
+            # that today truly had nothing to summarise.
+            if past_deadline:
+                self._last_daily_date = date_key
+                _logger.info(
+                    "daily activity summary skipped date=%s (no samples this day)",
+                    date_key,
+                )
             return
+
+        # Buffer has at least one sample. Decide whether to emit now.
+        # In the first 30 minutes of the window, if the drain worker is
+        # actively consuming a substantial backlog, defer the emit so
+        # late-arriving samples get included. After 30 minutes (or at
+        # the 23:00 deadline) we send whatever we have.
+        if in_window and now_dt.minute < 30:
+            ring_size = sum(len(r) for r in self._rings.values())
+            spill_size = self._spill_count()
+            pending = ring_size + spill_size
+            # ≥10 pending frames AND drain is unblocked = "wait for it"
+            if pending >= 10 and self._gate_open_now and not self._paused:
+                _logger.debug(
+                    "daily summary deferred: pending=%d gate_open=True minute=%d",
+                    pending, now_dt.minute,
+                )
+                return
+
         samples = self._daily_buffer[-C.ACTIVITY_DAILY_SUMMARY_MAX_SAMPLES:]
         raw_text = self._render_daily_summary(date_key, samples)
         try:
@@ -659,8 +1282,9 @@ class PersonalityMonitor:
                 sample_count=len(samples),
             )
             _logger.info(
-                "daily activity summary emitted date=%s samples=%d",
-                date_key, len(samples),
+                "daily activity summary emitted date=%s samples=%d "
+                "(in_window=%s past_deadline=%s)",
+                date_key, len(samples), in_window, past_deadline,
             )
             self._last_daily_date = date_key
             self._daily_buffer = []

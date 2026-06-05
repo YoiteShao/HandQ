@@ -1096,13 +1096,11 @@ class RuntimeAgent:
         # Note: desktop is handled by the task-scoped block above and is
         # intentionally absent here.
         tool_switch_map = {
-            "write":      "tool_write",
-            "edit":       "tool_edit",
-            "bash":       "tool_bash",
-            "shell":      "tool_shell",
-            "browser":    "tool_browser",
-            "web_search": "tool_web_search",
-            "email":      "tool_email",
+            "write":   "tool_write",
+            "edit":    "tool_edit",
+            "bash":    "tool_bash",
+            "shell":   "tool_shell",
+            "browser": "tool_browser",
         }
         if tool_name in tool_switch_map:
             switch_name = tool_switch_map[tool_name]
@@ -1241,7 +1239,7 @@ class RuntimeAgent:
         try:
             if self._interaction_manager is not None:
                 truncated_params: Optional[Dict[str, Any]] = (
-                    {k: (str(v)[:100] + "..." if len(str(v)) > 100 else str(v)) for k, v in parameters.items()}
+                    {k: (str(v)[:2000] + "..." if len(str(v)) > 2000 else str(v)) for k, v in parameters.items()}
                     if parameters else None
                 )
                 self._interaction_manager.notify_tool_execution_started(
@@ -1264,12 +1262,12 @@ class RuntimeAgent:
                 output: Optional[Dict[str, Any]] = None
                 if result.output:
                     output = {
-                        k: (str(v)[:100] + "..." if len(str(v)) > 100 else str(v))
+                        k: (str(v)[:2000] + "..." if len(str(v)) > 2000 else str(v))
                         for k, v in result.output.items()
                         if not (tool_name.lower() in ("bash", "shell") and k == "command")
                     }
                 self._interaction_manager.notify_tool_execution_started(
-                    self.current_iteration, None, None, output)
+                    self.current_iteration, tool_name, None, output)
         except Exception as e:
             self.logger.error(f"[{self.current_iteration}][Act] Post-exec UI notify error: {e}",
                               component="RuntimeAgent", exc_info=True)
@@ -1658,7 +1656,7 @@ class RuntimeAgent:
 
                 # Mid-stream fallback: safe only when no tool calls dispatched yet.
                 if not stream_tool_calls:
-                    next_offset = service_offset + len(services_slice)
+                    next_offset = service_offset + 1
                     if next_offset < len(self._services):
                         self.logger.warning(
                             f"[{self.current_iteration}][ThinkStream] Mid-stream error before "
