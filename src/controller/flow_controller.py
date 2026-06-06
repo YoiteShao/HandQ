@@ -2256,6 +2256,11 @@ class FlowController:
                             and s.has_status(StepStatus.COMPLETED)
                             for s in completed_steps
                         )
+                        already_rechecked = any(
+                            s.step_id.startswith('acceptance_default_recheck')
+                            and s.has_status(StepStatus.COMPLETED)
+                            for s in completed_steps
+                        )
                         try:
                             verdict = await self.planner.synthesize_acceptance(
                                 original_goal=goal,
@@ -2302,62 +2307,78 @@ class FlowController:
                             else:
                                 # PARTIAL / FAIL
                                 if verdict.corrective_step is None:
-                                    # Synthesise a default goal-verification step so a
-                                    # PARTIAL verdict (incl. fail-CLOSED fallback when
-                                    # synthesis itself errored) cannot silently complete
-                                    # the task. The agent re-reads artifacts and confirms
-                                    # every named goal entity is present, or reports a gap.
-                                    self.logger.warning(
-                                        f'Acceptance verdict={verdict.verdict} but no '
-                                        f'corrective_step — synthesizing default goal-'
-                                        f'verification step',
-                                        component='FlowController',
-                                    )
-                                    from ..models.plan import Step as _Step
-                                    default_corrective = _Step.from_planner(
-                                        step_id='acceptance_default_recheck',
-                                        description='[Default goal-verification re-check]',
-                                        goal=(
-                                            "The acceptance check returned "
-                                            f"{verdict.verdict} but did not provide a "
-                                            "corrective step. VERIFICATION OBLIGATION: "
-                                            "extract every named entity from the "
-                                            "ORIGINAL goal (hostnames, machine names, "
-                                            "file paths, function names, IDs, URLs, "
-                                            "ticket numbers) and confirm each one "
-                                            "appears verbatim in the produced "
-                                            "artifacts. If ANY goal entity is absent, "
-                                            "the work is INCOMPLETE — say so explicitly "
-                                            "in your factual_outcome / issues; do NOT "
-                                            "synthesize a closing report from data "
-                                            "targeting a different entity."
-                                        ),
-                                        expected_outcomes=[
-                                            "Every named entity from the original goal "
-                                            "verifiably appears in at least one artifact",
-                                            "If a goal entity is missing, "
-                                            "factual_outcome explicitly reports the "
-                                            "gap rather than fabricating closure",
-                                            "Artifacts contain factual answers to the "
-                                            "user's original question, not data from a "
-                                            "different target",
-                                        ],
-                                        risk_assessment=(
-                                            "Low risk — read-only re-verification step"
-                                        ),
-                                        required_context_keys=[],
-                                    )
-                                    corrective = self._dedup_step_id(
-                                        default_corrective, completed_steps
-                                    )
-                                    self.logger.info(
-                                        f"Acceptance {verdict.verdict} (no corrective "
-                                        f"from planner) — injecting default recheck: "
-                                        f"{corrective.step_id}",
-                                        component='FlowController',
-                                    )
-                                    next_steps_list = [corrective]
-                                    continue
+                                    if already_rechecked:
+                                        # A default recheck already ran.  The planner is
+                                        # still returning PARTIAL with no corrective —
+                                        # this means the gap is genuinely unverifiable
+                                        # from local tools (anti-pattern #4 in the
+                                        # acceptance synthesis prompt).  Complete the
+                                        # task and surface gap_summary to the user
+                                        # rather than looping forever.
+                                        self.logger.info(
+                                            f'Acceptance {verdict.verdict} (no corrective) '
+                                            f'after recheck already ran — completing task; '
+                                            f'gap: {verdict.gap_summary[:120]}',
+                                            component='FlowController',
+                                        )
+                                        _do_complete = True
+                                    else:
+                                        # First time: synthesise a default goal-verification
+                                        # step so a PARTIAL verdict (incl. fail-CLOSED
+                                        # fallback when synthesis itself errored) cannot
+                                        # silently complete the task without at least one
+                                        # entity-presence check.
+                                        self.logger.warning(
+                                            f'Acceptance verdict={verdict.verdict} but no '
+                                            f'corrective_step — synthesizing default goal-'
+                                            f'verification step',
+                                            component='FlowController',
+                                        )
+                                        from ..models.plan import Step as _Step
+                                        default_corrective = _Step.from_planner(
+                                            step_id='acceptance_default_recheck',
+                                            description='[Default goal-verification re-check]',
+                                            goal=(
+                                                "The acceptance check returned "
+                                                f"{verdict.verdict} but did not provide a "
+                                                "corrective step. VERIFICATION OBLIGATION: "
+                                                "extract every named entity from the "
+                                                "ORIGINAL goal (hostnames, machine names, "
+                                                "file paths, function names, IDs, URLs, "
+                                                "ticket numbers) and confirm each one "
+                                                "appears verbatim in the produced "
+                                                "artifacts. If ANY goal entity is absent, "
+                                                "the work is INCOMPLETE — say so explicitly "
+                                                "in your factual_outcome / issues; do NOT "
+                                                "synthesize a closing report from data "
+                                                "targeting a different entity."
+                                            ),
+                                            expected_outcomes=[
+                                                "Every named entity from the original goal "
+                                                "verifiably appears in at least one artifact",
+                                                "If a goal entity is missing, "
+                                                "factual_outcome explicitly reports the "
+                                                "gap rather than fabricating closure",
+                                                "Artifacts contain factual answers to the "
+                                                "user's original question, not data from a "
+                                                "different target",
+                                            ],
+                                            risk_assessment=(
+                                                "Low risk — read-only re-verification step"
+                                            ),
+                                            required_context_keys=[],
+                                        )
+                                        corrective = self._dedup_step_id(
+                                            default_corrective, completed_steps
+                                        )
+                                        self.logger.info(
+                                            f"Acceptance {verdict.verdict} (no corrective "
+                                            f"from planner) — injecting default recheck: "
+                                            f"{corrective.step_id}",
+                                            component='FlowController',
+                                        )
+                                        next_steps_list = [corrective]
+                                        continue
                                 else:
                                     corrective = self._dedup_step_id(
                                         verdict.corrective_step, completed_steps

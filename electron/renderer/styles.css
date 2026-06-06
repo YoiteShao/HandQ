@@ -13,7 +13,7 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    background: rgba(248, 248, 250, 0.96);
+    background: rgba(252, 252, 252, 0.96);
     backdrop-filter: blur(20px);
     -webkit-backdrop-filter: blur(20px);
     transition: opacity 320ms ease;
@@ -78,7 +78,7 @@
     padding: 8px 14px;
     font-size: 12px;
     color: #3a3f48;
-    background: #f0f0f2;
+    background: #f0f0f0;
     border: 1px solid rgba(0, 0, 0, 0.10);
     border-radius: 8px;
     max-width: 360px;
@@ -303,6 +303,8 @@ html, body {
     box-shadow: var(--shadow-card);
     line-height: 1.5;
     word-wrap: break-word;
+    overflow-wrap: break-word;
+    overflow: hidden;
     align-self: flex-start;
     color: var(--fg);
     border-top-left-radius: 6px;
@@ -331,7 +333,7 @@ html, body {
 .bubble.system {
     align-self: stretch;
     max-width: 100%;
-    background: rgba(245, 245, 248, 0.65);
+    background: rgba(245, 245, 245, 0.65);
     border-color: rgba(0, 0, 0, 0.10);
     color: #3a3f48;
     text-align: center;
@@ -749,7 +751,7 @@ html, body {
     padding: 4px 12px;
     border: 1px solid rgba(0, 0, 0, 0.08);
     border-radius: 999px;
-    background: #f5f5f7;
+    background: #f5f5f5;
     color: var(--fg-mute);
     font: inherit;
     font-family: var(--mono);
@@ -759,7 +761,7 @@ html, body {
                 border-color 120ms ease;
 }
 .activity-strip:hover {
-    background: #ededef;
+    background: #ededed;
     color: var(--fg-soft);
     border-color: rgba(0, 0, 0, 0.12);
 }
@@ -791,7 +793,7 @@ html, body {
 /* Latest confidence as 0–100 integer, monospaced for stable width. */
 .activity-strip .ag-num {
     display: inline-block;
-    min-width: 2ch;
+    min-width: 3ch;
     text-align: right;
     font-weight: 600;
     font-variant-numeric: tabular-nums;
@@ -824,7 +826,7 @@ html, body {
 
 .activity-strip.complete {
     color: #3a3f48;
-    background: #ededef;
+    background: #ededed;
     border-color: rgba(0, 0, 0, 0.10);
     font-weight: 600;
 }
@@ -842,7 +844,7 @@ html, body {
     max-height: 560px;
     display: flex;
     flex-direction: column;
-    background: #f8f8fa;
+    background: #f8f8f8;
     border: 1px solid rgba(0, 0, 0, 0.10);
     border-radius: 14px;
     box-shadow: var(--shadow-floating);
@@ -864,7 +866,7 @@ html, body {
     justify-content: space-between;
     padding: 0 12px;
     border-bottom: 1px solid rgba(0, 0, 0, 0.06);
-    background: #f0f0f2;
+    background: #f0f0f0;
 }
 .activity-popover-header .activity-title {
     font-size: 11px;
@@ -943,7 +945,7 @@ html, body {
     animation: ai-slide-in 220ms ease;
 }
 .activity-item:hover {
-    background: #f5f5f7;
+    background: #f5f5f5;
     border-color: rgba(0, 0, 0, 0.10);
 }
 @keyframes ai-slide-in {
@@ -1212,7 +1214,7 @@ html, body {
     min-height: 80px;
 }
 .settings-form textarea[readonly] {
-    background: rgba(245, 248, 252, 0.55);
+    background: rgba(245, 245, 245, 0.55);
     color: var(--fg-mute);
     cursor: default;
 }
@@ -1283,7 +1285,7 @@ html, body {
 .settings-form .fieldset-intro {
     margin: 0 0 12px;
     padding: 8px 10px;
-    background: rgba(245, 248, 252, 0.55);
+    background: rgba(245, 245, 245, 0.55);
     border-left: 3px solid var(--tint);
     border-radius: 4px;
 }
@@ -1383,7 +1385,7 @@ html, body {
     font-family: var(--mono);
     font-weight: 600;
     letter-spacing: 0.02em;
-    background: rgba(245, 248, 252, 0.55);
+    background: rgba(245, 245, 245, 0.55);
 }
 .settings-form input[readonly]#cfg-hotkey:focus {
     background: rgba(255, 255, 255, 0.85);

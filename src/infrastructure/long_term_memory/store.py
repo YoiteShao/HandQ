@@ -1302,6 +1302,40 @@ class SQLiteStore:
         )
         return int(row[0]) if row else 0
 
+    async def prune_candidate_raw_text(self, older_than_ts: int) -> int:
+        """Clear raw_text for fully-processed candidates older than cutoff.
+
+        Only touches accepted_* and rejected rows — pending/triaging/failed
+        rows still need their raw_text for the next triage attempt.
+        Returns the number of rows updated.
+        """
+        statuses = ("accepted_memory", "accepted_knowledge", "accepted_both", "rejected")
+        placeholders = ",".join("?" * len(statuses))
+        async with self._write_lock:
+            cur = await asyncio.to_thread(
+                self._raw.execute,
+                f"UPDATE memory_candidates SET raw_text='' "
+                f"WHERE status IN ({placeholders}) "
+                f"AND created_at < ? AND raw_text != ''",
+                (*statuses, older_than_ts),
+            )
+            await asyncio.to_thread(self._raw.commit)
+            return cur.rowcount
+
+    async def prune_recall_log(self, older_than_ts: int) -> int:
+        """Delete recall_log rows older than cutoff.
+
+        Returns the number of rows deleted.
+        """
+        async with self._write_lock:
+            cur = await asyncio.to_thread(
+                self._raw.execute,
+                "DELETE FROM recall_log WHERE recalled_at < ?",
+                (older_than_ts,),
+            )
+            await asyncio.to_thread(self._raw.commit)
+            return cur.rowcount
+
     # ── Retriage progress (resumable migration scans) ───────────────────────
 
     async def get_retriage_progress(self, rule_version: int) -> Optional[str]:

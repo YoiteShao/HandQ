@@ -347,6 +347,11 @@ class DreamWorker:
                         await self._run_merge_scan()
                     except Exception:
                         _logger.exception("merge scan failed; will retry next cycle")
+                if self._cycle_count % C.LTM_CLEANUP_EVERY_N_CYCLES == 0:
+                    try:
+                        await self._run_ltm_cleanup()
+                    except Exception:
+                        _logger.exception("ltm cleanup failed; will retry next cycle")
                 # L2 / L3 dream synthesis. Gating uses WALL-CLOCK time,
                 # not in-memory cycle counts: the bridge is interactive
                 # and may be restarted multiple times a day, so a pure
@@ -981,6 +986,23 @@ class DreamWorker:
             )
 
     # ── Merge / exact-group scanner (post-hoc dedup) ────────────────────────
+
+    async def _run_ltm_cleanup(self) -> None:
+        """Prune stale raw_text and recall_log rows (TTL = 90 days each).
+
+        Called every LTM_CLEANUP_EVERY_N_CYCLES from the main loop. Both
+        operations are pure SQL (no LLM calls) so they complete in
+        milliseconds even on large tables.
+        """
+        cutoff_raw = int(time.time()) - C.LTM_CANDIDATE_RAWTEXT_TTL_DAYS * 86400
+        n_raw = await self._store.prune_candidate_raw_text(cutoff_raw)
+        cutoff_log = int(time.time()) - C.LTM_RECALL_LOG_TTL_DAYS * 86400
+        n_log = await self._store.prune_recall_log(cutoff_log)
+        if n_raw or n_log:
+            _logger.info(
+                "ltm cleanup: cleared raw_text=%d candidates, recall_log=%d rows",
+                n_raw, n_log,
+            )
 
     async def _run_merge_scan(self) -> None:
         """Run dedup scan on both memory and knowledge entries.

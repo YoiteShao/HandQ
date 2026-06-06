@@ -763,7 +763,7 @@
         }
         agSpark.textContent = confidenceHistory.map(_confChar).join('');
         const latest = confidenceHistory[confidenceHistory.length - 1];
-        agNum.textContent = String(Math.round(latest * 100));
+        agNum.textContent = String(Math.round(latest * 100)) + '%';
     }
 
     function setConfidenceGauge(conf) {

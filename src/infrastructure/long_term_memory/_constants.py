@@ -149,6 +149,9 @@ DREAM_STARTUP_DELAY_SECONDS: int = 30
 #   - PROPOSE(>= MERGE_PROPOSE_THRESHOLD) : write to merge_proposals,
 #                                            surface to user for review
 MERGE_SCAN_EVERY_N_CYCLES: int = 15         # 15 × 60s = once per 15min
+LTM_CLEANUP_EVERY_N_CYCLES: int = 100      # ~100 × 60s min = once per ~1.7h
+LTM_CANDIDATE_RAWTEXT_TTL_DAYS: int = 90
+LTM_RECALL_LOG_TTL_DAYS: int = 90
 MERGE_EXACT_THRESHOLD: float = 0.90          # auto-merge bar
 MERGE_PROPOSE_THRESHOLD: float = 0.78        # propose bar (< exact)
 MERGE_MIN_PAIR_AGE_SECONDS: int = 300        # don't dedup same-batch entries
