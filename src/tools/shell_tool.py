@@ -685,6 +685,7 @@ class ShellTool(BaseTool):
                     interrupt_task = asyncio.create_task(self.interrupt_event.wait())
                     done, pending = await asyncio.wait(
                         [communicate_task, interrupt_task],
+                        timeout=effective_timeout if effective_timeout > 0 else None,
                         return_when=asyncio.FIRST_COMPLETED,
                     )
                     for t in pending:
@@ -700,6 +701,30 @@ class ShellTool(BaseTool):
                             success=False,
                             output={'stdout': '', 'stderr': 'interrupted by user', 'exit_code': -1, 'truncated': False},
                             error=f"Interrupted by planner: {command}",
+                            execution_time=time.time() - start_time,
+                            tool_name=self.name,
+                            tool_parameters={'command': command, 'timeout': timeout},
+                        )
+
+                    # Neither completed within the timeout window: the command
+                    # is genuinely stuck. Without this guard the interrupt-aware
+                    # branch waits forever (the non-interrupt branch already has
+                    # wait_for). Kill the process tree and report a timeout.
+                    if communicate_task not in done:
+                        await _kill_process_tree_graceful(process)
+                        return ToolResult(
+                            success=False,
+                            output={
+                                "exit_code": None,
+                                "stdout": "",
+                                "stderr": f"Command timed out after {effective_timeout}s",
+                                "truncated": False,
+                                "cwd_used": effective_cwd,
+                                "command": command,
+                                "shell": executable,
+                                "venv": self.venv_path,
+                            },
+                            error=f"Command execution timeout ({effective_timeout}s): {command}",
                             execution_time=time.time() - start_time,
                             tool_name=self.name,
                             tool_parameters={'command': command, 'timeout': timeout},
