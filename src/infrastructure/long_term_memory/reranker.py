@@ -223,7 +223,8 @@ def _parse_llm_scores(raw: str, *, expected_n: int) -> List[float]:
 
 def from_config(config: dict) -> Reranker:
     """Pick a reranker from :mod:`_constants`. ``config`` carries
-    ``llm.API_KEY`` + ``llm.roles`` for providers that need an LLM pool.
+    ``llm.API_KEY`` + ``llm.helper_models`` / ``llm.models`` for providers
+    that need an LLM pool.
     """
     from . import _constants as C
     kind = C.RERANKER_PROVIDER
@@ -253,18 +254,16 @@ def from_config(config: dict) -> Reranker:
 def _build_llm_services_for_rerank(config: dict) -> List:
     """Build the LLM pool the reranker calls.
 
-    Mirrors ``DreamWorker._init_helper_pool`` policy: prefer the same tier
-    triage uses (typically receptionist), fall back through from_data and
-    agent. Latency matters more here than for triage (rerank gates user-
-    facing recall), but quality also matters; receptionist tier is the
-    same compromise.
+    Uses ``llm.helper_models`` (cheap pool for simple background tasks);
+    falls back to ``llm.models`` when ``helper_models`` is empty. Latency
+    matters here because rerank gates user-facing recall, so the cheaper
+    helper pool is the right default.
     """
     try:
-        from src.infrastructure.role_resolver import resolve_role_models
+        from src.infrastructure.role_resolver import resolve_models_and_helper
         from src.infrastructure.anthropic_streaming_service import (
             AnthropicStreamingService,
         )
-        from . import _constants as C
     except Exception:
         _logger.exception("failed to import LLM stack for rerank")
         return []
@@ -273,12 +272,7 @@ def _build_llm_services_for_rerank(config: dict) -> List:
     api_key = llm_cfg.get("API_KEY")
     if not api_key:
         return []
-    roles = resolve_role_models(llm_cfg)
 
-    tier = C.TRIAGE_LLM_TIER
-    models = list(roles.get(tier) or [])
-    if not models:
-        models = list(roles.get(C.TIER_FROM_DATA) or [])
-    if not models:
-        models = list(roles.get("agent") or [])
+    main_models, helper_models = resolve_models_and_helper(llm_cfg)
+    models = helper_models or main_models
     return [AnthropicStreamingService(model=m, api_key=api_key) for m in models]

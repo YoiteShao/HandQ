@@ -51,6 +51,8 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set
 from urllib.parse import urlparse
 
+from playwright.async_api import async_playwright  # type: ignore[import-not-found]
+
 from .logger import get_logger
 from .teams_api import GRAPH_RESOURCE, get_teams_auth
 
@@ -110,9 +112,19 @@ _NUDGE_ROUTES = (
 # The audiences we want to harvest in addition to Graph. Teams' own
 # internal API and presence service get their own ATs that we can
 # reuse for the read_chat / presence actions later.
+#
+#   chatsvcagg → list_chats (the chat roster)
+#   presence   → get_presence
+#   ic3        → per-conversation message history. The chatsvcagg
+#                aggregator does NOT serve message bodies (every path
+#                404s); Teams Web reads them from the region-scoped
+#                /api/chatsvc/{region}/v1/... endpoint authed with the
+#                ic3.teams.office.com token. Minted when /conversations
+#                is opened — already one of the _NUDGE_ROUTES below.
 _EXTRA_AUDIENCES = (
     "https://chatsvcagg.teams.microsoft.com",
     "https://presence.teams.microsoft.com",
+    "https://ic3.teams.office.com",
 )
 
 
@@ -267,6 +279,56 @@ def parse_identity(storage: Dict[str, str]) -> Dict[str, str]:
     return out
 
 
+def parse_region(storage: Dict[str, str]) -> str:
+    """Extract the Teams messaging region (e.g. ``amer``) from MSAL /
+    Discover localStorage entries.
+
+    Teams Web caches the region in several places — observed shapes:
+      * ``tmp.react-web-client.cachedPrimaryUser`` → top-level ``region``
+      * ``...Discover.DISCOVER-USER-DETAILS`` → ``item.region``
+      * ``...Discover.SKYPE-TOKEN`` → ``item.userDetails.region`` and
+        ``item.regionGtms.chatService`` = ``https://amer.ng.msg.teams...``
+
+    We scan every JSON value, vote on each short ``region`` string and
+    on the host prefix of any ``chatService`` URL, and return the most
+    common token. Returns ``""`` when nothing region-like is found
+    (caller treats that as "needs re-bootstrap").
+    """
+    votes: Dict[str, int] = {}
+
+    def _note(val: str) -> None:
+        v = (val or "").strip().lower()
+        if v and v.isalnum() and len(v) <= 12:
+            votes[v] = votes.get(v, 0) + 1
+
+    def _walk(o: Any) -> None:
+        if isinstance(o, dict):
+            for k, v in o.items():
+                kl = k.lower()
+                if kl == "region" and isinstance(v, str):
+                    _note(v)
+                elif kl == "chatservice" and isinstance(v, str):
+                    # https://amer.ng.msg.teams.microsoft.com → amer
+                    host = urlparse(v).hostname or ""
+                    if host:
+                        _note(host.split(".", 1)[0])
+                _walk(v)
+        elif isinstance(o, list):
+            for it in o:
+                _walk(it)
+
+    for raw in storage.values():
+        try:
+            j = json.loads(raw)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        _walk(j)
+
+    if not votes:
+        return ""
+    return max(votes.items(), key=lambda kv: kv[1])[0]
+
+
 async def _read_storage(page) -> Dict[str, str]:
     return await page.evaluate("""() => {
         const out = {};
@@ -324,15 +386,6 @@ async def bootstrap_from_teams_web(
             "Use the browser tool at least once to create it.",
             code="profile_missing",
         )
-
-    try:
-        from playwright.async_api import async_playwright  # type: ignore[import-not-found]
-    except ImportError as exc:
-        raise BootstrapError(
-            "playwright is not installed. Run: pip install playwright "
-            "&& playwright install chromium",
-            code="playwright_missing",
-        ) from exc
 
     async with async_playwright() as p:
         try:
@@ -469,6 +522,7 @@ async def bootstrap_from_teams_web(
 
             tokens = parse_msal_access_tokens(storage)
             identity = parse_identity(storage)
+            region = parse_region(storage)
         finally:
             try:
                 await ctx.close()
@@ -501,6 +555,7 @@ async def bootstrap_from_teams_web(
         "tenant_id": identity["tenant_id"],
         "account":   g.get("account") or identity["account"],
         "username":  g.get("username") or identity["username"],
+        "region":    region,
         "tokens":    tokens,
     }
 
@@ -510,7 +565,7 @@ async def bootstrap_from_teams_web(
     logger.info(
         f"TeamsWebBridge: bootstrap succeeded for "
         f"{creds.get('username') or creds.get('account')} "
-        f"(audiences: {sorted(tokens.keys())})",
+        f"(region: {region or 'unknown'}; audiences: {sorted(tokens.keys())})",
         component="TeamsWebBridge",
     )
     return creds

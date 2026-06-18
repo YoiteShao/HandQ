@@ -20,11 +20,9 @@ import asyncio
 import logging
 from typing import Any, List, Optional
 
-try:
-    from httpx import ConnectError
-except ImportError:  # httpx is a hard dep of openai; this is just defence
-    class ConnectError(Exception):  # type: ignore[no-redef]
-        pass
+import httpx
+from httpx import ConnectError
+from openai import AsyncOpenAI
 
 from .base import EmbeddingProvider
 
@@ -63,6 +61,9 @@ class HttpApiEmbedder(EmbeddingProvider):
         self._http: Any = None
         self._client: Any = None
         self._init_failed: bool = False
+        # Holds the task that closes a stranded http client when SDK init
+        # fails, so the cleanup task isn't garbage-collected mid-flight.
+        self._cleanup_task: Optional[asyncio.Task] = None
 
     # ── EmbeddingProvider interface ─────────────────────────────────────────
 
@@ -173,25 +174,6 @@ class HttpApiEmbedder(EmbeddingProvider):
         if self._client is not None or self._init_failed:
             return
         try:
-            from openai import AsyncOpenAI
-        except ImportError:
-            _logger.error(
-                "HttpApiEmbedder needs the `openai` package; recall will "
-                "stay on FTS-only. Run: pip install openai",
-            )
-            self._init_failed = True
-            self.available = False
-            return
-        try:
-            import httpx
-        except ImportError:
-            _logger.error(
-                "HttpApiEmbedder needs `httpx`; recall will stay on FTS-only.",
-            )
-            self._init_failed = True
-            self.available = False
-            return
-        try:
             self._http = httpx.AsyncClient(
                 verify=self._verify_ssl, timeout=self._timeout,
             )
@@ -212,6 +194,19 @@ class HttpApiEmbedder(EmbeddingProvider):
                 "HttpApiEmbedder client construction failed; "
                 "recall will stay on FTS-only",
             )
+            if self._http is not None:
+                # We're called from _call() which is async, so a running
+                # loop should exist. Use the modern API; if for some reason
+                # there's no running loop (e.g. _ensure_client invoked from
+                # a sync test harness), the http client will be cleaned up
+                # when the process exits.
+                try:
+                    loop = asyncio.get_running_loop()
+                    # Hold a reference so the task isn't GC'd before completion.
+                    self._cleanup_task = loop.create_task(self._http.aclose())
+                except RuntimeError:
+                    pass
+                self._http = None
             self._init_failed = True
             self.available = False
 

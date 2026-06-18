@@ -3,7 +3,7 @@ Tool Registry - Centralized Tool Management
 Provides a single source of truth for all tools, their metadata, and schemas
 """
 import sys
-from typing import Dict, List, Type, Any, Optional
+from typing import TYPE_CHECKING, Dict, List, Type, Any, Optional
 from .base_tool import BaseTool
 from .read_tool import ReadTool
 from .write_tool import WriteTool
@@ -20,6 +20,9 @@ from .web_search_tool import WebSearchTool
 from .email_tool import EmailTool
 from .teams_tool import TeamsTool
 from .ask_human_tool import AskHumanTool
+
+if TYPE_CHECKING:
+    from ..controller_v2.session_context import SessionContext
 
 _IS_WINDOWS = sys.platform == "win32"
 
@@ -55,10 +58,15 @@ class ToolMetadata:
         self.usage_guide = usage_guide
         self.on_demand = on_demand
 
-    def create_instance(self) -> BaseTool:
-        """Create an instance of the tool"""
-        # Tool classes have their own __init__ that sets the name
-        return self.tool_class()  # type: ignore
+    def create_instance(self, ctx: Optional["SessionContext"] = None) -> BaseTool:
+        """Create an instance of the tool, optionally injecting a SessionContext."""
+        # Tool classes have their own __init__ that sets the name; many of them
+        # also accept an optional ``ctx`` keyword. Try with ctx first, fall
+        # back to no-args for tools whose ``__init__`` doesn't take it.
+        try:
+            return self.tool_class(ctx=ctx)  # type: ignore
+        except TypeError:
+            return self.tool_class()  # type: ignore
 
 
 class ToolRegistry:
@@ -1955,11 +1963,23 @@ EXAMPLES
         return metadata.create_instance()
 
     @classmethod
-    def create_all_tool_instances(cls, venv_path: Optional[str] = None, extra_tool_names: Optional[List[str]] = None) -> Dict[str, BaseTool]:
+    def create_all_tool_instances(
+        cls,
+        ctx: Optional["SessionContext"] = None,
+        venv_path: Optional[str] = None,
+        extra_tool_names: Optional[List[str]] = None,
+    ) -> Dict[str, BaseTool]:
         """
         Create instances of all registered tools.
 
         Args:
+            ctx: Optional :class:`SessionContext` carrying per-session
+                 resources (IM, file_state, ssh_pool, browser_session,
+                 session_registry, desktop_state, interrupt_event). When
+                 supplied, every tool's ``__init__`` is called with
+                 ``ctx=ctx``; tools that don't read from ctx ignore it.
+                 ``None`` is allowed for callers without a session (test
+                 fixtures) — tools then fall back to their module-level state.
             venv_path: Optional path to a virtual environment root.  When set,
                        all bash commands run inside that venv (PATH is prepended
                        with the venv bin directory and VIRTUAL_ENV is set),
@@ -1978,13 +1998,13 @@ EXAMPLES
             if metadata.on_demand and name not in requested:
                 continue
             if name in (cls.SHELL, cls.BASH):
-                instances[name] = ShellTool(venv_path=venv_path)
+                instances[name] = ShellTool(ctx=ctx, venv_path=venv_path)
             elif name == cls.SSH:
-                instances[name] = StatelessSSHTool()
+                instances[name] = StatelessSSHTool(ctx=ctx) if ctx is not None else StatelessSSHTool()
             elif name == cls.SESSION:
-                instances[name] = metadata.create_instance()
+                instances[name] = metadata.create_instance(ctx)
             else:
-                instances[name] = metadata.create_instance()
+                instances[name] = metadata.create_instance(ctx)
         return instances
 
     @classmethod

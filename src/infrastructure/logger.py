@@ -409,3 +409,67 @@ def get_logger() -> HandQLogger:
     if _global_logger is None:
         _global_logger = HandQLogger(name="HandQ", level=LogLevel.INFO, log_file=None)
     return _global_logger
+
+
+def add_root_file_handler(
+    log_path: str,
+    level: LogLevel = LogLevel.INFO,
+    max_bytes: int = 10 * 1024 * 1024,
+    backup_count: int = 5,
+) -> logging.Handler:
+    """
+    Attach a session-scoped file handler to the ROOT logger and return it.
+
+    initialize_logger()'s file handler is bound to the "HandQ" logger name, so
+    it only captures get_logger() calls. This handler sits on the root logger
+    instead, so it records everything that propagates to root during the
+    session: the HandQ tree PLUS every stdlib logging.getLogger(__name__)
+    module (shell_tool / session_tool / session_context / ...). The
+    background-daemon trees that set propagate=False (handq.ltm /
+    handq.personality / handq.activity / handq.scheduler — diverted to
+    .dia/internal-trace.log by bridge_main.py) are deliberately excluded.
+
+    The bridge calls this once a session directory is allocated and pairs it
+    with remove_root_file_handler() at session teardown, making
+    handq-engine.log a clean "everything that happened in this session" view.
+
+    Args:
+        log_path:     Absolute path of the per-session log file.
+        level:        Minimum level the handler records.
+        max_bytes:    Rotation threshold per file (default: 10MB).
+        backup_count: Number of rotated backups to keep (default: 5).
+    """
+    log_path_obj = Path(log_path)
+    log_path_obj.parent.mkdir(parents=True, exist_ok=True)
+    handler = SafeRotatingFileHandler(
+        log_path_obj,
+        maxBytes=max_bytes,
+        backupCount=backup_count,
+        encoding="utf-8",
+    )
+    handler.setFormatter(MultiLineFormatter(
+        '[%(asctime)s] [%(levelname)s] [%(filename)s:%(lineno)d] %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S',
+    ))
+    handler.setLevel(getattr(logging, level.value))
+    logging.getLogger().addHandler(handler)
+    return handler
+
+
+def remove_root_file_handler(handler: Optional[logging.Handler]) -> None:
+    """
+    Detach and close a handler returned by add_root_file_handler().
+
+    Safe to call with None or with a handler that is no longer attached.
+    Closing flushes and releases the file so the next session can open a fresh
+    handq-engine.log without a lingering Windows file lock.
+    """
+    if handler is None:
+        return
+    try:
+        logging.getLogger().removeHandler(handler)
+    finally:
+        try:
+            handler.close()
+        except Exception:
+            pass

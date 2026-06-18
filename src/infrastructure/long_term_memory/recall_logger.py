@@ -93,9 +93,12 @@ class RecallLogger:
         # flush land in a fresh window rather than getting double-written.
         self._buf.clear()
         try:
-            await store.insert_recall_log_batch(rows)
+            await store.insert_mem_recall_log_batch(rows)
         except Exception:
-            _logger.exception("recall_log flush failed; dropped %d rows", len(rows))
+            # Re-add lost rows so they survive to the next flush attempt
+            # rather than being silently dropped.
+            self._buf.extendleft(reversed(rows))
+            _logger.exception("recall_log flush failed; %d rows re-queued", len(rows))
             return 0
         return len(rows)
 

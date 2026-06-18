@@ -25,7 +25,6 @@ from .ssh_tool import (
     _connect,
     _exec_command,
     _load_credentials,
-    _PARAMIKO_AVAILABLE,
 )
 
 
@@ -218,19 +217,10 @@ class RemoteHandQTool(BaseTool):
         "additionalProperties": False,
     }
 
-    def __init__(self):
-        super().__init__("remote_handq")
+    def __init__(self, ctx=None):
+        super().__init__("remote_handq", ctx=ctx)
 
     def execute(self, **params) -> ToolResult:
-        if not _PARAMIKO_AVAILABLE:
-            return ToolResult(
-                success=False,
-                output=None,
-                tool_name=self.name,
-                tool_parameters=params,
-                error="paramiko is not installed. Run: pip install paramiko",
-            )
-
         action = params.get("action", "")
         creds_file = params.get("credentials_file", "")
 

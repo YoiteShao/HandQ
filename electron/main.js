@@ -125,18 +125,65 @@ try {
 
 const LOG_FILE = path.join(LOG_DIR, 'handq-frontend.log');
 
-function logLine(component, msg, extra) {
+// Size-based rotation for handq-frontend.log. logLine() appends with no
+// built-in bound, so a single long-running launch would grow frontend.log
+// without limit. Mirror the Python bridge's bounded policy: when the file
+// crosses FRONTEND_LOG_MAX_BYTES, shuffle .log -> .1 -> .2 -> .3 (keep 3
+// backups) and reset. The byte counter is kept in memory (seeded from
+// statSync at startup) so the hot path avoids a stat() on every line.
+const FRONTEND_LOG_MAX_BYTES = 5 * 1024 * 1024;
+const FRONTEND_LOG_BACKUPS = 3;
+let frontendLogBytes = 0;
+try { frontendLogBytes = fs.statSync(LOG_FILE).size; } catch (_) { frontendLogBytes = 0; }
+
+function rotateFrontendLog() {
+    // Best-effort: a locked file (Windows log viewer open) must not crash the
+    // app — if a rename fails we just keep appending to the current file.
+    try { fs.rmSync(LOG_FILE + '.' + FRONTEND_LOG_BACKUPS, { force: true }); } catch (_) { /* ignore */ }
+    for (let i = FRONTEND_LOG_BACKUPS - 1; i >= 1; i--) {
+        try { fs.renameSync(LOG_FILE + '.' + i, LOG_FILE + '.' + (i + 1)); } catch (_) { /* ignore */ }
+    }
+    try { fs.renameSync(LOG_FILE, LOG_FILE + '.1'); frontendLogBytes = 0; } catch (_) { /* keep current */ }
+}
+
+// Set HANDQ_FRONTEND_DEBUG=1 to capture the high-volume diagnostic firehoses
+// (every bridge envelope incl. per-token streaming deltas, and the full bridge
+// stderr mirror). Off by default — those duplicate handq-bridge.log and would
+// otherwise dominate frontend.log. Lifecycle / IPC / error lines always log.
+const FRONTEND_DEBUG = !!process.env.HANDQ_FRONTEND_DEBUG;
+
+function formatLogLine(component, msg, extra) {
     const ts = new Date().toISOString();
     let line = '[' + ts + '] [' + component + '] ' + msg;
     if (extra !== undefined) {
         try { line += ' ' + JSON.stringify(extra); } catch (_) { line += ' [unserialisable]'; }
     }
+    return line;
+}
+
+function writeFrontendLine(line) {
     // Console mirror — visible to the terminal that launched `electron .`.
     try { console.log(line); } catch (_) { /* ignore */ }
     // File mirror — best-effort; never throw.
     if (LOG_FILE) {
-        try { fs.appendFileSync(LOG_FILE, line + '\n'); } catch (_) { /* swallow */ }
+        try {
+            const buf = line + '\n';
+            fs.appendFileSync(LOG_FILE, buf);
+            frontendLogBytes += Buffer.byteLength(buf);
+            if (frontendLogBytes >= FRONTEND_LOG_MAX_BYTES) rotateFrontendLog();
+        } catch (_) { /* swallow */ }
     }
+}
+
+function logLine(component, msg, extra) {
+    writeFrontendLine(formatLogLine(component, msg, extra));
+}
+
+// Debug-gated variant for the high-volume firehoses (see FRONTEND_DEBUG).
+// No-op (not even a console echo) unless HANDQ_FRONTEND_DEBUG is set.
+function logLineDebug(component, msg, extra) {
+    if (!FRONTEND_DEBUG) return;
+    writeFrontendLine(formatLogLine(component, msg, extra));
 }
 
 // Strip API_KEY (and the legacy api_key) out of any payload we log
@@ -430,35 +477,6 @@ function notifyConfirmationNeeded(evt) {
     startTrayFlash();
 }
 
-function notifyTaskCompleted(evt) {
-    if (!mainWindow || mainWindow.isDestroyed()) return;
-    const windowNeedsAttention =
-        !mainWindow.isVisible() ||
-        mainWindow.isMinimized() ||
-        !mainWindow.isFocused();
-    if (!windowNeedsAttention) return;
-
-    const summary = String((evt && evt.summary) || '');
-    const title = 'HandQ — 任务完成';
-    let body = summary || '任务已完成。';
-    if (body.length > 120) body = body.slice(0, 117) + '…';
-
-    if (Notification.isSupported()) {
-        const note = new Notification({ title, body, silent: false });
-        note.on('click', () => {
-            if (!mainWindow || mainWindow.isDestroyed()) return;
-            if (mainWindow.isMinimized()) mainWindow.restore();
-            mainWindow.show();
-            mainWindow.focus();
-        });
-        note.show();
-        logLine('NOTIFY', 'task_completed toast shown');
-    }
-
-    try { mainWindow.flashFrame(true); } catch (_) { /* ignore */ }
-    startTrayFlash();
-}
-
 function writeToBridge(obj) {
     if (!pythonChild || !pythonChild.stdin || pythonChild.stdin.destroyed) {
         logLine('IPC-OUT', 'bridge stdin unavailable',
@@ -555,7 +573,7 @@ function spawnBridge() {
             });
             return;
         }
-        logLine('BRIDGE-OUT', 'line', {
+        logLineDebug('BRIDGE-OUT', 'line', {
             evt_type: evtType,
             id: evt && evt.id,
             raw: truncated,
@@ -605,14 +623,6 @@ function spawnBridge() {
                         { err: err && err.message });
             }
         }
-        // Notify the user when a task completes and the window is not in focus.
-        if (evtType === 'status' && evt && evt.kind === 'task_completed') {
-            try { notifyTaskCompleted(evt); }
-            catch (err) {
-                logLine('NOTIFY', 'notifyTaskCompleted threw',
-                        { err: err && err.message });
-            }
-        }
         sendToRenderer(evt);
     });
 
@@ -627,7 +637,7 @@ function spawnBridge() {
         const text = String(chunk);
         // Strip a single trailing newline so the log line isn't double-broken.
         const stripped = text.endsWith('\n') ? text.slice(0, -1) : text;
-        logLine('BRIDGE-LOG', stripped);
+        logLineDebug('BRIDGE-LOG', stripped);
         // Buffer for the crash dialog. Split on newlines so multi-line
         // tracebacks don't get glued together visually. Cap at
         // STDERR_RING_SIZE total lines.

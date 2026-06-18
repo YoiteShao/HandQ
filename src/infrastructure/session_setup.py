@@ -1,35 +1,28 @@
 """
-Session Setup — Context provider that prepares the interactive session tool.
+Session Setup — Context provider that emits the interactive-session usage hint.
 
-Activation is purely Planner-driven: when "session" appears in
-step.tools_required, FlowController invokes prepare() to inject a usage
-hint into effective_goal. There is no keyword scan — if the Planner did
-not declare session, this provider does nothing.
-
-The session tool itself spawns local subprocesses directly; no credential
-or resource preparation is needed. prepare() exists solely to remind the
-agent which of the 4 irreplaceable scenarios applies and how to use alias
-for cross-step session reuse.
+The session tool spawns local subprocesses directly; no credential or resource
+preparation is needed. ``before_item`` exists solely to remind the agent which
+of the four irreplaceable scenarios applies and how to use ``alias`` for
+cross-step session reuse.
 """
 from __future__ import annotations
 
 from typing import TYPE_CHECKING, Optional
 
-from .step_context_provider import StepContextProvider
 from .logger import get_logger
+from ..controller_v2.context import ContextProvider, ItemContext, ProviderCache
 
 if TYPE_CHECKING:
-    from ..controller.interaction_manager import InteractionManager
-    from .memory import Memory
-    from ..models.plan import Step
+    from ..controller_v2.interaction_manager import InteractionManager
 
 
-class SessionContextProvider(StepContextProvider):
-    """Inject the session-tool usage hint when the Planner declares it.
+class SessionContextProvider(ContextProvider):
+    """Inject the session-tool usage hint when the Planner activates ``session``.
 
-    Responsibility narrowed to hint injection — there is no credential
-    prep or resource initialisation. The session tool's runtime registry
-    handles subprocess lifecycle directly.
+    Hint is identical for every item — the session tool's runtime registry
+    handles subprocess lifecycle directly so there is no first-vs-subsequent
+    distinction.
     """
 
     def __init__(self) -> None:
@@ -39,11 +32,11 @@ class SessionContextProvider(StepContextProvider):
     def tool_name(self) -> str:
         return "session"
 
-    async def prepare(
+    async def before_item(
         self,
-        step: "Step",
-        interaction_manager: "InteractionManager",
-        memory: "Memory",
+        ctx: ItemContext,
+        im: "InteractionManager",
+        cache: ProviderCache,
     ) -> Optional[str]:
         return (
             "[Session activated] Confirm ONE of the 4 scenarios in the session "

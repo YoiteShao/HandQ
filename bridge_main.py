@@ -213,6 +213,9 @@ def _ensure_user_config_present() -> None:
 
 _PRESERVE_PATHS = frozenset({
     "llm.API_KEY",
+    "llm.available_models",
+    "llm.agent_models",
+    "llm.helper_models",
     "session",
     "interaction_switches",
     "teams",
@@ -350,6 +353,21 @@ def _merge_user_config_with_seed() -> None:
         shutil.copy2(user_cfg, backup)
         merged = _merge_config(ship_dict, user_dict)
         merged["version"] = new_version_str  # explicit; OVERRIDE default already does this
+        # Post-merge migration: old `models` → new `available_models` schema.
+        # If the user still has the legacy flat `models` key (preserved through
+        # the merge because it was their data) but the shipped config introduced
+        # `available_models`, convert now so the UI sees the new schema.
+        _llm = merged.get("llm")
+        if isinstance(_llm, dict) and "models" in _llm and "available_models" not in _llm:
+            _old_models = _llm.pop("models", []) or []
+            _old_helper = _llm.pop("helper_models", []) or []
+            if not isinstance(_old_models, list):
+                _old_models = []
+            if not isinstance(_old_helper, list):
+                _old_helper = []
+            _llm["available_models"] = list(dict.fromkeys(_old_models + _old_helper))
+            _llm["agent_models"] = _old_models
+            _llm["helper_models"] = _old_helper if _old_helper else _old_models[-1:]
         tmp_path = user_cfg + ".tmp"
         with open(tmp_path, "w", encoding="utf-8") as f:
             yaml.safe_dump(merged, f, allow_unicode=True, sort_keys=False)
@@ -385,8 +403,9 @@ _emit_boot_progress(
 #   - StreamHandler(sys.stderr) at INFO   — human-readable diagnostics
 #   - RotatingFileHandler(<log_dir>/handq-bridge.log) at INFO  — bridge log
 # Root level is DEBUG so the diag handler (attached below to handq.ltm /
-# personality / scheduler trees) can write full trace into .dia/
-# internal-trace.log without affecting the main handq-bridge.log. The
+# personality / activity / scheduler trees, which set propagate=False) can
+# write their full trace into .dia/internal-trace.log; those trees are
+# diverted away from the main handq-bridge.log entirely. The
 # main file handler filters to INFO+ to keep handq-bridge.log readable —
 # DEBUG from PIL chunk dumps, httpcore wire trace, and Anthropic /
 # OpenAI request bodies (which contain plaintext user activity text)
@@ -546,13 +565,13 @@ _emit_boot_progress("logging_ready", log_dir=str(_LOG_DIR))
 #
 # Production debugging needs deep visibility into the long-term memory and
 # activity-monitor subsystems WITHOUT cluttering the main bridge log.
-# This handler attaches to specific logger trees and writes to a separate
-# file at <logs_base>/.dia/ — a dot-prefixed sibling of the per-launch
-# directories. We additionally set the Windows HIDDEN attribute on the
-# directory so it stays out of the user's normal browse view; a curious
-# user with "Show hidden files" can still find it. We're not hiding from
-# a determined investigator — we're just keeping the visible-debug-surface
-# small.
+# This handler attaches to specific logger trees and DIVERTS them (those
+# trees set propagate=False below) into a separate file at <logs_base>/.dia/
+# — a dot-prefixed sibling of the per-launch directories. We additionally
+# set the Windows HIDDEN attribute on the directory so it stays out of the
+# user's normal browse view; a curious user with "Show hidden files" can
+# still find it. We're not hiding from a determined investigator — we're
+# just keeping the visible-debug-surface small.
 #
 # The diag file is bounded by RotatingFileHandler (1 MB × 5) so it can't
 # grow without bound. It is intentionally NOT wiped by _prune_old_log_dirs
@@ -575,13 +594,20 @@ try:
     )
     _diag_handler.setLevel(logging.DEBUG)
     _diag_handler.setFormatter(_formatter)
-    # Attach to the LTM / activity / scheduler logger trees only —
-    # the main bridge logs stay in the main file. Logger propagation
-    # means the root handler (handq-bridge.log) ALSO gets these
-    # records, which is fine: the diag log is an extra copy, not a
-    # diversion.
-    for _name in ("handq.ltm", "handq.personality", "handq.scheduler"):
-        logging.getLogger(_name).addHandler(_diag_handler)
+    # Divert the background-subsystem logger trees into the diag file ONLY.
+    # Setting propagate=False stops these records from reaching the root
+    # handler, so they no longer appear in handq-bridge.log OR the per-session
+    # handq-engine.log — the full DEBUG trace (errors included) lands solely in
+    # .dia/internal-trace.log. These subsystems are long-running daemons that
+    # don't belong to any single session; keeping them out of the main logs is
+    # what makes engine.log a clean "everything that happened in this session"
+    # view. handq.activity.* (personality capture/diff/input hot loop) is
+    # included here — it is a child of neither handq.personality nor
+    # handq.scheduler and would otherwise leak into the main logs.
+    for _name in ("handq.ltm", "handq.personality", "handq.activity", "handq.scheduler"):
+        _tree = logging.getLogger(_name)
+        _tree.addHandler(_diag_handler)
+        _tree.propagate = False
     _boot_logger = logging.getLogger("handq.bridge.boot")
     _boot_logger.info("internal-trace log: %s", _DIAG_FILE)
 except Exception:
@@ -740,7 +766,13 @@ async def _run_with_long_term_memory() -> None:
     _emit_boot_progress("ltm_init_start", db_path=str(db_path))
     _t_ltm = time.monotonic()
     try:
-        ltm = await LongTermMemory.init(db_path=db_path, config_path=config_path)
+        # Inject the bridge's IPC emitter so LTM background workers can push
+        # chat-feed hints (e.g. a freshly-staged skill proposal). stdio_bridge
+        # was imported above, so its module-level _emit is already live.
+        ltm = await LongTermMemory.init(
+            db_path=db_path, config_path=config_path,
+            emit=stdio_bridge._emit,
+        )
     except BaseException as exc:
         _emit_boot_progress("ltm_init_failed", error=str(exc))
         raise

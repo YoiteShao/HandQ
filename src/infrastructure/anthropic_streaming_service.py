@@ -354,15 +354,25 @@ class AnthropicStreamingService(LLMService):
                         block_index=event.index,
                     )
             elif etype == "message_delta":
-                # message_delta carries the real input+output token counts for streaming
+                # message_delta carries the real input+output token counts for
+                # streaming AND the cache_creation / cache_read fields. The
+                # message_start branch below is a fallback only; on Anthropic
+                # (and the QGenie gateway) cache tokens land here.
                 usage = getattr(event, "usage", None)
                 if usage is not None:
                     input_tokens = getattr(usage, "input_tokens", 0) or 0
                     output_tokens = getattr(usage, "output_tokens", 0) or 0
+                    _cc = getattr(usage, "cache_creation_input_tokens", 0) or 0
+                    _cr = getattr(usage, "cache_read_input_tokens", 0) or 0
+                    if _cc:
+                        cache_creation_input_tokens = _cc
+                    if _cr:
+                        cache_read_input_tokens = _cr
 
             elif etype == "message_start":
-                # message_start usage is always 0 for streaming (confirmed in logs);
-                # kept here only as a fallback for non-standard server implementations.
+                # Fallback only — most server implementations leave cache
+                # fields null here and report them in message_delta. Kept
+                # for non-standard servers that put them on message_start.
                 msg = getattr(event, "message", None)
                 if msg is not None:
                     usage = getattr(msg, "usage", None)
@@ -372,7 +382,6 @@ class AnthropicStreamingService(LLMService):
                         if _in or _out:  # only override if non-zero
                             input_tokens = _in
                             output_tokens = _out
-                        # Cache tokens are typically reported in message_start
                         _cc = getattr(usage, "cache_creation_input_tokens", 0) or 0
                         _cr = getattr(usage, "cache_read_input_tokens", 0) or 0
                         if _cc:
@@ -467,7 +476,13 @@ class AnthropicStreamingService(LLMService):
 
         system_content = "\n\n".join(m.get("content", "") for m in system_msgs)
         if system_content:
-            api_kwargs["system"] = system_content
+            api_kwargs["system"] = [
+                {
+                    "type": "text",
+                    "text": system_content,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ]
         if stop:
             api_kwargs["stop_sequences"] = stop
         if top_k is not None:
@@ -475,7 +490,10 @@ class AnthropicStreamingService(LLMService):
         if top_p is not None:
             api_kwargs["top_p"] = top_p
         if tools:
-            api_kwargs["tools"] = self._convert_tools(tools)
+            converted_tools = self._convert_tools(tools)
+            if converted_tools:
+                converted_tools[-1]["cache_control"] = {"type": "ephemeral"}
+            api_kwargs["tools"] = converted_tools
         if tool_choice is not None:
             api_kwargs["tool_choice"] = tool_choice
         if thinking_budget_tokens is not None:
@@ -544,10 +562,59 @@ class AnthropicStreamingService(LLMService):
             content = msg.get("content")
             if content is None:
                 content = ""
-            result.append({**msg, "content": content})
+            out_msg = {**msg, "content": content}
+            # `_cache_anchor` is a private convention from PersistentAgent
+            # (see _build_messages): the last skill-prelude message carries
+            # this flag so we attach a cache_control breakpoint here. The
+            # flag is stripped before sending to the API.
+            anchor = out_msg.pop("_cache_anchor", False)
+            if anchor:
+                if isinstance(content, str):
+                    out_msg["content"] = [{
+                        "type": "text",
+                        "text": content,
+                        "cache_control": {"type": "ephemeral"},
+                    }]
+                elif isinstance(content, list) and content:
+                    content[-1] = {**content[-1], "cache_control": {"type": "ephemeral"}}
+                    out_msg["content"] = content
+            result.append(out_msg)
             i += 1
 
-        return result
+        return AnthropicStreamingService._merge_adjacent_same_role(result)
+
+    @staticmethod
+    def _merge_adjacent_same_role(messages: list[dict]) -> list[dict]:
+        """Coalesce consecutive messages that share a role.
+
+        The Anthropic API requires user/assistant roles to alternate; two
+        consecutive same-role messages are rejected with a 400. Two callers
+        legitimately produce adjacency:
+          - PersistentAgent's instruction-at-bottom layout places a tool-result
+            user message (the last turn's observations) directly before the
+            per-item instruction user message.
+          - An obs-less completion turn can sit next to another assistant
+            message.
+        Content is normalised to a block list before concatenation so text and
+        tool_use/tool_result blocks combine cleanly; tool_result blocks keep
+        their leading position because turns always precede the instruction.
+        Any cache_control already attached to a block is preserved.
+        """
+        def _as_blocks(content: Any) -> list[dict]:
+            if isinstance(content, list):
+                return content
+            if isinstance(content, str):
+                return [{"type": "text", "text": content}] if content else []
+            return []
+
+        merged: list[dict] = []
+        for msg in messages:
+            if merged and merged[-1].get("role") == msg.get("role"):
+                prev = merged[-1]
+                prev["content"] = _as_blocks(prev.get("content")) + _as_blocks(msg.get("content"))
+            else:
+                merged.append(dict(msg))
+        return merged
 
     @staticmethod
     def _convert_tools(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -681,15 +748,50 @@ class AnthropicStreamingService(LLMService):
                     )
                     raise
 
-                # Rate-limit (429): fast-fail so llm_pool can fall back to the next
-                # service immediately.  Retrying the same exhausted service is futile
-                # (tokens_per_day limits can have retry_after of many hours).
-                if isinstance(e, anthropic.RateLimitError) or "rate limit exceeded" in str(e).lower():
-                    self._exhausted = True
-                    self.logger.warning(
-                        f"AnthropicStreaming service marked exhausted for this session: {type(e).__name__}: {e}",
-                        component="AnthropicStreamingService",
-                    )
+                # Rate-limit (429): fast-fail so llm_pool can fall back to the
+                # next service immediately. Retrying the same throttled service
+                # within a single call is futile.
+                #
+                # Whether to mark the service _exhausted (skip it for the rest
+                # of the session) depends on the retry window: for tokens_per_day
+                # the Retry-After is many hours, so a session-wide skip is
+                # correct; for RPM/burst throttles it's tens of seconds, so
+                # marking exhausted would silently shrink the pool for the
+                # rest of the session even though the service will recover
+                # within the same call's lifetime.
+                is_429 = (
+                    isinstance(e, anthropic.RateLimitError)
+                    or "rate limit exceeded" in str(e).lower()
+                )
+                if is_429:
+                    retry_after_secs = 0.0
+                    try:
+                        resp = getattr(e, "response", None)
+                        if resp is not None:
+                            hdrs = getattr(resp, "headers", None)
+                            if hdrs is not None:
+                                ra = hdrs.get("Retry-After") or hdrs.get("retry-after")
+                                if ra is not None:
+                                    retry_after_secs = float(ra)
+                    except (TypeError, ValueError, AttributeError):
+                        pass
+
+                    if retry_after_secs > 300.0:
+                        self._exhausted = True
+                        self.logger.warning(
+                            f"AnthropicStreaming service marked exhausted "
+                            f"(retry_after={retry_after_secs:.0f}s): "
+                            f"{type(e).__name__}: {e}",
+                            component="AnthropicStreamingService",
+                        )
+                    else:
+                        self.logger.warning(
+                            f"AnthropicStreaming throttled "
+                            f"(retry_after={retry_after_secs:.0f}s); "
+                            f"falling back without marking exhausted: "
+                            f"{type(e).__name__}: {e}",
+                            component="AnthropicStreamingService",
+                        )
                     raise
 
                 if attempt < self.max_retries - 1:

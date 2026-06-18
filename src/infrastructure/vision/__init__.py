@@ -26,6 +26,7 @@ from .ocr import (
     OCRBox,
     OCRResult,
     get_local_ocr,
+    get_local_ocr_background,
     flush_local_ocr,
 )
 
@@ -39,5 +40,6 @@ __all__ = [
     "OCRBox",
     "OCRResult",
     "get_local_ocr",
+    "get_local_ocr_background",
     "flush_local_ocr",
 ]

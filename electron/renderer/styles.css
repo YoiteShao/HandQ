@@ -294,6 +294,7 @@ html, body {
 
 .bubble {
     max-width: 78%;
+    min-width: 0;
     padding: 10px 14px;
     border-radius: 16px;
     border: 1px solid var(--asst-bubble-border);
@@ -304,7 +305,6 @@ html, body {
     line-height: 1.5;
     word-wrap: break-word;
     overflow-wrap: break-word;
-    overflow: hidden;
     align-self: flex-start;
     color: var(--fg);
     border-top-left-radius: 6px;
@@ -438,6 +438,7 @@ html, body {
     border-radius: 10px;
     padding: 10px 12px;
     overflow-x: auto;
+    max-width: 100%;
     font-family: var(--mono);
     font-size: 12px;
     line-height: 1.5;
@@ -469,6 +470,9 @@ html, body {
 .md-rendered table {
     border-collapse: collapse;
     margin: 0.5em 0;
+    display: block;
+    overflow-x: auto;
+    max-width: 100%;
 }
 .md-rendered th, .md-rendered td {
     border: 1px solid var(--hairline);
@@ -1290,6 +1294,82 @@ html, body {
     border-radius: 4px;
 }
 
+/* ── Model selector panel (Agent / Helper / Available tabs) ──────── */
+.model-selector-panel {
+    margin-top: 4px;
+    border: 1px solid var(--hairline);
+    border-radius: 8px;
+    overflow: hidden;
+    background: rgba(255, 255, 255, 0.25);
+}
+.model-selector-tabs {
+    display: flex;
+    gap: 2px;
+    padding: 0 12px;
+    border-bottom: 1px solid var(--hairline);
+}
+.model-tab {
+    background: transparent;
+    border: none;
+    border-bottom: 2px solid transparent;
+    padding: 8px 14px;
+    margin-bottom: -1px;
+    color: var(--fg-mute);
+    font: inherit;
+    font-size: 12px;
+    cursor: pointer;
+    transition: color 120ms, border-color 120ms;
+}
+.model-tab:hover { color: var(--fg); }
+.model-tab.active {
+    color: var(--fg);
+    border-bottom-color: var(--tint);
+    font-weight: 600;
+}
+.model-tab-panel {
+    padding: 10px 14px;
+    max-height: 180px;
+    overflow-y: auto;
+}
+.model-tab-panel.hidden { display: none; }
+.model-tab-panel textarea {
+    width: 100%;
+    box-sizing: border-box;
+    margin-top: 6px;
+}
+.model-check-list {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+    gap: 4px 8px;
+    margin-top: 6px;
+}
+.model-check-list label {
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    margin-bottom: 0;
+    padding: 3px 6px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-family: var(--mono);
+    font-size: 12px;
+    transition: background 120ms;
+}
+.model-check-list label:hover {
+    background: rgba(255, 255, 255, 0.35);
+}
+.model-check-list .mcl-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.model-check-list input[type="checkbox"] {
+    flex: none;
+    accent-color: var(--tint);
+}
+
 .settings-form label.checkbox-row {
     display: grid;
     grid-template-columns: auto 1fr;
@@ -1402,94 +1482,6 @@ code {
 }
 
 .muted { color: var(--fg-mute); font-size: 12px; }
-
-/* ---------- Per-role model tabs ---------- */
-
-.settings-form .role-tabs {
-    display: flex;
-    gap: 2px;
-    margin: 4px 0 0;
-    border-bottom: 1px solid var(--hairline);
-    flex-wrap: wrap;
-}
-.settings-form .role-tab {
-    padding: 6px 12px;
-    border: 1px solid transparent;
-    border-bottom: none;
-    background: transparent;
-    color: var(--fg-mute);
-    font: inherit;
-    font-size: 12px;
-    font-family: var(--mono);
-    cursor: pointer;
-    border-top-left-radius: 8px;
-    border-top-right-radius: 8px;
-    margin-bottom: -1px;
-}
-.settings-form .role-tab:hover {
-    color: var(--fg);
-    background: rgba(255, 255, 255, 0.45);
-}
-.settings-form .role-tab.active {
-    color: var(--fg);
-    background: rgba(255, 255, 255, 0.55);
-    border-color: var(--hairline);
-    border-bottom-color: rgba(255, 255, 255, 0.55);
-    font-weight: 600;
-}
-.settings-form .role-tab:focus {
-    outline: none;
-    border-color: rgba(155, 130, 200, 0.55);
-    color: var(--fg);
-}
-
-/* ---------- Per-role model checkbox list ---------- */
-
-.settings-form .role-model-list {
-    display: grid;
-    grid-template-columns: 1fr 1fr 1fr;
-    gap: 0;
-    padding: 3px 3px;
-    max-height: 200px;
-    overflow-y: auto;
-    border: 1px solid var(--hairline);
-    border-radius: 8px;
-    background: rgba(255, 255, 255, 0.25);
-    margin-top: 4px;
-}
-.settings-form .role-model-list[hidden] { display: none; }
-
-.settings-form .model-checkbox {
-    display: flex;
-    flex-direction: row;
-    align-items: center;
-    gap: 4px;
-    padding: 1px 3px;
-    border-radius: 3px;
-    cursor: pointer;
-    font-family: var(--mono);
-    font-size: 11px;
-    color: var(--fg);
-    line-height: 1.3;
-    overflow: hidden;
-    margin-bottom: 0;
-}
-.settings-form .model-checkbox span {
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-}
-.settings-form .model-checkbox:hover {
-    background: rgba(255, 255, 255, 0.35);
-}
-.settings-form .model-checkbox input[type="checkbox"] {
-    width: 13px;
-    height: 13px;
-    accent-color: rgba(155, 130, 200, 0.85);
-    cursor: pointer;
-    flex-shrink: 0;
-    margin: 0;
-}
 
 .settings-section-header { cursor: pointer; display: flex; align-items: center; justify-content: space-between; user-select: none; }
 .settings-section-header .settings-chevron { transition: transform .2s ease; display: inline-block; }
@@ -2403,517 +2395,6 @@ button.danger:hover:not(:disabled) {
 }
 #overlay-sched-form { z-index: 1500; }
 
-/* ---------- GEP parameter panel ---------- */
-/* Opens when a template is matched on the initial message and the planner
-   enters its 5-minute confirmation window. Same visual language as the
-   Settings overlay (overlay-card / settings-form / fieldset / actions row)
-   so it feels native rather than bolted-on. */
-.gep-card {
-    width: min(720px, 92vw);
-    max-height: 90vh;
-}
-.gep-card .overlay-header {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-}
-.gep-card .overlay-header h2 {
-    flex: 1 1 auto;
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-}
-
-.gep-countdown-pill {
-    flex: 0 0 auto;
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    padding: 3px 12px;
-    border-radius: 999px;
-    background: rgba(155, 130, 200, 0.12);
-    color: var(--tint-strong);
-    border: 1px solid rgba(155, 130, 200, 0.28);
-    font-family: var(--mono);
-    font-size: 12.5px;
-    font-weight: 600;
-    font-variant-numeric: tabular-nums;
-    transition: background 200ms ease, color 200ms ease, border-color 200ms ease;
-}
-.gep-countdown-pill.warn {
-    background: rgba(155, 130, 200, 0.16);
-    color: #6e58a8;
-    border-color: rgba(155, 130, 200, 0.45);
-}
-.gep-countdown-pill.urgent {
-    /* Same warn palette — no red, no scale animation. The pill is purely
-       informational; aggressive red + pulse turned out to read as a stray
-       "empty red region" against the surrounding chrome rather than an
-       urgency cue. We still distinguish the urgent class so JS callers
-       don't have to be reworked. */
-    background: rgba(220, 130, 130, 0.18);
-    color: #b85050;
-    border-color: rgba(220, 130, 130, 0.45);
-}
-
-.gep-progress {
-    flex: 0 0 4px;
-    width: 100%;
-    background: rgba(155, 130, 200, 0.08);
-    overflow: hidden;
-}
-.gep-progress-bar {
-    height: 100%;
-    width: 100%;
-    background: linear-gradient(90deg, rgba(155, 130, 200, 0.85), rgba(155, 130, 200, 0.55));
-    transition: width 600ms linear;
-}
-
-.gep-form {
-    overflow-y: auto;
-    padding: 14px 22px 18px 22px;
-    margin: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 14px;
-}
-.gep-description {
-    margin: 0;
-    color: var(--fg-soft);
-    line-height: 1.45;
-}
-.gep-section {
-    border: 1px solid var(--hairline-soft);
-    border-radius: 10px;
-    padding: 10px 14px 12px 14px;
-    margin: 0;
-    background: rgba(255, 255, 255, 0.45);
-}
-.gep-section legend {
-    padding: 0 6px;
-    font-size: 12px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.6px;
-    color: var(--fg-soft);
-}
-
-.gep-steps {
-    margin: 6px 0 0 16px;
-    padding: 0;
-    color: var(--fg-soft);
-    font-size: 13px;
-    line-height: 1.5;
-}
-.gep-steps li {
-    margin-bottom: 4px;
-}
-.gep-steps .gep-step-name {
-    color: var(--fg);
-    font-weight: 500;
-}
-.gep-steps .gep-step-desc {
-    color: var(--fg-mute);
-    font-size: 12.5px;
-}
-
-.gep-params {
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-}
-.gep-param-row {
-    display: grid;
-    grid-template-columns: minmax(140px, 1fr) 2fr;
-    gap: 10px;
-    align-items: start;
-}
-.gep-param-row .gep-param-label {
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-    color: var(--fg);
-    font-size: 13px;
-}
-.gep-param-row .gep-param-label .gep-param-name {
-    font-weight: 600;
-    font-family: var(--mono);
-    font-size: 12.5px;
-}
-.gep-param-row .gep-param-label .gep-param-type {
-    color: var(--fg-mute);
-    font-size: 11.5px;
-    font-family: var(--mono);
-}
-.gep-param-row .gep-param-label .gep-param-desc {
-    color: var(--fg-soft);
-    font-size: 12px;
-    line-height: 1.4;
-}
-.gep-param-row input[type="text"],
-.gep-param-row input[type="number"],
-.gep-param-row textarea {
-    width: 100%;
-    padding: 6px 9px;
-    border: 1px solid var(--hairline);
-    border-radius: 6px;
-    background: rgba(255, 255, 255, 0.85);
-    font: inherit;
-    font-family: var(--mono);
-    font-size: 12.5px;
-}
-.gep-param-row textarea { min-height: 56px; resize: vertical; }
-.gep-param-row input[type="checkbox"] { transform: translateY(4px); }
-.gep-param-row.emphasis .gep-param-label .gep-param-name {
-    color: var(--tint-strong);
-}
-
-.gep-hint {
-    margin: 0;
-    color: var(--fg-mute);
-    font-size: 12px;
-    line-height: 1.4;
-}
-
-/* ── GEP action row ──────────────────────────────────────────────────
-   Buttons use the same pill aesthetic as the bottom shortcut bar
-   (.shortcut-btn) so the panel feels native rather than dialog-y. We
-   override the .settings-actions defaults (rectangular border + blue
-   submit fill) to avoid the "form modal" look. */
-.gep-actions {
-    padding-top: 12px;
-    display: flex;
-    gap: 10px;
-    justify-content: flex-end;
-    /* Drop the .settings-actions border-top — the form already has
-       its own structure from <fieldset> sections. */
-    border-top: none;
-}
-.gep-actions button,
-.gep-actions button[type="submit"] {
-    /* Match .shortcut-btn — rounded pill, neutral bg, subtle hover.
-       Keep these selectors specific so we beat .settings-actions
-       button[type="submit"] (which would otherwise paint Confirm blue
-       in a way that conflicts with the .primary class). */
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    padding: 6px 16px;
-    border: 1px solid rgba(0, 0, 0, 0.08);
-    border-radius: 999px;
-    background: rgba(255, 255, 255, 0.55);
-    color: var(--fg-soft);
-    font: inherit;
-    font-family: var(--sans);
-    font-size: 13px;
-    font-weight: 500;
-    cursor: pointer;
-    transition: background 120ms ease, color 120ms ease,
-                border-color 120ms ease, transform 80ms ease;
-    /* Reset stuff settings-actions added that we don't want. */
-    backdrop-filter: none;
-}
-.gep-actions button:hover {
-    color: var(--fg);
-    background: rgba(255, 255, 255, 0.85);
-    border-color: rgba(0, 0, 0, 0.14);
-}
-.gep-actions button:active { transform: translateY(1px); }
-.gep-actions button.primary,
-.gep-actions button[type="submit"] {
-    /* Confirm now — slightly emphasized but still pill-shaped.
-       Same palette as the shortcut bar's hover state on a primary
-       affordance, blue tint. */
-    background: rgba(155, 130, 200, 0.14);
-    color: var(--tint-strong);
-    border-color: rgba(155, 130, 200, 0.40);
-}
-.gep-actions button.primary:hover,
-.gep-actions button[type="submit"]:hover {
-    background: rgba(155, 130, 200, 0.24);
-    border-color: rgba(155, 130, 200, 0.55);
-    color: var(--tint-strong);
-}
-
-#overlay-gep { z-index: 1400; }
-
-/* ---------- Templates review panel ---------- */
-.templates-card {
-    width: min(820px, 94vw);
-    max-height: 88vh;
-}
-.templates-body {
-    display: flex;
-    flex-direction: column;
-    gap: 10px;
-    padding: 12px 18px 18px 18px;
-    overflow: hidden;
-    flex: 1 1 auto;
-    min-height: 0;
-}
-.templates-list-header {
-    display: flex;
-    align-items: center;
-    gap: 10px;
-}
-/* Header buttons (Refresh + Load history) — same pill aesthetic as the
-   bottom shortcut bar (.shortcut-btn) so the panel reads as native
-   chrome rather than a heavy form. The primary class adds a subtle blue
-   accent without flipping to the chunky filled-button look. */
-.templates-list-header button {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    padding: 5px 14px;
-    border: 1px solid rgba(0, 0, 0, 0.08);
-    border-radius: 999px;
-    background: rgba(255, 255, 255, 0.55);
-    color: var(--fg-soft);
-    font: inherit;
-    font-family: var(--sans);
-    font-size: 13px;
-    font-weight: 500;
-    cursor: pointer;
-    transition: background 120ms ease, color 120ms ease,
-                border-color 120ms ease, transform 80ms ease;
-    backdrop-filter: none;
-}
-.templates-list-header button:hover {
-    color: var(--fg);
-    background: rgba(255, 255, 255, 0.85);
-    border-color: rgba(0, 0, 0, 0.14);
-}
-.templates-list-header button:active { transform: translateY(1px); }
-.templates-list-header button.primary {
-    color: var(--tint-strong);
-    border-color: rgba(155, 130, 200, 0.40);
-    background: rgba(155, 130, 200, 0.10);
-}
-.templates-list-header button.primary:hover {
-    background: rgba(155, 130, 200, 0.20);
-    border-color: rgba(155, 130, 200, 0.55);
-}
-.templates-list-header button.primary:disabled,
-.templates-list-header button:disabled {
-    opacity: 0.45;
-    cursor: not-allowed;
-    background: rgba(0, 0, 0, 0.03);
-    color: var(--fg-mute);
-    border-color: rgba(0, 0, 0, 0.10);
-}
-.templates-count { font-size: 12px; }
-
-.templates-list {
-    flex: 0 0 auto;
-    max-height: 30vh;
-    overflow-y: auto;
-    list-style: none;
-    margin: 0;
-    padding: 0;
-    border: 1px solid var(--hairline-soft);
-    border-radius: 8px;
-    background: rgba(255, 255, 255, 0.50);
-}
-.templates-list:empty::after {
-    content: 'No templates yet — finish a task and click Save as GEP.';
-    display: block;
-    padding: 16px;
-    color: var(--fg-mute);
-    font-size: 13px;
-    text-align: center;
-}
-.templates-list-item {
-    padding: 10px 14px;
-    border-bottom: 1px solid var(--hairline-soft);
-    cursor: pointer;
-    display: flex;
-    flex-direction: column;
-    gap: 3px;
-    transition: background 120ms ease;
-}
-.templates-list-item:last-child { border-bottom: none; }
-.templates-list-item:hover { background: rgba(155, 130, 200, 0.06); }
-.templates-list-item.active {
-    background: rgba(155, 130, 200, 0.12);
-    box-shadow: inset 3px 0 0 rgba(155, 130, 200, 0.65);
-}
-.templates-list-item.invalid { background: rgba(220, 130, 130, 0.06); }
-.templates-list-item-title {
-    font-size: 13.5px;
-    font-weight: 600;
-    color: var(--fg);
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-}
-.templates-list-item-title .templates-version-badge {
-    font-family: var(--mono);
-    font-size: 11px;
-    color: var(--fg-mute);
-    font-weight: 400;
-}
-.templates-list-item-title .templates-invalid-badge {
-    font-size: 10.5px;
-    padding: 1px 7px;
-    border-radius: 999px;
-    background: rgba(220, 130, 130, 0.18);
-    color: #b85050;
-    font-weight: 600;
-}
-.templates-list-item-desc {
-    font-size: 12px;
-    color: var(--fg-soft);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-}
-
-.templates-detail-pane {
-    flex: 1 1 auto;
-    overflow-y: auto;
-    border: 1px solid var(--hairline-soft);
-    border-radius: 8px;
-    background: rgba(255, 255, 255, 0.55);
-    padding: 12px 14px;
-    min-height: 0;
-}
-.templates-detail-empty { padding: 18px; text-align: center; }
-.templates-detail.hidden { display: none; }
-.templates-detail-header {
-    display: flex;
-    align-items: baseline;
-    gap: 10px;
-    margin-bottom: 6px;
-}
-.templates-detail-header h3 { margin: 0; font-size: 15px; }
-.templates-detail-version {
-    font-family: var(--mono);
-    font-size: 11.5px;
-    color: var(--fg-mute);
-}
-.templates-detail-desc { margin: 4px 0 12px 0; color: var(--fg-soft); line-height: 1.5; }
-
-.templates-detail-problems {
-    border: 1px solid rgba(220, 130, 130, 0.35);
-    background: rgba(220, 130, 130, 0.08);
-    color: #b85050;
-    border-radius: 6px;
-    padding: 8px 12px;
-    margin-bottom: 10px;
-    font-size: 12.5px;
-}
-/* Without this rule, .hidden is meaningless on this element and the empty
-   red banner stays visible above Parameters even when there are no problems. */
-.templates-detail-problems.hidden { display: none; }
-.templates-detail-problems ul { margin: 4px 0 0 18px; padding: 0; }
-
-.templates-detail-section { margin-top: 12px; }
-.templates-detail-section h4 {
-    margin: 0 0 6px 0;
-    font-size: 12px;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.6px;
-    color: var(--fg-soft);
-}
-
-.templates-detail-params { display: flex; flex-direction: column; gap: 8px; }
-.templates-detail-param {
-    display: grid;
-    grid-template-columns: minmax(140px, 1fr) 2fr;
-    gap: 10px;
-    align-items: start;
-    padding: 6px 8px;
-    border-radius: 6px;
-    background: rgba(0, 0, 0, 0.02);
-    font-size: 12.5px;
-}
-.templates-detail-param.emphasis {
-    background: rgba(155, 130, 200, 0.06);
-    border-left: 3px solid rgba(155, 130, 200, 0.45);
-    padding-left: 8px;
-}
-.templates-detail-param-name {
-    font-family: var(--mono);
-    font-weight: 600;
-    color: var(--fg);
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-}
-.templates-detail-param-type {
-    font-size: 11px;
-    color: var(--fg-mute);
-    font-weight: 400;
-}
-.templates-detail-param-default {
-    font-family: var(--mono);
-    font-size: 12px;
-    color: var(--fg);
-    background: rgba(255, 255, 255, 0.65);
-    padding: 2px 6px;
-    border-radius: 4px;
-    border: 1px solid var(--hairline-soft);
-    word-break: break-all;
-    margin-bottom: 3px;
-    display: inline-block;
-}
-.templates-detail-param-desc {
-    color: var(--fg-soft);
-    font-size: 12px;
-    line-height: 1.4;
-}
-
-.templates-detail-steps {
-    margin: 0 0 0 18px;
-    padding: 0;
-    color: var(--fg);
-    font-size: 13px;
-    line-height: 1.5;
-}
-.templates-detail-steps li { margin-bottom: 8px; }
-.templates-detail-step-desc { font-weight: 500; }
-.templates-detail-step-tools {
-    font-family: var(--mono);
-    font-size: 11.5px;
-    color: var(--tint-strong);
-    margin-left: 4px;
-}
-.templates-detail-step-goal {
-    display: block;
-    margin-top: 2px;
-    color: var(--fg-soft);
-    font-size: 12px;
-    font-family: var(--mono);
-    line-height: 1.45;
-    white-space: pre-wrap;
-    word-break: break-word;
-}
-
-.templates-detail-meta {
-    display: grid;
-    grid-template-columns: 80px 1fr;
-    gap: 4px 12px;
-    margin: 14px 0 0 0;
-    font-size: 12px;
-}
-.templates-detail-meta dt { color: var(--fg-mute); }
-.templates-detail-meta dd {
-    margin: 0;
-    color: var(--fg-soft);
-    font-family: var(--mono);
-    word-break: break-all;
-}
-.templates-detail-actions { padding-top: 10px; }
-.templates-detail-actions .danger {
-    background: rgba(220, 130, 130, 0.10);
-    color: #b85050;
-    border-color: rgba(220, 130, 130, 0.35);
-}
-.templates-detail-actions .danger:hover { background: rgba(220, 130, 130, 0.20); }
-
-#overlay-templates { z-index: 1300; }
-
 /* Toast inside the schedules panel — same look as settings-toast. */
 .settings-toast {
     margin: 0 22px;
@@ -2929,3 +2410,4 @@ button.danger:hover:not(:disabled) {
     color: #b85050;
 }
 .settings-toast.hidden { display: none; }
+

@@ -178,7 +178,6 @@
     const scSettings = document.getElementById('sc-settings');
     const scScheduler = document.getElementById('sc-scheduler');
     const scNew      = document.getElementById('sc-new');
-    const scTemplates = document.getElementById('sc-templates');
 
     // Titlebar
     const tbMin   = document.getElementById('tb-min');
@@ -318,8 +317,6 @@
     // Overlays
     const overlaySettings  = document.getElementById('overlay-settings');
     const overlayConfirm   = document.getElementById('overlay-confirmation');
-    const overlayGep       = document.getElementById('overlay-gep');
-    const overlayTemplates = document.getElementById('overlay-templates');
     const settingsCancel   = document.getElementById('settings-cancel');
     const confirmTitle     = document.getElementById('confirm-title');
     const confirmDescEl    = document.getElementById('confirm-description');
@@ -340,16 +337,10 @@
     const cfgLlmApiKey       = document.getElementById('cfg-llm-api-key');
     const cfgLlmApiKeyToggle = document.getElementById('cfg-llm-api-key-toggle');
     const cfgLlmMaxTokens    = document.getElementById('cfg-llm-max-tokens');
-    const cfgLlmModels       = document.getElementById('cfg-llm-models');
-    const cfgLlmRoleTabs     = document.getElementById('cfg-llm-role-tabs');
-    const cfgLlmRolePanes = {
-        planner:      document.getElementById('cfg-llm-role-pane-planner'),
-        receptionist: document.getElementById('cfg-llm-role-pane-receptionist'),
-        agent:        document.getElementById('cfg-llm-role-pane-agent'),
-        helper:       document.getElementById('cfg-llm-role-pane-helper'),
-    };
+    const cfgLlmAvailableModels = document.getElementById('cfg-llm-available-models');
+    const cfgLlmAgentChecks     = document.getElementById('cfg-llm-agent-checks');
+    const cfgLlmHelperChecks    = document.getElementById('cfg-llm-helper-checks');
     const cfgSessionLogLevel      = document.getElementById('cfg-session-log-level');
-    const cfgSessionStepThreshold = document.getElementById('cfg-session-step-threshold');
     const cfgSessionVenvPath      = document.getElementById('cfg-session-venv-path');
     const cfgSwToolWrite = document.getElementById('cfg-sw-tool-write');
     const cfgSwToolEdit  = document.getElementById('cfg-sw-tool-edit');
@@ -397,12 +388,6 @@
         state:      'idle',
     };
 
-    // taskCompleted "locks" the pill to the completion banner until the user
-    // submits a new message (or hits New). Backend often emits a stray
-    // state_changed→idle after task_completed; without the lock the user
-    // would see the pill flip from "complete" back to "idle" instantly.
-    let taskCompleted = false;
-
     // Session generation watermark. The bridge tags every outbound envelope
     // with a `gen` field (see stdio_bridge.py: _StdioUI._generation). When
     // New is clicked, the renderer optimistically bumps `currentGen` BEFORE
@@ -420,9 +405,6 @@
     // Thinking bubble shown in chat while receptionist prepares a reply.
     let thinkingBubble = null;
 
-    // First "replanning" state is displayed as "designing" (initial plan).
-    let firstReplanSeen = false;
-
     function gateGen(evt) {
         // Returns true if the event should be DROPPED.
         if (!evt) return true;
@@ -436,37 +418,11 @@
         return false;
     }
 
-    function setPill(text, opts) {
-        const o = opts || {};
+    function setPill(text) {
         // The "tooltip" always tracks the latest backend event so users can
         // hover the strip mid-completion to see what's happening underneath.
         if (activityStrip) activityStrip.title = text || '';
-        if (taskCompleted && !o.force) return;
         if (activityCurrent) activityCurrent.textContent = text || 'idle';
-    }
-
-    function markCompleted(summary) {
-        taskCompleted = true;
-        if (activityStrip) {
-            activityStrip.classList.add('complete');
-            activityStrip.title = summary
-                ? ('complete — ' + truncate(summary, 200))
-                : 'complete';
-        }
-        if (activityCurrent) activityCurrent.textContent = 'complete';
-        session.state = 'complete';
-        if (summary) addAssistantTextBubble(summary);
-    }
-
-    function clearCompleted() {
-        if (!taskCompleted) return;
-        taskCompleted = false;
-        if (activityStrip) {
-            activityStrip.classList.remove('complete');
-            activityStrip.title = '';
-        }
-        if (activityCurrent) activityCurrent.textContent = 'idle';
-        session.state = 'idle';
     }
 
     function truncate(s, n) {
@@ -477,11 +433,13 @@
     // Whether the planner/agent has a real task in flight. Used to gate
     // receptionist-side pill updates so a chat reply mid-task can't reset
     // the activity strip to "idle". `session.state` is set by state_changed
-    // events; `activeExecCount` covers the brief window where a tool is
-    // running before the next state_changed lands.
+    // events (V2 emits planning / thinking / executing / idle);
+    // `activeExecCount` covers the brief window where a tool is running
+    // before the next state_changed lands.
     function isTaskRunning() {
-        return session.state === 'executing'
-            || session.state === 'replanning'
+        return session.state === 'planning'
+            || session.state === 'thinking'
+            || session.state === 'executing'
             || activeExecCount > 0;
     }
 
@@ -721,7 +679,6 @@
 
     function setWorking(text) {
         if (!activityStrip) return;
-        if (taskCompleted) return;
         if (activityLiveTimer) clearTimeout(activityLiveTimer);
         activityStrip.classList.add('live', 'working');
         if (activityCurrent) activityCurrent.textContent = text || '';
@@ -733,60 +690,11 @@
         activityStrip.classList.remove('working');
     }
 
-    // ----- Confidence gauge ------------------------------------------------
-    //
-    // A 5-character Unicode block sparkline (▁▂▃▄▅▆▇█) followed by the latest
-    // confidence as an integer 0–100. Right-aligned: newest character on the
-    // right. Grayscale only — no per-tier colors. Driven by the
-    // step_confidence envelope (stdio_bridge.py `notify_step_confidence`).
-
-    const activityGauge = document.getElementById('activity-gauge');
-    const agSpark       = document.getElementById('ag-spark');
-    const agNum         = document.getElementById('ag-num');
-    const GAUGE_CAPACITY = 5;
-    // ▁ U+2581 .. █ U+2588 — eight discrete heights, mapped from conf ∈ [0,1].
-    const SPARK_CHARS = ['▁', '▂', '▃', '▄',
-                         '▅', '▆', '▇', '█'];
-    const confidenceHistory = [];
-
-    function _confChar(c) {
-        const idx = Math.max(1, Math.min(8, Math.ceil(c * 8)));
-        return SPARK_CHARS[idx - 1];
-    }
-
-    function _renderGauge() {
-        if (!agSpark || !agNum) return;
-        if (confidenceHistory.length === 0) {
-            agSpark.textContent = '';
-            agNum.textContent = '';
-            return;
-        }
-        agSpark.textContent = confidenceHistory.map(_confChar).join('');
-        const latest = confidenceHistory[confidenceHistory.length - 1];
-        agNum.textContent = String(Math.round(latest * 100)) + '%';
-    }
-
-    function setConfidenceGauge(conf) {
-        if (!activityStrip || !activityGauge) return;
-        let c = Number(conf);
-        if (!Number.isFinite(c)) return;
-        if (c < 0) c = 0;
-        if (c > 1) c = 1;
-        confidenceHistory.push(c);
-        if (confidenceHistory.length > GAUGE_CAPACITY) confidenceHistory.shift();
-        _renderGauge();
-        activityStrip.title = activityStrip.title +
-            (activityStrip.title ? ' · ' : '') +
-            'conf ' + c.toFixed(2);
-    }
-
-    function resetGauge() {
-        confidenceHistory.length = 0;
-        _renderGauge();
-    }
-
     // Track last tool name for post-execution display (backend sends None for tool in post events)
     var lastCalledTool = '';
+    // Latest agent reasoning (from decision_made). Used to label the activity
+    // strip with the actual thinking content instead of a generic "thinking…".
+    var lastThinking = '';
     // Count of currently in-flight tool executions. When > 0, the strip stays
     // in "working" state showing the active execution rather than flipping to
     // a completed result.
@@ -1161,9 +1069,6 @@
 
     // ----- chat state ------------------------------------------------------
 
-    let activeAssistantBubble = null;
-    const toolCardsByCallId = new Map();
-
     function el(tag, className, textContent) {
         const node = document.createElement(tag);
         if (className) node.className = className;
@@ -1182,26 +1087,6 @@
         scrollToBottom();
     }
 
-    function startAssistantBubble() {
-        const bubble = el('div', 'bubble assistant streaming');
-        const body = el('div', 'bubble-body');
-        bubble.appendChild(body);
-        bubble._body = body;
-        // Most-recent text-stream segment. Reset to null whenever a tool
-        // card is appended so subsequent text deltas land *after* the card
-        // in DOM order (preserving the actual chronological interleaving).
-        bubble._currentTextSpan = null;
-        conversation.appendChild(bubble);
-        activeAssistantBubble = bubble;
-        scrollToBottom();
-        return bubble;
-    }
-
-    function ensureAssistantBubble() {
-        if (!activeAssistantBubble) return startAssistantBubble();
-        return activeAssistantBubble;
-    }
-
     function scheduleMarkdownRender(span) {
         if (span._renderPending) return;
         span._renderPending = true;
@@ -1215,65 +1100,6 @@
                 span.textContent = span._rawText || '';
             }
         });
-    }
-
-    function appendTextDelta(text) {
-        if (!text) return;
-        const bubble = ensureAssistantBubble();
-        let span = bubble._currentTextSpan;
-        if (!span) {
-            span = el('div', 'text-stream md-rendered');
-            span._rawText = '';
-            bubble._body.appendChild(span);
-            bubble._currentTextSpan = span;
-        }
-        span._rawText += text;
-        scheduleMarkdownRender(span);
-        scrollToBottom();
-    }
-
-    function renderToolCall(callId, toolName, args, blockIndex) {
-        const bubble = ensureAssistantBubble();
-        // Close out the current text segment so any text that arrives next
-        // appears in a NEW span placed after this tool card.
-        bubble._currentTextSpan = null;
-
-        const card = el('details', 'tool-card');
-        card.open = false;
-
-        const summary = el('summary');
-        summary.appendChild(el('span', 'tool-badge', 'tool'));
-        summary.appendChild(el('span', 'tool-name', toolName || '(unnamed)'));
-        if (typeof blockIndex === 'number') {
-            summary.appendChild(el('span', 'tool-index', '#' + blockIndex));
-        }
-        card.appendChild(summary);
-
-        const pre = el('pre', 'tool-args');
-        try {
-            pre.textContent = JSON.stringify(args, null, 2);
-        } catch (_) {
-            pre.textContent = String(args);
-        }
-        card.appendChild(pre);
-
-        bubble._body.appendChild(card);
-        if (callId) toolCardsByCallId.set(callId, card);
-        scrollToBottom();
-    }
-
-    function sealActiveBubble(extraClass) {
-        if (!activeAssistantBubble) return;
-        activeAssistantBubble.classList.remove('streaming');
-        activeAssistantBubble.classList.add('complete');
-        if (extraClass) activeAssistantBubble.classList.add(extraClass);
-        // Force a final render so the last delta isn't stuck in rAF.
-        if (activeAssistantBubble._currentTextSpan) {
-            const span = activeAssistantBubble._currentTextSpan;
-            try { span.innerHTML = renderMarkdown(span._rawText || ''); }
-            catch (_) { span.textContent = span._rawText || ''; }
-        }
-        activeAssistantBubble = null;
     }
 
     function addAssistantTextBubble(text) {
@@ -1290,7 +1116,7 @@
         scrollToBottom();
     }
 
-    // Streaming receptionist reply — uses same pattern as appendTextDelta
+    // Streaming receptionist reply — incremental markdown render per delta.
     var activeReceptionistBubble = null;
 
     function appendReceptionistDelta(text) {
@@ -1492,11 +1318,15 @@
             renderDecisionSummary(evt.decision);
             confirmSecretWrap.classList.add('hidden');
             confirmSecretIn.value = '';
-            confirmGuidanceEl.classList.add('hidden');
+            // Guidance is open by default: the box is the primary affordance,
+            // so the user can type instructions for the agent without first
+            // clicking "Provide guidance". An empty box still submits as
+            // Approve (see confirmSubmitBtn handler).
+            confirmGuidanceEl.classList.remove('hidden');
             confirmGuidanceEl.value = '';
             confirmRejectBtn.classList.remove('hidden');
             confirmGuidBtn.classList.remove('hidden');
-            confirmGuidBtn.textContent = 'Provide guidance';
+            confirmGuidBtn.textContent = 'Cancel guidance';
             confirmSubmitBtn.textContent = isDesktopTakeover ? 'Approve task-wide' : 'Approve';
             // Tag the card so styles.css can paint it more loudly for the
             // task-scoped desktop approval.
@@ -1519,6 +1349,7 @@
             handq.sendRequest({
                 type: 'user_input',
                 kind: 'confirmation',
+                id: activePromptId,
                 answer: String(answer || ''),
             });
         } catch (e) {
@@ -1531,28 +1362,6 @@
     }
 
     // ----- bridge events ---------------------------------------------------
-
-    handq.onTokenStream((evt) => {
-        if (gateGen(evt)) return;
-        const kind = evt && evt.event;
-        window.__handqLog('DEBUG', 'onTokenStream', {
-            type: evt && evt.type,
-            id: evt && evt.id,
-            event: kind,
-            payload: window.__handqTrunc(evt, 200),
-        });
-        // Token stream = bridge is fully alive and the engine is producing
-        // output. Drop the boot overlay if it somehow lingered past the
-        // first status event.
-        if (!bootHidden) hideBootOverlay();
-        if (kind === 'text_delta') {
-            appendTextDelta(evt.text || '');
-        } else if (kind === 'tool_call') {
-            renderToolCall(evt.call_id, evt.tool_name, evt.args, evt.block_index);
-        } else if (kind === 'done') {
-            sealActiveBubble();
-        }
-    });
 
     // ── Interactive Session Terminal Panel (xterm.js) ───────────────────────────
     //
@@ -1963,70 +1772,48 @@
 
         if (evt.kind === 'state_changed' && evt.state) {
             session.state = evt.state;
-            if (evt.state === 'replanning') {
-                if (!firstReplanSeen) {
-                    firstReplanSeen = true;
-                    setWorking('designing…');
-                } else {
-                    setWorking('replanning…');
-                }
+            // V2 activity-strip vocabulary (see controller_v2):
+            //   planning  — orchestrator is composing/revising the checklist
+            //   thinking  — agent has the LLM stream open (reasoning + tools)
+            //   executing — agent dispatching tools / between think-streams
+            //   idle      — task settled, final reply sent
+            // The first three are live working phases → animated label,
+            // consistent with the receptionist's "thinking…". idle clears the
+            // working animation and rests the strip.
+            if (evt.state === 'planning') {
+                setWorking('designing…');
+            } else if (evt.state === 'thinking') {
+                // Show the actual thinking content (latest reasoning) rather
+                // than a generic label; falls back to "thinking…" only before
+                // any reasoning has streamed for this task.
+                setWorking(lastThinking
+                    ? 'thinking: ' + truncate(lastThinking, 120)
+                    : 'thinking…');
+            } else if (evt.state === 'executing') {
+                setWorking('working…');
+            } else if (evt.state === 'idle') {
+                clearWorking();
+                setPill('idle');
             } else {
-                if (evt.state === 'executing') {
-                    clearWorking();
-                }
                 setPill(evt.state);
             }
-            // Keep the Templates panel "Load history" button in sync with
-            // the running-task state — it should refuse imports while a
-            // task is in flight.
-            try { refreshLoadHistoryEnabled(); } catch (_) { /* declared later */ }
-        } else if (evt.kind === 'gep_intro') {
-            try {
-                gepRenderTemplate(evt.template || {});
-            } catch (e) {
-                window.__handqLog('ERROR', 'gep_intro render failed',
-                    { error: String(e) });
-            }
-        } else if (evt.kind === 'gep_countdown') {
-            try {
-                gepUpdateCountdown(typeof evt.remaining === 'number' ? evt.remaining : -1);
-            } catch (e) {
-                window.__handqLog('ERROR', 'gep_countdown update failed',
-                    { error: String(e) });
-            }
         } else if (evt.kind === 'inline_event') {
-            // Backend-emitted step-style line (e.g. GEP banner messages).
+            // Backend-emitted step-style line.
             // Render with addStepBubble so it visually matches planner step
             // events instead of the chunkier system bubble used by display_message.
             addStepBubble(String(evt.icon || '·'), String(evt.desc || ''));
-        } else if (evt.kind === 'progress') {
-            const cur = evt.current || 0;
-            const tot = evt.total || 0;
-            setPill('progress ' + cur + '/' + tot);
-            addStepBubble('•', 'Progress ' + cur + '/' + tot);
-        } else if (evt.kind === 'step_started') {
-            const stepId = String(evt.step_id || args[0] || '');
-            const desc = String(evt.desc || args[1] || '');
-            pushActivity('▶', 'Step started', desc);
-            setWorking('▶ ' + truncate(desc, 120));
-            addStepBubble('▶', desc);
-        } else if (evt.kind === 'step_completed') {
-            const stepId = String(evt.step_id || args[0] || '');
-            const desc = String(evt.desc || args[1] || '');
-            pushActivity('✓', 'Step completed', desc);
-            setPill('✓ ' + truncate(desc, 120));
-            addStepBubble('✓', desc);
-        } else if (evt.kind === 'step_confidence') {
-            const conf = parseFloat(args[0]);
-            if (!Number.isNaN(conf)) {
-                pushActivity('◎', 'Step confidence', Math.round(conf * 100) + '%');
-                setConfidenceGauge(conf);
-            }
+        } else if (evt.kind === 'recall_started') {
+            // LTM recall is in flight (orchestrator INTENT/PLAN gather, or a
+            // per-item / stagnation agent recall). Show a transient working
+            // label on the activity strip; the next state_changed / decision /
+            // tool event (or a streamed chat reply) supersedes it.
+            setWorking('🧠 recalling…');
         } else if (evt.kind === 'decision_made') {
             const iter = args[0] || '';
             const reasoning = args[1] || '';
-            pushActivity('💭', 'Decision iter ' + iter, reasoning);
-            setWorking('💭 ' + truncate(reasoning, 120));
+            lastThinking = reasoning;
+            pushActivity('💭', 'thinking' + (iter ? ' · iter ' + iter : ''), reasoning);
+            setWorking('thinking: ' + truncate(reasoning, 120));
         } else if (evt.kind === 'tool_execution_started') {
             const iter   = args[0] || '';
             var rawTool  = args[1] || '';
@@ -2064,20 +1851,9 @@
                             (readable ? ' · ' + readable : ''));
                 }
             }
-        } else if (evt.kind === 'task_completed') {
-            const summary = evt.summary
-                || (args.length ? String(args[0]) : '')
-                || '';
-            // Push to feed FIRST, then mark complete — the markCompleted
-            // setter pins the strip text to "complete" via its taskCompleted
-            // lock, and we want the entry to land in the popover regardless.
-            pushActivity('🏁', 'Task completed', summary);
-            markCompleted(summary);
-        } else if (evt.kind === 'metrics_report') {
-            addAssistantTextBubble(evt.text || '');
         } else if (evt.kind === 'bridge_exit') {
             session.state = 'bridge exited';
-            setPill('bridge exited', { force: true });
+            setPill('bridge exited');
             pushActivity('⚠', 'Bridge exited', 'code=' + evt.code + ' signal=' + evt.signal);
         } else if (evt.kind === 'reply') {
             addAssistantTextBubble(evt.text || '');
@@ -2095,8 +1871,6 @@
             appendReceptionistDelta(evt.text || '');
         } else if (evt.kind === 'reply_done') {
             sealReceptionistBubble();
-        } else if (evt.kind === 'message') {
-            addSystemBubble(evt.text || '');
         } else if (evt.kind === 'receptionist_thinking_on') {
             // Show the chat-side thinking bubble unconditionally; only steal
             // the activity strip pill when no real task is running, otherwise
@@ -2135,7 +1909,7 @@
             addSystemBubble('📡 ' + (evt.message || '网络中断，等待恢复…')
                 + '\nHandQ will resume automatically once the connection is restored.');
             pushActivity('📡', 'Network down', 'waiting for LLM endpoint');
-            setPill('offline…', { force: true });
+            setPill('offline…');
         } else if (evt.kind === 'network_waiting') {
             const retryIn = (typeof evt.retry_in === 'number' && evt.retry_in > 0)
                 ? evt.retry_in + 's' : '…';
@@ -2144,6 +1918,20 @@
             addSystemBubble('✅ ' + (evt.message || '网络已恢复，继续执行'));
             pushActivity('✅', 'Network restored', 'resuming');
             setPill('working…');
+        } else if (evt.kind === 'skill_proposed') {
+            // Background LTM hint: a new skill was staged from observed
+            // activity. Passive surface — the user activates it by moving the
+            // staged SKILL.md into the live Skill dir themselves (no buttons).
+            const desc = evt.description || '(no description)';
+            const staged = evt.staging_path || '(unknown path)';
+            const skillDir = evt.skill_dir || '';
+            let msg = '💡 New skill suggested: ' + desc
+                + '\nStaged at: ' + staged;
+            if (skillDir) {
+                msg += '\nMove this file into ' + skillDir + ' to activate it.';
+            }
+            addSystemBubble(msg);
+            pushActivity('💡', 'Skill proposed', desc);
         }
     });
 
@@ -2158,8 +1946,6 @@
         // Any final response means the bridge is alive and serving — fade
         // the boot overlay if it's still up.
         if (!bootHidden) hideBootOverlay();
-
-        if (activeAssistantBubble) sealActiveBubble('final');
 
         if (evt.result && evt.result.config && evt.result.config_path !== undefined) {
             window.__handqLog('INFO', 'config_get final received',
@@ -2204,7 +1990,7 @@
                      evt.message || '(no message)');
         if (evt.fatal) {
             session.state = 'fatal';
-            setPill('fatal', { force: true });
+            setPill('fatal');
         }
     });
 
@@ -2256,10 +2042,6 @@
         addUserBubble(text);
         composerInput.value = '';
         composerExpandedInput.value = '';
-        activeAssistantBubble = null;
-        // A new turn — release the "complete" pill lock so live status text
-        // resumes flowing.
-        clearCompleted();
 
         if (!firstSendDone) {
             firstSendDone = true;
@@ -2450,17 +2232,17 @@
     });
 
     confirmGuidBtn.addEventListener('click', () => {
-        // Toggle guidance textarea: first click reveals + relabels Submit.
+        // Toggle the guidance textarea. The submit button keeps its approve
+        // label (set in showConfirmationModal): an empty box submits as
+        // Approve, a filled box sends the guidance text instead.
         if (confirmGuidanceEl.classList.contains('hidden')) {
             confirmGuidanceEl.classList.remove('hidden');
             confirmGuidBtn.textContent = 'Cancel guidance';
-            confirmSubmitBtn.textContent = 'Send guidance';
             try { confirmGuidanceEl.focus(); } catch (_) { /* ignore */ }
         } else {
             confirmGuidanceEl.classList.add('hidden');
             confirmGuidanceEl.value = '';
             confirmGuidBtn.textContent = 'Provide guidance';
-            confirmSubmitBtn.textContent = 'Approve';
         }
     });
 
@@ -2543,26 +2325,18 @@
         }
 
         conversation.innerHTML = '';
-        toolCardsByCallId.clear();
-        activeAssistantBubble = null;
         activeReceptionistBubble = null;
         thinkingBubble = null;
         lastCalledTool = '';
+        lastThinking = '';
         activeExecCount = 0;
         firstSendDone = false;
-        firstReplanSeen = false;
-        clearCompleted();
         clearWorking();
-        resetGauge();
         session.state = 'idle';
         setPill('idle');
         clearActivity();
         if (popoverOpen) closePopover();
         composerInput.focus();
-        // New session: reset GEP-confirm state.
-        closeGepOverlay();
-        gepInfo = null;
-        gepCountdownActive = false;
         // Tear down any open session terminals — the generation bump above
         // blocks future session_closed events from the old flow, so we must
         // clean up the panel synchronously here.
@@ -2572,563 +2346,8 @@
         hideTerminalPanel();
     });
 
-    // ----- GEP parameter panel + Templates review panel --------------------
-    //
-    // GEP save no longer has an in-conversation Save button. The only entry
-    // point is the Templates panel (Load history) — see further down. This
-    // section sets up the GEP confirmation/parameter panel and the templates
-    // browser overlay.
 
-    let gepInfo = null;            // last template descriptor from gep_intro
-    let gepCountdownActive = false;
-    let gepTotalSecs = 300;        // updated when gep_intro lands
-
-    // ── Templates review panel (browse / inspect / delete) ────────────────
-
-    const templatesListEl     = document.getElementById('templates-list');
-    const templatesCountEl    = document.getElementById('templates-count');
-    const templatesRefreshBtn = document.getElementById('templates-refresh');
-    const templatesLoadHistoryBtn = document.getElementById('templates-load-history');
-    const templatesCloseBtn   = document.getElementById('templates-close');
-    const templatesToastEl    = document.getElementById('templates-toast');
-    const templatesDetailEl       = document.getElementById('templates-detail');
-    const templatesDetailEmptyEl  = document.getElementById('templates-detail-empty');
-    const templatesDetailNameEl    = document.getElementById('templates-detail-name');
-    const templatesDetailVersionEl = document.getElementById('templates-detail-version');
-    const templatesDetailDescEl    = document.getElementById('templates-detail-desc');
-    const templatesDetailProblemsEl = document.getElementById('templates-detail-problems');
-    const templatesDetailParamsEl  = document.getElementById('templates-detail-params');
-    const templatesDetailParamsWrap= document.getElementById('templates-detail-params-wrap');
-    const templatesDetailStepsEl   = document.getElementById('templates-detail-steps');
-    const templatesDetailStepsWrap = document.getElementById('templates-detail-steps-wrap');
-    const templatesDetailIdEl      = document.getElementById('templates-detail-id');
-    const templatesDetailCreatedEl = document.getElementById('templates-detail-created');
-    const templatesDetailDeleteBtn = document.getElementById('templates-detail-delete');
-
-    let templatesCache = [];
-    let templatesActiveId = null;
-    // id-correlated response waiters for the Templates panel.
-    // The bridge replies with a `final` envelope carrying the same id we
-    // sent. handq.sendRequest itself is fire-and-forget, so we wire up a
-    // small map and inspect each `final` arrival via handq.onFinal.
-    const _templatesPending = new Map(); // id → {resolve, reject, timer}
-    let _templatesNextId = 1;
-
-    function templatesRpc(type, payload) {
-        const id = `templates-${type}-${_templatesNextId++}-${Date.now()}`;
-        return new Promise((resolve, reject) => {
-            const timer = setTimeout(() => {
-                if (_templatesPending.has(id)) {
-                    _templatesPending.delete(id);
-                    reject(new Error(`${type} timed out after 10s`));
-                }
-            }, 10000);
-            _templatesPending.set(id, { resolve, reject, timer });
-            try {
-                handq.sendRequest(Object.assign({ type: type, id: id }, payload || {}));
-            } catch (err) {
-                clearTimeout(timer);
-                _templatesPending.delete(id);
-                reject(err);
-            }
-        });
-    }
-
-    handq.onFinal((evt) => {
-        if (!evt || !evt.id || !_templatesPending.has(evt.id)) return;
-        const pending = _templatesPending.get(evt.id);
-        _templatesPending.delete(evt.id);
-        clearTimeout(pending.timer);
-        pending.resolve(evt.result || {});
-    });
-    handq.onError((evt) => {
-        if (!evt || !evt.id || !_templatesPending.has(evt.id)) return;
-        const pending = _templatesPending.get(evt.id);
-        _templatesPending.delete(evt.id);
-        clearTimeout(pending.timer);
-        pending.reject(new Error(evt.message || 'bridge error'));
-    });
-
-    function templatesShowToast(text, kind) {
-        if (!templatesToastEl) return;
-        templatesToastEl.textContent = text;
-        templatesToastEl.classList.remove('hidden', 'ok', 'err');
-        templatesToastEl.classList.add(kind === 'err' ? 'err' : 'ok');
-        clearTimeout(templatesShowToast._t);
-        templatesShowToast._t = setTimeout(() => {
-            templatesToastEl.classList.add('hidden');
-        }, 3500);
-    }
-
-    function templatesRenderList() {
-        if (!templatesListEl) return;
-        templatesListEl.innerHTML = '';
-        if (templatesCountEl) {
-            templatesCountEl.textContent = templatesCache.length
-                ? `${templatesCache.length} template${templatesCache.length === 1 ? '' : 's'}`
-                : '';
-        }
-        for (const t of templatesCache) {
-            const li = el('li', 'templates-list-item');
-            li.dataset.id = String(t.id || '');
-            if (Array.isArray(t.problems) && t.problems.length) li.classList.add('invalid');
-            if (t.id === templatesActiveId) li.classList.add('active');
-
-            const title = el('div', 'templates-list-item-title');
-            title.appendChild(document.createTextNode(t.name || '(unnamed)'));
-            if (t.version != null) {
-                title.appendChild(el('span', 'templates-version-badge', `v${t.version}`));
-            }
-            if (Array.isArray(t.problems) && t.problems.length) {
-                title.appendChild(el('span', 'templates-invalid-badge', 'invalid'));
-            }
-            li.appendChild(title);
-
-            const desc = el('div', 'templates-list-item-desc',
-                (t.description || '').replace(/\s+/g, ' '));
-            li.appendChild(desc);
-
-            li.addEventListener('click', () => {
-                templatesActiveId = t.id;
-                templatesRenderList();
-                templatesRenderDetail(t);
-            });
-            templatesListEl.appendChild(li);
-        }
-    }
-
-    function templatesRenderDetail(t) {
-        if (!templatesDetailEl || !t) return;
-        templatesDetailEmptyEl.classList.add('hidden');
-        templatesDetailEl.classList.remove('hidden');
-
-        templatesDetailNameEl.textContent = t.name || '(unnamed)';
-        templatesDetailVersionEl.textContent = t.version != null ? `v${t.version}` : '';
-        templatesDetailDescEl.textContent = t.description || '';
-        templatesDetailIdEl.textContent = t.id || '';
-        templatesDetailCreatedEl.textContent = t.created_at || '';
-
-        const problems = Array.isArray(t.problems) ? t.problems : [];
-        if (problems.length) {
-            templatesDetailProblemsEl.innerHTML = '';
-            const intro = el('strong', null, 'This template is invalid and will be skipped:');
-            templatesDetailProblemsEl.appendChild(intro);
-            const ul = document.createElement('ul');
-            for (const p of problems) ul.appendChild(el('li', null, p));
-            templatesDetailProblemsEl.appendChild(ul);
-            templatesDetailProblemsEl.classList.remove('hidden');
-        } else {
-            templatesDetailProblemsEl.classList.add('hidden');
-            templatesDetailProblemsEl.innerHTML = '';
-        }
-
-        const params = Array.isArray(t.params) ? t.params : [];
-        templatesDetailParamsEl.innerHTML = '';
-        if (params.length) {
-            for (const p of params) {
-                const row = el('div', 'templates-detail-param');
-                if (p.emphasis) row.classList.add('emphasis');
-                const left = el('div', 'templates-detail-param-name');
-                left.appendChild(document.createTextNode(p.name || ''));
-                if (p.type) left.appendChild(el('span', 'templates-detail-param-type', p.type));
-                row.appendChild(left);
-
-                const right = el('div');
-                if (p.default !== null && p.default !== undefined && p.default !== '') {
-                    const defaultStr = (typeof p.default === 'object')
-                        ? JSON.stringify(p.default)
-                        : String(p.default);
-                    right.appendChild(el('span', 'templates-detail-param-default',
-                        `default: ${defaultStr}`));
-                }
-                if (p.description) {
-                    right.appendChild(el('div', 'templates-detail-param-desc', p.description));
-                }
-                row.appendChild(right);
-                templatesDetailParamsEl.appendChild(row);
-            }
-            templatesDetailParamsWrap.hidden = false;
-        } else {
-            templatesDetailParamsWrap.hidden = true;
-        }
-
-        const steps = Array.isArray(t.steps) ? t.steps : [];
-        templatesDetailStepsEl.innerHTML = '';
-        if (steps.length) {
-            for (const s of steps) {
-                const li = el('li');
-                li.appendChild(el('span', 'templates-detail-step-desc',
-                    s.description || s.step_id || '(step)'));
-                if (Array.isArray(s.tools_required) && s.tools_required.length) {
-                    const tools = el('span', 'templates-detail-step-tools');
-                    tools.textContent =
-                        ' [' + s.tools_required.map(String).join(', ') + ']';
-                    li.appendChild(tools);
-                }
-                if (s.goal) {
-                    li.appendChild(el('span', 'templates-detail-step-goal', s.goal));
-                }
-                templatesDetailStepsEl.appendChild(li);
-            }
-            templatesDetailStepsWrap.hidden = false;
-        } else {
-            templatesDetailStepsWrap.hidden = true;
-        }
-    }
-
-    function templatesLoad() {
-        if (!handq.sendRequest) return;
-        if (templatesCountEl) templatesCountEl.textContent = 'loading…';
-        templatesRpc('gep_list_templates').then((result) => {
-            templatesCache = (result && Array.isArray(result.templates))
-                ? result.templates : [];
-            if (templatesActiveId
-                && !templatesCache.some((t) => t.id === templatesActiveId)) {
-                templatesActiveId = null;
-                templatesDetailEl.classList.add('hidden');
-                templatesDetailEmptyEl.classList.remove('hidden');
-            }
-            templatesRenderList();
-            if (templatesActiveId) {
-                const active = templatesCache.find((t) => t.id === templatesActiveId);
-                if (active) templatesRenderDetail(active);
-            }
-        }).catch((err) => {
-            templatesShowToast('Load failed: ' + (err && err.message), 'err');
-            if (templatesCountEl) templatesCountEl.textContent = '';
-        });
-    }
-
-    function openTemplatesOverlay() {
-        if (!overlayTemplates) return;
-        overlayTemplates.classList.remove('hidden');
-        overlayTemplates.setAttribute('aria-hidden', 'false');
-        templatesLoad();
-        refreshLoadHistoryEnabled();
-    }
-    function closeTemplatesOverlay() {
-        if (!overlayTemplates) return;
-        overlayTemplates.classList.add('hidden');
-        overlayTemplates.setAttribute('aria-hidden', 'true');
-    }
-
-    if (scTemplates) {
-        scTemplates.addEventListener('click', () => {
-            if (overlayTemplates && !overlayTemplates.classList.contains('hidden')) {
-                closeTemplatesOverlay();
-            } else {
-                openTemplatesOverlay();
-            }
-        });
-    }
-    if (templatesCloseBtn) templatesCloseBtn.addEventListener('click', closeTemplatesOverlay);
-    if (templatesRefreshBtn) templatesRefreshBtn.addEventListener('click', templatesLoad);
-
-    // Load-history is the SOLE entry point for generating a new template.
-    // No in-conversation Save button exists anymore — every save goes
-    // through this picker, which:
-    //   1) requires no active task (server-side gate refuses if any),
-    //   2) defaults to %USERPROFILE%\HandQ\History\ so users see their
-    //      own session list without typing a path,
-    //   3) sends gep_save with the chosen log_file.
-    // The save flow then takes over the conversation pane just like any
-    // other request — the user can refine the template via chat.
-    function templatesIsBusy() {
-        return isTaskRunning() || gepCountdownActive;
-    }
-    function refreshLoadHistoryEnabled() {
-        if (!templatesLoadHistoryBtn) return;
-        const busy = templatesIsBusy();
-        templatesLoadHistoryBtn.disabled = busy;
-        templatesLoadHistoryBtn.title = busy
-            ? 'Finish or cancel the current task before importing a session log'
-            : 'Generate a GEP template from any past session log';
-    }
-    if (templatesLoadHistoryBtn) {
-        templatesLoadHistoryBtn.addEventListener('click', async () => {
-            if (templatesIsBusy()) {
-                templatesShowToast(
-                    'Cannot import while a task is running — wait for completion or click New first.',
-                    'err',
-                );
-                return;
-            }
-            const dlg = window.handqDialog;
-            if (!dlg || !dlg.pickHistoryLog) {
-                templatesShowToast('File picker unavailable.', 'err');
-                return;
-            }
-            let result;
-            try {
-                result = await dlg.pickHistoryLog();
-            } catch (err) {
-                templatesShowToast('Picker failed: ' + (err && err.message), 'err');
-                return;
-            }
-            if (!result || result.canceled || !result.path) return;
-            window.__handqLog('INFO', 'load history picked', { path: result.path });
-            try {
-                handq.sendRequest({ type: 'gep_save', log_file: result.path });
-                closeTemplatesOverlay();
-                addStepBubble('⤓', 'Importing session log: ' + result.path);
-                clearCompleted();
-                setWorking('saving template…');
-            } catch (err) {
-                templatesShowToast('Send failed: ' + (err && err.message), 'err');
-            }
-        });
-    }
-
-    if (templatesDetailDeleteBtn) {
-        templatesDetailDeleteBtn.addEventListener('click', () => {
-            if (!templatesActiveId) return;
-            const t = templatesCache.find((x) => x.id === templatesActiveId);
-            if (!t) return;
-            const ok = window.confirm(
-                `Delete template "${t.name || t.id}"? This removes the JSON file from disk and cannot be undone.`
-            );
-            if (!ok) return;
-            templatesRpc('gep_delete_template', { id: templatesActiveId })
-                .then((result) => {
-                    if (result && result.ok) {
-                        templatesShowToast('Template deleted.', 'ok');
-                        templatesActiveId = null;
-                        templatesLoad();
-                    } else {
-                        templatesShowToast(
-                            'Delete failed: ' + ((result && result.error) || 'unknown'),
-                            'err',
-                        );
-                    }
-                })
-                .catch((err) => {
-                    templatesShowToast('Delete failed: ' + (err && err.message), 'err');
-                });
-        });
-    }
-
-    if (overlayTemplates) {
-        overlayTemplates.addEventListener('click', (e) => {
-            if (e.target === overlayTemplates) closeTemplatesOverlay();
-        });
-    }
-
-    // ── GEP parameter panel ────────────────────────────────────────────────
-
-    const gepTitleEl       = document.getElementById('gep-title');
-    const gepDescriptionEl = document.getElementById('gep-description');
-    const gepStepsEl       = document.getElementById('gep-steps');
-    const gepStepsSection  = document.getElementById('gep-steps-section');
-    const gepKeyParamsEl       = document.getElementById('gep-key-params');
-    const gepKeyParamsSection  = document.getElementById('gep-key-params-section');
-    const gepOtherParamsEl       = document.getElementById('gep-other-params');
-    const gepOtherParamsSection  = document.getElementById('gep-other-params-section');
-    const gepCountdownEl   = document.getElementById('gep-countdown');
-    const gepProgressBar   = document.getElementById('gep-progress-bar');
-    const gepFormEl        = document.getElementById('gep-form');
-    const gepCloseBtn      = document.getElementById('gep-close');
-    const gepSkipBtn       = document.getElementById('gep-skip');
-    const gepConfirmBtn    = document.getElementById('gep-confirm');
-
-    function gepRenderParam(spec) {
-        const row = el('div', 'gep-param-row');
-        if (spec.emphasis) row.classList.add('emphasis');
-        const label = el('label', 'gep-param-label');
-        const name  = el('span', 'gep-param-name', String(spec.name || ''));
-        label.appendChild(name);
-        const typeStr = (spec.type || '').toString();
-        if (typeStr) {
-            const t = el('span', 'gep-param-type', '[' + typeStr + ']');
-            label.appendChild(t);
-        }
-        const desc = (spec.description || '').toString();
-        if (desc) {
-            label.appendChild(el('span', 'gep-param-desc', desc));
-        }
-        row.appendChild(label);
-
-        let input;
-        const lower = typeStr.toLowerCase();
-        if (lower === 'bool' || lower === 'boolean') {
-            input = document.createElement('input');
-            input.type = 'checkbox';
-            input.checked = spec.default === true || spec.default === 'true';
-        } else if (lower === 'int' || lower === 'integer' || lower === 'number') {
-            input = document.createElement('input');
-            input.type = 'number';
-            if (spec.default !== null && spec.default !== undefined) {
-                input.value = String(spec.default);
-            }
-        } else if (lower === 'list') {
-            input = document.createElement('textarea');
-            input.rows = 2;
-            input.placeholder = 'one item per line';
-            if (Array.isArray(spec.default)) {
-                input.value = spec.default.join('\n');
-            } else if (spec.default != null) {
-                input.value = String(spec.default);
-            }
-        } else {
-            input = document.createElement('input');
-            input.type = 'text';
-            if (spec.default !== null && spec.default !== undefined) {
-                input.value = String(spec.default);
-            }
-        }
-        input.dataset.paramName = String(spec.name || '');
-        input.dataset.paramType = typeStr;
-        input.classList.add('gep-param-input');
-        row.appendChild(input);
-        return row;
-    }
-
-    function gepCollectParams() {
-        if (!gepFormEl) return [];
-        const out = [];
-        const inputs = gepFormEl.querySelectorAll('.gep-param-input');
-        inputs.forEach((inp) => {
-            const name = inp.dataset.paramName;
-            if (!name) return;
-            let value;
-            if (inp.type === 'checkbox') {
-                value = inp.checked ? 'true' : 'false';
-            } else {
-                value = (inp.value || '').toString();
-            }
-            out.push({ name: name, value: value });
-        });
-        return out;
-    }
-
-    function gepFormatParamsAsMessage() {
-        const params = gepCollectParams();
-        if (!params.length) return '';
-        const lines = params
-            .filter((p) => p.value !== '' && p.value != null)
-            .map((p) => `- ${p.name} = ${p.value}`);
-        if (!lines.length) return '';
-        return 'GEP parameters:\n' + lines.join('\n');
-    }
-
-    function openGepOverlay() {
-        if (!overlayGep) return;
-        overlayGep.classList.remove('hidden');
-        overlayGep.setAttribute('aria-hidden', 'false');
-    }
-    function closeGepOverlay() {
-        if (!overlayGep) return;
-        overlayGep.classList.add('hidden');
-        overlayGep.setAttribute('aria-hidden', 'true');
-    }
-
-    function gepRenderTemplate(info) {
-        gepInfo = info || {};
-        if (gepTitleEl) gepTitleEl.textContent = info && info.name ? info.name : 'GEP Template';
-        if (gepDescriptionEl) gepDescriptionEl.textContent = (info && info.description) || '';
-
-        if (gepStepsEl) gepStepsEl.innerHTML = '';
-        const steps = (info && Array.isArray(info.steps)) ? info.steps : [];
-        if (steps.length && gepStepsEl) {
-            for (const s of steps) {
-                const li = el('li');
-                const desc = (s.description || s.goal || '').toString();
-                li.appendChild(el('span', 'gep-step-name', desc || s.step_id || '(step)'));
-                if (s.goal && s.goal !== desc) {
-                    li.appendChild(document.createElement('br'));
-                    li.appendChild(el('span', 'gep-step-desc', s.goal));
-                }
-                gepStepsEl.appendChild(li);
-            }
-            if (gepStepsSection) gepStepsSection.hidden = false;
-        } else if (gepStepsSection) {
-            gepStepsSection.hidden = true;
-        }
-
-        const params = (info && Array.isArray(info.params)) ? info.params : [];
-        const keyParams = params.filter((p) => p.emphasis);
-        const otherParams = params.filter((p) => !p.emphasis);
-
-        if (gepKeyParamsEl)   gepKeyParamsEl.innerHTML = '';
-        if (gepOtherParamsEl) gepOtherParamsEl.innerHTML = '';
-
-        if (keyParams.length && gepKeyParamsEl) {
-            for (const p of keyParams) gepKeyParamsEl.appendChild(gepRenderParam(p));
-            if (gepKeyParamsSection) gepKeyParamsSection.hidden = false;
-        } else if (gepKeyParamsSection) {
-            gepKeyParamsSection.hidden = true;
-        }
-        if (otherParams.length && gepOtherParamsEl) {
-            for (const p of otherParams) gepOtherParamsEl.appendChild(gepRenderParam(p));
-            if (gepOtherParamsSection) gepOtherParamsSection.hidden = false;
-        } else if (gepOtherParamsSection) {
-            gepOtherParamsSection.hidden = true;
-        }
-
-        gepTotalSecs = (info && Number(info.timeout_secs)) || 300;
-        gepCountdownActive = true;
-        gepUpdateCountdown(gepTotalSecs);
-        openGepOverlay();
-    }
-
-    function gepUpdateCountdown(remaining) {
-        if (!gepCountdownEl || !gepProgressBar) return;
-        if (typeof remaining !== 'number' || remaining < 0) {
-            // -1 from backend == clear
-            gepCountdownActive = false;
-            gepCountdownEl.textContent = '--';
-            gepProgressBar.style.width = '0%';
-            closeGepOverlay();
-            return;
-        }
-        gepCountdownActive = true;
-        const total = Math.max(1, gepTotalSecs || 300);
-        const pct = Math.max(0, Math.min(100, (remaining / total) * 100));
-        gepProgressBar.style.width = pct + '%';
-        const mm = Math.floor(remaining / 60);
-        const ss = remaining % 60;
-        gepCountdownEl.textContent =
-            (mm > 0 ? (mm + 'm ') : '') + (ss < 10 ? '0' + ss : ss) + 's';
-        gepCountdownEl.classList.remove('warn', 'urgent');
-        if (remaining <= 10)       gepCountdownEl.classList.add('urgent');
-        else if (remaining <= 60)  gepCountdownEl.classList.add('warn');
-    }
-
-    function gepSendChatMessage(text) {
-        if (!text) return;
-        addUserBubble(text);
-        try {
-            handq.sendRequest({ type: 'user_input', kind: 'message', text: text });
-        } catch (err) {
-            addErrorBubble(String(err && err.message || err), 'gep');
-        }
-    }
-
-    if (gepFormEl) {
-        gepFormEl.addEventListener('submit', (e) => {
-            e.preventDefault();
-            const paramsBlock = gepFormatParamsAsMessage();
-            const lines = ['yes'];
-            if (paramsBlock) lines.push('', paramsBlock);
-            gepSendChatMessage(lines.join('\n'));
-            // Optimistically close the overlay; backend will clear the
-            // countdown via gep_countdown=-1 when the template activates.
-            closeGepOverlay();
-        });
-    }
-    if (gepCloseBtn) {
-        gepCloseBtn.addEventListener('click', () => {
-            // "Close" only hides the overlay — countdown keeps running so
-            // the user can re-open it via the chat or wait for auto-activation.
-            closeGepOverlay();
-        });
-    }
-    if (gepSkipBtn) {
-        gepSkipBtn.addEventListener('click', () => {
-            gepSendChatMessage('no');
-            closeGepOverlay();
-        });
-    }
-    // ----- settings form helpers (model master-list + per-role checkboxes) -----
+    // ----- settings form helpers (model pool + Agent/Helper tabs) -----
 
     function textToModels(text) {
         if (!text) return [];
@@ -3143,127 +2362,101 @@
         return models.map((m) => String(m)).join('\n');
     }
 
-    const PLANNER_MIN_VERSION = [4, 5];
-
-    function modelVersion(modelStr) {
-        const name = String(modelStr).split('::').pop().split(':')[0];
-        let m = name.match(/claude-(\d+)-(\d+)-/);
-        if (m) return [parseInt(m[1], 10), parseInt(m[2], 10)];
-        m = name.match(/claude-(\d+)-[a-z]/);
-        if (m) return [parseInt(m[1], 10), 0];
-        return [0, 0];
-    }
-    function versionGte(a, b) {
-        if (a[0] !== b[0]) return a[0] > b[0];
-        return a[1] >= b[1];
-    }
-    function assignRoles(allModels) {
-        const all = Array.isArray(allModels) ? allModels.slice() : [];
-        const capable = all.filter((m) => versionGte(modelVersion(m), PLANNER_MIN_VERSION));
-        if (capable.length === 0) {
-            return {
-                agent: all.slice(),
-                planner: all.slice(),
-                receptionist: all.slice(),
-                helper: all.slice(),
-            };
+    // Mirror of src/infrastructure/role_resolver.resolve_models_and_helper —
+    // handles both new schema (available_models + agent_models + helper_models)
+    // and legacy schema (models + helper_models). On Save we always write the
+    // new schema and drop legacy fields.
+    function resolveModelsAndHelper(llm) {
+        if (!llm || typeof llm !== 'object') return { pool: [], agent: [], helper: [] };
+        // New schema: available_models + agent_models + helper_models
+        if (Array.isArray(llm.available_models) && llm.available_models.length) {
+            const pool = llm.available_models.filter(Boolean).map(String);
+            const agent = Array.isArray(llm.agent_models)
+                ? llm.agent_models.filter(Boolean).map(String)
+                : [pool[0]];
+            const helper = Array.isArray(llm.helper_models)
+                ? llm.helper_models.filter(Boolean).map(String)
+                : [pool[pool.length - 1]];
+            return { pool, agent, helper };
         }
-        const n = capable.length;
-        const opusN = capable.filter((m) => m.includes('opus')).length;
-        let recepSkip;
-        let fdataSkip;
-        if (opusN > 0) {
-            recepSkip = Math.min(opusN, n - 1);
-            fdataSkip = Math.min(opusN + 2, n - 1);
-        } else {
-            recepSkip = Math.min(1, n - 1);
-            fdataSkip = Math.min(2, n - 1);
+        // Legacy: `models` + `helper_models` (flat arrays)
+        const modelsRaw = Array.isArray(llm.models) ? llm.models.filter(Boolean).map(String) : [];
+        const helperRaw = Array.isArray(llm.helper_models) ? llm.helper_models.filter(Boolean).map(String) : [];
+        const rolesRaw = (llm.roles && typeof llm.roles === 'object') ? llm.roles : null;
+        // (1) Modern flat shape — models + explicit helper_models
+        if (modelsRaw.length > 0) {
+            if (helperRaw.length > 0) {
+                const pool = [...new Set([...modelsRaw, ...helperRaw])];
+                return { pool, agent: modelsRaw, helper: helperRaw };
+            }
+            // No helper_models but roles present → fall through to roles handler
+            if (!rolesRaw) {
+                const pool = [...new Set(modelsRaw)];
+                return { pool, agent: modelsRaw, helper: [modelsRaw[modelsRaw.length - 1]] };
+            }
         }
-        return {
-            agent: all.slice(),
-            planner: capable.slice(),
-            receptionist: capable.slice(recepSkip),
-            helper: capable.slice(fdataSkip),
-        };
+        // (2) Legacy roles shape
+        if (rolesRaw) {
+            const listOf = (key) =>
+                Array.isArray(rolesRaw[key]) ? rolesRaw[key].filter(Boolean).map(String) : [];
+            const seen = new Set();
+            let models = [];
+            for (const key of ['agent', 'planner', 'receptionist']) {
+                for (const m of listOf(key)) {
+                    if (!seen.has(m)) { seen.add(m); models.push(m); }
+                }
+            }
+            const helper = listOf('helper').length ? listOf('helper') : listOf('from_data');
+            if (models.length === 0 && modelsRaw.length > 0) models = modelsRaw;
+            const pool = [...new Set([...models, ...helper])];
+            return { pool, agent: models, helper };
+        }
+        return { pool: [], agent: [], helper: [] };
     }
 
-    // Per-role checked state: { planner: Set, receptionist: Set, agent: Set, helper: Set }
-    let roleSelections = {
-        planner: new Set(),
-        receptionist: new Set(),
-        agent: new Set(),
-        helper: new Set(),
-    };
+    // ── Model selector tab switching + checkbox rendering ────────────
+    document.querySelectorAll('.model-tab').forEach(btn => {
+        btn.addEventListener('click', () => {
+            document.querySelectorAll('.model-tab').forEach(b => b.classList.remove('active'));
+            document.querySelectorAll('.model-tab-panel').forEach(p => p.classList.add('hidden'));
+            btn.classList.add('active');
+            document.getElementById('model-panel-' + btn.dataset.tab).classList.remove('hidden');
+        });
+    });
 
-    function modelDisplayName(model) {
-        const idx = model.indexOf('::');
-        return idx >= 0 ? model.slice(idx + 2) : model;
-    }
-
-    function rebuildRoleCheckboxes() {
-        const models = textToModels(cfgLlmModels.value);
-        for (const role of Object.keys(cfgLlmRolePanes)) {
-            const pane = cfgLlmRolePanes[role];
-            if (!pane) continue;
-            const sel = roleSelections[role] || new Set();
-            pane.innerHTML = '';
-            if (models.length === 0) {
-                const empty = document.createElement('span');
-                empty.className = 'help-text';
-                empty.textContent = 'Add models in Available tab.';
-                pane.appendChild(empty);
+    function renderModelCheckboxes() {
+        const pool = textToModels(cfgLlmAvailableModels.value);
+        for (const [container, group] of [
+            [cfgLlmAgentChecks, 'agent'],
+            [cfgLlmHelperChecks, 'helper'],
+        ]) {
+            const checked = new Set(
+                [...container.querySelectorAll('input:checked')].map(el => el.value)
+            );
+            container.innerHTML = '';
+            if (pool.length === 0) {
+                container.innerHTML = '<span style="color:var(--fg-mute);font-size:11px">Add models above first</span>';
                 continue;
             }
-            for (const model of models) {
+            for (const m of pool) {
                 const lbl = document.createElement('label');
-                lbl.className = 'model-checkbox';
+                lbl.title = m;
                 const cb = document.createElement('input');
                 cb.type = 'checkbox';
-                cb.value = model;
-                cb.checked = sel.has(model);
-                cb.addEventListener('change', () => {
-                    if (cb.checked) sel.add(model);
-                    else sel.delete(model);
-                });
-                const span = document.createElement('span');
-                span.textContent = modelDisplayName(model);
-                span.title = model;
-                lbl.appendChild(cb);
-                lbl.appendChild(span);
-                pane.appendChild(lbl);
+                cb.name = group + '_models';
+                cb.value = m;
+                if (checked.has(m)) cb.checked = true;
+                const nameSpan = document.createElement('span');
+                nameSpan.className = 'mcl-name';
+                // Display only the model name — hide any "provider::" prefix.
+                // The full id stays as cb.value (saved) and lbl.title (hover).
+                nameSpan.textContent = m.includes('::') ? m.slice(m.lastIndexOf('::') + 2) : m;
+                lbl.append(cb, nameSpan);
+                container.append(lbl);
             }
         }
     }
-
-    if (cfgLlmModels) {
-        cfgLlmModels.addEventListener('input', () => {
-            rebuildRoleCheckboxes();
-        });
-    }
-
-    function selectRoleTab(role) {
-        const tabs = cfgLlmRoleTabs ? cfgLlmRoleTabs.querySelectorAll('.role-tab') : [];
-        tabs.forEach((btn) => {
-            const active = btn.dataset.role === role;
-            btn.classList.toggle('active', active);
-            btn.setAttribute('aria-selected', active ? 'true' : 'false');
-        });
-        // "available" tab controls the master textarea
-        if (cfgLlmModels) cfgLlmModels.hidden = (role !== 'available');
-        for (const key of Object.keys(cfgLlmRolePanes)) {
-            const pane = cfgLlmRolePanes[key];
-            if (!pane) continue;
-            pane.hidden = (key !== role);
-        }
-    }
-    if (cfgLlmRoleTabs) {
-        cfgLlmRoleTabs.addEventListener('click', (e) => {
-            const btn = e.target && e.target.closest('.role-tab');
-            if (!btn) return;
-            const role = btn.dataset.role;
-            if (role) selectRoleTab(role);
-        });
-    }
+    cfgLlmAvailableModels.addEventListener('input', renderModelCheckboxes);
 
     function showToast(message, kind) {
         settingsToast.textContent = message;
@@ -3289,58 +2482,24 @@
         cfgLlmMaxTokens.value =
             (llm.max_tokens === undefined || llm.max_tokens === null) ? '' : String(llm.max_tokens);
 
-        // Determine master model list and per-role selections
-        const rolesObj = (llm.roles && typeof llm.roles === 'object') ? llm.roles : null;
-        let masterModels = [];
-        let perRole = { planner: [], receptionist: [], agent: [], helper: [] };
-
-        if (Array.isArray(llm.models) && llm.models.length > 0) {
-            masterModels = llm.models.map(String);
+        const resolved = resolveModelsAndHelper(llm);
+        cfgLlmAvailableModels.value = modelsToText(resolved.pool);
+        renderModelCheckboxes();
+        for (const m of resolved.agent) {
+            const cb = cfgLlmAgentChecks.querySelector(`input[value="${CSS.escape(m)}"]`);
+            if (cb) cb.checked = true;
         }
-
-        if (rolesObj) {
-            perRole.planner      = Array.isArray(rolesObj.planner) ? rolesObj.planner.map(String) : [];
-            perRole.receptionist = Array.isArray(rolesObj.receptionist) ? rolesObj.receptionist.map(String) : [];
-            perRole.agent        = Array.isArray(rolesObj.agent) ? rolesObj.agent.map(String) : [];
-            perRole.helper       = Array.isArray(rolesObj.helper) ? rolesObj.helper.map(String) : [];
-            // If master list is empty, derive it as de-duped union of all role lists
-            if (masterModels.length === 0) {
-                const seen = new Set();
-                for (const role of ['planner', 'receptionist', 'agent', 'helper']) {
-                    for (const m of perRole[role]) {
-                        if (!seen.has(m)) { seen.add(m); masterModels.push(m); }
-                    }
-                }
-            }
-        } else if (masterModels.length > 0) {
-            // Legacy: only llm.models exists, auto-assign roles
-            const derived = assignRoles(masterModels);
-            perRole.planner      = derived.planner;
-            perRole.receptionist = derived.receptionist;
-            perRole.agent        = derived.agent;
-            perRole.helper       = derived.helper;
+        for (const m of resolved.helper) {
+            const cb = cfgLlmHelperChecks.querySelector(`input[value="${CSS.escape(m)}"]`);
+            if (cb) cb.checked = true;
         }
-
-        cfgLlmModels.value = modelsToText(masterModels);
-
-        // Populate roleSelections Sets and rebuild checkboxes
-        roleSelections.planner      = new Set(perRole.planner);
-        roleSelections.receptionist = new Set(perRole.receptionist);
-        roleSelections.agent        = new Set(perRole.agent);
-        roleSelections.helper       = new Set(perRole.helper);
-        rebuildRoleCheckboxes();
-        selectRoleTab('planner');
 
         cfgSessionLogLevel.value = sessCfg.log_level || '';
-        cfgSessionStepThreshold.value =
-            (sessCfg.step_verification_threshold === undefined ||
-             sessCfg.step_verification_threshold === null)
-                ? '' : String(sessCfg.step_verification_threshold);
         cfgSessionVenvPath.value = sessCfg.venv_path || '';
 
-        // readSwitch reads either `auto_approve` or `enabled` from a
-        // switch entry. `enabled` defaults to true when missing (back-compat
-        // with older configs that only carry `auto_approve`).
+        // readSwitch reads `auto_approve` (or `enabled`) from a switch entry.
+        // `enabled` defaults to true when missing (back-compat with older
+        // configs that only carry `auto_approve`).
         function readSwitch(name, field) {
             const v = switches[name];
             if (!v || typeof v !== 'object') {
@@ -3363,7 +2522,7 @@
             ? blacklist.join(', ')
             : (typeof blacklist === 'string' ? blacklist : '');
 
-        // ── Personalization fields ────────────────────────────────
+    // ── Personalization fields ────────────────────────────────
         const persCfg = cfg.personalization || {};
         cfgPersEnabled.checked = persCfg.enabled !== false;  // default true
         cfgPersExcludedApps.value = Array.isArray(persCfg.excluded_apps)
@@ -3396,27 +2555,27 @@
             if (!Number.isNaN(n)) llm.max_tokens = n;
         }
 
-        // Master model list
-        const masterModels = textToModels(cfgLlmModels.value);
-        llm.models = masterModels;
-
-        // Per-role selections (preserve master-list order)
-        if ('models' in llm && llm.models.length === 0) delete llm.models;
-        llm.roles = {};
-        for (const role of ['planner', 'receptionist', 'agent', 'helper']) {
-            const sel = roleSelections[role] || new Set();
-            llm.roles[role] = masterModels.filter((m) => sel.has(m));
-        }
+        // Model pool + checked subsets (new schema). Drop legacy fields.
+        const pool = textToModels(cfgLlmAvailableModels.value);
+        const agentModels = pool.filter(m =>
+            cfgLlmAgentChecks.querySelector(`input[value="${CSS.escape(m)}"]:checked`)
+        );
+        const helperModels = pool.filter(m =>
+            cfgLlmHelperChecks.querySelector(`input[value="${CSS.escape(m)}"]:checked`)
+        );
+        if (pool.length) llm.available_models = pool;
+        else delete llm.available_models;
+        if (agentModels.length) llm.agent_models = agentModels;
+        else delete llm.agent_models;
+        if (helperModels.length) llm.helper_models = helperModels;
+        else delete llm.helper_models;
+        delete llm.models;
+        delete llm.roles;
 
         if (cfgSessionLogLevel.value) sess.log_level = cfgSessionLogLevel.value;
         else delete sess.log_level;
 
-        if (cfgSessionStepThreshold.value === '') {
-            delete sess.step_verification_threshold;
-        } else {
-            const f = parseFloat(cfgSessionStepThreshold.value);
-            if (!Number.isNaN(f)) sess.step_verification_threshold = f;
-        }
+        if ('step_verification_threshold' in sess) delete sess.step_verification_threshold;
         if ('workspace_base' in sess) delete sess.workspace_base;
         if (cfgSessionVenvPath.value) sess.venv_path = cfgSessionVenvPath.value;
         else delete sess.venv_path;

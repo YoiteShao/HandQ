@@ -218,38 +218,36 @@ if (-not $ElectronOnly) {
         '--include-package=src',
 
         # ── Always-required third-party packages ──────────────────────────────
-        # Top-level imports that Nuitka *can* follow statically, but we list
-        # them explicitly so they survive any refactor that moves the import
-        # inside a function.
-        '--include-package=yaml',           # PyYAML: stdio_bridge, config_manager
+        # All deps are imported eagerly at module top in V2 — Nuitka's static
+        # analysis will pick them up. We list them anyway as a belt-and-braces
+        # check so any future refactor that hides an import behind a function
+        # still ships the package.
+        '--include-package=yaml',           # PyYAML: stdio_bridge, config_manager, ssh_tool, browser_tool
         '--include-package=anthropic',      # LLM client: llm_service, anthropic_streaming_service
-        '--include-package=httpx',          # HTTP: direct + transitive dep of anthropic/openai
-        '--include-package=json_repair',    # JSON repair: conditional top-level in utils.py
-
-        # ── Conditionally-imported packages (try/except ImportError guards) ───
-        # Nuitka's static analysis cannot see through try/except ImportError
-        # blocks.  These packages will be missing from the standalone dist
-        # unless we list them explicitly here.
-        '--include-package=openai',         # vision/llm.py: from openai import AsyncOpenAI (lazy)
-        '--include-package=PIL',            # pillow: browser_tool + vision/llm.py (lazy)
-        '--include-package=paramiko',       # ssh_tool.py, ssh_setup.py
-        '--include-package=keyring',        # ssh_tool.py, ssh_setup.py
+        '--include-package=httpx',          # HTTP: llm_service, vision/llm.py, teams_api, LTM embedding
+        '--include-package=json_repair',    # JSON repair: utils.py (eager top-level)
+        '--include-package=openai',         # vision/llm.py + LTM embedding (eager top-level)
+        '--include-package=PIL',            # pillow: browser_tool, vision/llm.py, desktop_tool
+        '--include-package=paramiko',       # ssh_tool, ssh_setup, remote_handq_tool
+        '--include-package=keyring',        # ssh_tool, ssh_setup
         '--include-package=keyrings',       # keyrings.alt: file-based backend for headless envs
         '--include-package=cryptography',   # transitive dep of paramiko + httpx TLS
         '--include-package=cffi',           # transitive dep of cryptography
-        '--include-package=mss',            # desktop_tool.py: fast screen capture
-        '--include-package=pyautogui',      # desktop_tool.py: mouse/keyboard automation
+        '--include-package=mss',            # desktop_tool.py: fast screen capture (eager)
+        '--include-package=pyautogui',      # desktop_tool.py: mouse/keyboard automation (eager)
         '--include-package=win32gui',       # desktop_tool.py (pywin32): window enumeration
         '--include-package=win32process',   # desktop_tool.py (pywin32): PID lookups
         '--include-package=win32con',       # desktop_tool.py (pywin32): win32 constants
         '--include-package=pywintypes',     # pywin32: shared C types required by win32gui etc.
-        '--include-package=win32com',       # email_tool.py: Dispatch / EnsureDispatch
-        '--include-package=pythoncom',      # email_tool.py: CoInitialize / CoUninitialize
+        '--include-package=win32com',       # email_tool.py: Dispatch / EnsureDispatch (eager)
+        '--include-package=pythoncom',      # email_tool.py: CoInitialize / CoUninitialize (eager)
         '--include-package-data=win32com',  # gen_py cache support under Nuitka (doc §13)
-        '--include-package=playwright',     # browser_tool.py: async_api (browsers installed separately)
-        '--include-package=rapidocr_onnxruntime',  # vision/ocr.py: local OCR engine (lazy)
-        '--include-package=rapidfuzz',      # desktop_tool.py: fuzzy text match (lazy)
-        '--include-package=psutil',         # desktop_tool.py: process name lookup (lazy)
+        '--include-package=playwright',     # browser_tool.py + teams_setup + teams_web_bridge (eager)
+        '--include-package=pywinauto',      # desktop_tool.py: UIA control discovery (eager)
+        '--include-package=pdfplumber',     # read_tool.py: canonical PDF parser (eager)
+        '--include-package=rapidocr_onnxruntime',  # vision/ocr.py: local OCR engine (eager)
+        '--include-package=rapidfuzz',      # desktop_tool.py: fuzzy text match (eager)
+        '--include-package=psutil',         # desktop_tool.py + personality.input_idle (eager)
 
         # ── Package data that must travel alongside the exe ───────────────────
         # rapidocr ships det/rec/cls *.onnx model files (~10 MB) as package data.
@@ -265,6 +263,24 @@ if (-not $ElectronOnly) {
         # user fills in their API key. Embedding the dev's working yaml would
         # leak whichever API key happens to be in it.
         "--include-data-files=$REPO_ROOT\handq_config.example.yaml=handq_config.yaml",
+
+        # uia_query.ps1 — PowerShell UI Automation worker script for the LTM
+        # Dream/Personality pipeline. Spawned as a long-lived child process by
+        # ``infrastructure.long_term_memory.uia_worker.UIAWorker`` to extract
+        # ax_text / parsed_json / top_window_titles from foreground windows,
+        # which augment OCR snapshots with structured signals (URLs in browsers,
+        # paths in Explorer/VSCode, prompts in terminals).
+        #
+        # The worker resolves the script via ``Path(__file__).parent / "scripts"
+        # / "uia_query.ps1"``; in the standalone dist, ``__file__`` for the
+        # compiled uia_worker module maps to
+        # ``<dist>/src/infrastructure/long_term_memory/uia_worker.py`` (virtual),
+        # so the resource MUST land at the same relative path. Without this
+        # directive the file is missing post-pack and ``_spawn`` logs
+        # "UIA script not found" then permanently disables the worker — the
+        # entire ax_text augmentation channel goes silently dark on every
+        # fresh install.
+        "--include-data-files=$REPO_ROOT\src\infrastructure\long_term_memory\scripts\uia_query.ps1=src\infrastructure\long_term_memory\scripts\uia_query.ps1",
 
         # ── Size reduction: trim unused sub-packages of large deps ────────────
         # Rules here only if the module is a genuinely separate entry-point that

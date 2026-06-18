@@ -132,7 +132,7 @@ def _insert_candidate(commit: dict) -> None:
         conn.execute("PRAGMA busy_timeout=10000")
         conn.execute("BEGIN IMMEDIATE")
         conn.execute(
-            "INSERT INTO memory_candidates "
+            "INSERT INTO mem_candidates "
             "(id, source, source_ref, raw_text, hint, metadata, status, "
             " retry_count, created_at, updated_at) "
             "VALUES (?, 'post_commit', ?, ?, ?, ?, 'pending', 0, ?, ?)",
@@ -142,6 +142,62 @@ def _insert_candidate(commit: dict) -> None:
                 metadata, now, now,
             ),
         )
+        # LTM 2.0 — also upsert the commit author as a person principal in
+        # ent_principals so the entity graph picks them up. This runs in the
+        # same transaction so it succeeds-or-fails atomically with the
+        # candidate insert. If ent_principals doesn't exist (pre-v5 DB), the
+        # IntegrityError below catches and skips.
+        author_email = commit.get("author_email") or ""
+        if author_email:
+            canonical = author_email.split("@")[0]
+            try:
+                row = conn.execute(
+                    "SELECT id FROM ent_principals "
+                    "WHERE kind='person' AND canonical_name=?",
+                    (canonical,),
+                ).fetchone()
+                if row:
+                    pid = row[0]
+                    conn.execute(
+                        "UPDATE ent_principals "
+                        "SET last_seen=?, sighting_count=sighting_count+1 "
+                        "WHERE id=?",
+                        (now, pid),
+                    )
+                else:
+                    pid = str(uuid.uuid4())
+                    conn.execute(
+                        "INSERT INTO ent_principals "
+                        "(id, kind, canonical_name, display_name, email, "
+                        " first_seen, last_seen, sighting_count, archived) "
+                        "VALUES (?, 'person', ?, ?, ?, ?, ?, 1, 0)",
+                        (pid, canonical, canonical, author_email, now, now),
+                    )
+                # Alias the full email (idempotent via INSERT OR IGNORE
+                # which we approximate with try/except since the partial
+                # UNIQUE is enforced by PRIMARY KEY).
+                try:
+                    conn.execute(
+                        "INSERT INTO ent_aliases (principal_id, alias) VALUES (?, ?)",
+                        (pid, author_email),
+                    )
+                except sqlite3.IntegrityError:
+                    pass
+                # Sighting row tying this commit to the principal.
+                conn.execute(
+                    "INSERT INTO ent_sightings "
+                    "(id, principal_id, source_kind, source_id, sighted_at, context) "
+                    "VALUES (?, ?, 'mem_entry', ?, ?, ?)",
+                    (
+                        str(uuid.uuid4()), pid, cid, now,
+                        json.dumps({"sha": commit["sha"][:8],
+                                    "is_self": commit["author_is_self"]},
+                                   ensure_ascii=False),
+                    ),
+                )
+            except sqlite3.OperationalError:
+                # Pre-v5 DB without ent_* tables — skip silently.
+                pass
         conn.commit()
     finally:
         conn.close()

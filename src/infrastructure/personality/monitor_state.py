@@ -5,8 +5,7 @@ The state caches:
 
 - the ``MonitorTier`` for cadence selection
 - the previous frame's perceptual hash for de-dup
-- the last accepted OCR excerpt for novelty comparison
-- the buffered samples awaiting flush
+- the last accepted OCR excerpt(s) for novelty comparison
 - timestamps that drive both promotion (immediate on activity) and
   demotion (delayed by ``ACTIVITY_TIER_DEMOTE_GRACE_SEC`` so a single
   read-and-think pause doesn't ping-pong).
@@ -29,10 +28,10 @@ import logging
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Optional
 
 from ..long_term_memory.models import (
-    ActivitySample, MonitorInfo, MonitorTier,
+    MonitorInfo, MonitorTier,
 )
 from ..long_term_memory import _constants as C
 
@@ -65,8 +64,6 @@ class MonitorState:
     recent_texts: deque = field(
         default_factory=lambda: deque(maxlen=C.ACTIVITY_TEXT_HISTORY_SIZE)
     )
-    buffer: List[ActivitySample] = field(default_factory=list)
-    buffer_started_ts: float = 0.0
 
     # ── Cadence ─────────────────────────────────────────────────────────────
 
@@ -146,24 +143,3 @@ class MonitorState:
             )
             self.tier = new_tier
 
-    # ── Buffer ─────────────────────────────────────────────────────────────
-
-    def append_sample(self, sample: ActivitySample, now: float) -> None:
-        if not self.buffer:
-            self.buffer_started_ts = now
-        self.buffer.append(sample)
-
-    def flush_due(self, now: float) -> bool:
-        if not self.buffer:
-            return False
-        if len(self.buffer) >= C.ACTIVITY_BUFFER_FLUSH_AFTER_N:
-            return True
-        if (now - self.buffer_started_ts) >= C.ACTIVITY_BUFFER_FLUSH_AFTER_SEC:
-            return True
-        return False
-
-    def drain_buffer(self) -> List[ActivitySample]:
-        out = self.buffer
-        self.buffer = []
-        self.buffer_started_ts = 0.0
-        return out

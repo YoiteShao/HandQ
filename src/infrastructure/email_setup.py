@@ -19,13 +19,14 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Optional
 
+import win32com.client  # noqa: F401  type: ignore[import-untyped]
+import pythoncom  # noqa: F401  type: ignore[import-untyped]
+
 from .logger import get_logger
-from .step_context_provider import StepContextProvider
+from ..controller_v2.context import ContextProvider, ItemContext, ProviderCache
 
 if TYPE_CHECKING:
-    from ..controller.interaction_manager import InteractionManager
-    from .memory import Memory
-    from ..models.plan import Step
+    from ..controller_v2.interaction_manager import InteractionManager
 
 
 def _build_full_hint() -> str:
@@ -126,7 +127,7 @@ def _build_brief_hint() -> str:
     )
 
 
-class EmailContextProvider(StepContextProvider):
+class EmailContextProvider(ContextProvider):
     """Activate when the Planner declares ``email`` in tools_required."""
 
     def __init__(self) -> None:
@@ -155,32 +156,12 @@ class EmailContextProvider(StepContextProvider):
             '`["email"]` for sending mail — write path not yet wired; composer + send come later',
         ]
 
-    async def prepare(
+    async def before_item(
         self,
-        step: "Step",
-        interaction_manager: "InteractionManager",
-        memory: "Memory",
+        ctx: ItemContext,
+        im: "InteractionManager",
+        cache: ProviderCache,
     ) -> Optional[str]:
-        try:
-            import win32com.client  # noqa: F401  type: ignore[import-untyped]
-        except ImportError:
-            return (
-                "[Email Context — UNAVAILABLE]\n"
-                "win32com.client is not importable. "
-                "Install pywin32:\n"
-                "  pip install pywin32"
-            )
-
-        try:
-            import pythoncom  # noqa: F401  type: ignore[import-untyped]
-        except ImportError:
-            return (
-                "[Email Context — UNAVAILABLE]\n"
-                "pythoncom is not importable. "
-                "Install pywin32:\n"
-                "  pip install pywin32"
-            )
-
         # Smoke-test: verify Outlook.Application is reachable before the agent
         # spends tokens on email steps that will just fail with COM errors.
         # Skip the 5s executor round-trip when the handle is already cached
@@ -212,8 +193,8 @@ class EmailContextProvider(StepContextProvider):
                 "in to a MAPI profile."
             )
 
-        cached = memory.get_email_context("email")
+        cached = cache.get("email")
         if cached and cached.get("prepared"):
             return _build_brief_hint()
-        memory.set_email_context("email", {"prepared": True})
+        cache.set("email", "default", {"prepared": True})
         return _build_full_hint()

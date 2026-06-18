@@ -18,11 +18,12 @@ worker. The worker is a single asyncio.Task spawned inside
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 from .embedding import EmbeddingProvider, vec_to_bytes
 from .embedding.base import cosine, vec_from_bytes
@@ -39,7 +40,14 @@ from .models import (
     VerdictAction,
 )
 from .pii import PIIFilter
-from .prompts import TRIAGE_SYSTEM, parse_verdict, render_user
+from .prompts import (
+    MERGE_ARBITER_SYSTEM,
+    SKILL_EXTRACTION_SYSTEM,
+    TRIAGE_SYSTEM,
+    parse_skill_extraction,
+    parse_verdict,
+    render_user,
+)
 from .store import SQLiteStore
 from . import _constants as C
 
@@ -103,10 +111,11 @@ def _looks_structured(text: str) -> bool:
     return False
 
 
-# Path-fragment regex used by the activity_observer guard. Catches the
-# common "I saw VSCode showing C:\foo\bar" type summaries that the LLM
-# kept proposing as INSIGHT memory. Matches: drive-letter Windows paths,
-# /Local/... POSIX-ish paths, and any backslash-heavy fragment.
+# Path-fragment regex used by the semantic-event promotion guard.
+# Catches the common "I saw VSCode showing C:\foo\bar" type summaries
+# that the LLM kept proposing as INSIGHT memory. Matches: drive-letter
+# Windows paths, /Local/... POSIX-ish paths, and any backslash-heavy
+# fragment.
 import re as _re  # local import to keep top-of-file imports unchanged
 _PATH_FRAGMENT_RE = _re.compile(
     r"(?:[A-Za-z]:[\\/][\w./\\\-]+|/[Ll]ocal/[\w./\\\-]+|[\w\-]+[\\/][\w\-]+[\\/][\w\-]+)"
@@ -125,10 +134,10 @@ _BEHAVIOUR_VERBS_EN = (
 def _is_path_inventory(summary: str) -> bool:
     """True iff *summary* is mostly file-path tokens with no behaviour signal.
 
-    Activity_observer keeps producing entries like
-    ``"HandQ project at C:\\CodeProject\\HandQ"`` — the LLM saw a path,
+    The semantic-event LLM sometimes proposes entries like
+    ``"HandQ project at C:\\CodeProject\\HandQ"`` — it saw a path on screen,
     decided it was an "insight", but a passively-observed path is not a
-    durable signal (the user just had VSCode open). Guard rejects the
+    durable signal (the user just had VSCode open). The guard rejects the
     entry rather than letting it pollute injection context.
 
     Behaviour verbs ("uses ... for X", "always run Y") earn the entry
@@ -156,6 +165,112 @@ def _user_handq_root() -> Path:
     triage module doesn't import from bridge_main)."""
     home = os.environ.get("USERPROFILE") or os.path.expanduser("~")
     return Path(home) / "HandQ"
+
+
+def _extract_frame(metadata: Optional[dict]) -> Optional[dict]:
+    """Extract LTM 2.0 frame info from candidate metadata.
+
+    Activity-observer submissions (and any future source) embed frame
+    info as ``metadata['frame'] = {'os': ..., 'host': ..., 'confidence': ...}``.
+    Returns the dict or None when absent/malformed.
+    """
+    if not metadata:
+        return None
+    f = metadata.get("frame")
+    if not isinstance(f, dict):
+        return None
+    if not f.get("os"):
+        return None
+    return f
+
+
+# SemanticExtractor labels a session with a *content-type* category
+# (ssh_session / editing / browsing / ...), which is a different vocabulary
+# from the KnowledgeCategory enum (domain / people / process / coding /
+# other) that mem_entries(kind='knowledge') stores. Without an explicit
+# bridge, only the lone shared value "other" would ever match and every
+# observation-sourced knowledge row would land uncategorized — defeating
+# category-scoped recall. This table maps the content-type vocabulary onto
+# the closest KnowledgeCategory.
+_CONTENT_TYPE_TO_KNOWLEDGE: dict = {
+    "ssh_session": KnowledgeCategory.PROCESS,
+    "remote_desktop": KnowledgeCategory.PROCESS,
+    "editing": KnowledgeCategory.CODING,
+    "debugging": KnowledgeCategory.CODING,
+    "browsing": KnowledgeCategory.DOMAIN,
+    "meeting": KnowledgeCategory.PEOPLE,
+    "other": KnowledgeCategory.OTHER,
+}
+
+
+def _map_knowledge_category(category: Optional[str]) -> Optional[KnowledgeCategory]:
+    """Resolve a semantic-event category string to a KnowledgeCategory.
+
+    Honors a value that is *already* in the KnowledgeCategory vocabulary
+    (future-proofs against the SemanticExtractor prompt being upgraded to
+    emit knowledge categories directly), then falls back to the
+    content-type → knowledge mapping. Returns None for anything unknown
+    so the entry is stored uncategorized rather than mis-categorized.
+    """
+    if not category:
+        return None
+    c = category.strip().lower()
+    try:
+        return KnowledgeCategory(c)
+    except ValueError:
+        pass
+    return _CONTENT_TYPE_TO_KNOWLEDGE.get(c)
+
+
+# Function words stripped from a skill title before fingerprinting, so that
+# phrasing differences ("open the settings page" vs "opens settings page")
+# collapse to the same dedup key. Deliberately small — only high-frequency
+# connectives/articles, never domain nouns or verbs that carry the skill's
+# meaning.
+_SKILL_FP_STOPWORDS: frozenset = frozenset({
+    "a", "an", "the", "to", "of", "for", "in", "on", "at", "by", "with",
+    "and", "or", "is", "are", "be", "this", "that", "it", "as", "from",
+    "into", "via", "how", "when", "then", "your", "you",
+})
+
+_SKILL_FP_TOKEN_RE = _re.compile(r"[a-z0-9]+")
+
+
+def _skill_fingerprint_tokens(title: str) -> List[str]:
+    """Normalize a skill title to a sorted, de-duplicated token list.
+
+    Lowercase → split on non-alphanumeric runs → drop stopwords → sort+dedup.
+    This is the phrasing-insensitive component of the skill dedup fingerprint:
+    two proposals describing the same action with reordered or reworded titles
+    collapse to one token set, hence one ``skill_fingerprint``.
+    """
+    tokens = _SKILL_FP_TOKEN_RE.findall(title.lower())
+    return sorted({t for t in tokens if t and t not in _SKILL_FP_STOPWORDS})
+
+
+def _skill_fingerprint(category: Optional[str], title: str) -> str:
+    """sha256 over canonical JSON of ``(category, normalized title tokens)``.
+
+    This is BOTH the skill-proposal dedup key (the partial UNIQUE
+    ``idx_mem_skill_dedup``) AND the recurrence-cluster key
+    (``skill_recurrence.fingerprint``). The two share one formula on purpose,
+    so "have we seen this skill 3 times" and "is there an active proposal for
+    it" agree on what counts as the same skill. Using a sorted token *set*
+    (see ``_skill_fingerprint_tokens``) makes it insensitive to word order,
+    stopwords and punctuation; it does NOT stem, so "open" vs "opens" stay
+    distinct — deliberately conservative to avoid over-merging.
+    """
+    import hashlib
+    canonical = json.dumps(
+        {
+            "category": (category or "").strip().lower(),
+            "tokens": _skill_fingerprint_tokens(title),
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _write_memory_note_file(entry_id: str, summary: str, content: str,
@@ -216,11 +331,17 @@ class DreamWorker:
         embedder: EmbeddingProvider,
         pii_filter: PIIFilter,
         config: dict,
+        emit: Optional[Callable[[dict], None]] = None,
     ) -> None:
         self._store = store
         self._embedder = embedder
         self._pii = pii_filter
         self._config = config
+        # Outbound chat-feed channel (stdio_bridge._emit), injected by
+        # LongTermMemory.init. None in tests / headless runs — every call
+        # site guards on it. Used to surface a hint when a skill proposal
+        # is freshly staged so the user knows it exists and how to activate.
+        self._emit = emit
         self._helper_services: List = []
         # Adaptive cadence (see _constants.py §3):
         # - 60s floor — even when ``submit_candidate`` writes a fresh
@@ -293,9 +414,9 @@ class DreamWorker:
                     # Process the batch concurrently with a small semaphore so
                     # we don't slam the helper LLM. Bounded fanout (3) keeps
                     # the LLM-side load tame while still cutting total batch
-                    # time roughly 3x vs the previous strict serial loop —
-                    # which was a real bottleneck when activity_observer
-                    # produced bursts faster than 1 candidate / 5-30s.
+                    # time roughly 3x vs a strict serial loop — which is a real
+                    # bottleneck when background observation produces candidate
+                    # bursts faster than 1 / 5-30s.
                     sem = asyncio.Semaphore(C.DREAM_TRIAGE_CONCURRENCY)
 
                     async def _guarded(cand):
@@ -306,6 +427,18 @@ class DreamWorker:
                                 _logger.exception("triage failed cid=%s", cand.id)
 
                     await asyncio.gather(*(_guarded(c) for c in cands))
+                # LTM 2.0 second consumer: obs_semantic_events from the
+                # observation pipeline. These are LLM-abstracted "what user
+                # did" events; we promote them to mem_entries based on the
+                # SemanticExtractor's worth_memory/worth_knowledge/worth_skill
+                # flags. Frame info on the parent session is propagated onto
+                # mem_entries.frame_json so recall can later filter by os/host.
+                try:
+                    n_evt = await self._process_semantic_events_batch()
+                    if n_evt:
+                        _logger.debug("processed %d semantic events", n_evt)
+                except Exception:
+                    _logger.exception("_process_semantic_events_batch failed")
                 # Adaptive interval update: snap back to MIN whenever we
                 # found work; otherwise grow geometrically up to MAX.
                 if cands:
@@ -381,6 +514,380 @@ class DreamWorker:
                 except asyncio.CancelledError:
                     return
 
+    # ── LTM 2.0 semantic-event promotion ──────────────────────────────────
+
+    async def _process_semantic_events_batch(self) -> int:
+        """LTM 2.0 path: promote obs_semantic_events into mem_entries.
+
+        Reads pending events (accepted_entries IS NULL), then for each event:
+          - if worth_memory: insert mem_entries(kind='memory', dimension=INSIGHT)
+            with frame_json from the parent session
+          - if worth_knowledge: insert mem_entries(kind='knowledge')
+          - if worth_skill: insert mem_entries(kind='skill_proposal') with
+            skill_fingerprint dedup (partial UNIQUE handles collision)
+
+        Returns the count of events processed (with at least one mem_entry
+        produced). Events with all worth_* flags false are still marked
+        ``accepted_entries=[]`` so they don't get rescanned forever.
+        """
+        events = await self._store.list_semantic_events_pending_triage(limit=8)
+        if not events:
+            return 0
+
+        processed = 0
+        for ev in events:
+            (eid, session_id, synthetic_origin, title, description, category,
+             entities_json, apps_json, frame_os, frame_host, frame_conf,
+             task_worthy) = ev
+            try:
+                entries = await self._promote_one_event(
+                    event_id=eid,
+                    session_id=session_id,
+                    synthetic_origin=synthetic_origin,
+                    title=title,
+                    description=description,
+                    category=category,
+                    entities_json=entities_json,
+                    frame_os=frame_os, frame_host=frame_host,
+                    frame_confidence=frame_conf,
+                    task_worthy=bool(task_worthy),
+                )
+                await self._store.set_semantic_event_accepted(eid, entries)
+                if entries:
+                    processed += 1
+            except Exception:
+                _logger.exception(
+                    "promote_semantic_event failed eid=%s", eid[:8],
+                )
+        return processed
+
+    async def _promote_one_event(
+        self,
+        *,
+        event_id: str,
+        session_id: Optional[str],
+        synthetic_origin: Optional[str],
+        title: str,
+        description: str,
+        category: Optional[str],
+        entities_json: Optional[str],
+        frame_os: Optional[str],
+        frame_host: Optional[str],
+        frame_confidence: Optional[float],
+        task_worthy: bool,
+    ) -> list:
+        """Apply worth_* flags from one semantic event → mem_entries rows.
+
+        Returns the list of ``{kind, id}`` dicts written to obs_semantic_events
+        .accepted_entries — the audit trail for what this event produced.
+        """
+        # Re-fetch the worth flags + skill fields directly (the listing query
+        # didn't return them).
+        full = await self._store._fetchone(
+            "SELECT worth_memory, worth_knowledge, worth_skill "
+            "FROM obs_semantic_events WHERE id=?",
+            (event_id,),
+        )
+        if not full:
+            return []
+        # _worth_skill is intentionally unused. Skill proposals now come
+        # ONLY from successful HandQ task sessions (see _apply_session_skill),
+        # not from passive activity observation. The obs_semantic_events
+        # .worth_skill column is left inert rather than removed — dropping it
+        # would touch insert_obs_semantic_event + the schema for no real gain.
+        worth_memory, worth_knowledge, _worth_skill = bool(full[0]), bool(full[1]), bool(full[2])
+
+        if not (worth_memory or worth_knowledge):
+            return []  # caller still marks accepted_entries=[] so we skip next time
+
+        frame: Optional[dict] = None
+        if frame_os:
+            frame = {
+                "os": frame_os,
+                "host": frame_host or "unknown",
+                "confidence": float(frame_confidence) if frame_confidence is not None else 0.5,
+                "evidence": f"semantic_event:{event_id[:8]}",
+            }
+
+        content_lines = [
+            f"## {title}",
+            description or "",
+        ]
+        if entities_json:
+            try:
+                ents = json.loads(entities_json)
+                if isinstance(ents, list) and ents:
+                    content_lines.append("**Entities**: " + ", ".join(str(e) for e in ents))
+            except (json.JSONDecodeError, TypeError, ValueError):
+                pass
+        content = "\n\n".join(filter(None, content_lines))
+
+        # PII gate. This content is derived from raw OCR excerpts + window
+        # titles (see SemanticExtractor) — the single highest-risk on-screen
+        # secret source: tokens echoed in terminals, tokenized URLs in title
+        # bars, env-var assignments. Every observation→memory write must pass
+        # self._pii. Frame anchoring does NOT close this hole (a frame scopes
+        # *relevance*, not *secrecy*). Drop ALL tracks on a hit — a secret-
+        # bearing observation produces no durable memory. We still return []
+        # so the event is marked processed and not rescanned forever.
+        if self._pii.has_secret(content):
+            _logger.info(
+                "semantic event %s dropped: PII detected in promoted content",
+                event_id[:8],
+            )
+            return []
+
+        accepted: list = []
+
+        if worth_memory and _is_path_inventory(title):
+            # Passively-observed file paths ("HandQ project at C:\\...")
+            # are not durable preference signal — the user just had an
+            # editor open. Skip the INSIGHT memory track but still let the
+            # knowledge / skill tracks run (they carry reusable facts).
+            _logger.info(
+                "semantic event %s: worth_memory skipped (path-inventory title=%r)",
+                event_id[:8], title[:60],
+            )
+            worth_memory = False
+
+        if worth_memory:
+            try:
+                mem_id = await self._store.insert_entry(
+                    kind=EntryKind.MEMORY,
+                    dimension=MemoryDimension.INSIGHT,
+                    summary=title[:120],
+                    content=content,
+                    source="semantic_event",
+                    source_event_id=event_id,
+                    frame=frame,
+                )
+                accepted.append({"kind": "memory", "id": mem_id})
+            except Exception:
+                _logger.exception("worth_memory promote failed eid=%s", event_id[:8])
+
+        if worth_knowledge:
+            try:
+                cat = _map_knowledge_category(category)
+                kn_id = await self._store.insert_entry(
+                    kind=EntryKind.KNOWLEDGE,
+                    category=cat,
+                    summary=title[:120],
+                    content=content,
+                    source="semantic_event",
+                    source_event_id=event_id,
+                )
+                accepted.append({"kind": "knowledge", "id": kn_id})
+            except Exception:
+                _logger.exception("worth_knowledge promote failed eid=%s", event_id[:8])
+
+        return accepted
+
+    async def _promote_to_skill_proposal(
+        self,
+        *,
+        title: str,
+        content: str,
+        category: Optional[str],
+        frame: Optional[dict],
+        source: str,
+        source_event_id: Optional[str] = None,
+        source_ref: Optional[str] = None,
+        fingerprint: Optional[str] = None,
+        recurrence_count: int = 1,
+    ) -> Optional[str]:
+        """Insert mem_entries(kind='skill_proposal') + stage + emit.
+
+        ``fingerprint`` defaults to ``_skill_fingerprint(category, title)`` when
+        not supplied. Callers that have already computed the fingerprint (the
+        session-skill path, which needs it for recurrence counting) pass it in
+        so promote and the recurrence counter agree on exactly one value. The
+        partial UNIQUE index ``idx_mem_skill_dedup`` enforces a single active
+        proposal per fingerprint at the SQL level — IntegrityError on collision
+        means "this skill already has an active proposal", which we treat as a
+        dedup-merge (no-op).
+        """
+        if fingerprint is None:
+            fingerprint = _skill_fingerprint(category, title)
+
+        try:
+            from .models import SkillProposalStatus
+            skill_id = await self._store.insert_entry(
+                kind=EntryKind.SKILL_PROPOSAL,
+                summary=title[:120],
+                content=content,
+                source=source,
+                source_event_id=source_event_id,
+                source_ref=source_ref,
+                frame=frame,
+                skill_status=SkillProposalStatus.PROPOSED,
+                skill_fingerprint=fingerprint,
+                recurrence_count=recurrence_count,
+            )
+        except Exception as exc:
+            # Partial UNIQUE collision means a duplicate proposal already
+            # exists — that's the dedup-merge happy path.
+            _logger.debug("skill proposal dedup or insert failed: %s", exc)
+            return None
+
+        # Write staging file (phase 7 IPC moves it to live skill dir on approve).
+        # On a successful write, surface a chat-feed hint so the user knows a
+        # new skill was staged and how to activate it.
+        try:
+            staging_md = await self._write_skill_staging_file(
+                skill_id, title, content,
+            )
+        except Exception:
+            _logger.exception("skill staging file write failed sid=%s", skill_id[:8])
+        else:
+            self._emit_skill_proposed(
+                skill_id=skill_id, description=title[:140], staging_md=staging_md,
+            )
+        return skill_id
+
+    async def _write_skill_staging_file(
+        self, skill_id: str, title: str, content: str,
+    ) -> Path:
+        """Write a candidate SKILL.md to %USERPROFILE%\\HandQ\\Skill\\.proposed\\<id>\\.
+
+        Returns the path to the written SKILL.md so the caller can point the
+        user at it in the chat-feed hint.
+        """
+        from pathlib import Path
+        skill_root = Path.home() / "HandQ" / "Skill" / ".proposed" / skill_id[:8]
+        skill_md = skill_root / "SKILL.md"
+
+        def _write() -> None:
+            skill_root.mkdir(parents=True, exist_ok=True)
+            skill_md.write_text(
+                f"---\nname: proposed-{skill_id[:8]}\ndescription: {title[:140]}\n---\n\n{content}\n",
+                encoding="utf-8",
+            )
+
+        await asyncio.to_thread(_write)
+        return skill_md
+
+    def _emit_skill_proposed(
+        self, *, skill_id: str, description: str, staging_md: Path,
+    ) -> None:
+        """Push a small-text hint into the chat feed for a freshly-staged
+        skill. No-op when no emit channel is wired (tests / headless). The
+        renderer (kind='skill_proposed') renders this as a system bubble;
+        the envelope carries no ``gen`` so it is never dropped by the
+        renderer's session-generation watermark.
+        """
+        if self._emit is None:
+            return
+        live_dir = staging_md.parent.parent.parent  # …/HandQ/Skill
+        try:
+            self._emit({
+                "type": "status",
+                "kind": "skill_proposed",
+                "skill_id": skill_id,
+                "description": description,
+                "staging_path": str(staging_md),
+                "skill_dir": str(live_dir),
+            })
+        except Exception:
+            _logger.exception("skill_proposed emit failed sid=%s", skill_id[:8])
+
+    async def _extract_skill_from_session(self, c: Candidate) -> Optional[dict]:
+        """Run the dedicated skill-extraction LLM pass on one task trajectory.
+
+        Returns the parsed verdict dict (see ``parse_skill_extraction``) or
+        None when no helper service is configured. The verdict's
+        ``worth_skill`` is the gate the caller checks; this is a SEPARATE LLM
+        call from the main triage verdict so the 500-line TRIAGE_SYSTEM stays
+        focused on memory/knowledge and the skill prompt can be specialized.
+        """
+        if not self._helper_services:
+            return None
+        from src.infrastructure.llm_pool import call_with_fallback
+
+        result = await call_with_fallback(
+            self._helper_services,
+            dict(
+                messages=[
+                    {"role": "system", "content": SKILL_EXTRACTION_SYSTEM},
+                    {"role": "user", "content": c.raw_text},
+                ],
+                json_mode=True,
+                max_tokens=600,
+            ),
+        )
+        return parse_skill_extraction(result.content or "")
+
+    async def _apply_session_skill(self, c: Candidate) -> bool:
+        """Extract a candidate skill from a successful task session and, only
+        once the same task pattern has recurred enough times, promote it to a
+        skill proposal.
+
+        Flow: extract (LLM) → PII gate → fingerprint → bump recurrence counter
+        → gate on ``SKILL_RECURRENCE_THRESHOLD``. Below threshold we ONLY
+        increment the counter and return False (no proposal written) — that is
+        the whole point: a one-off task never becomes a skill, only a repeated
+        one does. At/above threshold we promote (the partial UNIQUE index then
+        de-dupes against any still-active proposal). Returns True only when a
+        proposal row was actually written.
+        """
+        verdict = await self._extract_skill_from_session(c)
+        if not verdict or verdict.get("worth_skill") is not True:
+            return False
+
+        title = verdict["name"]
+        content_lines = [
+            f"# {title}",
+            verdict.get("description") or "",
+        ]
+        when = verdict.get("when_to_use")
+        if when:
+            content_lines.append(f"**When to use**: {when}")
+        steps = verdict.get("steps_md")
+        if steps:
+            content_lines.append(steps)
+        content = "\n\n".join(filter(None, content_lines))
+
+        # PII post-filter. The LLM-generated steps can surface a secret that
+        # the raw trajectory's pre-filter didn't (e.g. a token paraphrased
+        # into a step). Mirror the memory/knowledge post-filter: a secret-
+        # bearing skill produces no proposal.
+        if self._pii.has_secret(content):
+            _logger.info(
+                "session skill dropped: PII detected in extracted steps cid=%s",
+                c.id[:8],
+            )
+            return False
+
+        category = verdict.get("category")
+        fp = _skill_fingerprint(category, title)
+        try:
+            count = await self._store.bump_skill_recurrence(
+                fp, category=category, title=title,
+            )
+        except Exception:
+            _logger.exception("bump_skill_recurrence failed cid=%s", c.id[:8])
+            return False
+
+        if count < C.SKILL_RECURRENCE_THRESHOLD:
+            _logger.info(
+                "session skill below recurrence threshold cid=%s count=%d/%d fp=%s",
+                c.id[:8], count, C.SKILL_RECURRENCE_THRESHOLD, fp[:8],
+            )
+            return False
+
+        skill_id = await self._promote_to_skill_proposal(
+            title=title,
+            content=content,
+            category=category,
+            frame=_extract_frame(c.metadata),
+            source=c.source,
+            source_event_id=None,
+            source_ref=c.source_ref,
+            fingerprint=fp,
+            recurrence_count=count,
+        )
+        return bool(skill_id)
+
+
     # ── Per-candidate ───────────────────────────────────────────────────────
 
     async def _triage_one(self, c: Candidate) -> None:
@@ -422,6 +929,14 @@ class DreamWorker:
         existing_mem = await self._fetch_similar(c.raw_text, kind=EntryKind.MEMORY.value)
         existing_kn = await self._fetch_similar(c.raw_text, kind=EntryKind.KNOWLEDGE.value)
 
+        # Heartbeat after the FTS phase so a multi-second helper-LLM call
+        # below doesn't push us past the stuck-triaging threshold while
+        # we're still actively working. The reset_stuck_triaging gate is
+        # currently 300s; long triage paths (slow LLM + reranker) can
+        # legitimately exceed that, and getting reset mid-flight produces
+        # duplicate entries via the secondary triage path.
+        await self._store.heartbeat_candidate(c.id)
+
         try:
             verdict = await self._call_llm(c, existing_mem, existing_kn)
         except Exception as exc:
@@ -431,6 +946,11 @@ class DreamWorker:
                     c.id, CandidateStatus.FAILED, reason=C.REASON_MAX_RETRY,
                 )
             return
+
+        # Heartbeat again after the LLM call. The remaining work
+        # (PII post-filter, guards, _apply_memory chunking + insert,
+        # embedding warmup) is bounded but non-trivial.
+        await self._store.heartbeat_candidate(c.id)
 
         # ── Source-specific accept-override ───────────────────────────
         # MANUAL_REMEMBER candidates come from an explicit user
@@ -485,46 +1005,9 @@ class DreamWorker:
             verdict.memory_dimension = None
             verdict.reason = (verdict.reason + " | " + C.REASON_GUARD_FAILED_NO_MEMORY)[:200]
 
-        # Defensive guard: ACTIVITY_OBSERVER (background observation, not
-        # user consent) cannot promote AGENTIC memory. Watching the user
-        # type into VSCode is NOT evidence they prefer VSCode — they could
-        # be debugging someone else's setup. INSIGHT memory (stable env
-        # facts: "primary editor in use is VSCode") and knowledge
-        # ("project rooted at C:\\HandQ") are fine.
-        if (
-            c.source == CandidateSource.ACTIVITY_OBSERVER.value
-            and verdict.worth_memory
-            and verdict.memory_dimension == MemoryDimension.AGENTIC
-        ):
-            verdict.worth_memory = False
-            verdict.memory_action = VerdictAction.SKIP.value
-            verdict.memory_dimension = None
-            verdict.reason = (
-                verdict.reason + " | guard:activity_no_agentic_memory"
-            )[:200]
-
-        # Defensive guard: ACTIVITY_OBSERVER INSIGHT memories that are just
-        # path inventories ("HandQ project at C:\\CodeProject\\HandQ") are
-        # not durable signals — they're "the user happens to have VSCode
-        # open right now". Rejecting them keeps INSIGHT memory focused on
-        # actual environment facts ("primary OS is Windows 11", "uses ssh
-        # for remote") rather than a transient set of opened folders.
-        if (
-            c.source == CandidateSource.ACTIVITY_OBSERVER.value
-            and verdict.worth_memory
-            and verdict.memory_dimension == MemoryDimension.INSIGHT
-            and _is_path_inventory(verdict.memory_summary)
-        ):
-            verdict.worth_memory = False
-            verdict.memory_action = VerdictAction.SKIP.value
-            verdict.memory_dimension = None
-            verdict.reason = (
-                verdict.reason + " | guard:activity_path_inventory"
-            )[:200]
-
         # Defensive guard: ARCHIVE is destructive. Only direct user channels
         # may archive existing entries — observation / batched derivations
-        # are NOT consent. Without this guard, an activity_observer OCR
+        # are NOT consent. Without this guard, a background-observed OCR
         # capture that happens to contain "stopped using X" prose would
         # archive a real preference based on environmental noise.
         _archive_allowed = c.source in (
@@ -547,7 +1030,56 @@ class DreamWorker:
                     verdict.reason + " | guard:archive_only_from_user_channels"
                 )[:200]
 
+        # Defensive guard: IDENTITY dimension is restricted to direct user
+        # channels only. Background sources (session_*, post_commit) observing
+        # "respond in Chinese" on-screen is NOT the user's cross-session
+        # directive — it might be a colleague's setting or an example in
+        # documentation. Downgrade to AGENTIC so the signal is still preserved
+        # but won't be unconditionally injected.
+        if (
+            verdict.worth_memory
+            and verdict.memory_dimension == MemoryDimension.IDENTITY
+            and c.source not in (
+                CandidateSource.RECEPTIONIST_TURN.value,
+                CandidateSource.MANUAL_REMEMBER.value,
+            )
+        ):
+            verdict.memory_dimension = MemoryDimension.AGENTIC
+            verdict.reason = (
+                verdict.reason + " | guard:identity_downgrade_to_agentic"
+            )[:200]
+
+        # Identity entries do NOT support in-place update — the risk of
+        # silently mutating an always-injected directive is too high. Convert
+        # update(id) to archive(old) + create(new) so the old directive is
+        # explicitly retired and the new one stands alone.
+        if (
+            verdict.worth_memory
+            and verdict.memory_dimension == MemoryDimension.IDENTITY
+            and verdict.memory_action == VerdictAction.UPDATE.value
+            and verdict.memory_update_id
+        ):
+            verdict.memory_action = VerdictAction.CREATE.value
+            verdict.memory_archive_id = verdict.memory_update_id
+            verdict.memory_update_id = None
+            verdict.reason = (
+                verdict.reason + " | identity_update_split_to_archive+create"
+            )[:200]
+
         wrote_mem = wrote_kn = False
+        # Defensive CAS: if reset_stuck_triaging fired during this triage
+        # (e.g. slow LLM pushed total work past 300s), the candidate is now
+        # back in 'pending' and the next dream cycle will re-triage it.
+        # Skipping the writes here prevents duplicate entries — the new
+        # triage will produce its own (possibly different) verdict.
+        current_status = await self._store.get_candidate_status(c.id)
+        if current_status != CandidateStatus.TRIAGING.value:
+            _logger.warning(
+                "triage cid=%s status changed to %s mid-flight (likely "
+                "reset_stuck_triaging); skipping writes to avoid duplicates",
+                c.id[:8], current_status,
+            )
+            return
         if verdict.worth_memory:
             try:
                 await self._apply_memory(c, verdict)
@@ -561,12 +1093,28 @@ class DreamWorker:
             except Exception:
                 _logger.exception("apply_knowledge failed cid=%s", c.id)
 
+        # Skill side-channel: a successful task trajectory may also be a
+        # reusable skill. This runs INDEPENDENTLY of mem/kn (a session can
+        # produce both a memory and a skill proposal) and only for
+        # SESSION_COMPLETE — failed trajectories are not reusable procedures.
+        # The proposal is written by _apply_session_skill itself; here we only
+        # capture whether one was, to pick a terminal status when nothing else
+        # was written.
+        wrote_skill = False
+        if c.source == CandidateSource.SESSION_COMPLETE.value:
+            try:
+                wrote_skill = await self._apply_session_skill(c)
+            except Exception:
+                _logger.exception("apply_session_skill failed cid=%s", c.id)
+
         if wrote_mem and wrote_kn:
             status = CandidateStatus.ACCEPTED_BOTH
         elif wrote_mem:
             status = CandidateStatus.ACCEPTED_MEMORY
         elif wrote_kn:
             status = CandidateStatus.ACCEPTED_KNOWLEDGE
+        elif wrote_skill:
+            status = CandidateStatus.ACCEPTED_SKILL
         else:
             status = CandidateStatus.REJECTED
         await self._store.set_candidate_status(
@@ -617,6 +1165,35 @@ class DreamWorker:
                 v.memory_update_id[:8], c.id[:8],
             )
             # fall through to insert path
+        # Identity split: CREATE with a pending archive (old entry to retire).
+        # The identity guard above converts UPDATE→CREATE+archive_id; here we
+        # honour that by archiving before inserting the replacement.
+        # Gated on IDENTITY dimension so a hallucinated archive_id on a
+        # non-identity CREATE can never silently archive an unrelated entry.
+        # If the archive fails, we abort the entire operation — creating the
+        # new entry without retiring the old would leave two contradictory
+        # identity directives both unconditionally injected.
+        if (
+            v.memory_action == VerdictAction.CREATE.value
+            and v.memory_archive_id
+            and v.memory_dimension == MemoryDimension.IDENTITY
+        ):
+            try:
+                await self._store.archive_memory_entry(
+                    v.memory_archive_id,
+                    reason="superseded",
+                )
+                _logger.info(
+                    "identity split: archived old entry=%s before create cid=%s",
+                    v.memory_archive_id[:8], c.id[:8],
+                )
+            except Exception:
+                _logger.exception(
+                    "identity split: archive old entry=%s failed cid=%s; "
+                    "aborting create to prevent duplicate identity directives",
+                    v.memory_archive_id[:8], c.id[:8],
+                )
+                raise
         entry_id = await self._store.insert_memory_entry(
             dimension=v.memory_dimension,
             summary=v.memory_summary,
@@ -624,6 +1201,7 @@ class DreamWorker:
             candidate_id=c.id,
             source=c.source,
             source_ref=c.source_ref,
+            frame=_extract_frame(c.metadata),
         )
         await self._maybe_warmup_embedding(entry_id, kind=EntryKind.MEMORY.value)
 
@@ -689,6 +1267,7 @@ class DreamWorker:
             candidate_id=c.id,
             source=c.source,
             source_ref=ref,
+            frame=_extract_frame(c.metadata),
         )
         await self._maybe_warmup_embedding(actual_id, kind=EntryKind.MEMORY.value)
         await self._store.set_candidate_status(
@@ -848,7 +1427,7 @@ class DreamWorker:
             rows = await self._store.fts_search_memory(raw_text, limit=limit)
             entries: List[Entry] = []
             for r in rows:
-                eid, _chunk_id, _text, summary, dim, _created, _rank = r
+                eid, _chunk_id, _text, summary, dim, _created, _rank, _frame_os = r
                 try:
                     dim_enum = MemoryDimension(dim) if dim else None
                 except ValueError:
@@ -857,12 +1436,24 @@ class DreamWorker:
                     id=eid, kind=EntryKind.MEMORY,
                     dimension=dim_enum, summary=summary,
                 ))
+            # Always include identity entries so the triage LLM can see
+            # them for archive/dedup decisions regardless of FTS match.
+            seen_ids = {e.id for e in entries}
+            identity_entries = await self._store.list_memory_entries(
+                dimension=MemoryDimension.IDENTITY,
+                archived=False,
+                limit=C.IDENTITY_TRIAGE_EXISTING_LIMIT,
+            )
+            for ie in identity_entries:
+                if ie.id not in seen_ids:
+                    entries.append(ie)
+                    seen_ids.add(ie.id)
             return entries
         if kind == EntryKind.KNOWLEDGE.value:
             rows = await self._store.fts_search_knowledge(raw_text, limit=limit)
             entries = []
             for r in rows:
-                eid, _chunk_id, _text, summary, cat, _created, _rank = r
+                eid, _chunk_id, _text, summary, cat, _created, _rank, _frame_os = r
                 try:
                     cat_enum = KnowledgeCategory(cat) if cat else None
                 except ValueError:
@@ -904,17 +1495,14 @@ class DreamWorker:
     async def _init_helper_pool(self) -> None:
         """Build the LLM service list the dream worker calls.
 
-        Tier choice (per ``_constants.TRIAGE_LLM_TIER``):
-          - "receptionist" (default): same model class the user-facing
-            receptionist uses. Triage is async background so latency
-            doesn't matter; quality of the worth-memory / worth-knowledge
-            classification does, and matches receptionist intent
-            classification in difficulty.
-          - "from_data": cheapest/lowest-priority slice. Use only when
-            cost dominates quality (very high LTM volume).
+        Uses ``llm.helper_models`` (cheap pool for background classification)
+        with fallback to ``llm.models`` when ``helper_models`` is empty. Triage
+        is async background so latency doesn't matter; quality of the
+        worth-memory / worth-knowledge classification does — but the helper
+        pool is sized for exactly this kind of cheap classification work.
         """
         try:
-            from src.infrastructure.role_resolver import resolve_role_models
+            from src.infrastructure.role_resolver import resolve_models_and_helper
             from src.infrastructure.llm_pool import make_from_data_services
             from src.infrastructure.anthropic_streaming_service import (
                 AnthropicStreamingService,
@@ -925,55 +1513,39 @@ class DreamWorker:
             return
 
         llm_cfg = self._config.get("llm") or {}
-        roles = resolve_role_models(llm_cfg)
         api_key = llm_cfg.get("API_KEY")
         if not api_key:
             _logger.warning("llm.API_KEY missing; dream worker has no helper services")
             return
 
-        tier = C.TRIAGE_LLM_TIER
-        if tier == C.TIER_RECEPTIONIST:
-            models: List[str] = list(roles.get(C.TIER_RECEPTIONIST) or [])
-            tier_label = C.TIER_RECEPTIONIST
-        elif tier == C.TIER_FROM_DATA:
-            models = list(roles.get(C.TIER_FROM_DATA) or [])
-            tier_label = C.TIER_FROM_DATA
-        else:
-            _logger.warning("unknown TRIAGE_LLM_TIER=%r; defaulting to receptionist", tier)
-            models = list(roles.get(C.TIER_RECEPTIONIST) or [])
-            tier_label = C.TIER_RECEPTIONIST
-
-        if not models:
-            # Tier-specific list empty → fall back through the chain:
-            #   receptionist → from_data → derive from agent pool.
+        # Use the helper pool (cheap models for background classification);
+        # fall back to the main pool when no helper is configured. As a last
+        # resort, derive from the main pool with the make_from_data_services
+        # helper which downgrades the chain to the cheaper-end models.
+        main_models, helper_models = resolve_models_and_helper(llm_cfg)
+        if helper_models:
+            models: List[str] = list(helper_models)
+            tier_label = "helper"
+        elif main_models:
             _logger.info(
-                "triage tier %s has no models; falling back to from_data/agent",
-                tier_label,
+                "triage: helper_models empty; deriving from main pool",
             )
-            from_data = list(roles.get(C.TIER_FROM_DATA) or [])
-            if from_data:
-                models = from_data
-                tier_label = f"{C.TIER_FROM_DATA} (fallback)"
-            else:
-                agent_models = list(roles.get("agent") or [])
-                # Annotate as List[LLMService] (the supertype) so List
-                # invariance doesn't reject this where make_from_data_services
-                # expects List[LLMService]. AnthropicStreamingService IS-A
-                # LLMService, but the literal list-comp is inferred as
-                # List[AnthropicStreamingService].
-                services: List[LLMService] = [
-                    AnthropicStreamingService(model=m, api_key=api_key)
-                    for m in agent_models
-                ]
-                self._helper_services = (
-                    make_from_data_services(services) if services else []
+            services: List[LLMService] = [
+                AnthropicStreamingService(model=m, api_key=api_key)
+                for m in main_models
+            ]
+            self._helper_services = (
+                make_from_data_services(services) if services else []
+            )
+            if self._helper_services:
+                _logger.info(
+                    "triage tier: main-pool-derived fallback (%d service(s))",
+                    len(self._helper_services),
                 )
-                if self._helper_services:
-                    _logger.info(
-                        "triage tier: agent-derived fallback (%d service(s))",
-                        len(self._helper_services),
-                    )
-                return
+            return
+        else:
+            _logger.warning("triage: no models in helper or main pool")
+            return
 
         self._helper_services = [
             AnthropicStreamingService(model=m, api_key=api_key)
@@ -988,20 +1560,71 @@ class DreamWorker:
     # ── Merge / exact-group scanner (post-hoc dedup) ────────────────────────
 
     async def _run_ltm_cleanup(self) -> None:
-        """Prune stale raw_text and recall_log rows (TTL = 90 days each).
+        """Prune stale LTM and observation rows on a periodic pass.
 
-        Called every LTM_CLEANUP_EVERY_N_CYCLES from the main loop. Both
+        Called every LTM_CLEANUP_EVERY_N_CYCLES from the main loop. All
         operations are pure SQL (no LLM calls) so they complete in
-        milliseconds even on large tables.
+        milliseconds even on large tables. TTLs differ per table:
+          - mem_candidates.raw_text / mem_recall_log : 90 days (seconds)
+          - mem_correction_proposals (status=pending): 30 days (seconds)
+          - obs_sessions (done/skipped, ended)       : 30 days (unix MS)
+          - obs_semantic_events (triaged)            : 30 days (seconds)
+          - mem_entries skill_proposal (un-acted)    : 30 days (archive, seconds)
+          - obs_snapshots                            : 7 days (unix MS)
+          - obs_events                               : 7 days (unix MS)
+          - obs_pipeline_runs                        : 30 days (seconds)
+
+        obs_snapshots.captured_at, obs_events.occurred_at AND
+        obs_sessions.ended_at are in unix MILLISECONDS (the SessionAggregator
+        stamps them from the snapshot's captured_at), so those cutoffs are
+        multiplied by 1000; the other cutoffs stay in seconds. Deleting a
+        snapshot cascades to obs_ocr_frames and evicts its FTS row. Stale
+        skill proposals are ARCHIVED (not deleted) and their staging dirs
+        removed; everything else is a hard DELETE.
         """
-        cutoff_raw = int(time.time()) - C.LTM_CANDIDATE_RAWTEXT_TTL_DAYS * 86400
+        now_s = int(time.time())
+        cutoff_raw = now_s - C.LTM_CANDIDATE_RAWTEXT_TTL_DAYS * 86400
         n_raw = await self._store.prune_candidate_raw_text(cutoff_raw)
-        cutoff_log = int(time.time()) - C.LTM_RECALL_LOG_TTL_DAYS * 86400
-        n_log = await self._store.prune_recall_log(cutoff_log)
-        if n_raw or n_log:
+        cutoff_log = now_s - C.LTM_RECALL_LOG_TTL_DAYS * 86400
+        n_log = await self._store.prune_mem_recall_log(cutoff_log)
+        cutoff_corr = now_s - C.LTM_CORRECTION_PROPOSAL_TTL_DAYS * 86400
+        n_corr = await self._store.prune_correction_proposals(cutoff_corr)
+        cutoff_sess_ms = (now_s - C.LTM_OBS_SESSION_TTL_DAYS * 86400) * 1000
+        n_sess = await self._store.prune_obs_sessions(cutoff_sess_ms)
+        cutoff_sem = now_s - C.LTM_OBS_SEMANTIC_EVENT_TTL_DAYS * 86400
+        n_sem = await self._store.prune_obs_semantic_events(cutoff_sem)
+        cutoff_skill = now_s - C.LTM_SKILL_PROPOSAL_TTL_DAYS * 86400
+        expired_skill_ids = await self._store.archive_stale_skill_proposals(cutoff_skill)
+        n_skill = len(expired_skill_ids)
+        if expired_skill_ids:
+            import shutil
+            from pathlib import Path
+            staging_root = Path.home() / "HandQ" / "Skill" / ".proposed"
+            for sid in expired_skill_ids:
+                staging_dir = staging_root / sid[:8]
+                try:
+                    if staging_dir.exists():
+                        await asyncio.to_thread(shutil.rmtree, staging_dir, True)
+                except Exception:
+                    _logger.debug(
+                        "auto-expire staging cleanup failed sid=%s",
+                        sid[:8], exc_info=True,
+                    )
+        cutoff_snap_ms = (now_s - C.LTM_OBS_SNAPSHOT_TTL_DAYS * 86400) * 1000
+        n_snap = await self._store.prune_obs_snapshots(cutoff_snap_ms)
+        cutoff_evt_ms = (now_s - C.LTM_OBS_EVENT_TTL_DAYS * 86400) * 1000
+        n_evt = await self._store.prune_obs_events(cutoff_evt_ms)
+        cutoff_run = now_s - C.LTM_OBS_PIPELINE_RUN_TTL_DAYS * 86400
+        n_run = await self._store.prune_obs_pipeline_runs(cutoff_run)
+        if (n_raw or n_log or n_corr or n_sess or n_sem or n_skill
+                or n_snap or n_evt or n_run):
             _logger.info(
-                "ltm cleanup: cleared raw_text=%d candidates, recall_log=%d rows",
-                n_raw, n_log,
+                "ltm cleanup: raw_text=%d candidates, recall_log=%d rows, "
+                "correction_proposals=%d pending, obs_sessions=%d, "
+                "obs_semantic_events=%d, skill_proposals=%d archived, "
+                "obs_snapshots=%d, obs_events=%d, obs_pipeline_runs=%d",
+                n_raw, n_log, n_corr, n_sess, n_sem, n_skill,
+                n_snap, n_evt, n_run,
             )
 
     async def _run_merge_scan(self) -> None:
@@ -1009,34 +1632,58 @@ class DreamWorker:
 
         For each kind: pull every non-archived entry's representative
         embedding (chunk 0), brute-force cosine over all pairs, classify:
-          - similarity >= MERGE_EXACT_THRESHOLD   → auto-merge
-          - similarity >= MERGE_PROPOSE_THRESHOLD → propose to user
+          - similarity >= MERGE_EXACT_THRESHOLD     → auto-merge
+          - similarity in [LLM_GATE, EXACT)         → helper-LLM arbiter
+          - similarity < LLM_GATE                   → keep both (no write)
+
+        A merge is suppressed when the older (to-be-archived) entry was
+        recalled within CORRECTION_RECALL_PRIORITY_DAYS: an actively-used
+        entry is load-bearing, so both are kept and the pair is re-checked
+        on the next scan (protection expires with the recall window).
 
         Skips pairs younger than ``MERGE_MIN_PAIR_AGE_SECONDS`` so two
         candidates from the same triage batch (which the LLM already
         decided are distinct) aren't second-guessed.
+
+        The LLM-arbiter band shares one ``MERGE_LLM_MAX_PAIRS_PER_SCAN``
+        budget across both kinds, and skips pairs already judged (their
+        verdict is persisted as merged / kept_distinct), so a borderline
+        pair costs at most one helper-LLM call ever — not one per scan.
         """
         if not self._embedder.available:
             return  # No vectors → nothing to compare
+        decided = await self._store.list_decided_merge_pairs()
+        llm_budget = C.MERGE_LLM_MAX_PAIRS_PER_SCAN
         for kind in (EntryKind.MEMORY.value, EntryKind.KNOWLEDGE.value):
             try:
-                await self._run_merge_scan_kind(kind)
+                llm_budget = await self._run_merge_scan_kind(
+                    kind, decided=decided, llm_budget=llm_budget,
+                )
             except Exception:
                 _logger.exception("merge scan failed for kind=%s", kind)
 
-    async def _run_merge_scan_kind(self, kind: str) -> None:
+    async def _run_merge_scan_kind(
+        self, kind: str, *, decided: set, llm_budget: int,
+    ) -> int:
         rows = await self._store.list_entry_centroids(
             kind=kind,
             provider=self._embedder.provider,
             model=self._embedder.model,
         )
         if len(rows) < 2:
-            return  # Nothing to compare against
+            return llm_budget  # Nothing to compare against
 
         # Decode once up-front so we don't unpack bytes inside the inner loop.
         decoded = []
         now = int(time.time())
-        for entry_id, summary, created_at, updated_at, emb_bytes in rows:
+        for row in rows:
+            # LTM 2.0: list_entry_centroids returns 6-tuple
+            # (entry_id, summary, created_at, updated_at, emb_bytes, frame_os)
+            entry_id = row[0]
+            summary = row[1]
+            created_at = row[2]
+            updated_at = row[3]
+            emb_bytes = row[4]
             vec = vec_from_bytes(emb_bytes)
             if vec:
                 decoded.append((
@@ -1044,10 +1691,10 @@ class DreamWorker:
                     int(updated_at or now), vec,
                 ))
         if len(decoded) < 2:
-            return
+            return llm_budget
 
         exact_pairs = []
-        propose_pairs = []
+        arbiter_pairs = []
         # O(n^2) pairwise. At ~1500 entries × ~1024 dim that's
         # ~1.1M comparisons × cheap cosine ≈ <2s in pure Python.
         # When we cross 5000 entries we'll need an ANN structure.
@@ -1062,12 +1709,16 @@ class DreamWorker:
                 sim = cosine(av, bv)
                 if sim >= C.MERGE_EXACT_THRESHOLD:
                     exact_pairs.append((ai, bi, au, bu, sim))
-                elif sim >= C.MERGE_PROPOSE_THRESHOLD:
-                    propose_pairs.append((ai, bi, sim))
+                elif sim >= C.MERGE_LLM_GATE_THRESHOLD:
+                    arbiter_pairs.append((ai, bi, au, bu, asum, bsum, sim))
+                # sim < MERGE_LLM_GATE_THRESHOLD → keep both, write nothing.
 
         # Auto-merge: keep newer (higher updated_at), archive older.
         for ai, bi, au, bu, sim in exact_pairs:
             keep, drop = (ai, bi) if au >= bu else (bi, ai)
+            # Recall protection: don't archive an actively-recalled entry.
+            if await self._recently_recalled(drop, kind):
+                continue
             try:
                 await self._auto_merge(
                     kind=kind, keep_id=keep, drop_id=drop, similarity=sim,
@@ -1078,23 +1729,137 @@ class DreamWorker:
                     kind, keep[:8], drop[:8],
                 )
 
-        # Propose: write to merge_proposals; bridge / future UI surfaces.
-        for ai, bi, sim in propose_pairs:
+        # LLM arbiter for the [0.85, 0.90) band. Without a helper LLM we
+        # cannot judge the band, so skip it entirely (write nothing). The
+        # pre-LLM behaviour staged a 'pending' review proposal "so no signal
+        # is lost", but HandQ has no review surface — that row was never
+        # consumed, and because a pending pair is NOT in the decided-memo
+        # (list_decided_merge_pairs returns only merged/kept_distinct) the
+        # same pair was re-staged on every scan → unbounded growth. Skipping
+        # is lossless: the pair is re-evaluated on the next scan once a helper
+        # pool is wired.
+        if not self._helper_services:
+            arbiter_pairs = []
+
+        # Judge most-similar pairs first so a tight budget spends on the
+        # likeliest duplicates.
+        arbiter_pairs.sort(key=lambda t: t[6], reverse=True)
+        arbiter_merged = 0
+        arbiter_distinct = 0
+        for ai, bi, au, bu, asum, bsum, sim in arbiter_pairs:
+            if llm_budget <= 0:
+                break
+            pair = frozenset((ai, bi))
+            if pair in decided:
+                continue
+            # Recall protection: the older entry is the merge's drop target.
+            # If it's actively recalled, keep both and skip the LLM call so no
+            # budget is spent; the pair is re-checked next scan and protection
+            # expires with the recall window.
+            drop_candidate = ai if au < bu else bi
+            if await self._recently_recalled(drop_candidate, kind):
+                continue
+            llm_budget -= 1  # an attempted call counts against the cap
             try:
-                await self._store.insert_merge_proposal(
-                    kind=kind, entry_a_id=ai, entry_b_id=bi, similarity=sim,
+                same = await self._arbitrate_merge(
+                    asum or "", bsum or "", sim,
                 )
             except Exception:
                 _logger.exception(
-                    "insert_merge_proposal failed kind=%s a=%s b=%s",
+                    "merge arbiter LLM failed kind=%s a=%s b=%s",
                     kind, ai[:8], bi[:8],
                 )
+                continue  # leave undecided; retry next scan
+            decided.add(pair)  # judged → never re-send to the LLM
+            if same:
+                keep, drop = (ai, bi) if au >= bu else (bi, ai)
+                try:
+                    await self._auto_merge(
+                        kind=kind, keep_id=keep, drop_id=drop, similarity=sim,
+                    )
+                    arbiter_merged += 1
+                except Exception:
+                    _logger.exception(
+                        "arbiter auto-merge failed kind=%s keep=%s drop=%s",
+                        kind, keep[:8], drop[:8],
+                    )
+            else:
+                # Persist 'keep both' so the pair is skipped on future scans.
+                try:
+                    pid = await self._store.insert_merge_proposal(
+                        kind=kind, entry_a_id=ai, entry_b_id=bi, similarity=sim,
+                    )
+                    await self._store.resolve_merge_proposal(
+                        proposal_id=pid, status="kept_distinct",
+                    )
+                    arbiter_distinct += 1
+                except Exception:
+                    _logger.exception(
+                        "arbiter kept_distinct record failed kind=%s a=%s b=%s",
+                        kind, ai[:8], bi[:8],
+                    )
 
-        if exact_pairs or propose_pairs:
+        if exact_pairs or arbiter_pairs:
             _logger.info(
-                "merge scan kind=%s: auto-merged=%d, proposed=%d",
-                kind, len(exact_pairs), len(propose_pairs),
+                "merge scan kind=%s: auto-merged=%d, arbiter(merged=%d, "
+                "distinct=%d)",
+                kind, len(exact_pairs), arbiter_merged, arbiter_distinct,
             )
+        return llm_budget
+
+    async def _arbitrate_merge(
+        self, summary_a: str, summary_b: str, similarity: float,
+    ) -> bool:
+        """Ask the helper LLM whether two near-duplicate entries are the
+        same memory. Returns True (merge) or False (keep distinct).
+
+        Only called for the [0.85, 0.90) similarity band: >=0.90 auto-merges
+        and <0.85 keeps both silently. Unparseable / ambiguous
+        replies fall back to False — keeping both entries never loses data.
+        """
+        from src.infrastructure.llm_pool import call_with_fallback
+
+        user_prompt = (
+            "Two long-term memory entries scored embedding cosine similarity "
+            f"{similarity:.3f}.\n\n"
+            f"ENTRY A:\n{summary_a}\n\n"
+            f"ENTRY B:\n{summary_b}\n\n"
+            "Are they the same memory (one redundant), or distinct? Reply JSON."
+        )
+        result = await call_with_fallback(
+            self._helper_services,
+            dict(
+                messages=[
+                    {"role": "system", "content": MERGE_ARBITER_SYSTEM},
+                    {"role": "user", "content": user_prompt},
+                ],
+                json_mode=True,
+                max_tokens=200,
+            ),
+        )
+        try:
+            data = json.loads((result.content or "").strip())
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return False  # conservative: keep both
+        return data.get("same") is True
+
+    async def _recently_recalled(self, entry_id: str, kind: str) -> bool:
+        """True if *entry_id* was recalled within CORRECTION_RECALL_PRIORITY_DAYS.
+
+        Protects actively-used entries from auto-merge archival: an entry the
+        user keeps pulling up is load-bearing, so we keep both near-duplicates
+        rather than silently dropping the older one. Fails open (returns
+        False) so a recall-log hiccup never blocks dedup.
+        """
+        try:
+            n = await self._store.count_recent_recalls(
+                entry_id=entry_id,
+                kind=kind,
+                since_seconds=C.CORRECTION_RECALL_PRIORITY_DAYS * 86400,
+            )
+        except Exception:
+            return False
+        return n > 0
 
     async def _auto_merge(
         self,
@@ -1128,7 +1893,7 @@ class DreamWorker:
         )
         # Immediately resolve as 'merged' since we already executed.
         # Find the proposal we just wrote (it's the most recent pending pair).
-        for pid, _k, ea, eb, _sim, _ts in await self._store.list_merge_proposals(
+        for pid, _, ea, eb, _, _ in await self._store.list_merge_proposals(
             status="pending", limit=10,
         ):
             if {ea, eb} == {keep_id, drop_id}:
@@ -1140,32 +1905,31 @@ class DreamWorker:
     # ── L2 / L3 dream synthesis ─────────────────────────────────────────────
 
     async def _should_run_synthesis(self, *, level: int) -> bool:
-        """Wall-clock gate for L2/L3 dream synthesis.
+        """Idle-aware gate for L2/L3 dream synthesis.
 
-        Returns True when the most recent successful run for *level*
-        (across BOTH memory and knowledge kinds) is older than the
-        configured cadence. Surviving restarts is the whole point: a
-        cycle-counter gate would reset on every bridge launch, so a
-        user who closes HandQ before 24h is up would never see L2.
+        Three conditions must ALL be met:
+          1. Wall-clock cadence: time since last run ≥ configured interval
+          2. Idle gate: system input idle ≥ DREAM_SYNTHESIS_IDLE_SEC
+          3. Material gate: enough new source entries accumulated
 
-        Cadence:
-          - level 2  →  ``DREAM_L2_EVERY_N_CYCLES * DREAM_INTERVAL_SECONDS``
-                        (default 24h)
-          - level 3  →  ``DREAM_L3_EVERY_N_CYCLES * DREAM_INTERVAL_SECONDS``
-                        (default 7d)
+        Hard fallback: if the cadence gap exceeds DREAM_SYNTHESIS_FORCE_
+        AFTER_SEC (7 days), conditions 2 and 3 are bypassed — synthesis
+        runs regardless, preventing unbounded memory growth for users who
+        never stay idle long enough.
 
-        Failure-mode handling: if a previous run is still ``running`` or
-        ended in ``failed`` we still allow a new attempt past the cadence
-        so a transient failure can't permanently block synthesis.
+        Surviving restarts: the gate uses the wall-clock timestamp of the
+        most recent ``dream_runs`` row, not in-memory cycle counts.
         """
         if level == 2:
             min_age_seconds = (
                 C.DREAM_L2_EVERY_N_CYCLES * C.DREAM_INTERVAL_SECONDS
             )
+            min_new_entries = C.DREAM_L2_MIN_NEW_ENTRIES
         elif level == 3:
             min_age_seconds = (
                 C.DREAM_L3_EVERY_N_CYCLES * C.DREAM_INTERVAL_SECONDS
             )
+            min_new_entries = C.DREAM_L3_MIN_NEW_ENTRIES
         else:
             return False
 
@@ -1188,10 +1952,58 @@ class DreamWorker:
             started = int(row[1] or 0)
             if started > latest:
                 latest = started
+
         if latest == 0:
-            # No run yet on this DB → fire as soon as we have material.
+            # No run yet on this DB → fire as soon as we have material
+            # (still respect idle gate for first run).
+            pass
+        elif (now - latest) < int(min_age_seconds):
+            # Cadence not met — too soon since last run.
+            return False
+
+        # ── Hard fallback: force after 7 days regardless of idle/material
+        gap = now - latest if latest > 0 else C.DREAM_SYNTHESIS_FORCE_AFTER_SEC
+        force = gap >= C.DREAM_SYNTHESIS_FORCE_AFTER_SEC
+        if force:
+            _logger.info(
+                "L%d synthesis force-firing: %dd since last run (cap=%dd)",
+                level, gap // 86400, C.DREAM_SYNTHESIS_FORCE_AFTER_SEC // 86400,
+            )
             return True
-        return (now - latest) >= int(min_age_seconds)
+
+        # ── Idle gate: don't compete with user activity
+        from ..personality.input_idle import system_idle_seconds
+        idle = system_idle_seconds()
+        if idle is None:
+            # Non-Windows or GetLastInputInfo failed — skip the idle gate
+            # so synthesis still works (degrades to cadence-only).
+            pass
+        elif idle < C.DREAM_SYNTHESIS_IDLE_SEC:
+            return False
+
+        # ── Material gate: enough new entries to justify clustering
+        try:
+            since_ts = latest if latest > 0 else 0
+            new_count = await self._store.count_entries_since(
+                kind=EntryKind.MEMORY.value,
+                since_ts=since_ts,
+                synthesis_level=(0 if level == 2 else 2),
+            )
+            # Also count knowledge entries — synthesis runs on both kinds
+            new_count += await self._store.count_entries_since(
+                kind=EntryKind.KNOWLEDGE.value,
+                since_ts=since_ts,
+                synthesis_level=(0 if level == 2 else 2),
+            )
+        except Exception:
+            _logger.debug("count_entries_since failed L%d", level, exc_info=True)
+            # On failure, don't block synthesis — fall through.
+            return True
+
+        if new_count < min_new_entries:
+            return False
+
+        return True
 
     async def _run_dream_synthesis(self, *, level: int) -> None:
         """Run L2 (level=2) or L3 (level=3) synthesis on both memory and
@@ -1273,7 +2085,16 @@ class DreamWorker:
         try:
             # ── 2. Decode embeddings + greedy cluster
             decoded = []
-            for entry_id, facet, summary, content_text, emb_bytes in rows:
+            for row in rows:
+                # LTM 2.0: list_entries_by_synthesis_level returns 6-tuple
+                # (entry_id, facet, summary, content_text, emb_bytes, frame_os).
+                # frame_os is None for frame-agnostic entries.
+                entry_id = row[0]
+                facet = row[1]
+                summary = row[2]
+                content_text = row[3]
+                emb_bytes = row[4]
+                frame_os = row[5] if len(row) > 5 else None
                 vec = vec_from_bytes(emb_bytes)
                 if vec:
                     decoded.append({
@@ -1282,11 +2103,18 @@ class DreamWorker:
                         "summary": summary,
                         "content": content_text,
                         "vec": vec,
+                        "frame_os": frame_os,
                     })
 
-            clusters = self._greedy_cluster(
-                decoded, threshold=cluster_threshold,
-                min_size=min_size,
+            # LTM 2.0 frame partition: cluster INSIGHT entries (memory.insight)
+            # SEPARATELY per frame_os. AGENTIC / IDENTITY / all-of-knowledge
+            # are frame-agnostic so they cluster unpartitioned. This prevents
+            # the "wine-bug Frankenstein" synthesis where a Linux-frame
+            # observation and a Windows-frame observation get fused into a
+            # single context-blind L2 entry.
+            clusters = self._cluster_with_frame_partition(
+                decoded, kind=kind,
+                threshold=cluster_threshold, min_size=min_size,
             )
             # ── 3. Slice + cap
             clusters = clusters[:max_clusters]
@@ -1362,6 +2190,50 @@ class DreamWorker:
         clusters = [c for c in clusters if len(c) >= min_size]
         clusters.sort(key=len, reverse=True)
         return clusters
+
+    @classmethod
+    def _cluster_with_frame_partition(
+        cls, items: List[dict], *, kind: str,
+        threshold: float, min_size: int,
+    ) -> List[List[dict]]:
+        """LTM 2.0 frame-aware clustering.
+
+        For memory INSIGHT entries: partition by ``frame_os`` so that
+        observations captured on different execution frames (windows vs
+        linux vs remote) never fuse into a single L2 synthesis. This is
+        the structural fix that prevents the "wine-bug Frankenstein"
+        described in the LTM 2.0 plan §4.
+
+        For AGENTIC / IDENTITY / all-of-knowledge: clustering is
+        unpartitioned because those facets carry frame-agnostic
+        information (user preferences, team facts).
+        """
+        if kind != EntryKind.MEMORY.value:
+            # knowledge: no partition
+            return cls._greedy_cluster(
+                items, threshold=threshold, min_size=min_size,
+            )
+        # Memory: split INSIGHT items by frame_os, AGENTIC unpartitioned.
+        insight_buckets: dict = {}
+        non_insight: List[dict] = []
+        for it in items:
+            if it.get("facet") == MemoryDimension.INSIGHT.value:
+                bucket_key = it.get("frame_os") or "_null_"
+                insight_buckets.setdefault(bucket_key, []).append(it)
+            else:
+                non_insight.append(it)
+        all_clusters: List[List[dict]] = []
+        for bucket_key, bucket_items in insight_buckets.items():
+            for c in cls._greedy_cluster(
+                bucket_items, threshold=threshold, min_size=min_size,
+            ):
+                all_clusters.append(c)
+        for c in cls._greedy_cluster(
+            non_insight, threshold=threshold, min_size=min_size,
+        ):
+            all_clusters.append(c)
+        all_clusters.sort(key=len, reverse=True)
+        return all_clusters
 
     async def _apply_synth_cluster(
         self,
@@ -1448,6 +2320,22 @@ class DreamWorker:
             )
             return False
 
+        # LTM 2.0: when all sources of an INSIGHT cluster share a frame_os
+        # (true by construction because _cluster_with_frame_partition split
+        # them by frame), stamp that frame onto the synthesis row so it
+        # remains filterable by recall. AGENTIC / IDENTITY / knowledge
+        # clusters get frame=None (they're frame-agnostic).
+        synth_frame = None
+        if kind == EntryKind.MEMORY.value and facet == MemoryDimension.INSIGHT.value:
+            cluster_frames = {it.get("frame_os") for it in cluster if it.get("frame_os")}
+            if len(cluster_frames) == 1:
+                # Single shared frame — preserve it
+                only_os = next(iter(cluster_frames))
+                synth_frame = {
+                    "os": only_os, "host": "unknown",
+                    "confidence": 0.75, "evidence": f"dream_l{level}_synth",
+                }
+
         synth_id = await self._store.insert_synthesis_entry(
             kind=kind,
             target_facet=facet,
@@ -1456,6 +2344,7 @@ class DreamWorker:
             synthesis_level=level,
             source_entry_ids=[it["id"] for it in cluster],
             source_run_id=run_id,
+            frame=synth_frame,
         )
         # Archive the source entries that the synthesis subsumed.
         # Without this, recall returns BOTH the cluster originals AND the

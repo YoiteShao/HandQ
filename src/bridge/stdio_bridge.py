@@ -70,14 +70,15 @@ def _redact_payload(obj: Any, n: int = 200) -> str:
         text = "<unserialisable>"
     return _truncate(text, n)
 
-# Existing public symbols — imported per porting_design.md §3.1.
-# These imports are required by the design contract; they are not all used
-# at startup (FlowController is built lazily on the first 'request' message
-# so that config-only round-trips do not need an API key).
-from src.controller.flow_controller import FlowController  # noqa: F401
-from src.controller.interaction_manager import InteractionManager
-from src.models.decision import Decision
-from src.models.state import UserConfirmation
+# Public symbols imported from the controller stack. FlowControllerV2
+# is built lazily on the first 'request' so config-only round-trips don't
+# need an API key. UserConfirmation is the value type returned by our async
+# _StdioUI confirmation handlers; the InteractionManager is imported for
+# typing only — the bridge never constructs one (FlowControllerV2 owns its
+# IM and exposes it as ``flow.interaction_manager``).
+from src.controller_v2.flow_controller import FlowControllerV2
+from src.controller_v2.interaction_manager import InteractionManager  # noqa: F401  (type only)
+from src.controller_v2.user_confirmation import UserConfirmation
 from src.infrastructure.anthropic_streaming_service import (  # noqa: F401
     AnthropicStreamingService,
     StreamTextDeltaEvent,
@@ -85,6 +86,7 @@ from src.infrastructure.anthropic_streaming_service import (  # noqa: F401
     StreamDoneEvent,
 )
 from src.infrastructure.config_manager import ConfigManager
+from src.infrastructure.llm_service import LLMService
 
 
 DEFAULT_CONFIG_PATH = "./handq_config.yaml"
@@ -340,8 +342,16 @@ def _slugify_goal(goal: str, max_len: int = 40) -> str:
     return cleaned[:max_len]
 
 
-def _allocate_session_dir(goal: str) -> Path:
-    """Create %USERPROFILE%\\HandQ\\History\\<TS>-<slug>\\ and return it."""
+def _allocate_session_dir(goal: str, workspace_subdir: str = ".workspace") -> Path:
+    """Create %USERPROFILE%\\HandQ\\History\\<TS>-<slug>\\ and pre-create the
+    inner agent workspace subdir. Returns the session root.
+
+    The agent's prompt only ever sees ``<session>/<workspace_subdir>/``. The
+    session root itself holds framework metadata (handq-engine.log,
+    executions_logs/) and is invisible to the LLM — keeping the workspace as a
+    dedicated child means even an absolute-path slip-up by the agent lands
+    inside the session subtree, not the user's filesystem.
+    """
     ts = time.strftime("%Y%m%d-%H%M%S")
     slug = _slugify_goal(goal)
     base = _session_history_root()
@@ -352,6 +362,7 @@ def _allocate_session_dir(goal: str) -> Path:
         n += 1
         candidate = base / f"{ts}-{slug}-{n}"
     candidate.mkdir(parents=True, exist_ok=True)
+    (candidate / workspace_subdir).mkdir(exist_ok=True)
     return candidate
 
 
@@ -418,186 +429,129 @@ def _emit(obj: Dict[str, Any], gen: Optional[int] = None) -> None:
 
 
 class _StdioUI:
-    """
-    UI delegate registered via ``InteractionManager.set_ui``.
+    """V2 ``UIDelegate`` implementation for the Electron renderer.
 
-    Method names match the ``_BackgroundUI`` protocol used by the engine;
-    every call is serialised to a JSON envelope on stdout. Methods the
-    engine does not call are simply absent (InteractionManager skips them
-    silently — see interaction_manager.py:141).
+    Each method serialises a JSON envelope onto the IPC stdout. The async
+    ``request_*`` methods register an ``asyncio.Future`` keyed by prompt id;
+    the stdin-reader thread resolves the matching future via
+    :meth:`deliver_confirmation_response` when the user answers the modal.
 
-    Generation tag: every _StdioUI instance is born with a generation
-    number captured at construction time. The bridge bumps the
-    generation in `_do_new_session` and constructs a *fresh* _StdioUI
-    for the new singleton — the OLD _StdioUI remains attached to the
-    old InteractionManager (still referenced by the old FlowController's
-    captured singleton ref), so any straggling notify_* call from a
-    wedged old subtask emits with the OLD generation. The renderer
-    drops those, so the new conversation never sees old-flow content.
+    Generation tag: each instance is born with a generation captured at
+    construction; every envelope carries it. ``_do_new_session`` bumps gen
+    and builds a fresh ``_StdioUI``, leaving the OLD instance bound to the
+    OLD flow's ``InteractionManager``. Stragglers from the old flow keep
+    emitting with the OLD generation; the renderer's gen-watermark drops
+    them, so the new conversation never sees old-flow content.
     """
 
-    def __init__(self, generation: int = 0, im: Optional[InteractionManager] = None) -> None:
+    def __init__(self, generation: int = 0) -> None:
         self._generation = generation
-        # InteractionManager reference is required for the confirmation
-        # methods (request_risk_confirmation / request_tool_confirmation /
-        # request_secret_input) to install a pending-callback into the IM
-        # so inbound `user_input.kind=confirmation` envelopes can unblock
-        # the waiter. None is allowed only for legacy code paths that
-        # never call those methods.
-        self._im: Optional[InteractionManager] = im
+        # Bridge-owned confirmation registry. The IM is a clean async
+        # forwarder with no internal state to hook, so the bridge keeps
+        # its own pending-future map.
+        self._pending: Dict[str, "asyncio.Future[str]"] = {}
+        self._pending_lock = threading.Lock()
+        # Loop captured by ``StdioBridge`` after construction so confirmation
+        # responses (delivered from the stdin-reader thread) can resolve
+        # futures via ``call_soon_threadsafe``. ``None`` until bound.
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
-    # --- generic display ----------------------------------------------------
-    def display_message(self, msg: str) -> None:
-        _ui_logger.debug("display_message: %s", _truncate(msg))
-        _emit({"type": "status", "kind": "message", "text": str(msg)},
-              gen=self._generation)
+    def deliver_confirmation_response(self, prompt_id: str, answer: str) -> None:
+        """Resolve a pending confirmation future. Called from the stdin
+        reader thread when ``user_input.kind=confirmation`` arrives.
+        Uses ``call_soon_threadsafe`` so the future's result is set on the
+        asyncio loop owned by the bridge.
+        """
+        with self._pending_lock:
+            fut = self._pending.pop(prompt_id, None)
+        if fut is None:
+            _ui_logger.warning(
+                "deliver_confirmation_response: no pending future for id=%s",
+                prompt_id,
+            )
+            return
+        if self._loop is None or fut.done():
+            return
+        try:
+            self._loop.call_soon_threadsafe(fut.set_result, answer)
+        except RuntimeError:
+            # Loop closed during shutdown — best-effort; future is dropped.
+            pass
 
-    def display_receptionist_reply(self, msg: str) -> None:
-        _ui_logger.debug("display_receptionist_reply: %s", _truncate(msg))
-        _emit({"type": "status", "kind": "reply", "text": str(msg)},
-              gen=self._generation)
+    # ── V2 UIDelegate Protocol — fire-and-forget ──────────────────────────
 
     def display_error(self, msg: str) -> None:
         _ui_logger.error("display_error: %s", _truncate(msg))
         _emit({"type": "error", "where": "engine", "message": str(msg),
                "fatal": False}, gen=self._generation)
 
-    def display_progress_status(self, current: int, total: int) -> None:
-        _ui_logger.debug("display_progress_status: %s/%s", current, total)
-        _emit({"type": "status", "kind": "progress",
-               "current": current, "total": total}, gen=self._generation)
-
-    # --- state / step events -----------------------------------------------
     def show_state_changed(self, state: Any) -> None:
         _ui_logger.debug("show_state_changed: %s", _truncate(state))
         _emit({"type": "status", "kind": "state_changed", "state": str(state)},
               gen=self._generation)
 
-    def show_step_started(self, step_id: Any, desc: str = "") -> None:
-        _ui_logger.debug("show_step_started: id=%s desc=%s", step_id, _truncate(desc))
-        _emit({"type": "status", "kind": "step_started",
-               "step_id": str(step_id), "desc": str(desc)},
-              gen=self._generation)
-
-    def show_step_completed(self, step_id: Any, desc: str = "") -> None:
-        _ui_logger.debug("show_step_completed: id=%s desc=%s", step_id, _truncate(desc))
-        _emit({"type": "status", "kind": "step_completed",
-               "step_id": str(step_id), "desc": str(desc)},
-              gen=self._generation)
-
-    # --- engine notifications ----------------------------------------------
-    def notify_decision_made(self, *args: Any, **kwargs: Any) -> None:
-        _ui_logger.debug("notify_decision_made: args=%s kwargs=%s",
-                         _redact_payload(list(args)), _redact_payload(kwargs))
-        _emit({"type": "status", "kind": "decision_made",
-               "args": [str(a) for a in args],
-               "kwargs": {k: str(v) for k, v in kwargs.items()}},
-              gen=self._generation)
-
-    def notify_tool_execution_started(self, *args: Any, **kwargs: Any) -> None:
-        _ui_logger.debug("notify_tool_execution_started: args=%s kwargs=%s",
-                         _redact_payload(list(args)), _redact_payload(kwargs))
-        _emit({"type": "status", "kind": "tool_execution_started",
-               "args": [str(a) for a in args],
-               "kwargs": {k: str(v) for k, v in kwargs.items()}},
-              gen=self._generation)
-
-    def notify_step_confidence(self, *args: Any, **kwargs: Any) -> None:
-        _ui_logger.debug("notify_step_confidence: args=%s kwargs=%s",
-                         _redact_payload(list(args)), _redact_payload(kwargs))
-        _emit({"type": "status", "kind": "step_confidence",
-               "args": [str(a) for a in args],
-               "kwargs": {k: str(v) for k, v in kwargs.items()}},
-              gen=self._generation)
-
-    def notify_task_completed(self, *args: Any, **kwargs: Any) -> None:
-        _ui_logger.debug("notify_task_completed: args=%s kwargs=%s",
-                        _redact_payload(list(args)), _redact_payload(kwargs))
-        _emit({"type": "status", "kind": "task_completed",
-               "args": [str(a) for a in args],
-               "kwargs": {k: str(v) for k, v in kwargs.items()}},
-              gen=self._generation)
-
-    # InteractionManager.notify_task_completed routes through
-    # _ui_call("show_task_completed", summary) (interaction_manager.py:554),
-    # so we MUST expose show_task_completed by that exact name. The previous
-    # build only had notify_task_completed, which was never invoked from the
-    # engine — the renderer therefore never saw the completion event. Promote
-    # the summary to a top-level field so the renderer can read it directly.
-    def show_task_completed(self, summary: Any = "", *args: Any, **kwargs: Any) -> None:
-        text = "" if summary is None else str(summary)
-        _ui_logger.debug("show_task_completed: %s", _truncate(text))
-        _emit({"type": "status", "kind": "task_completed",
-               "summary": text}, gen=self._generation)
-
-    def show_metrics_report(self, markdown: str) -> None:
-        _ui_logger.debug("show_metrics_report: %s", _truncate(markdown))
-        _emit({"type": "status", "kind": "metrics_report", "text": str(markdown)},
-              gen=self._generation)
-
-    def show_receptionist_thinking(self) -> None:
-        _ui_logger.debug("show_receptionist_thinking")
-        _emit({"type": "status", "kind": "receptionist_thinking_on"},
-              gen=self._generation)
-
-    def clear_receptionist_thinking(self) -> None:
-        _ui_logger.debug("clear_receptionist_thinking")
-        _emit({"type": "status", "kind": "receptionist_thinking_off"},
-              gen=self._generation)
-
-    def stream_receptionist_reply_chunk(self, text: str) -> None:
-        _emit({"type": "status", "kind": "reply_delta", "text": str(text)},
-              gen=self._generation)
-
-    def seal_receptionist_reply(self) -> None:
-        _emit({"type": "status", "kind": "reply_done"},
-              gen=self._generation)
-
-    # ── GEP countdown ──────────────────────────────────────────────────────
-    # FlowController._planner_loop fires notify_gep_countdown(remaining, name)
-    # once per second while waiting for the user to confirm a matched template.
-    # remaining_secs == -1 clears the timer (templates declined / activated).
-    def show_gep_countdown(self, remaining_secs: int, template_name: str) -> None:
-        _emit({"type": "status", "kind": "gep_countdown",
-               "remaining": int(remaining_secs),
-               "template_name": str(template_name or "")},
-              gen=self._generation)
-
-    def show_gep_intro(self, template_info: Any) -> None:
-        """One-shot structured template info; renderer opens the parameter panel."""
-        info = template_info if isinstance(template_info, dict) else {}
-        _emit({"type": "status", "kind": "gep_intro",
-               "template": info},
-              gen=self._generation)
-
     def show_inline_event(self, icon: str, desc: str) -> None:
-        """Emit a one-line status event styled like a planner step.
-
-        Used for short GEP-flow banners (saving / activated / instantiation
-        failed) that should appear as a tight icon + text line, identical
-        in style to step_started events. The renderer maps kind=inline_event
-        to addStepBubble.
+        """Single-line status banner (icon + text). Renderer maps
+        ``kind=inline_event`` to addStepBubble.
         """
         _emit({"type": "status", "kind": "inline_event",
                "icon": str(icon or "·"),
                "desc": str(desc or "")},
               gen=self._generation)
 
-    # ── Desktop takeover indicator ──────────────────────────────────────────
-    #
-    # InteractionManager._ui_call invokes these via getattr() when the
-    # desktop tool's input-action guard fires the start/end events. The
-    # Electron main process (electron/main.js) listens for the resulting
-    # status envelopes and shows / hides the fullscreen takeover overlay.
-    # Without these methods the events would be silently dropped — which
-    # was the bug pre-2026-05.
+    def show_recall_started(self) -> None:
+        """LTM recall in flight. Renderer maps ``kind=recall_started`` to a
+        transient 'recalling…' label on the activity strip, superseded by the
+        next state / decision / tool event.
+        """
+        _emit({"type": "status", "kind": "recall_started"},
+              gen=self._generation)
+
+    def notify_decision_made(
+        self, iteration: int, reasoning: str, token_count: int = 0,
+    ) -> None:
+        _ui_logger.debug("notify_decision_made: iter=%s tokens=%s",
+                         iteration, token_count)
+        # Renderer reads args[0]=iter, args[1]=reasoning (renderer.js:2004-2007).
+        _emit({"type": "status", "kind": "decision_made",
+               "args": [str(iteration), str(reasoning), str(token_count)],
+               "kwargs": {}},
+              gen=self._generation)
+
+    def notify_tool_execution_started(
+        self,
+        iteration: int,
+        tool_name: Optional[str],
+        params: Optional[Dict[str, Any]],
+        output: Any,
+    ) -> None:
+        _ui_logger.debug("notify_tool_execution_started: iter=%s tool=%s",
+                         iteration, tool_name)
+        # Renderer reads args[0..3] = iter, tool, params, output
+        # (renderer.js:2009-2045). Pre-event has output=None; post-event
+        # has output set. Both are emitted by V2 PersistentAgent.
+        _emit({"type": "status", "kind": "tool_execution_started",
+               "args": [str(iteration),
+                        str(tool_name) if tool_name else "",
+                        params,
+                        output],
+               "kwargs": {}},
+              gen=self._generation)
+
+    # ── Non-Protocol forwarders (called by IM via ``_ui_call``) ──────────
+    # The V2 ``UIDelegate`` Protocol is intentionally minimal. These methods
+    # receive events the Protocol doesn't list — the IM's ``_ui_call`` resolves
+    # them by string name and silently skips when missing. Tools / receptionist
+    # streaming hook here; renderer-side handlers stay unchanged.
+
     def notify_desktop_takeover_started(self, reason: str = "input_action") -> None:
+        """Desktop tool entered an input-driving phase. Pause the activity
+        monitor (so its OCR samples don't capture agent-driven mouse / keyboard
+        events) and emit the ``desktop_takeover_started`` envelope so the
+        Electron overlay shows the fullscreen border + Ctrl+Shift+C revoke
+        hook.
+        """
         _ui_logger.debug("notify_desktop_takeover_started: reason=%s", reason)
-        # Pause the activity monitor while the desktop tool is driving
-        # the screen — capture during takeover would (a) interleave with
-        # the agent's own mouse / keyboard events, polluting OCR samples,
-        # and (b) potentially capture content the user already approved
-        # to share with a specific tool but not with LTM.
         try:
             if personality_monitor is not None:
                 personality_monitor.pause()
@@ -616,130 +570,109 @@ class _StdioUI:
         _emit({"type": "status", "kind": "desktop_takeover_ended",
                "reason": str(reason)}, gen=self._generation)
 
-    # ── Interactive session events ─────────────────────────────────────────
-    #
-    # The session_tool emits lifecycle events (open/exec_done/close) through
-    # InteractionManager._ui_call → getattr(ui, "notify_session_event").
-    # The renderer uses these to render a live session monitor panel showing
-    # which sessions are active, their last command, and output previews.
     def notify_session_event(self, event_name: str, data: Any = None) -> None:
-        _ui_logger.debug("notify_session_event: %s data=%s", event_name, _truncate(data))
+        """Live shell session lifecycle (open / exec_done / close). Renderer
+        renders a session monitor panel from these events. Currently no V2
+        caller — ``session_tool`` is neutered until its V2 rewire — but kept
+        here so the rewire is just adding the call back."""
+        _ui_logger.debug("notify_session_event: %s", event_name)
         _emit({"type": "status", "kind": "session_event",
                "event": str(event_name),
                "data": data if isinstance(data, dict) else {}},
               gen=self._generation)
 
-    # ── Confirmation dialogs (UI delegate path) ──────────────────────────────
-    #
-    # InteractionManager.request_*_confirmation() probes the UI delegate
-    # via getattr(...). When these methods are present, the IM defers to
-    # them instead of falling back to its CLI blocking path (which reads
-    # stdin — useless under Electron because stdin is the bridge's IPC
-    # pipe, not a keyboard).
-    #
-    # Synchronisation: the IM has a generic `_pending_confirmation_callback`
-    # slot it invokes when an inbound `user_input.kind=confirmation`
-    # envelope arrives (stdio_bridge dispatcher → submit_confirmation_response
-    # → _deliver_confirmation_response → callback). We install a closure
-    # that captures the user's answer and unblocks a threading.Event;
-    # the calling thread (RuntimeAgent._check_before_act, executed inside
-    # an async task on the event loop thread) blocks on .wait() until
-    # the renderer responds.
-    #
-    # Caller threading: these methods are called from the asyncio event
-    # loop thread via a synchronous call chain (act → _execute_one →
-    # _check_before_act → confirmation_callback → IM → _StdioUI). Blocking
-    # the event loop is the existing CLI-path behaviour and is acceptable
-    # here because no other agent work can proceed until the user answers.
-    # The stdin reader thread (and inbound IPC dispatcher) keep running
-    # because they live on separate threads / asyncio tasks.
+    def show_receptionist_thinking(self) -> None:
+        _emit({"type": "status", "kind": "receptionist_thinking_on"},
+              gen=self._generation)
 
-    def _summarise_decision(self, decision: Decision) -> Dict[str, Any]:
-        """Produce a compact, JSON-safe summary of a Decision for the modal.
+    def clear_receptionist_thinking(self) -> None:
+        _emit({"type": "status", "kind": "receptionist_thinking_off"},
+              gen=self._generation)
 
-        Keys: tool_calls (list of {tool_name, params_preview}), reasoning.
-        Parameter values are truncated to 200 chars each — the dialog only
-        needs enough context for the user to recognise what's about to run.
+    def stream_receptionist_reply_chunk(self, text: str) -> None:
+        _emit({"type": "status", "kind": "reply_delta", "text": str(text)},
+              gen=self._generation)
+
+    def seal_receptionist_reply(self) -> None:
+        _emit({"type": "status", "kind": "reply_done"},
+              gen=self._generation)
+
+    # ── V2 UIDelegate Protocol — async confirmations ──────────────────────
+
+    @staticmethod
+    def _resolve_confirmation(answer: str) -> UserConfirmation:
+        """Map a raw renderer answer string to a ``UserConfirmation``.
+
+        Conventions:
+          - ``"yes" / "y" / "ok" / "approve"`` → :py:meth:`UserConfirmation.yes`
+          - ``"no" / "n" / "reject" / "deny"`` → :py:meth:`UserConfirmation.no`
+          - empty / ``None``                   → ``no()``
+          - ``"risk:<text>"``                  → :py:meth:`risk_guidance`
+          - any other non-empty text           → :py:meth:`with_message`
         """
-        def _trunc(v: Any, n: int = 200) -> str:
-            s = str(v)
-            return s if len(s) <= n else s[:n] + "…"
+        a = (answer or "").strip()
+        low = a.lower()
+        if not a:
+            return UserConfirmation.no()
+        if low in ("yes", "y", "ok", "approve", "approved"):
+            return UserConfirmation.yes()
+        if low in ("no", "n", "reject", "rejected", "deny"):
+            return UserConfirmation.no()
+        if low.startswith("risk:"):
+            return UserConfirmation.risk_guidance(a[len("risk:"):].strip())
+        return UserConfirmation.with_message(a)
 
-        tool_calls: List[Dict[str, Any]] = []
-        for tc in (decision.tool_calls or []):
-            params_preview = {k: _trunc(v) for k, v in (tc.parameters or {}).items()}
-            tool_calls.append({
-                "tool_name": tc.tool_name,
-                "params": params_preview,
-            })
-        return {
-            "tool_calls": tool_calls,
-            "reasoning": _trunc(decision.reasoning or "", 500),
-        }
-
-    def _await_user_response(
-        self,
-        kind: str,
-        payload: Dict[str, Any],
-        prompt_id: str,
+    async def _await_user_response(
+        self, kind: str, payload: Dict[str, Any], prompt_id: str,
     ) -> str:
-        """Emit a confirmation envelope and block until the renderer responds.
+        """Emit a confirmation envelope; await the renderer's response.
 
-        - Installs a callback into IM._pending_confirmation_callback.
-        - Emits {"type":"status","kind":<kind>, "id":prompt_id, ...payload}.
-        - Blocks on a threading.Event released by the callback.
-        - Returns the raw answer string from the user.
-
-        ``prompt_id`` is included so the renderer can correlate a response
-        with its prompt; this matters when bursts of confirmations arrive.
+        Registers a fresh ``asyncio.Future`` under ``prompt_id``; the stdin
+        reader thread resolves it via :meth:`deliver_confirmation_response`
+        when the user answers in the renderer modal.
         """
-        event = threading.Event()
-        holder: List[str] = []
-
-        def _on_response(answer: str) -> None:
-            holder.append(answer)
-            event.set()
-
-        # IM has a generic single-slot pending callback (it serialises
-        # confirmations — there is never more than one in flight). Install
-        # ours; IM will clear it after delivering the response.
-        with self._im._pending_confirmation_lock:
-            self._im._pending_confirmation_question = payload.get("description") or payload.get("prompt") or ""
-            self._im._pending_confirmation_callback = _on_response
-
+        loop = asyncio.get_running_loop()
+        if self._loop is None:
+            self._loop = loop
+        fut: "asyncio.Future[str]" = loop.create_future()
+        with self._pending_lock:
+            self._pending[prompt_id] = fut
         env: Dict[str, Any] = {"type": "status", "kind": kind, "id": prompt_id}
         env.update(payload)
         _emit(env, gen=self._generation)
         _ui_logger.debug("await_user_response: kind=%s id=%s", kind, prompt_id)
+        try:
+            return await fut
+        except asyncio.CancelledError:
+            with self._pending_lock:
+                self._pending.pop(prompt_id, None)
+            raise
 
-        event.wait()
-        return holder[0] if holder else ""
-
-    def request_risk_confirmation(
-        self, decision: Decision, risk_description: str
+    async def request_risk_confirmation(
+        self, description: str,
     ) -> UserConfirmation:
-        """High-risk operation gate. Blocks until renderer returns yes/no/text."""
-        prompt_id = f"risk-{int(time.time() * 1000)}-{id(decision) & 0xffff:04x}"
-        payload = {
-            "description": str(risk_description),
-            "decision": self._summarise_decision(decision),
-        }
-        answer = self._await_user_response("risk_confirmation", payload, prompt_id)
-        return self._im._resolve_confirmation(answer)
+        """High-risk operation gate. Emits ``kind=risk_confirmation``;
+        awaits the renderer's yes/no/text answer."""
+        prompt_id = f"risk-{int(time.time() * 1000)}-{id(description) & 0xffff:04x}"
+        payload = {"description": str(description)}
+        answer = await self._await_user_response("risk_confirmation", payload, prompt_id)
+        return self._resolve_confirmation(answer)
 
-    def request_tool_confirmation(
-        self, tool_name: str, decision: Decision
+    async def request_tool_confirmation(
+        self,
+        tool_name: str,
+        params: Dict[str, Any],
+        hint: str,
     ) -> UserConfirmation:
-        """Tool-specific gate (write/edit/bash/...). Same shape as risk."""
-        prompt_id = f"tool-{int(time.time() * 1000)}-{id(decision) & 0xffff:04x}"
+        """Tool-specific gate. ``desktop`` is task-scoped (single approval
+        covers every desktop action until task end); other tools use
+        per-call scope and surface the ``params`` dict so the modal can
+        show what's about to run."""
+        prompt_id = f"tool-{int(time.time() * 1000)}-{id(params) & 0xffff:04x}"
         payload: Dict[str, Any] = {
             "tool": str(tool_name),
+            "hint": str(hint),
         }
-        # Desktop is task-scoped — be loud about it in the modal so the
-        # user knows a single yes covers every desktop action until task
-        # end (or until they hit the Ctrl+Shift+C revoke). The renderer
-        # uses ``description`` (and styles the card differently when
-        # ``scope=='task'``).
         if str(tool_name) == "desktop":
             payload["scope"] = "task"
             payload["description"] = (
@@ -749,46 +682,30 @@ class _StdioUI:
                 "every subsequent desktop action will run without "
                 "asking again. Press Ctrl+Shift+C anytime to revoke."
             )
-            # Task-scope approval covers ALL desktop actions, not just
-            # the FIRST one that happened to fire. Showing
-            # "action: list_windows" in the modal is misleading — it
-            # implies the user is approving that specific call.
-            # Drop tool_calls / params and keep only the LLM's
-            # reasoning so the user has high-level context without
-            # the per-action red herring.
-            reasoning = (decision.reasoning or "").strip()
-            if reasoning:
-                payload["reasoning"] = reasoning if len(reasoning) <= 500 else reasoning[:500] + "..."
         else:
-            # Per-action confirmations (browser / write / edit / shell)
-            # genuinely scope to the specific call, so the modal needs
-            # to show what is about to run.
-            payload["decision"] = self._summarise_decision(decision)
-        answer = self._await_user_response("tool_confirmation", payload, prompt_id)
-        return self._im._resolve_confirmation(answer)
+            def _trunc(v: Any, n: int = 200) -> str:
+                s = str(v)
+                return s if len(s) <= n else s[:n] + "…"
+            payload["params"] = {
+                k: _trunc(v) for k, v in (params or {}).items()
+            }
+        answer = await self._await_user_response("tool_confirmation", payload, prompt_id)
+        return self._resolve_confirmation(answer)
 
-    def request_secret_input(self, prompt: str) -> str:
-        """Hidden text input (passwords, SSH credentials).
-
-        Returns the raw string entered by the user. The renderer is
-        responsible for rendering an <input type=password> so the value
-        is not displayed on screen.
-        """
+    async def request_secret_input(self, prompt: str) -> str:
+        """Hidden text input (passwords, SSH credentials)."""
         prompt_id = f"secret-{int(time.time() * 1000)}"
         payload = {"prompt": str(prompt)}
-        return self._await_user_response("secret_input", payload, prompt_id)
+        return await self._await_user_response("secret_input", payload, prompt_id)
 
-    def request_user_text(self, prompt: str) -> str:
-        """Free-text input (ask_human tool — agent's clarifying question).
-
-        Same plumbing as request_secret_input, but the renderer shows a
-        non-masked text input and an "agent question" framing. Returns the
-        raw string entered by the user (may be empty if they dismiss the
-        modal).
-        """
+    async def request_user_text(self, prompt: str) -> str:
+        """Free-form (non-secret) clarifying question from the agent
+        (``ask_human`` tool). Emits ``kind=ask_human`` — the renderer shows
+        an UNMASKED text field (distinct from the masked ``secret_input``) —
+        and awaits the user's typed answer."""
         prompt_id = f"ask-{int(time.time() * 1000)}"
         payload = {"prompt": str(prompt)}
-        return self._await_user_response("ask_human", payload, prompt_id)
+        return await self._await_user_response("ask_human", payload, prompt_id)
 
 
 # ---------------------------------------------------------------------------
@@ -805,31 +722,18 @@ class StdioBridge:
         self._inbox: Optional[asyncio.Queue] = None
 
         # Lazy backend state — built on first 'request' message.
-        self._flow: Optional[FlowController] = None
-        self._flow_task: Optional[asyncio.Task] = None
-        self._services: List[AnthropicStreamingService] = []
+        self._flow: Optional[FlowControllerV2] = None
+        self._services: List[LLMService] = []
 
-        # When a scheduled task triggered this flow, stash the id so
-        # _run_flow_session can call scheduler.notify_task_finished
-        # in its finally-block. Cleared as soon as the notify lands.
-        self._pending_scheduled_task_id: Optional[str] = None
-
-        # ── Scheduled-task lifecycle markers ────────────────────────────
-        # _scheduled_running_id: set when a scheduled flow_task is in
-        # flight. Read by _do_new_session (to detect user-new abort) and
-        # by _after_flow_done (to know whether to notify the scheduler).
-        # Cleared inside _after_flow_done.
-        # _cancelled_scheduled_ids: ids that the user-new-abort path
-        # already wrote CANCELLED for. _after_flow_done checks this
-        # set so it doesn't overwrite CANCELLED with FAILED when the
-        # done-callback fires after the cancellation.
-        self._scheduled_running_id: Optional[str] = None
-        self._cancelled_scheduled_ids: set[str] = set()
+        # Session-scoped handq-engine.log handler, attached to the ROOT logger
+        # by _ensure_flow and detached by _do_new_session so each session gets
+        # a fresh, isolated engine log (see logger.add_root_file_handler).
+        self._engine_log_handler: Optional[logging.Handler] = None
 
         # Session generation. Bumped by _do_new_session before the new
         # singleton is constructed, so a fresh _StdioUI with the new
         # generation drives the new flow while the OLD _StdioUI (still
-        # referenced by the old IM via the old FlowController) keeps
+        # referenced by the old IM via the old FlowControllerV2) keeps
         # emitting with its captured OLD generation. The renderer drops
         # any envelope whose gen is older than its current generation,
         # which is what isolates the new conversation from a wedged
@@ -837,14 +741,12 @@ class StdioBridge:
         # finally returns (Windows: no portable thread kill).
         self._generation: int = 0
 
-        # Construct IM first so _StdioUI can hold a reference to it; the
-        # confirmation-dialog methods (request_risk_confirmation etc.) need
-        # to install a pending callback into IM so inbound user_input
-        # envelopes can unblock the waiter.
-        im = InteractionManager.get_instance()
-        self._ui = _StdioUI(self._generation, im=im)
-        im.set_ui(self._ui)
-        self._im = im
+        # The bridge no longer owns an InteractionManager — FlowControllerV2
+        # constructs and exposes one at ``flow.interaction_manager``. We
+        # build the _StdioUI here without an IM ref; ``_ensure_flow`` calls
+        # ``flow.interaction_manager.set_delegate(self._ui)`` to wire
+        # delegate-mode events.
+        self._ui = _StdioUI(self._generation)
 
         self._shutdown_requested: bool = False
 
@@ -900,23 +802,23 @@ class StdioBridge:
                     _redact_payload(obj),
                 )
                 # ── Fast path: confirmation responses bypass asyncio ─────────
-                # _StdioUI.{request_risk,request_tool,request_secret}_confirmation
-                # blocks the event loop on threading.Event.wait() while waiting
-                # for the user. If we routed the answer through the asyncio
-                # inbox, the dispatcher coroutine couldn't run (loop blocked) —
-                # the answer would queue up forever. Resolve it directly from
-                # this thread instead, which mirrors the IM CLI fallback's
-                # daemon-stdin-thread → _confirmation_queue model.
+                # ``_StdioUI.request_*`` await an asyncio.Future. If we routed
+                # the answer through the asyncio inbox, the dispatcher would
+                # have to run on the same loop that's blocked awaiting the
+                # future. Resolving the future directly from this thread (via
+                # ``call_soon_threadsafe`` inside ``deliver_confirmation_response``)
+                # avoids that ordering hazard.
                 if (isinstance(obj, dict)
                         and obj.get("type") == "user_input"
                         and obj.get("kind") == "confirmation"):
                     try:
-                        self._im.submit_confirmation_response(
-                            str(obj.get("answer", ""))
+                        prompt_id = str(obj.get("id") or "")
+                        self._ui.deliver_confirmation_response(
+                            prompt_id, str(obj.get("answer", "")),
                         )
                     except Exception:
                         logger.exception(
-                            "stdin reader: submit_confirmation_response failed"
+                            "stdin reader: deliver_confirmation_response failed"
                         )
                     continue
                 if self._loop is not None and self._inbox is not None:
@@ -1100,14 +1002,89 @@ class StdioBridge:
                     )
                     result = {"entries": [_entry_to_dict(e) for e in entries]}
                 else:  # ltm_archive
-                    eid = str(msg.get("id") or "")
+                    # ``entry_id`` (not ``id``): the envelope's ``id`` is the
+                    # RPC correlation key, overwritten by the renderer's rpc()
+                    # layer, so the row id must travel under a distinct key.
+                    eid = str(msg.get("entry_id") or "")
                     kind_raw = str(msg.get("kind") or "")
                     if not eid or not kind_raw:
-                        raise ValueError("ltm_archive: id and kind required")
+                        raise ValueError("ltm_archive: entry_id and kind required")
                     kind = EntryKind(kind_raw)
                     reason = str(msg.get("reason") or "user_request")
                     await ltm.archive(entry_id=eid, kind=kind, reason=reason)
                     result = {"ok": True}
+                _emit({"type": "final", "id": msg_id, "result": result},
+                      gen=self._generation)
+            except Exception as exc:
+                logger.exception("%s failed", msg_type)
+                _emit({"type": "error", "id": msg_id, "where": "bridge",
+                       "message": f"{msg_type} failed: {exc}",
+                       "fatal": False}, gen=self._generation)
+            return
+
+        # ── LTM 2.0 Skill proposal + Summary IPC ────────────────────────
+        # ``ltm_list_skill_proposals``: surface staged skill_proposal rows
+        #   so the UI can render an approval queue.
+        # ``ltm_approve_skill_proposal``: move the staging SKILL.md to live,
+        #   reload SkillRegistry, flip status='approved'.
+        # ``ltm_reject_skill_proposal``: archive the row and remove staging.
+        # ``ltm_query_summary``: read one obs_summaries row (date+type) for UI.
+        if msg_type in (
+            "ltm_list_skill_proposals", "ltm_approve_skill_proposal",
+            "ltm_reject_skill_proposal", "ltm_query_summary",
+        ):
+            try:
+                from src.infrastructure.long_term_memory import LongTermMemory
+                ltm = LongTermMemory.get()
+                if msg_type == "ltm_list_skill_proposals":
+                    status = str(msg.get("status") or "proposed")
+                    limit = int(msg.get("limit") or 50)
+                    proposals = await ltm.list_skill_proposals(
+                        status=status, limit=limit,
+                    )
+                    result = {"proposals": proposals}
+                elif msg_type == "ltm_approve_skill_proposal":
+                    # The entity id rides under ``skill_id``: the envelope's
+                    # ``id`` is the RPC correlation key and is overwritten by
+                    # the renderer's rpc() layer, so it cannot carry the row id.
+                    skill_id = str(msg.get("skill_id") or "")
+                    if not skill_id:
+                        raise ValueError("ltm_approve_skill_proposal: skill_id required")
+                    result = await ltm.approve_skill_proposal(skill_id)
+                elif msg_type == "ltm_reject_skill_proposal":
+                    skill_id = str(msg.get("skill_id") or "")
+                    if not skill_id:
+                        raise ValueError("ltm_reject_skill_proposal: skill_id required")
+                    reason = str(msg.get("reason") or "")
+                    result = await ltm.reject_skill_proposal(skill_id, reason=reason)
+                else:  # ltm_query_summary
+                    date_iso = str(msg.get("date") or "")
+                    # NB: the envelope's ``type`` field is the routing key
+                    # (== "ltm_query_summary" here), so the period must travel
+                    # under a distinct key or it would be clobbered.
+                    type_ = str(msg.get("summary_type") or "daily")
+                    lang = str(msg.get("language") or "en")
+                    if not date_iso:
+                        raise ValueError("ltm_query_summary: date required")
+                    row = await ltm._store.get_obs_summary(
+                        date=date_iso, type_=type_, language=lang,
+                    )
+                    if row is None:
+                        result = {"found": False}
+                    else:
+                        import json as _json
+                        try:
+                            moments = _json.loads(row[3]) if row[3] else []
+                        except (TypeError, _json.JSONDecodeError):
+                            moments = []
+                        result = {
+                            "found": True,
+                            "date": row[0], "type": row[1], "language": row[2],
+                            "moments": moments,
+                            "summary_text": row[4] or "",
+                            "generated_model": row[5] or "",
+                            "generated_at": int(row[6] or 0),
+                        }
                 _emit({"type": "final", "id": msg_id, "result": result},
                       gen=self._generation)
             except Exception as exc:
@@ -1259,18 +1236,25 @@ class StdioBridge:
                         )
                         return
                 self._ensure_flow(goal=str(goal))
-                self._im.inject_user_message(str(goal))
-                if self._flow_task is None or self._flow_task.done():
-                    assert self._flow is not None
-                    self._flow_task = asyncio.create_task(
-                        self._run_flow_session(msg_id)
-                    )
-                    # External observer for schedule cleanup. Fires
-                    # AFTER the task has fully completed, so the cleanup
-                    # body (notify_task_finished + auto-new) runs in a
-                    # fresh asyncio task — never inside the flow task
-                    # itself, eliminating the finally-from-self deadlock.
-                    self._flow_task.add_done_callback(self._on_flow_task_done)
+                assert self._flow is not None
+                if not self._flow.started:
+                    await self._flow.start()
+                # ``on_user_message`` returns the receptionist's
+                # reply string (sync conversational answer); background
+                # agent + planner work proceeds inside the flow's own
+                # asyncio tasks and emits status events through the IM
+                # delegate as it happens. ``final`` correlates with this
+                # request id; subsequent activity arrives as status events.
+                try:
+                    reply = await self._flow.on_user_message(str(goal))
+                    _emit({"type": "final", "id": msg_id,
+                           "result": {"reply": reply, "ok": True}},
+                          gen=self._generation)
+                except Exception as exc:
+                    logger.exception("on_user_message failed; id=%s", msg_id)
+                    _emit({"type": "error", "id": msg_id, "where": "engine",
+                           "message": f"on_user_message failed: {exc}",
+                           "fatal": False}, gen=self._generation)
             except Exception as exc:
                 logger.exception("request failed")
                 _emit({"type": "error", "id": msg_id, "where": "bridge",
@@ -1282,9 +1266,21 @@ class StdioBridge:
             try:
                 kind = msg.get("kind", "message")
                 if kind == "message":
-                    self._im.inject_user_message(str(msg.get("text", "")))
+                    text = str(msg.get("text", ""))
+                    if self._flow is not None and self._flow.started:
+                        await self._flow.on_user_message(text)
+                    else:
+                        logger.warning(
+                            "user_input(message) before flow started; ignoring"
+                        )
                 elif kind == "confirmation":
-                    self._im.submit_confirmation_response(str(msg.get("answer", "")))
+                    # Normally consumed by the stdin reader fast-path; this
+                    # branch covers the (rare) case where the envelope reaches
+                    # the dispatcher via the asyncio inbox instead.
+                    prompt_id = str(msg.get("id") or "")
+                    self._ui.deliver_confirmation_response(
+                        prompt_id, str(msg.get("answer", "")),
+                    )
                 elif kind == "desktop_takeover_revoked":
                     # Frontend overlay's revoke hotkey (Ctrl+C or
                     # equivalent) sends this. We flip the takeover flag
@@ -1292,10 +1288,21 @@ class StdioBridge:
                     # of this task; read-only desktop actions stay
                     # available. The notify_desktop_takeover_ended
                     # event with reason='user_revoked' is emitted by
-                    # revoke_takeover() itself.
+                    # the DesktopState's revoke method itself.
                     try:
-                        from ..tools.desktop_tool import revoke_takeover
-                        changed = revoke_takeover()
+                        ds = (
+                            self._flow._ctx.desktop_state
+                            if self._flow is not None and self._flow._ctx is not None
+                            else None
+                        )
+                        if ds is not None:
+                            changed = ds.revoke_takeover()
+                        else:
+                            # Fallback for the (rare) race where revoke arrives
+                            # before the flow's ctx is built — the module-level
+                            # helper still toggles the takeover state machine.
+                            from ..tools.desktop_tool import revoke_takeover
+                            changed = revoke_takeover()
                         logger.info(
                             "user_input desktop_takeover_revoked: changed=%s",
                             changed,
@@ -1322,86 +1329,6 @@ class StdioBridge:
 
         if msg_type == "new_session":
             await self._do_new_session(msg_id)
-            return
-
-        if msg_type == "gep_save":
-            await self._do_gep_save(msg_id, msg)
-            return
-
-        if msg_type == "gep_list_templates":
-            try:
-                from src.infrastructure.gep_template import list_templates
-                templates = list_templates(include_invalid=True)
-                payload = []
-                for t in templates:
-                    entry = {
-                        "id":          t.id,
-                        "name":        t.name,
-                        "description": t.description,
-                        "version":     t.version,
-                        "created_at":  t.created_at,
-                        "params":      [
-                            {
-                                "name":        pname,
-                                "type":        getattr(pspec, "type", "") or "",
-                                "description": getattr(pspec, "description", "") or "",
-                                "default":     getattr(pspec, "default", None),
-                                "emphasis":    bool(getattr(pspec, "emphasis", False)),
-                            }
-                            for pname, pspec in (t.params_schema or {}).items()
-                        ],
-                        "steps": [
-                            {
-                                "step_id":     s.step_id,
-                                "description": s.description,
-                                "goal":        s.goal,
-                                "tools_required": list(s.tools_required or []),
-                            }
-                            for s in (t.guide_steps or [])
-                        ],
-                    }
-                    problems = getattr(t, "_problems", None)
-                    if problems:
-                        entry["problems"] = list(problems)
-                        entry["source_path"] = getattr(t, "_source_path", "")
-                    payload.append(entry)
-                _emit({"type": "final", "id": msg_id,
-                       "result": {"templates": payload}},
-                      gen=self._generation)
-            except Exception as exc:
-                logger.exception("gep_list_templates failed")
-                _emit({"type": "error", "id": msg_id, "where": "bridge",
-                       "message": f"gep_list_templates failed: {exc}",
-                       "fatal": False}, gen=self._generation)
-            return
-
-        if msg_type == "gep_delete_template":
-            try:
-                from src.infrastructure.gep_template import (
-                    _templates_dir, _sanitize_template_id,
-                )
-                tid = str(msg.get("id") or "").strip()
-                if not tid:
-                    raise ValueError("missing template id")
-                tdir = _templates_dir()
-                target = tdir / f"{_sanitize_template_id(tid)}.json"
-                if target.exists():
-                    target.unlink()
-                    ok = True
-                else:
-                    matches = list(tdir.glob(f"{_sanitize_template_id(tid)}*.json"))
-                    if len(matches) == 1:
-                        matches[0].unlink()
-                        ok = True
-                    else:
-                        ok = False
-                _emit({"type": "final", "id": msg_id,
-                       "result": {"ok": ok}}, gen=self._generation)
-            except Exception as exc:
-                logger.exception("gep_delete_template failed")
-                _emit({"type": "error", "id": msg_id, "where": "bridge",
-                       "message": f"gep_delete_template failed: {exc}",
-                       "fatal": False}, gen=self._generation)
             return
 
         logger.warning("unknown inbound type=%r id=%s", msg_type, msg_id)
@@ -1487,22 +1414,24 @@ class StdioBridge:
     # ------------------------------------------------------------------
 
     async def accept_scheduled_task(self, task) -> bool:  # type: ignore[no-untyped-def]
-        """Decide whether to fire *task* now.
+        """Fire a scheduled task on the persistent V2 flow.
 
-        Returns True if the task is being dispatched, False if the
-        bridge declined (busy / shutdown). The scheduler reads the
-        return value to decide whether to bump the next-fire timestamp.
+        Returns True iff dispatch was accepted (i.e. the bridge is alive
+        and not shutting down). The scheduler reads the return value to
+        decide whether to bump the next-fire timestamp.
+
+        Scheduled fires are just-another-user-message. ``ok`` passed to
+        :meth:`Scheduler.notify_task_finished` therefore means "the
+        receptionist returned a reply without raising", NOT "the agent
+        finished its background work". The persistent flow has no per-task
+        completion signal — the planner / agent run continuously until the
+        next user message. If finer-grained tracking is needed later, hook
+        into ``SharedCheckList.on_item_done`` for the items the planner
+        spawned in response to this dispatch.
         """
         if self._shutdown_requested:
             logger.info(
                 "scheduler dispatch refused: shutdown in progress task=%s",
-                task.id[:8],
-            )
-            return False
-        if self._flow_task is not None and not self._flow_task.done():
-            logger.info(
-                "scheduler dispatch refused: bridge busy task=%s "
-                "(scheduler will mark task PENDING)",
                 task.id[:8],
             )
             return False
@@ -1518,38 +1447,54 @@ class StdioBridge:
         except Exception:
             logger.exception("scheduler emit failed")
 
-        # Treat the firing exactly like an inbound `request` envelope.
-        # Stamp the message id with a marker the renderer can match
-        # against the scheduled_task_started toast.
         msg_id = f"sched-{task.id}-{int(time.time())}"
-        # `dispatch_prompt`, when present, is the agent-facing variant
+        # ``dispatch_prompt``, when present, is the agent-facing variant
         # with relative-time language ("一分钟后…") stripped — see
         # ScheduledTask docstring. Empty means "use prompt verbatim".
         goal_text = task.dispatch_prompt or task.prompt
-        synthetic = {
-            "type": "request",
-            "id": msg_id,
-            "goal": goal_text,
-            "scheduled": True,
-            "scheduled_task_id": task.id,
-        }
+
         try:
-            await self._handle(synthetic)
+            self._ensure_flow(goal=str(goal_text))
+            assert self._flow is not None
+            if not self._flow.started:
+                await self._flow.start()
         except Exception as exc:
-            logger.exception("scheduler synthetic _handle crashed")
-            try:
-                if scheduler is not None:
+            logger.exception("scheduler dispatch: flow setup failed")
+            if scheduler is not None:
+                try:
                     await scheduler.notify_task_finished(
-                        task.id, ok=False, error=f"dispatch crashed: {exc}",
+                        task.id, ok=False, error=f"flow setup failed: {exc}",
                     )
+                except Exception:
+                    logger.exception("scheduler notify_task_finished crashed")
+            return True
+
+        ok = True
+        err = ""
+        try:
+            reply = await self._flow.on_user_message(str(goal_text))
+            _emit({"type": "final", "id": msg_id,
+                   "result": {"reply": reply, "ok": True, "scheduled": True}},
+                  gen=self._generation)
+        except Exception as exc:
+            ok = False
+            err = str(exc)[:500]
+            logger.exception("scheduled task dispatch failed")
+            _emit({"type": "error", "id": msg_id, "where": "engine",
+                   "message": err, "fatal": False},
+                  gen=self._generation)
+
+        if scheduler is not None:
+            try:
+                await scheduler.notify_task_finished(task.id, ok=ok, error=err)
             except Exception:
-                logger.exception("scheduler notify_task_finished crashed")
-            return True  # already accepted; failure is recorded
-        # The actual flow runs asynchronously in self._flow_task. Its
-        # finally-block calls notify_task_finished; we attach that hook
-        # by stashing the task id on the bridge so _run_flow_session
-        # can pick it up.
-        self._pending_scheduled_task_id = task.id
+                logger.exception("scheduler notify_task_finished failed")
+            # Wake the scheduler so PENDING tasks get re-scanned now that
+            # this dispatch has returned.
+            try:
+                scheduler._wakeup.set()
+            except Exception:
+                pass
         return True
 
 
@@ -1557,7 +1502,7 @@ class StdioBridge:
     def _ensure_flow(self, goal: str) -> None:
         if self._flow is not None:
             return
-        from ..infrastructure.role_resolver import resolve_role_models
+        from ..infrastructure.role_resolver import resolve_models_and_helper
 
         cm = ConfigManager(str(self.config_path))
         cfg = cm.get_config()
@@ -1565,12 +1510,14 @@ class StdioBridge:
         sess_cfg = cfg.get("session", {}) or {}
 
         # Allocate this session's directory under %USERPROFILE%\HandQ\History\.
-        # Both `working_directory` and `storage_directory` point at it — the
-        # legacy distinction (CLI-era: cwd-of-invocation vs. workspace_base/<id>)
-        # is meaningless in the GUI, so we collapse them. All artifacts the
-        # agent writes via relative paths land here and are auto-scoped to the
-        # session.
-        session_dir = _allocate_session_dir(goal)
+        # The agent operates inside <session>/<workspace_subdir>/ — that's the
+        # ONLY path the agent's prompt knows about. The session root itself
+        # holds framework metadata (handq-engine.log, executions_logs/) and is
+        # never named in the system prompt. A leading-dot folder name from
+        # yaml (default ".workspace") just becomes a normal subdir on NTFS.
+        workspace_subdir = sess_cfg.get("workspace_base", ".workspace") or ".workspace"
+        session_dir = _allocate_session_dir(goal, workspace_subdir=workspace_subdir)
+        agent_workspace = session_dir / workspace_subdir
 
         # Initialise the HandQ engine logger now that we know the session dir
         # and can read log_level from config.  Must happen before FlowController
@@ -1583,15 +1530,37 @@ class StdioBridge:
         # cross-reference two different roots. The bridge-scoped log
         # (handq-bridge.log under HANDQ_LOG_DIR) is unaffected — it stays where
         # it is for cross-session correlation.
-        from ..infrastructure.logger import initialize_logger, LogLevel as _LogLevel
+        from ..infrastructure.logger import (
+            initialize_logger,
+            add_root_file_handler,
+            remove_root_file_handler,
+            LogLevel as _LogLevel,
+        )
         _log_level_str = sess_cfg.get("log_level", "INFO") or "INFO"
         _engine_log_dir = str(session_dir)
         try:
+            _level = _LogLevel[_log_level_str.upper()]
+            # initialize_logger sets the "HandQ" logger's level + console
+            # handler, but with log_file=None the per-session engine.log is NOT
+            # bound to the "HandQ" name. We attach it to the ROOT logger below
+            # so it captures the WHOLE session (HandQ tree + every stdlib
+            # logging.getLogger(__name__) module: shell_tool / session_tool /
+            # session_context / ...), minus the background-daemon trees that set
+            # propagate=False (handq.ltm / personality / activity / scheduler,
+            # diverted to .dia/internal-trace.log by bridge_main.py). Binding the
+            # file to "HandQ" too would double-write every get_logger() record.
             initialize_logger(
                 name="HandQ",
-                level=_LogLevel[_log_level_str.upper()],
-                log_file="handq-engine.log",
+                level=_level,
+                log_file=None,
                 log_dir=_engine_log_dir,
+            )
+            # Detach any stale handler from a prior session before attaching the
+            # new one (defensive — _do_new_session normally removes it first).
+            remove_root_file_handler(self._engine_log_handler)
+            self._engine_log_handler = add_root_file_handler(
+                str(session_dir / "handq-engine.log"),
+                level=_level,
             )
             logger.info(
                 "_ensure_flow: HandQ engine logger initialised; level=%s log_dir=%s",
@@ -1605,7 +1574,7 @@ class StdioBridge:
         api_key = llm_cfg.get("API_KEY") or ""
         # When `max_tokens` is missing or non-positive, leave it unset (None) so
         # AnthropicStreamingService falls back to the per-model ceiling instead of
-        # capping every model at a legacy default (e.g. 4096 truncates Sonnet/Haiku
+        # capping every model at a default (e.g. 4096 truncates Sonnet/Haiku
         # mid-tool-call, breaking write/edit with "missing required parameter").
         _mt_raw = llm_cfg.get("max_tokens")
         try:
@@ -1613,27 +1582,28 @@ class StdioBridge:
         except (TypeError, ValueError):
             _mt_int = 0
         max_tokens: Optional[int] = _mt_int if _mt_int > 0 else None
-        roles = resolve_role_models(llm_cfg)
 
-        # Fallback when both `roles` and `models` are absent — keep the bridge
+        # ── Resolve the main pool ───────────────────────────────────────
+        # Two pools come out of the resolver: ``models`` (main controller
+        # stack) and ``helper_models`` (auxiliary cheap pool consumed by
+        # scheduler.inferer + LTM triage / reranker / retriage). The bridge
+        # only cares about ``models`` here; helper_models is read directly by
+        # those auxiliary callers when they construct their own services.
+        models, _helper_models = resolve_models_and_helper(llm_cfg)
+
+        # Fallback when no models are configured at all — keep the bridge
         # bootable so the user can open Settings and configure models from the UI.
-        if not any(roles.values()):
-            roles = {
-                "agent":        ["anthropic::claude-4-5-haiku"],
-                "planner":      ["anthropic::claude-4-5-haiku"],
-                "receptionist": ["anthropic::claude-4-5-haiku"],
-                "from_data":    ["anthropic::claude-4-5-haiku"],
-            }
+        if not models:
+            models = ["anthropic::claude-4-5-haiku"]
 
         logger.debug(
-            "FlowController lazy construction: top_level_keys=%s llm_keys=%s session_keys=%s "
-            "roles={agent:%d, planner:%d, receptionist:%d, from_data:%d} "
-            "max_tokens=%s api_key_present=%s session_dir=%s",
+            "FlowController lazy construction: top_level_keys=%s llm_keys=%s "
+            "session_keys=%s n_models=%d n_helper=%d max_tokens=%s "
+            "api_key_present=%s session_dir=%s",
             sorted(cfg.keys()) if isinstance(cfg, dict) else None,
             sorted(llm_cfg.keys()),
             sorted(sess_cfg.keys()),
-            len(roles["agent"]), len(roles["planner"]),
-            len(roles["receptionist"]), len(roles["from_data"]),
+            len(models), len(_helper_models),
             max_tokens if max_tokens is not None else "auto(per-model ceiling)",
             bool(api_key),
             session_dir,
@@ -1641,35 +1611,22 @@ class StdioBridge:
         if not api_key:
             logger.warning("llm.API_KEY is empty in config; LLM calls will fail")
 
-        # Shared services for non-planner roles, dedup'd. Planner gets dedicated
-        # max_retries=50 instances to match the CLI behavior.
-        shared_models: list = []
-        for role_key in ("agent", "receptionist", "from_data"):
-            for m in roles.get(role_key, []):
-                if m not in shared_models:
-                    shared_models.append(m)
-        # Only forward max_tokens when explicitly configured; otherwise let
-        # AnthropicStreamingService pick its constructor default and per-model
-        # ceiling kick in via _resolve_max_tokens.
+        # ── Build the service list ──────────────────────────────────────
+        # One service per model. ``max_retries=10`` gives ~1-2 minutes of
+        # patience per model on transient rate limits before falling through
+        # to the next service in the chain. The fallback chain (built from
+        # the priority-ordered ``models`` list) is the primary resilience
+        # mechanism; max_retries handles short blips.
         _mt_kwargs: dict = {"max_tokens": max_tokens} if max_tokens is not None else {}
-        svc_map = {
-            m: AnthropicStreamingService(
-                api_key=api_key, model=m, max_retries=3, **_mt_kwargs,
-            )
-            for m in shared_models
-        }
-        agent_services        = [svc_map[m] for m in roles.get("agent", [])]
-        receptionist_services = [svc_map[m] for m in roles.get("receptionist", [])]
-        from_data_services    = [svc_map[m] for m in roles.get("from_data", [])]
-        planner_services      = [
+        consolidated_services: List[LLMService] = [
             AnthropicStreamingService(
-                api_key=api_key, model=m, max_retries=50, **_mt_kwargs,
+                api_key=api_key, model=m, max_retries=10, **_mt_kwargs,
             )
-            for m in roles.get("planner", [])
+            for m in models
         ]
 
         # Track every distinct service for shutdown.
-        self._services = list(svc_map.values()) + planner_services
+        self._services = list(consolidated_services)
 
         # Wire server-error notifications to the UI.  The closure captures
         # `self` so it always reads the current _generation at call time —
@@ -1686,25 +1643,73 @@ class StdioBridge:
         for svc in self._services:
             svc.on_server_error = _on_llm_server_error
 
-        self._flow = FlowController(
-            agent_llm_services=agent_services,
-            planner_llm_services=planner_services,
-            receptionist_llm_services=receptionist_services,
-            from_data_llm_services=from_data_services,
-            working_directory=None,
+        self._flow = FlowControllerV2(
+            llm_services=consolidated_services,
+            working_directory=str(agent_workspace),
             storage_directory=str(session_dir),
-            step_verification_threshold=float(
-                sess_cfg.get("step_verification_threshold", 0.7)
-            ),
-            venv_path=sess_cfg.get("venv_path"),
             config_path=str(self.config_path),
+            on_reply_to_user=self._on_receptionist_reply,
+            expose_session_storage_in_prompt=False,
         )
         logger.info(
-            "FlowController constructed; %d total service(s) (agent=%d planner=%d receptionist=%d from_data=%d)",
-            len(self._services),
-            len(agent_services), len(planner_services),
-            len(receptionist_services), len(from_data_services),
+            "FlowControllerV2 constructed; %d llm_service(s) in fallback chain",
+            len(consolidated_services),
         )
+
+        # Tell the UI where this session's agent workspace lives. The renderer
+        # uses this path to surface produced files (drag-out / save-to /
+        # preview). Emitted exactly once per session at construction time;
+        # the path is stable for the session's lifetime.
+        try:
+            _emit({
+                "type": "status",
+                "kind": "session_started",
+                "session_dir": str(session_dir),
+                "workspace_dir": str(agent_workspace),
+            }, gen=self._generation)
+        except Exception:
+            logger.exception("Failed to emit session_started status event")
+
+        # Make the agent's working directory real. The prompt advertises
+        # ``Working directory: <agent_workspace>`` and tells the agent to keep
+        # deliverables there, but the file/shell tools resolve relative paths
+        # against the PROCESS cwd (Path(p).absolute() / subprocess inherit) —
+        # and electron spawns the bridge with NO cwd set (electron/main.js:
+        # "No cwd is set on purpose"), so cwd was the electron launch dir. A
+        # bare-filename write therefore landed in C:\...\electron\ instead of
+        # the session workspace. chdir here closes that prompt↔runtime gap:
+        # relative writes/shell commands now land in the workspace, and the
+        # absolute path reported back (Path.absolute()) is the one the user
+        # can actually find. Bridge config/logs use absolute paths, so they
+        # are unaffected; on new_session this re-points cwd at the new
+        # session's workspace (single active session — no concurrency race).
+        try:
+            os.chdir(str(agent_workspace))
+            logger.info("session cwd set to agent workspace: %s", agent_workspace)
+        except Exception:
+            logger.exception(
+                "Failed to chdir into agent workspace %s; relative writes may "
+                "land in the process launch dir", agent_workspace,
+            )
+
+        # Bind the bridge's UI delegate to the IM that FlowControllerV2 owns.
+        # All ``notify_*`` / ``request_*`` calls inside the V2 stack route
+        # through here. The loop ref lets the stdin reader thread resolve
+        # confirmation futures via call_soon_threadsafe.
+        if self._flow.interaction_manager is not None:
+            self._flow.interaction_manager.set_delegate(self._ui)
+        try:
+            self._ui._loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # _ensure_flow may run before the loop is captured into _stdin
+            # context; the loop will be set on first await of a confirmation.
+            pass
+
+        # Tools (desktop_tool, browser_tool) pick up their IM ref from
+        # ``ctx.interaction_manager`` at construction (SessionContext DI).
+        # The bridge no longer wires ``set_interaction_manager`` on each
+        # tool — flow.start() built ctx with self.interaction_manager and
+        # passed ctx to PersistentAgent → ToolRegistry → tool __init__.
 
         # Wire module-level bridge hooks so llm_pool can emit status events
         # without touching deep planner/agent/receptionist call paths.
@@ -1760,131 +1765,16 @@ class StdioBridge:
 
         _set_net_fn(_on_network_event)
 
-    async def _run_flow_session(self, msg_id: Optional[str]) -> None:
-        assert self._flow is not None
-        # Snapshot the generation at task creation. If a new_session
-        # happens mid-flight, this task continues to emit with its OLD
-        # generation — the renderer drops those, isolating the new
-        # session's conversation from this orphan's tail.
-        gen = self._generation
-        # Snapshot the scheduled-task id (if any). The eager-clear of
-        # _pending_scheduled_task_id keeps it as a one-tick handoff
-        # token; the long-lived marker is _scheduled_running_id, which
-        # is read by _after_flow_done after this coroutine exits.
-        sched_id = self._pending_scheduled_task_id
-        self._pending_scheduled_task_id = None
-        if sched_id is not None:
-            self._scheduled_running_id = sched_id
-        logger.info("flow session starting; id=%s gen=%d sched=%s",
-                    msg_id, gen, sched_id)
-        try:
-            result = await self._flow.start_idle_session()
-            logger.info("flow session completed; id=%s gen=%d", msg_id, gen)
-            _emit({"type": "final", "id": msg_id, "result": result}, gen=gen)
-        except asyncio.CancelledError:
-            logger.info("flow session cancelled; id=%s gen=%d", msg_id, gen)
-            # Re-raise so task.cancelled() reports True; _after_flow_done
-            # uses that to set ok=False/error="cancelled".
-            raise
-        except Exception as exc:
-            logger.exception("flow session crashed; id=%s gen=%d", msg_id, gen)
-            _emit({"type": "error", "id": msg_id, "where": "engine",
-                   "message": f"start_idle_session failed: {exc}",
-                   "fatal": True}, gen=gen)
-        # NOTE: schedule-related cleanup (notify_task_finished, auto-new,
-        # scheduler wakeup) is NOT done here. It runs in _after_flow_done
-        # via add_done_callback so it executes strictly after this task
-        # has fully completed — keeping the flow internals pure and
-        # making finally-from-self deadlocks unreachable.
-
-    # ------------------------------------------------------------------
-    # External post-flow observer — handles all schedule-related cleanup.
-    #
-    # The done-callback chain:
-    #   _flow_task finishes → asyncio fires _on_flow_task_done (sync) →
-    #   schedules _after_flow_done as a fresh asyncio.Task → that task
-    #   runs *outside* _flow_task (which is already done), so anything
-    #   it awaits — including _do_new_session's wait_for(_flow_task) —
-    #   short-circuits immediately. No deadlock path.
-    # ------------------------------------------------------------------
-
-    def _on_flow_task_done(self, task: "asyncio.Task[Any]") -> None:
-        """Sync done-callback. asyncio invokes this AFTER the task's
-        coroutine has fully returned, so we are firmly outside the
-        flow_task. Done-callbacks must not block the loop, so we just
-        schedule the actual work as a fresh task."""
-        try:
-            asyncio.create_task(
-                self._after_flow_done(task),
-                name="after-flow-done",
-            )
-        except Exception:
-            logger.exception("_on_flow_task_done failed to schedule cleanup")
-
-    async def _after_flow_done(self, task: "asyncio.Task[Any]") -> None:
-        """External cleanup that runs strictly after _flow_task is done.
-
-        Three responsibilities, all schedule-related:
-          1. Wake the scheduler so PENDING tasks get re-scanned now
-             that bridge is idle (applies to every flow, not only
-             scheduled ones — a user task finishing also unblocks
-             pending schedules).
-          2. Notify scheduler of the scheduled task's outcome.
-          3. Trigger auto-new so the next scheduled fire starts on a
-             clean _flow / IM / tool state.
-
-        Two early-exit paths short-circuit (2) + (3):
-          * sid is None — plain user task, scheduler is uninvolved.
-          * sid in _cancelled_scheduled_ids — the user-new path already
-            wrote CANCELLED and is itself running _do_new_session;
-            doing it again here would just bump the generation an
-            extra time and double-reset the IM.
-
-        The flow itself owns NONE of this — _run_flow_session stays
-        pure business logic.
-        """
-        sid = self._scheduled_running_id
-        self._scheduled_running_id = None
-
-        # (1) Wake scheduler — runs for every flow.
-        if scheduler is not None:
-            try:
-                scheduler._wakeup.set()
-            except Exception:
-                pass
-
-        if sid is None:
-            return  # plain user task
-
-        if sid in self._cancelled_scheduled_ids:
-            # User-new abort path: _do_new_session is already in flight
-            # on the caller side. CANCELLED is already written; auto-new
-            # is already happening. Just clear the marker and exit.
-            self._cancelled_scheduled_ids.discard(sid)
+    def _on_receptionist_reply(self, text: str) -> None:
+        """``FlowControllerV2.on_reply_to_user`` callback. Emits the
+        receptionist's chat reply as a ``kind=reply`` status envelope so
+        the renderer can render an assistant text bubble. Streaming
+        (``reply_delta`` / ``reply_done``) is currently unwired — V2
+        baseline emits the full reply once."""
+        if not text:
             return
-
-        # (2) Real scheduled completion — notify outcome.
-        ok = (not task.cancelled()) and task.exception() is None
-        err = ""
-        if task.cancelled():
-            err = "cancelled"
-        elif task.exception() is not None:
-            err = str(task.exception())[:500]
-        if scheduler is not None:
-            try:
-                await scheduler.notify_task_finished(
-                    sid, ok=ok, error=err,
-                )
-            except Exception:
-                logger.exception("scheduler notify_task_finished failed")
-
-        # (3) Auto-new so the next scheduled fire starts clean. Runs in
-        # this fresh task; _flow_task.done() is True, so _do_new_session's
-        # wait_for(flow_task) returns immediately.
-        try:
-            await self._do_new_session(msg_id=None, _suppress_final=True)
-        except Exception:
-            logger.exception("auto-new after scheduled flow failed")
+        _emit({"type": "status", "kind": "reply", "text": str(text)},
+              gen=self._generation)
 
     # ------------------------------------------------------------------
     # New-session chain — equivalent to `handq new`. Designed for three
@@ -1894,184 +1784,47 @@ class StdioBridge:
     #      renderer's New button is fire-and-forget; if cleanup stalls,
     #      the user can still type the next goal and it sits in the
     #      stdin queue until cleanup finishes.
-    #  (2) NO LEAKS — release the FlowController graph, the per-service
-    #      httpx connection pools, and the InteractionManager singleton
-    #      so the next `request` builds against fresh state.
-    #  (3) NO ORPHAN SUBPROCESSES on Windows. The bash tool spawns child
-    #      processes with CREATE_NEW_PROCESS_GROUP and watches
-    #      _interrupt_event to kill the whole tree. We MUST drive the
-    #      shutdown through that interrupt path FIRST — hard-cancelling
-    #      the flow task while bash_tool is parked in `asyncio.wait(
-    #      [communicate_task, interrupt_task])` raises CancelledError on
-    #      the wait but does NOT cancel its child tasks, leaving
-    #      `process.communicate()` orphaned with a live subprocess.
+    #  (2) NO LEAKS — release the FlowControllerV2 graph and the per-service
+    #      httpx connection pools so the next `request` builds against
+    #      fresh state. V2 has no IM singleton — the IM dies with the flow.
+    #  (3) NO ORPHAN SUBPROCESSES on Windows. The shell tool spawns child
+    #      processes with CREATE_NEW_PROCESS_GROUP. ``flow.cancel_all_tasks``
+    #      cancels the asyncio tasks that own them; cooperative shutdown
+    #      via the orchestrator's planner_loop / agent's run_loop catches
+    #      CancelledError and drains.
     #
-    # Stragglers: if a child task ignores cancellation entirely (rare —
-    # would have to be wedged in a C-level syscall that doesn't honor
-    # asyncio's cancel), it survives as a background coroutine. It can
-    # emit a short tail of status envelopes before its underlying I/O
-    # finally times out. The renderer just renders them as live events;
-    # not a correctness issue, just cosmetic.
+    # Stragglers: if a child task ignores cancellation entirely, it survives
+    # as a background coroutine. It can emit a short tail of status envelopes
+    # before its underlying I/O finally times out. The renderer's
+    # generation-tag watermark drops them, so they don't pollute the new
+    # conversation — only correctness issue avoided is process leak, and the
+    # asyncio cancel handles that on the next event-loop pass.
     # ------------------------------------------------------------------
 
-    # Cleanup budget. Bridge total stall ≤ GRACE + HARD + CLOSE * len(services)
-    # — for the default 4 services, ≤ ~12s worst case, ≤ ~2.5s typical.
+    # Cleanup budget. Bridge total stall ≤ GRACE + CLOSE * len(services)
+    # — for the default 4 services, ≤ ~10s worst case, ≤ ~2s typical.
     _NEW_SESSION_GRACE_TIMEOUT = 2.5    # cooperative interrupt
     _NEW_SESSION_HARD_TIMEOUT  = 1.5    # after explicit cancel
     _NEW_SESSION_CLOSE_TIMEOUT = 2.0    # per-service httpx pool drain
 
-    async def _do_gep_save(
-        self, msg_id: Optional[str], msg: Dict[str, Any],
-    ) -> None:
-        """Trigger the GEP save-session flow.
-
-        Sole entry point for generating a template — invoked only by the
-        Templates panel's "Load history" file picker, which always passes
-        ``log_file``. The frontend already gates on idle, but this method
-        is the single source of truth for the server-side rules:
-
-          (a) NO task may be currently executing or replanning. We refuse
-              outright; we no longer cancel a live task to make room for
-              save (that was the old behaviour back when Save lived in the
-              completion bubble — nonsensical now that the user has to
-              navigate to Templates → Load history, which itself implies
-              "I'm done with whatever I was doing").
-          (b) A bootstrap FlowController is built on demand if none exists
-              yet, so the save flow works even before the user has sent
-              a single message in the session.
-
-        The save flow (``flow._trigger_save_session``) then constructs its
-        own fresh FlowController and takes over the InteractionManager —
-        the conversation pane becomes the template-generation chat.
-        """
-        from src.models.state import SystemState
-
-        log_file = msg.get("log_file") or None
-
-        # ── (a) hard refuse if a task is in flight ───────────────────────
-        if self._flow is not None and self._flow.state in (
-            SystemState.EXECUTING, SystemState.REPLANNING,
-        ):
-            _emit({"type": "error", "id": msg_id, "where": "bridge",
-                   "message": "GEP save: a task is currently running — wait for "
-                              "completion or click New first.",
-                   "fatal": False}, gen=self._generation)
-            return
-
-        # If the bridge already has a live flow_task whose state isn't
-        # IDLE/COMPLETED, treat that as "task running" too. Defensive: covers
-        # transient windows where state hasn't transitioned yet but the task
-        # is mid-execution.
-        if (
-            self._flow_task is not None
-            and not self._flow_task.done()
-            and self._flow is not None
-            and self._flow.state not in (SystemState.IDLE, SystemState.COMPLETED)
-        ):
-            _emit({"type": "error", "id": msg_id, "where": "bridge",
-                   "message": "GEP save: a task is currently running — wait for "
-                              "completion or click New first.",
-                   "fatal": False}, gen=self._generation)
-            return
-
-        # ── No log_file + no execution recorder = nothing to save ────────
-        # The Templates panel always supplies log_file, so this guard mostly
-        # catches programmatic callers that omit it.
-        if (
-            log_file is None
-            and (self._flow is None or self._flow._execution_recorder is None)
-        ):
-            _emit({"type": "error", "id": msg_id, "where": "bridge",
-                   "message": "GEP save: log_file is required when no completed "
-                              "task exists in the current session.",
-                   "fatal": False}, gen=self._generation)
-            return
-
-        # ── (b) bootstrap a parent flow if none exists ───────────────────
-        # _trigger_save_session builds its own save_flow but borrows the
-        # parent for config_manager / services / storage_directory. The
-        # bootstrap goal text is only used by _allocate_session_dir to slug
-        # the placeholder dir.
-        if self._flow is None:
-            try:
-                self._ensure_flow(goal="gep-save-bootstrap")
-            except Exception as exc:
-                logger.exception("gep_save: _ensure_flow failed")
-                _emit({"type": "error", "id": msg_id, "where": "bridge",
-                       "message": f"GEP save: could not initialise bridge "
-                                  f"flow: {exc}", "fatal": False},
-                      gen=self._generation)
-                return
-
-        flow = self._flow
-
-        # If there's a stale idle flow_task (planner_loop waiting for next
-        # message), gracefully cancel it so the save flow takes the IM
-        # singleton without contention. Safe because we already verified
-        # state is IDLE/COMPLETED above.
-        if self._flow_task is not None and not self._flow_task.done():
-            self._flow_task.cancel()
-            try:
-                flow.cancel_all_tasks()
-            except Exception:
-                logger.exception("gep_save: cancel_all_tasks raised")
-            try:
-                await asyncio.wait({self._flow_task}, timeout=3.0)
-            except Exception:
-                pass
-
-        # Run the save flow as a new task; it manages its own lifecycle.
-        save_task = asyncio.create_task(
-            flow._trigger_save_session(log_file=log_file),
-            name=f"handq-gep-save-{int(time.time())}",
-        )
-        # Bind the bridge's flow_task slot so subsequent gep_save / new_session
-        # calls see "task running" until the save flow concludes.
-        self._flow_task = save_task
-
-        _emit({"type": "final", "id": msg_id,
-               "result": {"started": True}},
-              gen=self._generation)
-        logger.info("gep_save: started save-session flow id=%s log_file=%s",
-                    msg_id, log_file)
-
     async def _do_new_session(
         self, msg_id: Optional[str], *, _suppress_final: bool = False,
     ) -> None:
-        # User-initiated new during a scheduled fire: tell the scheduler
-        # the task was cancelled BEFORE we tear anything down. Marker
-        # added to _cancelled_scheduled_ids so _after_flow_done (which
-        # will fire when we cancel _flow_task below) skips its own
-        # notify_task_finished and doesn't overwrite CANCELLED → FAILED.
-        # We use count_as_failure=False because user-cancellations are
-        # not real task failures and shouldn't trip the auto-disable
-        # counter.
-        if (
-            self._scheduled_running_id is not None
-            and scheduler is not None
-        ):
-            sid = self._scheduled_running_id
-            try:
-                await scheduler.notify_task_finished(
-                    sid, ok=False,
-                    error="cancelled by user new_session",
-                    count_as_failure=False,
-                )
-                self._cancelled_scheduled_ids.add(sid)
-            except Exception:
-                logger.exception("scheduler cancel-notify failed")
-
         # Bump the generation BEFORE doing any cleanup, then construct a
         # fresh _StdioUI bound to the new gen. The OLD _StdioUI is NOT
         # mutated — it stays referenced by the OLD InteractionManager
-        # (which is still referenced by the old FlowController), so any
-        # straggler `notify_*` call from a wedged old subtask continues
+        # (which is still referenced by the old FlowControllerV2), so any
+        # straggler ``notify_*`` call from a wedged old subtask continues
         # to emit through the OLD _StdioUI with the OLD generation. The
         # renderer's gen-watermark drops those.
         old_gen = self._generation
         self._generation = old_gen + 1
         new_gen = self._generation
         new_ui = _StdioUI(new_gen)
+        try:
+            new_ui._loop = asyncio.get_running_loop()
+        except RuntimeError:
+            pass
         logger.info("new_session sequence begin; id=%s old_gen=%d new_gen=%d suppress_final=%s",
                     msg_id, old_gen, new_gen, _suppress_final)
         t0 = time.monotonic()
@@ -2082,90 +1835,49 @@ class StdioBridge:
         # longer alias state on `self`. Crucially, a request that arrives
         # next tick sees `_flow is None` and rebuilds from scratch.
         flow = self._flow
-        flow_task = self._flow_task
         services = self._services
         self._flow = None
-        self._flow_task = None
         self._services = []
 
+        # Detach + close this session's engine.log handler from the root logger
+        # so the file is released and the next session's _ensure_flow opens a
+        # fresh handq-engine.log (no cross-session bleed, no lingering Windows
+        # file lock). The next _ensure_flow re-attaches a new one.
         try:
-            # ── 1. Cooperative shutdown ──────────────────────────────────
-            # Set _interrupt_event before cancelling anything. The
-            # engine's broadcast loop forwards it to per-agent events,
-            # which the bash tool listens for and uses to call
-            # _kill_process_tree (TerminateProcess on Windows). On Unix
-            # it sends SIGTERM to the process group via start_new_session.
+            from ..infrastructure.logger import remove_root_file_handler
+            remove_root_file_handler(self._engine_log_handler)
+        except Exception:
+            logger.exception("new_session: failed to detach engine.log handler")
+        finally:
+            self._engine_log_handler = None
+
+        try:
+            # ``flow.destroy()`` trips the SharedCheckList interrupt event
+            # (waking shell/session tools parked on subprocess waits), cancels
+            # the agent + planner asyncio tasks, then awaits
+            # ``SessionContext.close()`` which closes the Playwright browser,
+            # kills interactive shell sessions, drains the SSH connection
+            # pool, sweeps the desktop / browser screenshot stores, and drops
+            # the per-session ``FileState`` + ``DesktopState`` instances.
+            #
+            # That single async call collapses what would otherwise be 6
+            # manual flush sites + 2 detach calls. New tools that need
+            # session-scoped cleanup register on the SessionContext; the
+            # bridge does not need to know about them.
             if flow is not None:
                 try:
-                    flow._interrupt_event.set()
-                except Exception:
-                    logger.warning(
-                        "new_session: interrupt_event.set failed",
-                        exc_info=True,
-                    )
-                try:
-                    flow.cancel_all_tasks()
-                except Exception:
-                    logger.warning(
-                        "new_session: cancel_all_tasks failed",
-                        exc_info=True,
-                    )
-
-            # ── 2. Bounded drain ─────────────────────────────────────────
-            # asyncio.shield prevents wait_for from cancelling the task
-            # on timeout, so we control the cancel cascade ourselves.
-            # First wait for cooperative shutdown (engine sees the
-            # interrupt and exits cleanly). Only escalate to a hard
-            # cancel if it doesn't finish in time, since hard cancels
-            # can orphan Windows subprocesses (see header).
-            #
-            # Honest limit: if the old flow is parked in
-            # `loop.run_in_executor(blocking_io)` (e.g. ssh_tool retry
-            # backoff, ssh_setup getpass), task.cancel() cancels the
-            # asyncio future but the OS thread keeps running until the
-            # syscall returns. Python on Windows has no portable way
-            # to kill that thread. We accept the orphan and rely on
-            # the generation tag to keep its eventual emits out of the
-            # new conversation.
-            if flow_task is not None and not flow_task.done():
-                try:
-                    await asyncio.wait_for(
-                        asyncio.shield(flow_task),
-                        timeout=self._NEW_SESSION_GRACE_TIMEOUT,
-                    )
-                    logger.info(
-                        "new_session: cooperative drain ok (%.2f ms)",
-                        (time.monotonic() - t0) * 1000.0,
-                    )
+                    await asyncio.wait_for(flow.destroy(), timeout=2.0)
                 except asyncio.TimeoutError:
-                    logger.info(
-                        "new_session: cooperative drain expired after %.1fs; "
-                        "escalating to cancel",
-                        self._NEW_SESSION_GRACE_TIMEOUT,
+                    logger.warning("new_session: flow.destroy timed out (2.0s)")
+                except Exception:
+                    logger.warning(
+                        "new_session: flow.destroy failed", exc_info=True,
                     )
-                    flow_task.cancel()
-                    try:
-                        await asyncio.wait_for(
-                            flow_task,
-                            timeout=self._NEW_SESSION_HARD_TIMEOUT,
-                        )
-                    except asyncio.TimeoutError:
-                        logger.warning(
-                            "new_session: flow_task did not drain after "
-                            "cancel within %.1fs; leaving as background "
-                            "(gen=%d). Stragglers will be filtered by the "
-                            "renderer's generation watermark.",
-                            self._NEW_SESSION_HARD_TIMEOUT, old_gen,
-                        )
-                    except (asyncio.CancelledError, Exception):
-                        pass
-                except (asyncio.CancelledError, Exception):
-                    pass
 
-            # ── 3. Drain HTTP connection pools ───────────────────────────
-            # AnthropicStreamingService.close() awaits the bundled httpx
-            # client's aclose(). On Windows a half-open TCP socket can
-            # stall this for the full keepalive window, so cap it.
+            # AnthropicStreamingService instances live on the bridge (not on
+            # the flow) so flow.destroy doesn't touch them; the bridge owns
+            # their httpx pool drain. Cap each close to keep new_session
+            # bounded if a half-open TCP socket stalls.
             for i, svc in enumerate(services):
                 try:
                     await asyncio.wait_for(
@@ -2183,79 +1895,7 @@ class StdioBridge:
                         i, exc_info=True,
                     )
 
-            # ── 4. Reset the InteractionManager singleton ────────────────
-            # reset_instance() drops the cls._instance ref. The old
-            # instance's daemon stdin thread already EOF'd at boot
-            # (bridge_main.py redirects stdin → /dev/null), so no thread
-            # leak. Attach the FRESH _StdioUI (bound to new_gen) so the
-            # next FlowController's notify_* / show_* events route here
-            # with the new generation.
-            try:
-                InteractionManager.reset_instance()
-            except Exception:
-                logger.warning(
-                    "new_session: reset_instance failed", exc_info=True,
-                )
-            self._im = InteractionManager.get_instance()
-            # Bind the fresh IM into the new UI so its confirmation
-            # methods (request_risk_confirmation etc.) install pending
-            # callbacks into the right IM instance.
-            new_ui._im = self._im
             self._ui = new_ui
-            self._im.set_ui(self._ui)
-
-            # ── 5. Drop process-wide singleton state held by tools ───────
-            # FileState (read-before-write tracker) and the SSH connection
-            # pool both live at module level, so they survive the bridge's
-            # FlowController reset. If we don't flush them, the new flow
-            # could:
-            #   * Find an OLD pooled paramiko client (possibly closed by
-            #     our force_terminate fire) and try to use it.
-            #   * Treat a file as "already read this session" because the
-            #     OLD flow read it — bypassing the staleness gate.
-            # Both are silent correctness bugs across new_session, so we
-            # always flush.
-            try:
-                from ..tools.file_state import FileState as _FileState
-                _FileState.reset_for_session()
-                logger.info("new_session: FileState cleared")
-            except Exception:
-                logger.warning("new_session: FileState reset failed", exc_info=True)
-            try:
-                from ..tools.ssh_tool import flush_connection_pool as _flush_ssh
-                closed = _flush_ssh()
-                logger.info("new_session: SSH pool flushed (%d clients closed)", closed)
-            except Exception:
-                logger.warning("new_session: SSH pool flush failed", exc_info=True)
-            try:
-                from ..tools.browser_tool import flush_browser_pool as _flush_browser
-                browser_closed = await _flush_browser()
-                logger.info(
-                    "new_session: browser pool flushed (%d sessions closed)",
-                    browser_closed,
-                )
-            except Exception:
-                logger.warning("new_session: browser pool flush failed", exc_info=True)
-            try:
-                from ..tools.session_tool import flush_session_pool as _flush_sessions
-                session_result = await _flush_sessions()
-                if session_result:
-                    logger.info("new_session: %s", session_result)
-            except Exception:
-                logger.warning("new_session: session pool flush failed", exc_info=True)
-            try:
-                # Drop the desktop takeover memo so the next task starts
-                # unapproved. If the OLD task still had the overlay up,
-                # this emits notify_desktop_takeover_ended via the NEW
-                # IM/UI (we already rebuilt them above), which the
-                # Electron main process listens to and uses to close the
-                # overlay window. Keep this AFTER the IM reset so the
-                # event routes through the new UI.
-                from ..tools.desktop_tool import reset_takeover_state as _reset_takeover
-                _reset_takeover()
-                logger.info("new_session: desktop takeover state reset")
-            except Exception:
-                logger.warning("new_session: desktop takeover reset failed", exc_info=True)
         except Exception:
             logger.exception("new_session chain raised unexpectedly")
         finally:
@@ -2288,32 +1928,28 @@ class StdioBridge:
             if self._flow is not None:
                 t0 = time.monotonic()
                 try:
-                    self._flow._interrupt_event.set()
-                    logger.info("shutdown: interrupt_event.set OK (%.2f ms)", _step_ms(t0))
+                    # ``flow.destroy()`` is async: it trips the checklist
+                    # interrupt event, cancels both run-loops, and awaits
+                    # ``SessionContext.close()`` to tear down all per-session
+                    # resources (browser / shells / SSH pool / desktop state /
+                    # file state). The bridge no longer detaches IM refs or
+                    # calls flush_*_pool — destroy does all of it in one place.
+                    await asyncio.wait_for(
+                        self._flow.destroy(),
+                        timeout=2.5,
+                    )
+                    logger.info("shutdown: flow.destroy OK (%.2f ms)", _step_ms(t0))
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "shutdown: flow.destroy timed out (2.5s); leaving "
+                        "any stragglers as background — generation tag will "
+                        "filter their late emits",
+                    )
                 except Exception:
-                    logger.warning("shutdown: interrupt_event.set failed (%.2f ms)",
-                                   _step_ms(t0), exc_info=True)
-                t0 = time.monotonic()
-                try:
-                    self._flow.cancel_all_tasks()
-                    logger.info("shutdown: cancel_all_tasks OK (%.2f ms)", _step_ms(t0))
-                except Exception:
-                    logger.warning("shutdown: cancel_all_tasks failed (%.2f ms)",
+                    logger.warning("shutdown: flow.destroy failed (%.2f ms)",
                                    _step_ms(t0), exc_info=True)
             else:
-                logger.info("shutdown: no FlowController to interrupt/cancel")
-
-            if self._flow_task is not None and not self._flow_task.done():
-                t0 = time.monotonic()
-                self._flow_task.cancel()
-                try:
-                    await self._flow_task
-                    logger.info("shutdown: await flow_task OK (%.2f ms)", _step_ms(t0))
-                except (asyncio.CancelledError, Exception):
-                    logger.info("shutdown: await flow_task drained with exception (%.2f ms)",
-                                _step_ms(t0), exc_info=True)
-            else:
-                logger.info("shutdown: no live flow_task to await")
+                logger.info("shutdown: no FlowControllerV2 to destroy")
 
             for i, svc in enumerate(self._services):
                 t0 = time.monotonic()
@@ -2323,14 +1959,6 @@ class StdioBridge:
                 except Exception:
                     logger.warning("shutdown: svc[%d].close failed (%.2f ms)",
                                    i, _step_ms(t0), exc_info=True)
-
-            t0 = time.monotonic()
-            try:
-                InteractionManager.reset_instance()
-                logger.info("shutdown: InteractionManager.reset_instance OK (%.2f ms)", _step_ms(t0))
-            except Exception:
-                logger.warning("shutdown: InteractionManager.reset_instance failed (%.2f ms)",
-                               _step_ms(t0), exc_info=True)
         except Exception:
             logger.exception("shutdown chain raised unexpectedly")
         finally:

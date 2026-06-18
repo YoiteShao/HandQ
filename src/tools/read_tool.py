@@ -9,6 +9,9 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Union, List, Optional
+
+import pdfplumber  # type: ignore[import-not-found]
+
 from .base_tool import BaseTool, ToolResult
 from .file_state import FileState
 
@@ -146,53 +149,9 @@ def _read_pdf(path_obj: Path, pages: Optional[str] = None) -> dict:
         except (ValueError, IndexError):
             return {"success": False, "error": f"Invalid pages format: '{pages}'. Use '1-5', '3', or '10-20'."}
 
-    # Try PyPDF2
+    # pdfplumber — single canonical PDF parser. Imported eagerly at module load
+    # so missing dep fails at startup rather than at first PDF read.
     try:
-        import PyPDF2
-        with open(path_obj, "rb") as f:
-            reader = PyPDF2.PdfReader(f)
-            total_pages = len(reader.pages)
-
-            if end_page is None:
-                end_page = min(total_pages, start_page + _MAX_PDF_PAGES_PER_REQUEST)
-            end_page = min(end_page, total_pages)
-
-            if total_pages > _MAX_PDF_PAGES_PER_REQUEST and pages is None:
-                return {
-                    "success": False,
-                    "error": (
-                        f"PDF has {total_pages} pages (max {_MAX_PDF_PAGES_PER_REQUEST} per request). "
-                        f"Provide the 'pages' parameter (e.g., pages='1-10')."
-                    )
-                }
-
-            text_parts = []
-            for i in range(start_page, end_page):
-                page = reader.pages[i]
-                text = page.extract_text() or ""
-                text_parts.append(f"--- Page {i + 1} ---\n{text}")
-
-            content = "\n\n".join(text_parts)
-            return {
-                "success": True,
-                "output": {
-                    "type": "pdf",
-                    "path": str(path_obj.absolute()),
-                    "content": content,
-                    "total_pages": total_pages,
-                    "pages_read": f"{start_page + 1}-{end_page}",
-                    "size": path_obj.stat().st_size,
-                }
-            }
-    except ImportError:
-        pass
-    except Exception as e:
-        # PyPDF2 failed for non-import reason — try next library
-        pass
-
-    # Try pdfplumber
-    try:
-        import pdfplumber
         with pdfplumber.open(path_obj) as pdf:
             total_pages = len(pdf.pages)
 
@@ -227,64 +186,11 @@ def _read_pdf(path_obj: Path, pages: Optional[str] = None) -> dict:
                     "size": path_obj.stat().st_size,
                 }
             }
-    except ImportError:
-        pass
-    except Exception:
-        pass
-
-    # Try pymupdf (fitz)
-    try:
-        import fitz  # pymupdf
-        doc = fitz.open(str(path_obj))
-        total_pages = doc.page_count
-
-        if end_page is None:
-            end_page = min(total_pages, start_page + _MAX_PDF_PAGES_PER_REQUEST)
-        end_page = min(end_page, total_pages)
-
-        if total_pages > _MAX_PDF_PAGES_PER_REQUEST and pages is None:
-            doc.close()
-            return {
-                "success": False,
-                "error": (
-                    f"PDF has {total_pages} pages (max {_MAX_PDF_PAGES_PER_REQUEST} per request). "
-                    f"Provide the 'pages' parameter (e.g., pages='1-10')."
-                )
-            }
-
-        text_parts = []
-        for i in range(start_page, end_page):
-            page = doc[i]
-            text = page.get_text() or ""
-            text_parts.append(f"--- Page {i + 1} ---\n{text}")
-        doc.close()
-
-        content = "\n\n".join(text_parts)
+    except Exception as exc:
         return {
-            "success": True,
-            "output": {
-                "type": "pdf",
-                "path": str(path_obj.absolute()),
-                "content": content,
-                "total_pages": total_pages,
-                "pages_read": f"{start_page + 1}-{end_page}",
-                "size": path_obj.stat().st_size,
-            }
+            "success": False,
+            "error": f"PDF read failed via pdfplumber: {exc}",
         }
-    except ImportError:
-        pass
-    except Exception:
-        pass
-
-    # No PDF library available
-    return {
-        "success": False,
-        "error": (
-            "Cannot read PDF: no supported PDF library installed. "
-            "Install one of: PyPDF2, pdfplumber, or pymupdf (fitz). "
-            f"Example: pip install PyPDF2"
-        )
-    }
 
 
 class ReadTool(BaseTool):
@@ -293,8 +199,8 @@ class ReadTool(BaseTool):
     is_read_only = True
     is_concurrency_safe = True
 
-    def __init__(self):
-        super().__init__("read")
+    def __init__(self, ctx=None):
+        super().__init__("read", ctx=ctx)
 
     def _read_single_path(
         self,
@@ -382,13 +288,21 @@ class ReadTool(BaseTool):
                 }
             }
 
-        # Encoding fallback: utf-8 → latin-1 → hex summary
+        # Read raw bytes once, then decode. Avoids a second read for SHA
+        # later (which both wastes IO and opens a TOCTOU window where the
+        # file changes between the read and the hash, leaving FileState
+        # with a hash that doesn't match the bytes the agent saw).
+        try:
+            with open(path_obj, "rb") as _fh:
+                _raw_bytes = _fh.read()
+        except OSError as e:
+            return {"success": False, "path": path, "error": str(e)}
+
         content = None
         encoding_used = None
         for enc in ("utf-8", "latin-1"):
             try:
-                with open(path_obj, "r", encoding=enc) as f:
-                    content = f.read()
+                content = _raw_bytes.decode(enc)
                 encoding_used = enc
                 break
             except (UnicodeDecodeError, LookupError):
@@ -396,23 +310,19 @@ class ReadTool(BaseTool):
 
         if content is None:
             # Binary fallback: hex summary
-            try:
-                raw = _read_bytes_sample(path_obj, 256)
-                hex_preview = raw.hex(" ", 1)
-                return {
-                    "success": True,
-                    "output": {
-                        "type": "binary_file",
-                        "path": str(path_obj.absolute()),
-                        "size": file_size,
-                        "message": (
-                            f"Binary file detected ({file_size} bytes). Cannot display as text.\n"
-                            f"First 256 bytes (hex): {hex_preview}"
-                        ),
-                    }
+            hex_preview = _raw_bytes[:256].hex(" ", 1)
+            return {
+                "success": True,
+                "output": {
+                    "type": "binary_file",
+                    "path": str(path_obj.absolute()),
+                    "size": file_size,
+                    "message": (
+                        f"Binary file detected ({file_size} bytes). Cannot display as text.\n"
+                        f"First 256 bytes (hex): {hex_preview}"
+                    ),
                 }
-            except OSError as e:
-                return {"success": False, "path": path, "error": str(e)}
+            }
 
         all_lines = content.splitlines(keepends=True)
         total_lines = len(all_lines)
@@ -453,9 +363,8 @@ class ReadTool(BaseTool):
         more_after = last_returned < total_lines or char_truncated
 
         numbered = _add_line_numbers(selected, start=sl + 1)
-        with open(path_obj, "rb") as _fh:
-            _raw = _fh.read()
-        FileState.get_instance().record_read(path, hashlib.sha256(_raw).hexdigest())
+        fs = self.ctx.file_state if self.ctx is not None else FileState.get_instance()
+        fs.record_read(path, hashlib.sha256(_raw_bytes).hexdigest())
 
         output: dict = {
             "type": "file",

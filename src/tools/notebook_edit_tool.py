@@ -50,8 +50,8 @@ class NotebookEditTool(BaseTool):
     is_read_only = False
     is_concurrency_safe = False
 
-    def __init__(self):
-        super().__init__("notebook_edit")
+    def __init__(self, ctx=None):
+        super().__init__("notebook_edit", ctx=ctx)
 
     async def execute(
         self,

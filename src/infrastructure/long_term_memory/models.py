@@ -19,6 +19,11 @@ class CandidateStatus(str, Enum):
     ACCEPTED_MEMORY = "accepted_memory"
     ACCEPTED_KNOWLEDGE = "accepted_knowledge"
     ACCEPTED_BOTH = "accepted_both"
+    # A SESSION_COMPLETE candidate produced no memory/knowledge but its task
+    # pattern recurred enough times to be promoted to a skill proposal. Skill
+    # is a side-channel artifact (staging file + emit), so this status is only
+    # set when nothing else was written.
+    ACCEPTED_SKILL = "accepted_skill"
     REJECTED = "rejected"
     FAILED = "failed"
 
@@ -54,6 +59,7 @@ class CandidateSource(str, Enum):
 class MemoryDimension(str, Enum):
     AGENTIC = "agentic"   # how the user wants the agent to BEHAVE
     INSIGHT = "insight"   # factual context about the user / environment
+    IDENTITY = "identity"  # unconditional cross-session directives (always injected)
 
 
 class KnowledgeCategory(str, Enum):
@@ -72,6 +78,7 @@ class EntryKind(str, Enum):
     MEMORY = "memory"
     KNOWLEDGE = "knowledge"
     PROCEDURE = "procedure"  # P6 — not implemented in v1
+    SKILL_PROPOSAL = "skill_proposal"  # LTM 2.0: triage worth_skill output
 
 
 class VerdictAction(str, Enum):
@@ -189,6 +196,19 @@ class Entry:
     created_at: int = 0
     updated_at: int = 0
     score: Optional[float] = None              # filled at recall time
+    # LTM 2.0 additions:
+    frame_json: Optional[dict] = None          # {os, host, confidence, evidence}
+    source_event_id: Optional[str] = None      # → obs_semantic_events(id)
+    superseded_by: Optional[str] = None
+    synthesis_level: int = 0
+    source_entry_ids: List[str] = field(default_factory=list)
+    recall_count_30d: int = 0
+    principal_ids: List[str] = field(default_factory=list)
+    # skill_proposal only:
+    skill_status: Optional[str] = None         # 'proposed'|'approved'|'rejected'
+    skill_signature: Optional[dict] = None
+    skill_fingerprint: Optional[str] = None
+    recurrence_count: int = 1
 
 
 @dataclass
@@ -293,10 +313,12 @@ class MonitorInfo:
 class ActivitySample:
     """One accepted observation of a monitor at a point in time.
 
-    Buffered in-memory by the ActivityMonitor service until either
-    ``ACTIVITY_BUFFER_FLUSH_AFTER_N`` accumulate or the per-monitor flush
-    deadline elapses. On flush, the buffer is rendered into a single
-    ACTIVITY_OBSERVER candidate.
+    A transient in-memory carrier built in ``PersonalityMonitor._ocr_one``
+    once an OCR'd frame survives the Jaccard dedup. It is consumed
+    immediately to derive the LTM 2.0 frame (via ``_infer_sample_frame``)
+    and to write the ``obs_snapshots`` + ``obs_ocr_frames`` rows that feed
+    the observation pipeline. It is not persisted or buffered as its own
+    record.
 
     We deliberately do NOT keep the screenshot bytes here — by the time a
     sample exists, the source PNG has been unlinked. The OCR text excerpt
@@ -420,3 +442,304 @@ class ScheduledTask:
             created_at=int(d.get("created_at") or int(time.time())),
             updated_at=int(d.get("updated_at") or int(time.time())),
         )
+
+
+# ── LTM 2.0 observation / entity layer enums ───────────────────────────────
+
+
+class TriggerKind(str, Enum):
+    """What event opened an obs_sessions row."""
+    APP_SWITCH = "app_switch"
+    SSH_START = "ssh_start"
+    RDP_START = "rdp_start"
+    IDLE_RESUME = "idle_resume"
+    LONG_RUN = "long_run"          # forced rollover after MAX_OPEN_SESSION_MS
+
+
+class SemanticStatus(str, Enum):
+    PENDING = "pending"          # session ended, extractor not yet run
+    EXTRACTING = "extracting"    # extractor in flight
+    DONE = "done"
+    SKIPPED = "skipped"          # too-small / trivial session
+
+
+class PrincipalKind(str, Enum):
+    PERSON = "person"
+    MACHINE = "machine"
+    PROJECT = "project"
+
+
+class HostKind(str, Enum):
+    SSH = "ssh"
+    RDP = "rdp"
+    LOCAL = "local"
+    FTP = "ftp"
+
+
+class SkillProposalStatus(str, Enum):
+    PROPOSED = "proposed"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+
+
+class ObsEventKind(str, Enum):
+    FOREGROUND_CHANGE = "foreground_change"
+    IDLE_ENTER = "idle_enter"
+    IDLE_RESUME = "idle_resume"
+    APP_OPEN = "app_open"
+    APP_CLOSE = "app_close"
+    BROWSER_NAVIGATE = "browser_navigate"
+    SSH_CONNECT = "ssh_connect"
+    SSH_DISCONNECT = "ssh_disconnect"
+    RDP_CONNECT = "rdp_connect"
+    RDP_DISCONNECT = "rdp_disconnect"
+    NOTIFICATION = "notification"
+
+
+class SyntheticOrigin(str, Enum):
+    """Source of an obs_semantic_events row when no obs_session backs it."""
+    USER_MESSAGE = "user_message"
+    MANUAL = "manual"
+    POST_COMMIT = "post_commit"
+    SESSION_COMPLETE = "session_complete"
+    SESSION_FAILED = "session_failed"
+
+
+# ── LTM 2.0 observation / entity dataclasses ────────────────────────────────
+
+
+@dataclass
+class Frame:
+    """Execution-environment frame attached to observations and entries.
+
+    A frame answers: "Where (OS, host) was this observed? How confident
+    are we?" Encoded as JSON in obs_snapshots.frame_json /
+    mem_entries.frame_json; the os/host fields are exposed as STORED
+    generated columns so SQL WHERE clauses hit an index.
+
+    Confidence levels:
+      0.9-1.0 : high — process signal unambiguous (PowerShell on Windows)
+      0.6-0.9 : medium — process + title agree (mintty + user@host)
+      0.3-0.6 : low — only weak signal (browser, generic editor)
+      <0.3    : ambient — drop or quarantine
+    """
+    os: str                              # 'windows'|'linux'|'remote'|'unknown'|'any'
+    host: str = "unknown"                # 'local'|<hostname>|'unknown'
+    confidence: float = 0.0
+    evidence: str = ""
+
+    def to_json(self) -> dict:
+        return {"os": self.os, "host": self.host,
+                "confidence": self.confidence, "evidence": self.evidence}
+
+    @classmethod
+    def from_json(cls, d: Optional[dict]) -> Optional["Frame"]:
+        if not d:
+            return None
+        return cls(
+            os=str(d.get("os") or "unknown"),
+            host=str(d.get("host") or "unknown"),
+            confidence=float(d.get("confidence") or 0.0),
+            evidence=str(d.get("evidence") or ""),
+        )
+
+
+@dataclass
+class Snapshot:
+    """One captured frame from PersonalityMonitor → obs_snapshots row.
+
+    Replaces the older flat ActivitySample model. Carries everything the
+    observation pipeline needs to flow through session aggregation, semantic
+    extraction, and triage: OCR text (separately in obs_ocr_frames), UIA
+    structured text (ax_text/parsed_json), window/process metadata, frame
+    inference output, and focus-rect optimization markers.
+    """
+    id: str
+    captured_at: int                            # unix ms
+    monitor_index: int
+    monitor_label: str = ""
+    window_title: str = ""
+    process_name: str = ""
+    browser_url: Optional[str] = None
+    top_window_titles: List[str] = field(default_factory=list)
+    content_type: Optional[str] = None
+    ax_text: Optional[str] = None
+    parsed_json: Optional[dict] = None
+    frame: Optional[Frame] = None
+    focus_rect: Optional[Tuple[int, int, int, int]] = None  # (x, y, w, h)
+    ocr_used_focus_rect: bool = False
+    system_idle_sec: Optional[int] = None
+    novelty_score: float = 1.0
+    tier: str = "hot"
+    storage_tier: str = "hot"
+    session_id: Optional[str] = None
+    semantic_event_id: Optional[str] = None
+    pii_redacted: bool = False
+    discarded: bool = False
+    discarded_reason: Optional[str] = None
+
+
+@dataclass
+class OcrFrame:
+    """One OCR pass result attached to a Snapshot.
+
+    Multiple OcrFrames may share a snapshot_id when both full-monitor and
+    focus-rect OCR were run on the same capture (is_focus_rect distinguishes
+    them). The embedding column is BLOB-encoded and populated lazily by the
+    OCR drain worker after RapidOCR returns.
+    """
+    id: str
+    snapshot_id: str
+    text: str
+    confidence: Optional[float] = None
+    embedding: Optional[bytes] = None
+    pipeline_version: str = ""
+    captured_at: int = 0
+    is_focus_rect: bool = False
+
+
+@dataclass
+class ObsEvent:
+    """Discrete state-change event (foreground app changed, idle entered,
+    SSH connected, ...). Separate from Snapshot/OcrFrame because events are
+    instantaneous markers, not periodic captures.
+    """
+    id: str
+    session_id: Optional[str]
+    kind: ObsEventKind
+    data: dict
+    sort_order: int
+    occurred_at: int
+
+
+@dataclass
+class Session:
+    """A continuous span of user work with one ``trigger_kind`` (PowerShell
+    foreground, SSH'd into longjian6, RDP to APT-LV-SH186, ...). Built by
+    SessionAggregator by grouping consecutive Snapshots; closed when input
+    idle > 10min OR foreground process changes for >3s. One Session may
+    span dozens of Snapshots; one Snapshot belongs to exactly one Session.
+    """
+    id: str
+    session_key: str                            # idempotency token
+    trigger_kind: TriggerKind
+    started_at: int
+    ended_at: Optional[int] = None
+    frame_os: Optional[str] = None
+    frame_host: Optional[str] = None
+    primary_process: Optional[str] = None
+    primary_window_title: Optional[str] = None
+    semantic_status: SemanticStatus = SemanticStatus.PENDING
+    snapshot_count: int = 0
+    apps_seen: List[str] = field(default_factory=list)
+    principal_ids: List[str] = field(default_factory=list)
+
+
+@dataclass
+class SemanticEvent:
+    """LLM-abstracted "what the user did" record. The bridge between raw
+    Snapshots/Sessions and durable mem_entries. SemanticEvents are the
+    sole input to the triage gate — both observation-origin (real Session
+    sessions extracted by LLM) and synthetic-origin (user_message,
+    manual_remember, post_commit) events flow through this single shape.
+    """
+    id: str
+    session_id: Optional[str]
+    synthetic_origin: Optional[SyntheticOrigin]
+    extracted_at: int
+    title: str
+    description: str = ""
+    category: Optional[str] = None
+    entities: List[str] = field(default_factory=list)
+    apps: List[str] = field(default_factory=list)
+    time_range_start: int = 0
+    time_range_end: int = 0
+    task_worthy: bool = False
+    worth_memory: bool = False
+    worth_knowledge: bool = False
+    worth_skill: bool = False
+    frame_os: Optional[str] = None
+    frame_host: Optional[str] = None
+    frame_confidence: Optional[float] = None
+    accepted_entries: List[dict] = field(default_factory=list)
+
+
+@dataclass
+class Principal:
+    """One canonical entity (person, machine, project) the user interacts
+    with. Populated by:
+      - SSH credentials registry (~/.ssh/handq_<host>.yaml → machine)
+      - git author email (post_commit → person)
+      - @-mentions in user messages (→ person/project)
+      - SemanticExtractor LLM entity extraction (→ any)
+    """
+    id: str
+    kind: PrincipalKind
+    canonical_name: str
+    display_name: Optional[str] = None
+    email: Optional[str] = None
+    host_kind: Optional[HostKind] = None
+    os: Optional[str] = None
+    project_root: Optional[str] = None
+    description: Optional[str] = None
+    first_seen: int = 0
+    last_seen: int = 0
+    sighting_count: int = 0
+    archived: bool = False
+
+
+@dataclass
+class Alias:
+    principal_id: str
+    alias: str
+
+
+@dataclass
+class Sighting:
+    """When and where a Principal was seen."""
+    id: str
+    principal_id: str
+    source_kind: str                            # 'session'|'semantic_event'|'mem_entry'
+    source_id: str
+    sighted_at: int
+    context: Optional[dict] = None
+
+
+@dataclass
+class SkillProposal:
+    """View of a mem_entries row where kind='skill_proposal'.
+
+    Materially the same row as a memory/knowledge Entry, but with the
+    skill-specific fields filled in. Created by the triage gate when an
+    observation pattern looks like a repeatable script/workflow.
+    """
+    id: str
+    skill_status: SkillProposalStatus
+    skill_signature: dict
+    skill_fingerprint: str
+    summary: str
+    body_md: str                                 # full SKILL.md content
+    recurrence_count: int
+    staging_path: Optional[str]                  # %USERPROFILE%\HandQ\Skill\.proposed\<name>\SKILL.md
+    source_event_id: Optional[str]
+    created_at: int
+    updated_at: int
+
+
+@dataclass
+class Summary:
+    """Daily / weekly / monthly highlight rollup of obs_semantic_events.
+
+    Generated by ``summary_worker.py`` on a Scheduler cron. Stored in
+    obs_summaries with composite PK (date, type, language). The
+    ``moments_json`` list is a small set (<=10) of high-importance moments
+    from the period; ``summary_text`` is a narrative paragraph for UI
+    display.
+    """
+    date: str                                    # 'YYYY-MM-DD' | 'YYYY-Wnn' | 'YYYY-MM'
+    type: str                                    # 'daily' | 'weekly' | 'monthly'
+    language: str = "en"
+    moments: List[dict] = field(default_factory=list)
+    summary_text: str = ""
+    generated_model: str = ""
+    generated_at: int = 0

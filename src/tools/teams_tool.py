@@ -18,9 +18,11 @@ Authentication
 Token acquisition is handled by ``infrastructure.teams_auth``; this
 tool never sees a refresh token, just calls
 ``TeamsAuth.get_token_silent()`` once per request via TeamsClient.
-First-time interactive sign-in is performed eagerly by
-``TeamsContextProvider.prepare()`` so the agent never blocks on a
-browser pop-up mid-step.
+First-time interactive sign-in is lazy: the first call (or any call
+after the token cache expires) triggers ``_ensure_token_or_auth``,
+which opens a browser against teams.microsoft.com to harvest fresh
+tokens and posts a one-line notice to the chat UI so the user knows
+to complete sign-in. A warm cache skips all of this.
 
 Concurrency
 -----------
@@ -324,8 +326,8 @@ class TeamsTool(BaseTool):
         "additionalProperties": False,
     }
 
-    def __init__(self) -> None:
-        super().__init__("teams")
+    def __init__(self, ctx=None) -> None:
+        super().__init__("teams", ctx=ctx)
         self.logger = get_logger()
 
     async def execute(self, action: str = "", **kwargs: Any) -> ToolResult:
@@ -706,10 +708,12 @@ class TeamsTool(BaseTool):
         Used by the read-side actions (list_chats, read_chat,
         read_channel, get_presence) which Microsoft does not grant via
         Graph for the Teams Web client. The underlying tokens (chatsvcagg
-        + presence audiences) are harvested into teams_auth's cache
+        + presence + ic3 audiences) are harvested into teams_auth's cache
         during the same bootstrap as the Graph token, so the agent
         sees one unified 'auth-or-not' state regardless of which
-        backend a given action talks to.
+        backend a given action talks to. (read_chat's message bodies
+        come from the ic3-authed, region-scoped chatsvc endpoint; the
+        chatsvcagg aggregator only serves the chat roster.)
         """
         from ..infrastructure.teams_api import get_teams_chat_client
         return await get_teams_chat_client()
@@ -776,6 +780,16 @@ class TeamsTool(BaseTool):
                 "from the user's Teams Web session.",
                 component="TeamsTool",
             )
+            # Tell the user a browser is about to open and that they need to
+            # cooperate. Only reached on the cold-start / expired path — the
+            # fast path above returns before here, so a cached token raises no
+            # banner. Fire-and-forget chat notice, not a blocking prompt.
+            im = getattr(self.ctx, "interaction_manager", None) if self.ctx else None
+            if im is not None:
+                im.notify_inline_event(
+                    "🔐",
+                    "Teams Login required: The browser window is open. Please wait a moment after completing the login…",
+                )
             try:
                 await bootstrap_from_teams_web()
             except BootstrapError as exc:

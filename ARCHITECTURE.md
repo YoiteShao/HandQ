@@ -37,14 +37,17 @@ INSTALL_DIR =
 %USERPROFILE%\HandQ\               ← 唯一用户根 — 所有 HandQ 写到磁盘的东西
   handq_config.yaml                  用户配置（小、可漫游）
   scheduled_tasks.json               定时任务持久化（与 personality 解耦）
-  gep_templates\                     ← GEP 模板（每个一个 .json，UUID 命名）
-    <uuid>.json                        Save flow 写入；Templates 面板可 review
   History\                           会话历史（大、可手动清理）
-    <YYYYMMDD-HHMMSS>-<slug>\        每个 `request` 一个目录
-      session_state.json
-      handq-engine.log                 ← 该 session 完整的 engine 日志
-      executions_logs\
-      ... (FlowController 的所有输出)
+    <YYYYMMDD-HHMMSS>-<slug>\        每个 `request` 一个目录（session 根，框架元数据；prompt 不暴露）
+      handq-engine.log                 ← 该 session 内的全部日志（挂在 root logger：HandQ 树
+                                         + shell_tool / session_tool / session_context 等 stdlib
+                                          logger；后台常驻子系统已转移到 .dia 不在此，见 §1.5）
+      session_<TS>_persiste.log        ← ExecutionRecorder 写的结构化执行轨迹，直接落在 session 根
+                                         （文件名 = `session_<时间戳>_<plan_id[:8]>.log`；GUI 桥的 plan_id
+                                          恒为 `persistent_session`，故后缀恒为 `persiste`）
+      .workspace\                      ← agent 的"全世界"——prompt 中唯一出现的可写路径
+                                         （子目录名读自 `session.workspace_base`，默认 `.workspace`；
+                                         所有 agent 产物都落这里，UI 的 Files 面板读取并支持拖出/另存为）
   personality\                       ← "HandQ 学到的关于我"的所有数据
     memory.db                          长期记忆 SQLite (LTM)
     memory.db-wal                      WAL 写日志（运行时存在）
@@ -59,14 +62,18 @@ INSTALL_DIR =
   email_attachments\                 email_tool 附件沙箱
   logs\                              ← 框架日志（跨 session），每次 launch 一个目录
     <YYYYMMDD-HHMMSS>\
-      handq-bridge.log                 Python 端框架日志（含 LTM /
-                                         PersonalityMonitor / Scheduler 全部
-                                         通过 logging.getLogger 写入这里）
+      handq-bridge.log                 Python 端跨 session 框架日志
+                                         （LTM / PersonalityMonitor / activity /
+                                          Scheduler 已 propagate=False 转移到 .dia，
+                                          不再进这里）
       handq-frontend.log               Electron main + preload + renderer
+                                         （5MB×3 自轮转；逐 envelope / bridge stderr
+                                          镜像默认关，HANDQ_FRONTEND_DEBUG=1 开）
     .dia\                            ← 隐藏目录（NTFS HIDDEN attr 已设置）
-      internal-trace.log               LTM / PersonalityMonitor / Scheduler
-                                         三个 logger tree 的额外副本
-                                         （主 log 仍保留完整记录）
+      internal-trace.log               LTM / PersonalityMonitor / activity /
+                                         Scheduler 四棵 logger tree 的专属去处
+                                         （propagate=False 转移：含 error 在内的
+                                          全部级别只落这里，不进主 log）
 
 <install_root>\                    ← 程序文件（NSIS per-user 默认装到
                                      %LOCALAPPDATA%\Programs\HandQ\）
@@ -77,19 +84,20 @@ INSTALL_DIR =
     handq_post_commit.py               post-commit hook 源（被 stdio_bridge
                                          读取后写到 .git/hooks/post-commit）
     start_chrome_with_debug.bat        浏览器 attach 模式启动器
-  gep_templates\                     ship 的默认模板（首次启动拷到上面）
   _internal\                         Nuitka 运行时依赖
   resources\app.asar                 Electron renderer/main 打包包
 ```
+
+> **两种 session 目录形态**（在 `History\` 下会同时看到，属正常）：上图是 **Windows GUI 桥**（`stdio_bridge` → `FlowControllerV2`）的产物——ExecutionRecorder 直接写 `session_<TS>_persiste.log` 到 session 根，agent 产物落 `.workspace\`。另一种形态（`executions_logs\plan_<TS>_<hash>.log` + `session_state.json` + 产物直接落 session 根、无 `.workspace\`）来自 **Linux CLI / 远程委托**（`handq.py`，见 §8）——那条路径用 `session_dir/executions_logs/` 子目录、recorder 文件名前缀为 `plan_`。
 
 切分原则：
 
 | 数据 | 路径 | 漫游？ | 用户可见？ | 生命周期 |
 |---|---|---|---|---|
 | 用户配置 | `%USERPROFILE%\HandQ\handq_config.yaml` | 是 | 是 | 跨升级；按 PRESERVE/OVERRIDE 策略与 ship-default 合并（见下） |
-| GEP 模板 | `%USERPROFILE%\HandQ\gep_templates\<uuid>.json` | 否 | 是 | 跨升级；Templates 面板可 Delete |
 | Session 历史 | `%USERPROFILE%\HandQ\History\<id>\` | 否 | 是 | 跨升级，可手动清理 |
 | Per-session engine log | `%USERPROFILE%\HandQ\History\<id>\handq-engine.log` | 否 | 是 | 跟随 session |
+| Per-session 执行轨迹 | `%USERPROFILE%\HandQ\History\<id>\session_<TS>_persiste.log` | 否 | 是 | 跟随 session（ExecutionRecorder 写） |
 | LTM SQLite | `%USERPROFILE%\HandQ\personality\memory.db` | 否 | 是 | 跨升级；详见 LTM 设计文档 |
 | 长 /remember 镜像 | `%USERPROFILE%\HandQ\personality\memory_notes\<id>.md` | 否 | 是 | 跨升级；用户可编辑器打开 |
 | Ring 溢出 buffer | `%USERPROFILE%\HandQ\personality\spillover\` | 否 | 是 | RAM ring 满 / 监视器断开时落盘；OCR 完立删；启动时清理 >24h 残留 |
@@ -105,6 +113,13 @@ INSTALL_DIR =
 - **`logs\.dia\internal-trace.log`**：单文件，`RotatingFileHandler(maxBytes=1MB, backupCount=5)` 自封顶 5MB，跨 launch 持续累积以便交叉关联。Prune 不动它。
 - **隐藏机制**：dot 前缀（`.dia`）只在 Linux 风格生效，Windows Explorer 默认会显示。`bridge_main._set_hidden_on_windows()` 通过 `ctypes.windll.kernel32.SetFileAttributesW(FILE_ATTRIBUTE_HIDDEN)` 设置 NTFS HIDDEN 属性，让目录在默认浏览视图下消失（"显示隐藏文件"勾上仍能看到——刻意只拦"无意路过的用户"，不防备主动排查者）。
 
+三层日志的语义切分（§1.5 核心，各司其职、互不重复）：
+
+- **`handq-engine.log`（per-session，最全）**：`stdio_bridge._ensure_flow` 在分配 session 目录后，用 `logger.add_root_file_handler()` 把一个 `SafeRotatingFileHandler`（10MB×5）挂到 **root logger**，`_do_new_session` 用 `remove_root_file_handler()` 摘掉。挂 root 而非 `"HandQ"` 名，意味着它捕获本 session 内**冒泡到 root 的一切**——既有 `get_logger()` 的 HandQ 树，也有 `shell_tool` / `session_tool` / `session_context` 这些用 stdlib `logging.getLogger(__name__)` 的强 session 模块（旧版只挂 `"HandQ"` 名，漏掉这些，这正是 engine.log 曾经"单薄"的根因）。`initialize_logger(..., log_file=None)` 不再给 `"HandQ"` 名挂文件 handler，避免每条记录写两遍。
+- **`handq-bridge.log`（per-launch，跨 session）**：root 上常驻的 launch 级 handler，内容 = engine.log 的同源减去 session 边界（跨多个 session）。
+- **`.dia/internal-trace.log`（隔离，非副本）**：`handq.ltm` / `handq.personality` / `handq.activity` / `handq.scheduler` 四棵树在 `bridge_main.py` 里 `propagate=False`——它们是不属于任何单一 session 的常驻后台 daemon，**整段（含 error）只写 .dia**，既不进 bridge.log 也不进 engine.log。这让 engine.log 成为干净的"本 session 内发生的一切"视图，代价是排查这些后台子系统的崩溃必须去 .dia 看（刻意取舍）。
+- **`handq-frontend.log`（Electron）**：`logLine()` 自带 5MB×3 size-based 轮转（内存字节计数，热路径不每行 stat）。两个高频 firehose——逐 envelope（含每个流式 token delta）与 bridge stderr 全量镜像（后者本就是 bridge.log 的副本）——降级为 `logLineDebug()`，默认静默，置 `HANDQ_FRONTEND_DEBUG=1` 才写。`[bridge]` 的 stderr console echo 与崩溃对话框的 `stderrRing` 缓冲不受影响。
+
 PersonalityMonitor spillover 策略：
 
 - **常态行为（无落盘）**：capture 拿到的 frame 走 ndarray → perceptual_hash → JPEG 入 RAM ring(maxlen=128) per monitor，OCR 推迟到 idle/锁屏 gate 解锁后由 drain worker 串行消化。**正常用户日常 0 次磁盘写入**，与原"每 8s 落一次 PNG 再 unlink"的旧路径相比消除了 AV 扫描互动。
@@ -115,7 +130,7 @@ PersonalityMonitor spillover 策略：
 - **启动清理**：`PersonalityMonitor.start()` 扫一遍 `spillover\`，删除 mtime 超过 24h 的残留对（防止旧版本 schema、磁盘满等异常导致永久积压），并 cap 在 `ACTIVITY_SPILL_MAX_FILES`（256 对 = ≤51 MB）以内。
 - **路径选择理由**：放 `personality\` 下而非 `%LOCALAPPDATA%`：(1) 与 `memory.db` / `memory_notes` 同根，符合 §1.5 "HandQ 学到的关于我"统一原则；(2) NSIS 卸载器一并清理（`%LOCALAPPDATA%` 不被卸载器清）；(3) AV 扫描行为与 `%LOCALAPPDATA%` 等价，且自定义子目录默认不被 OneDrive 漫游；(4) 触发频率极低，把它和别的活动数据放一起更便于排障。
 
-> Session 根目录强制为 `%USERPROFILE%\HandQ\History\`，不可由 yaml 配置。GUI 模式下用户没有"我在哪个工作目录"的心智，所有任务的中间产物都自动留存在各自的 session 目录里，agent 的 `working_directory` 与 `storage_directory` 都指向该目录（在 `stdio_bridge._allocate_session_dir` 里分配）。
+> Session 根目录强制为 `%USERPROFILE%\HandQ\History\`，不可由 yaml 配置。GUI 模式下用户没有"我在哪个工作目录"的心智，所以 agent 的 `working_directory` 实际指向 `<session>/<workspace_base>/`（默认 `.workspace`）——这是 prompt 中**唯一**出现的可写路径，session 根本身只放 `handq-engine.log` / `session_*persiste.log` 等框架元数据，prompt 永远不提它。这层嵌套是结构防御：即使 LLM 抽风写 `../foo`，文件也只会落到 session 根而不是用户文件系统。`storage_directory` 仍存在但仅供框架内部使用（在 `stdio_bridge._allocate_session_dir` + `_ensure_flow` 里分配，向 PersistentAgent 传 `expose_session_storage_in_prompt=False` 抑制 prompt 里那一行）。
 
 升级时的配置合并：`bridge_main._merge_user_config_with_seed()` 在 boot 早期跑（`_ensure_user_config_present` 之后），按 yaml 顶部 `version:` 字段判断 user 是否落后 ship；如果是，按两套策略合并：
 
@@ -182,7 +197,6 @@ HandQ/                              ← 仓库根，也是直接运行时的 INS
 ├── handq_config.yaml               ← 本地工作配置（在 .gitignore 中，由 example 拷贝得到）
 ├── handq_config.example.yaml       ← 跟进 git 的模板（API_KEY 留空，作为 ship-default）
 ├── requirements.txt                ← Python 依赖（与 packaging\build.ps1 的 --include-package 对齐）
-├── gep_templates/                  ← ship-default 模板源（首次启动拷到 user 根）
 ├── scripts/
 │   ├── handq_post_commit.py        ← Git hook 源（bridge 安装到 .git/hooks/post-commit）
 │   └── start_chrome_with_debug.bat ← Edge/Chrome attach 模式启动器
@@ -511,7 +525,41 @@ Linux HandQ 不需要委托给自己。
 
 ---
 
-## 9. 待办
+## 9. 测试覆盖 (tests/v2/)
+
+Controller V2 的完整测试套件位于 `tests/v2/`。详细计划见 `tests/v2/TEST_PLAN_V2.md`。
+
+| 类别 | 测试数 | 运行时间 | 说明 |
+|---|---:|---|---|
+| 离线确定性测试 | 691 | ~14s | LLM stack、controller_v2 核心、工具层、信号链、风险检查、flow controller |
+| LLM 实时集成 | 8 | ~2min | 真实 QGenie 模型（chat/streaming/tool-call + 控制器路由） |
+| 端到端实时 (E2E) | 15 | ~17min | 完整 Orchestrator→Planner→Agent→Tools→磁盘，真实 LLM + 真实文件系统 |
+| **总计** | **714** | | |
+
+**E2E 覆盖的关键链路：**
+- 文件创建/读取/编辑/glob（核心工具链）
+- 多步骤规划 + 验证（planner→agent→acceptance gate）
+- 中途打断 + 重定向（interrupt_current 机制）
+- 工具路由激活（coding / ssh on-demand）
+- 承诺泄漏防护（commitment-leak guard）
+- 结构守卫（structural guard — 失败后不静默完成）
+- 反重复机制（anti-repeat pivot）
+- 多轮会话状态持久化
+- 并发消息（rapid-fire 无死锁）
+- 精确内容验证 + acceptance EXTEND 自限循环
+
+**运行命令：**
+```powershell
+# 快速健康检查（离线）
+python -m pytest tests/v2/ -q -m "not live" --timeout=60
+
+# 完整端到端（需要 api.txt + QGenie 可达）
+python -m pytest tests/v2/ -m live --timeout=600 -v
+```
+
+---
+
+## 10. 待办
 
 | # | 项目 | 状态 |
 |---|---|---|

@@ -99,6 +99,8 @@
         // First-load on each tab.
         if (name === 'memory') refreshMemory();
         if (name === 'knowledge') refreshKnowledge();
+        if (name === 'skills') refreshSkills();
+        if (name === 'summary') refreshSummary();
         if (name === 'stats') refreshStats();
         if (name === 'activity') refreshActivity();
     }
@@ -215,11 +217,194 @@
             return;
         }
         try {
-            await rpc('ltm_archive', { id: entryId, kind: kind, reason: 'user_request' });
+            await rpc('ltm_archive', { entry_id: entryId, kind: kind, reason: 'user_request' });
             showToast('Archived.');
             if (kind === 'memory') refreshMemory(); else refreshKnowledge();
         } catch (err) {
             showToast('archive failed: ' + err.message, 'error');
+        }
+    }
+
+    // ── Skills tab (proposal approval queue) ────────────────────
+    const skillStatus = document.getElementById('admin-skill-status');
+    const skillRefresh = document.getElementById('admin-skill-refresh');
+    const skillList = document.getElementById('admin-skill-list');
+    const skillCount = document.getElementById('admin-skill-count');
+
+    async function refreshSkills() {
+        const status = skillStatus.value || 'proposed';
+        try {
+            const r = await rpc('ltm_list_skill_proposals', { status, limit: 50 });
+            renderSkillList(r.proposals || []);
+            skillCount.textContent = `${(r.proposals || []).length} proposals`;
+        } catch (err) {
+            showToast('list skills failed: ' + err.message, 'error');
+        }
+    }
+    skillRefresh.addEventListener('click', refreshSkills);
+    skillStatus.addEventListener('change', refreshSkills);
+
+    function renderSkillList(proposals) {
+        skillList.innerHTML = '';
+        if (!proposals.length) {
+            const li = document.createElement('li');
+            li.textContent = '(no proposals)';
+            li.style.opacity = '0.5';
+            skillList.appendChild(li);
+            return;
+        }
+        for (const p of proposals) {
+            const li = document.createElement('li');
+
+            const main = document.createElement('div');
+            const summary = document.createElement('div');
+            summary.className = 'admin-entry-summary';
+            summary.textContent = p.summary || '(no summary)';
+            main.appendChild(summary);
+
+            const meta = document.createElement('div');
+            meta.className = 'admin-entry-meta';
+            const ts = p.updated_at
+                ? new Date(p.updated_at * 1000).toISOString().slice(0, 19).replace('T', ' ')
+                : '';
+            meta.textContent =
+                `seen ${p.recurrence_count}× · fp=${(p.fingerprint || '').slice(0, 12)} · ${ts}`;
+            main.appendChild(meta);
+
+            if (p.staging_path) {
+                const path = document.createElement('pre');
+                path.className = 'admin-entry-content';
+                path.textContent = p.staging_path;
+                main.appendChild(path);
+            }
+            li.appendChild(main);
+
+            const actions = document.createElement('div');
+            actions.className = 'admin-entry-actions';
+            // Only proposed rows are actionable; approved/rejected are terminal.
+            if (p.status === 'proposed') {
+                const approveBtn = document.createElement('button');
+                approveBtn.type = 'button';
+                approveBtn.textContent = 'Approve';
+                approveBtn.addEventListener('click', () => approveSkill(p.id));
+                const rejectBtn = document.createElement('button');
+                rejectBtn.type = 'button';
+                rejectBtn.textContent = 'Reject';
+                rejectBtn.addEventListener('click', () => rejectSkill(p.id));
+                actions.appendChild(approveBtn);
+                actions.appendChild(rejectBtn);
+            } else {
+                const badge = document.createElement('span');
+                badge.className = 'admin-entry-meta';
+                badge.textContent = p.status;
+                actions.appendChild(badge);
+            }
+            li.appendChild(actions);
+            skillList.appendChild(li);
+        }
+    }
+
+    async function approveSkill(id) {
+        if (!confirm('Approve this skill?\nIts SKILL.md will be installed into the live registry.')) {
+            return;
+        }
+        try {
+            const r = await rpc('ltm_approve_skill_proposal', { skill_id: id });
+            if (r && r.ok) {
+                showToast('Approved — skill installed.');
+            } else {
+                showToast('approve failed: ' + ((r && (r.reason || r.error)) || 'unknown'), 'error');
+            }
+            refreshSkills();
+        } catch (err) {
+            showToast('approve failed: ' + err.message, 'error');
+        }
+    }
+
+    async function rejectSkill(id) {
+        if (!confirm('Reject this skill proposal?\nStaging files are removed; the row is archived.')) {
+            return;
+        }
+        try {
+            await rpc('ltm_reject_skill_proposal', { skill_id: id, reason: 'user_request' });
+            showToast('Rejected.');
+            refreshSkills();
+        } catch (err) {
+            showToast('reject failed: ' + err.message, 'error');
+        }
+    }
+
+    // ── Summary tab (activity digest reader) ────────────────────
+    const sumDate = document.getElementById('admin-sum-date');
+    const sumType = document.getElementById('admin-sum-type');
+    const sumLoad = document.getElementById('admin-sum-load');
+    const sumNarrative = document.getElementById('admin-sum-narrative');
+    const sumMoments = document.getElementById('admin-sum-moments');
+
+    function refreshSummary() {
+        // Default the date picker to today the first time the tab opens.
+        if (!sumDate.value) {
+            sumDate.value = new Date().toISOString().slice(0, 10);
+        }
+        loadSummary();
+    }
+    sumLoad.addEventListener('click', loadSummary);
+    sumType.addEventListener('change', loadSummary);
+    sumDate.addEventListener('change', loadSummary);
+
+    async function loadSummary() {
+        const date = sumDate.value;
+        const type = sumType.value || 'daily';
+        if (!date) { showToast('pick a date', 'error'); return; }
+        try {
+            // The envelope's `type` is the routing key (ltm_query_summary), so
+            // the period rides under `summary_type` to avoid being clobbered.
+            const r = await rpc('ltm_query_summary', { date, summary_type: type, language: 'en' });
+            renderSummary(r);
+        } catch (err) {
+            showToast('load summary failed: ' + err.message, 'error');
+        }
+    }
+
+    function renderSummary(r) {
+        sumMoments.innerHTML = '';
+        if (!r || !r.found) {
+            sumNarrative.textContent = '(no summary for this date / period)';
+            return;
+        }
+        const model = r.generated_model ? ` · ${r.generated_model}` : '';
+        const gen = r.generated_at
+            ? new Date(r.generated_at * 1000).toISOString().slice(0, 19).replace('T', ' ')
+            : '';
+        sumNarrative.textContent =
+            (r.summary_text || '(no narrative)') +
+            `\n\n— ${r.type} · ${r.date}${model} · ${gen}`;
+        const moments = Array.isArray(r.moments) ? r.moments : [];
+        for (const m of moments) {
+            const li = document.createElement('li');
+            const main = document.createElement('div');
+
+            const title = document.createElement('div');
+            title.className = 'admin-entry-summary';
+            title.textContent = m.title || '(untitled moment)';
+            main.appendChild(title);
+
+            const meta = document.createElement('div');
+            meta.className = 'admin-entry-meta';
+            const t = m.time ? String(m.time).slice(0, 19).replace('T', ' ') : '';
+            const imp = (typeof m.importance === 'number')
+                ? ` · importance ${m.importance.toFixed(2)}` : '';
+            meta.textContent = `${m.category || 'other'} · ${t}${imp}`;
+            main.appendChild(meta);
+
+            if (m.summary) {
+                const body = document.createElement('pre');
+                body.className = 'admin-entry-content';
+                body.textContent = m.summary;
+                main.appendChild(body);
+            }
+            li.appendChild(main);
+            sumMoments.appendChild(li);
         }
     }
 

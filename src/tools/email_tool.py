@@ -25,7 +25,7 @@ import asyncio
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -79,18 +79,23 @@ _outlook_app = None   # lazy COM handle, created on first action
 
 
 def _get_app():
-    """Return Outlook.Application CDispatch. Runs INSIDE the executor thread."""
+    """Return Outlook.Application CDispatch. Runs INSIDE the executor thread.
+
+    Late-binding only (``Dispatch``, not ``gencache.EnsureDispatch``): every
+    method call goes through ``IDispatch::Invoke`` so we never touch the
+    ``%TEMP%\\gen_py\\`` cache. That sidesteps the recurring "module
+    'win32com.gen_py.<CLSID>' has no attribute 'CLSIDToPackageMap'" failure
+    that surfaces when Office upgrades the Outlook typelib past what the
+    on-disk makepy stub was generated against, or when prior runs left a
+    half-written cache. All Outlook constants we use (``olMail=43``,
+    ``olFolderInbox=6``, recipient types) are hard-coded above, so there is
+    no ``win32com.client.constants`` dependency to lose.
+    """
     global _outlook_app
     if _outlook_app is not None:
         return _outlook_app
-    from win32com.client import Dispatch, gencache  # type: ignore[import-untyped]
-    try:
-        # Early binding — ~1–3s on first call (writes %TEMP%\gen_py\...);
-        # instant on subsequent calls.  Falls back gracefully under Nuitka
-        # standalone where gen_py path resolution may differ (doc §13).
-        _outlook_app = gencache.EnsureDispatch("Outlook.Application")
-    except Exception:
-        _outlook_app = Dispatch("Outlook.Application")
+    from win32com.client import Dispatch  # type: ignore[import-untyped]
+    _outlook_app = Dispatch("Outlook.Application")
     return _outlook_app
 
 
@@ -325,9 +330,14 @@ def _mail_item_to_full(
     attachments: List[Dict[str, Any]] = []
     if include_attachments_meta:
         try:
-            for att in item.Attachments:
+            # 1-based enumerate aligns with Outlook's Attachments.Item(N)
+            # COM accessor — the 'index' is the only unambiguous handle
+            # when several attachments share a FileName (forwarded-mail
+            # chains commonly do).
+            for i, att in enumerate(item.Attachments, start=1):
                 try:
                     attachments.append({
+                        "index": i,
                         "name": str(att.FileName or ""),
                         "size": int(att.Size),
                         "content_type": "",   # MAPI property accessor needed for MIME type
@@ -442,12 +452,23 @@ def _sync_list_folders(params: Dict[str, Any]) -> Dict[str, Any]:
 def _build_dasl_prefilter(
     since_dt: Optional[datetime],
     unread_only: bool,
+    sender_q: str = "",
+    subject_q: str = "",
 ) -> Optional[str]:
     """Build a DASL @SQL filter for the index-side pre-filters of list_messages.
 
     DASL (vs. Jet syntax) is locale-invariant — Jet's date format depends on
     Windows regional settings, which would break ``[ReceivedTime] >= '...'``
     on non-en-US machines. Returns None when no pre-filter applies.
+
+    ``sender_q`` / ``subject_q`` push the LIKE match for sender_contains /
+    subject_contains down to the DASL index. Previously these ran as
+    Python-side post-filters, which meant per-item COM round-trips for
+    SenderName / SenderEmailAddress / Subject on every mail in scope —
+    on the 20260609-122314 run that took 13m34s for one Inbox-recursive
+    sweep over a 927-mail mailbox. Pushing to DASL on the indexed
+    fromname / fromemail / subject fields turns the same query into a
+    sub-second lookup.
     """
     parts: List[str] = []
     if since_dt is not None:
@@ -457,6 +478,17 @@ def _build_dasl_prefilter(
         )
     if unread_only:
         parts.append("\"urn:schemas:httpmail:read\" = 0")
+    if sender_q:
+        s_esc = _escape_dasl_like(sender_q)
+        parts.append(
+            f"(\"urn:schemas:httpmail:fromname\" LIKE '%{s_esc}%' "
+            f"OR \"urn:schemas:httpmail:fromemail\" LIKE '%{s_esc}%')"
+        )
+    if subject_q:
+        sub_esc = _escape_dasl_like(subject_q)
+        parts.append(
+            f"\"urn:schemas:httpmail:subject\" LIKE '%{sub_esc}%'"
+        )
     if not parts:
         return None
     return "@SQL=" + " AND ".join(parts)
@@ -510,7 +542,11 @@ def _scan_folder_messages(
             continue
 
         if fallback_python_filter:
-            # Restrict failed — re-apply since + unread in Python.
+            # DASL Restrict failed — re-apply ALL filters in Python:
+            # since, unread, sender, subject. Each costs a COM round-trip
+            # per item (SenderName / SenderEmailAddress / Subject), so
+            # this path is the slow one; the DASL prefilter is the fast
+            # path and should be preferred whenever Outlook accepts it.
             if unread_only:
                 try:
                     if not bool(item.UnRead):
@@ -524,22 +560,20 @@ def _scan_folder_messages(
                 if rt < since_dt:
                     # Items are sorted newest-first → break on first miss
                     break
-
-        if sender_filter:
-            try:
-                sn = (item.SenderName or "").lower()
-                se = (item.SenderEmailAddress or "").lower()
-                if sender_filter not in sn and sender_filter not in se:
+            if sender_filter:
+                try:
+                    sn = (item.SenderName or "").lower()
+                    se = (item.SenderEmailAddress or "").lower()
+                    if sender_filter not in sn and sender_filter not in se:
+                        continue
+                except Exception:
                     continue
-            except Exception:
-                continue
-
-        if subject_filter:
-            try:
-                if subject_filter not in (item.Subject or "").lower():
+            if subject_filter:
+                try:
+                    if subject_filter not in (item.Subject or "").lower():
+                        continue
+                except Exception:
                     continue
-            except Exception:
-                continue
 
         try:
             out.append(_mail_item_to_summary(
@@ -606,12 +640,19 @@ def _sync_list_messages(params: Dict[str, Any]) -> Dict[str, Any]:
             if not _is_folder_blacklisted(getattr(f, "Name", "") or "", blacklist)
         ]
 
-    # When no Python-side post-filters apply, total_estimated is exact (it
-    # equals the index-side count). Otherwise leave it None — Outlook can't
-    # cheaply count items that match a substring on SenderName/Subject.
-    post_filters_active = bool(sender_filter or subject_filter)
-    dasl_prefilter = _build_dasl_prefilter(since_dt, unread_only)
-    total_estimated: Optional[int] = 0 if not post_filters_active else None
+    # All four filters (since, unread, sender, subject) are pushed to
+    # DASL when possible — that turns 1000-mail recursive scans from
+    # 13-minute Python-side enumerations into sub-second indexed lookups.
+    # The Python-side filters in _scan_folder_messages only run when
+    # Restrict raises (fallback_python_filter), so total_estimated is
+    # exact whenever DASL succeeds and None only on the fallback path.
+    dasl_prefilter = _build_dasl_prefilter(
+        since_dt,
+        unread_only,
+        sender_q=sender_filter,
+        subject_q=subject_filter,
+    )
+    total_estimated: Optional[int] = 0
 
     merged: List[Dict[str, Any]] = []
     any_folder_hit_cap = False
@@ -752,12 +793,17 @@ def _sync_search(params: Dict[str, Any]) -> Dict[str, Any]:
                 f"OR \"urn:schemas:httpmail:textdescription\" ci_phrasematch '{q_esc}')"
             )
         else:
-            # 'substring': exact LIKE — body LIKE falls through to a row scan
-            # if WDS isn't current; slower but matches across word boundaries.
+            # 'substring': LIKE on subject only. Body LIKE
+            # ('textdescription LIKE %x%') is a row scan that opens every
+            # message and materialises its body sequentially on Outlook's
+            # STA UI thread — that path was observed in the 20260609-111806
+            # incident to hang Outlook for 4+ minutes with no way to
+            # interrupt. To match against body, use match_mode='phrase'
+            # (ci_phrasematch hits the Windows Search content index) or
+            # add sender_contains to keep the candidate set small.
             q_esc = _escape_dasl_like(query)
             dasl_parts.append(
-                f"(\"urn:schemas:httpmail:subject\" LIKE '%{q_esc}%' "
-                f"OR \"urn:schemas:httpmail:textdescription\" LIKE '%{q_esc}%')"
+                f"\"urn:schemas:httpmail:subject\" LIKE '%{q_esc}%'"
             )
 
     if sender_q:
@@ -770,15 +816,27 @@ def _sync_search(params: Dict[str, Any]) -> Dict[str, Any]:
             f"OR \"urn:schemas:httpmail:fromemail\" LIKE '%{s_esc}%')"
         )
 
-    if params.get("since"):
+    # `since` defaults to 365 days back when not supplied. Without a date
+    # lower bound the DASL query enumerates the full mail history; on a
+    # 925-mail Inbox plus archive subtree that materialises as tens of
+    # seconds of synchronous COM round-trips on Outlook's UI thread —
+    # the symptom that surfaced in the 20260608-162233 run as "Outlook
+    # is not responding". 365d covers the vast majority of "find recent
+    # mail from X" queries; an agent that needs older mail must pass
+    # `since` explicitly.
+    since_str = params.get("since")
+    since_dt: Optional[datetime] = None
+    if since_str:
         try:
-            since_dt = datetime.fromisoformat(str(params["since"]).replace("Z", ""))
-            dasl_parts.append(
-                f"\"urn:schemas:httpmail:datereceived\" >= "
-                f"'{since_dt.strftime('%Y/%m/%d %H:%M:%S')}'"
-            )
+            since_dt = datetime.fromisoformat(str(since_str).replace("Z", ""))
         except (ValueError, TypeError):
-            pass
+            since_dt = None
+    if since_dt is None:
+        since_dt = datetime.now() - timedelta(days=365)
+    dasl_parts.append(
+        f"\"urn:schemas:httpmail:datereceived\" >= "
+        f"'{since_dt.strftime('%Y/%m/%d %H:%M:%S')}'"
+    )
 
     dasl = "@SQL=" + " AND ".join(dasl_parts)
 
@@ -790,11 +848,17 @@ def _sync_search(params: Dict[str, Any]) -> Dict[str, Any]:
         else params["include_body_preview"]
     )
 
-    # search defaults to recursive=true for the same reason as list_messages:
-    # auto-routed mail is the common case, and DASL Restrict per-folder is
-    # cheap (Outlook indexes subject + datereceived).
+    # search defaults to recursive=False after the 20260608 incident.
+    # The previous default (True) walked every sub-folder under the
+    # resolved root, and on enterprise mailboxes with rule-routed
+    # sub-folders that meant ~30+ folders × Restrict + Sort + Count,
+    # all synchronous on Outlook's UI thread, giving a multi-minute
+    # "Outlook not responding" UI hang. Agents that genuinely need to
+    # scan sub-folders must pass recursive=True explicitly — the
+    # folder-context already advertises common sub-folder paths so the
+    # agent typically knows which leaf to target.
     recursive_param = params.get("recursive")
-    recursive = True if recursive_param is None else bool(recursive_param)
+    recursive = False if recursive_param is None else bool(recursive_param)
 
     folders_to_scan = (
         list(_walk_folders(root_folder, max_depth=max_depth))
@@ -813,6 +877,18 @@ def _sync_search(params: Dict[str, Any]) -> Dict[str, Any]:
     merged: List[Dict[str, Any]] = []
     any_folder_hit_cap = False
     for fld in folders_to_scan:
+        # Global early-stop: each folder's items are Sort'ed by
+        # ReceivedTime desc, and per-folder contribution is capped at
+        # `limit`. Once we have 2×limit candidates the global top-`limit`
+        # is effectively locked in (worst case a later folder displaces
+        # the tail of the window). The 2× is a slop margin — exact
+        # correctness would require each folder's max ReceivedTime up
+        # front, which itself is an RPC. This trade keeps Outlook
+        # responsive on mailboxes with many sub-folders.
+        if len(merged) >= limit * 2:
+            any_folder_hit_cap = True
+            break
+
         # E4: skip empty folders before the index round-trip.
         try:
             if int(fld.Items.Count) == 0:
@@ -825,14 +901,25 @@ def _sync_search(params: Dict[str, Any]) -> Dict[str, Any]:
         except Exception:
             folder_path = ""
 
+        # Restrict failure is fatal. The prior fallback (items = fld.Items)
+        # silently degraded to enumerating every mail in the folder, which
+        # is what produced the multi-minute Outlook hang when the Windows
+        # Search index was unavailable. Surface the error so the agent
+        # can pick another tactic (restart WSearch, narrow scope, or
+        # switch to list_messages with subject_contains).
         try:
             items = fld.Items.Restrict(dasl)
-            try:
-                folder_total = int(items.Count)
-            except Exception:
-                folder_total = -1
+        except Exception as exc:
+            raise RuntimeError(
+                f"DASL Restrict failed on {folder_path or 'folder'}: {exc}. "
+                f"Likely cause: Windows Search service stopped or index is "
+                f"rebuilding. Check 'Get-Service WSearch' or wait for "
+                f"indexing to catch up."
+            ) from exc
+
+        try:
+            folder_total = int(items.Count)
         except Exception:
-            items = fld.Items   # fallback: iterate all in this folder
             folder_total = -1
 
         if total_estimated is not None:
@@ -908,35 +995,179 @@ def _sync_download_attachment(params: Dict[str, Any]) -> Dict[str, Any]:
     if item.Class != _OL_MAIL_CLASS:
         raise ValueError("Entry ID is not a mail item")
 
-    target_name: str = str(params["attachment_name"])
+    target_index_raw = params.get("attachment_index")
+    target_name: Optional[str] = params.get("attachment_name")
+    save_as: Optional[str] = params.get("save_as")
     sandbox: str = str(params["_sandbox"])
     output_dir: Optional[str] = params.get("output_dir")
 
-    # Find attachment by name (case-insensitive)
     found = None
-    for att in item.Attachments:
+    if target_index_raw is not None:
+        # Index-based lookup is the unambiguous path. The 'index' field
+        # on read_message's attachments list maps directly to Outlook's
+        # 1-based Attachments.Item(N) — needed when several attachments
+        # share a FileName (the forwarded-.msg chain case that surfaced
+        # in the 20260609-125255 run, where 5 same-named .msg files all
+        # collapsed onto Attachments.Item(1) under name-based lookup).
         try:
-            if att.FileName.lower() == target_name.lower():
-                found = att
-                break
-        except Exception:
-            pass
-
-    if found is None:
-        available = []
-        for att in item.Attachments:
+            target_index = int(target_index_raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"attachment_index must be an integer, got {target_index_raw!r}"
+            ) from exc
+        try:
+            found = item.Attachments.Item(target_index)
+        except Exception as exc:
+            count = 0
             try:
-                available.append(att.FileName)
+                count = int(item.Attachments.Count)
             except Exception:
                 pass
+            raise ValueError(
+                f"attachment_index={target_index} not found "
+                f"(message has {count} attachment(s)): {exc}"
+            ) from exc
+        # When both index and name are passed, sanity-check they agree.
+        # Guards against stale read_message snapshots pointing at a
+        # message that has since been edited.
+        if target_name:
+            try:
+                actual = str(found.FileName or "")
+                if actual.lower() != target_name.lower():
+                    raise ValueError(
+                        f"attachment_index={target_index} resolves to "
+                        f"{actual!r}, not {target_name!r}. The message "
+                        f"may have changed since the read_message call."
+                    )
+            except AttributeError:
+                pass
+    elif target_name:
+        # Name-based fallback: returns the FIRST attachment whose name
+        # matches case-insensitively. Ambiguous when multiple share a
+        # name — caller should switch to attachment_index for that.
+        for att in item.Attachments:
+            try:
+                if att.FileName.lower() == target_name.lower():
+                    found = att
+                    break
+            except Exception:
+                pass
+        if found is None:
+            available = []
+            for att in item.Attachments:
+                try:
+                    available.append(att.FileName)
+                except Exception:
+                    pass
+            raise ValueError(
+                f"Attachment {target_name!r} not found. "
+                f"Available attachments: {available!r}"
+            )
+    else:
         raise ValueError(
-            f"Attachment {target_name!r} not found. "
-            f"Available attachments: {available!r}"
+            "download_attachment requires either 'attachment_index' "
+            "(preferred — unambiguous) or 'attachment_name'."
         )
 
-    save_path = _safe_attachment_path(target_name, output_dir, sandbox)
+    # Resolve save filename: explicit save_as wins; else use the
+    # attachment's own FileName. Path components are stripped inside
+    # _safe_attachment_path so passing a directory-traversal name fails
+    # safely there.
+    save_name = save_as or str(found.FileName or "attachment")
+    save_path = _safe_attachment_path(save_name, output_dir, sandbox)
     found.SaveAsFile(str(save_path))
     return {"path": str(save_path), "size": int(found.Size), "content_type": ""}
+
+
+def _sync_download_all_attachments(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Save every attachment of a message to output_dir, deduping same names.
+
+    Solves the forwarded-mail chain case: a single message may carry N
+    attachments that all share a FileName (e.g. five forwarded
+    ``滴滴出行电子发票及行程报销单.msg`` files in the 20260609-125255 run).
+    Single-shot ``download_attachment`` collapses them all onto the first
+    via name-based lookup; this action saves each one with a Windows
+    Explorer-style ``" (1)"`` / ``" (2)"`` suffix when names collide.
+
+    Returns ``{"count": N, "saved": [{index, name, original_name, path,
+    size}, ...]}``. Per-attachment errors don't abort the whole batch —
+    failed entries appear with ``"error": "..."`` and no ``path``.
+
+    ``extension_filter`` (optional) restricts which attachments to save
+    by file extension — useful for "give me just the PDFs" without
+    pulling embedded ``.msg`` containers or signature images.
+    """
+    app = _get_app()
+    namespace = app.GetNamespace("MAPI")
+    item = namespace.GetItemFromID(params["entry_id"])
+    if item.Class != _OL_MAIL_CLASS:
+        raise ValueError("Entry ID is not a mail item")
+
+    sandbox: str = str(params["_sandbox"])
+    output_dir: Optional[str] = params.get("output_dir")
+
+    raw_filter = params.get("extension_filter")
+    extension_filter: Optional[set] = None
+    if raw_filter:
+        extension_filter = set()
+        for e in raw_filter:
+            e = str(e).strip().lower()
+            if not e:
+                continue
+            if not e.startswith("."):
+                e = "." + e
+            extension_filter.add(e)
+
+    saved: List[Dict[str, Any]] = []
+    used_names: Dict[str, int] = {}
+
+    for i, att in enumerate(item.Attachments, start=1):
+        try:
+            original_name = str(att.FileName or f"attachment_{i}")
+        except Exception:
+            original_name = f"attachment_{i}"
+
+        if extension_filter is not None:
+            ext = Path(original_name).suffix.lower()
+            if ext not in extension_filter:
+                continue
+
+        # Dedup against the names we've ALREADY saved this call:
+        #   foo.pdf  → foo.pdf
+        #   foo.pdf  → foo (1).pdf
+        #   foo.pdf  → foo (2).pdf
+        # Doesn't read the destination directory — same-call collisions
+        # are the case the forwarded-chain bug needs solved, and reading
+        # the directory would race with concurrent writers.
+        key = original_name.lower()
+        n = used_names.get(key, 0)
+        if n == 0:
+            save_name = original_name
+        else:
+            stem = Path(original_name).stem
+            ext = Path(original_name).suffix
+            save_name = f"{stem} ({n}){ext}"
+        used_names[key] = n + 1
+
+        try:
+            save_path = _safe_attachment_path(save_name, output_dir, sandbox)
+            att.SaveAsFile(str(save_path))
+            saved.append({
+                "index": i,
+                "name": save_name,
+                "original_name": original_name,
+                "path": str(save_path),
+                "size": int(att.Size),
+            })
+        except Exception as exc:
+            saved.append({
+                "index": i,
+                "name": save_name,
+                "original_name": original_name,
+                "error": str(exc),
+            })
+
+    return {"count": len(saved), "saved": saved}
 
 
 # ── EmailTool ──────────────────────────────────────────────────────────────────
@@ -958,7 +1189,7 @@ class EmailTool(BaseTool):
                 "description": (
                     "Email action. One of: list_folders, list_messages, "
                     "read_message, search, mark_read, mark_unread, "
-                    "download_attachment."
+                    "download_attachment, download_all_attachments."
                 ),
                 "enum": [
                     "list_folders",
@@ -968,6 +1199,7 @@ class EmailTool(BaseTool):
                     "mark_read",
                     "mark_unread",
                     "download_attachment",
+                    "download_all_attachments",
                 ],
             },
             "folder": {
@@ -984,13 +1216,18 @@ class EmailTool(BaseTool):
                 "description": (
                     "[list_folders] Also list sub-folders one level deep. "
                     "Default: false.\n"
-                    "[list_messages / search] Also scan all sub-folders of "
-                    "`folder` (depth-first, up to 10 levels). Default: true. "
+                    "[list_messages] Also scan all sub-folders of `folder` "
+                    "(depth-first, up to 4 levels). Default: true. "
                     "Enterprise mailboxes often route incoming mail into "
-                    "Inbox sub-folders via rules — querying 'Inbox' alone "
-                    "with recursive=false will miss those. Each result row "
-                    "includes a `folder` field showing where it actually "
-                    "lives. Set false to scan only the named folder."
+                    "Inbox sub-folders via rules — list_messages on 'Inbox' "
+                    "alone with recursive=false will miss those.\n"
+                    "[search] Default: false. search is DASL-Restrict-based "
+                    "and synchronous on Outlook's UI thread; recursing into "
+                    "30+ rule-routed sub-folders has been observed to make "
+                    "Outlook unresponsive for minutes. Pass recursive=true "
+                    "explicitly when you need to scan a sub-tree, after "
+                    "narrowing `folder` to the smallest reasonable root "
+                    "(e.g. 'Inbox/Project-X', not the whole mailbox)."
                 ),
             },
             "parent": {
@@ -1082,42 +1319,92 @@ class EmailTool(BaseTool):
             "query": {
                 "type": "string",
                 "description": (
-                    "[search] Search text matched against subject + body. "
-                    "Wildcard chars (% _ [ ]) and quotes are escaped — your "
-                    "query is always treated literally. Match semantics are "
-                    "controlled by `match_mode`."
+                    "[search] Search text. Match scope depends on "
+                    "`match_mode`: 'phrase' matches subject + body via the "
+                    "Windows Search index; 'substring' matches subject "
+                    "only. Wildcard chars (% _ [ ]) and quotes are "
+                    "escaped — your query is always treated literally. "
+                    "Optional when sender_contains is provided — for "
+                    "'latest mail from <person>' queries, sender-only "
+                    "search is the fastest path (skips body scanning "
+                    "entirely)."
                 ),
             },
             "match_mode": {
                 "type": "string",
                 "enum": ["phrase", "substring"],
                 "description": (
-                    "[search] How `query` matches subject and body.\n"
-                    "  'phrase' (default): hits the Windows Search content "
-                    "index via DASL ci_phrasematch. Fast on large mailboxes; "
-                    "matches at word boundaries ('fail' matches 'fail' but "
-                    "NOT 'failed').\n"
-                    "  'substring': falls back to LIKE '%query%' — exact "
-                    "substring match across word boundaries (matches both "
-                    "'fail' and 'failed' for query='fail'), but body LIKE "
-                    "can be slow when WDS isn't current. Use this when you "
-                    "need partial-word hits or when 'phrase' returns "
-                    "unexpectedly empty (WDS still indexing)."
+                    "[search] How `query` matches.\n"
+                    "  'phrase' (default): subject + body via DASL "
+                    "ci_phrasematch — hits the Windows Search content "
+                    "index. Fast on large mailboxes; matches at word "
+                    "boundaries ('fail' matches 'fail' but NOT 'failed'). "
+                    "For CJK queries, requires the relevant Windows "
+                    "indexer language pack to be installed.\n"
+                    "  'substring': **subject only**, via LIKE '%query%'. "
+                    "Body LIKE was removed because it forces a row-scan "
+                    "that materialises every message body on Outlook's UI "
+                    "thread, hanging Outlook for minutes on enterprise "
+                    "mailboxes. To search inside body content, use "
+                    "match_mode='phrase' or narrow scope with "
+                    "sender_contains."
                 ),
             },
             "attachment_name": {
                 "type": "string",
                 "description": (
-                    "[download_attachment] Exact attachment file name as "
-                    "returned by read_message (e.g. 'report.pdf')."
+                    "[download_attachment] Attachment file name as "
+                    "returned in the 'name' field of read_message's "
+                    "attachments list. NOTE: when several attachments "
+                    "share a name (forwarded .msg chains commonly do), "
+                    "name-based lookup ALWAYS hits the first one — use "
+                    "attachment_index to disambiguate or "
+                    "action='download_all_attachments' for the whole set."
+                ),
+            },
+            "attachment_index": {
+                "type": "integer",
+                "description": (
+                    "[download_attachment] 1-based index from the "
+                    "'index' field of read_message's attachments list. "
+                    "Unambiguous; the right way to pick a specific "
+                    "attachment when several share a filename. When both "
+                    "attachment_index and attachment_name are passed they "
+                    "must agree (cross-check guards against stale "
+                    "read_message snapshots)."
+                ),
+            },
+            "save_as": {
+                "type": "string",
+                "description": (
+                    "[download_attachment] Optional output filename (no "
+                    "path components — those are stripped). Defaults to "
+                    "the attachment's original FileName. Use this when "
+                    "downloading several same-named attachments "
+                    "individually so each one gets a distinct path."
+                ),
+            },
+            "extension_filter": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "[download_all_attachments] Optional list of file "
+                    "extensions to include (case-insensitive, leading "
+                    "dot optional). Example: ['.pdf'] saves only PDFs "
+                    "and skips embedded .msg / images / signatures. "
+                    "Omit to save every attachment."
                 ),
             },
             "output_dir": {
                 "type": "string",
                 "description": (
-                    "[download_attachment] Absolute path to save the file. "
-                    "Must be within config.email.attachment_sandbox. "
-                    "Omit to use the default sandbox directory."
+                    "[download_attachment / download_all_attachments] "
+                    "Absolute path to save into. Must be within "
+                    "config.email.attachment_sandbox. Omit to use the "
+                    "default sandbox directory. "
+                    "download_all_attachments dedups same-named files "
+                    "with ' (1)', ' (2)' suffixes (matches Windows "
+                    "Explorer's collision pattern)."
                 ),
             },
         },
@@ -1125,8 +1412,8 @@ class EmailTool(BaseTool):
         "additionalProperties": False,
     }
 
-    def __init__(self) -> None:
-        super().__init__("email")
+    def __init__(self, ctx=None) -> None:
+        super().__init__("email", ctx=ctx)
         self.logger = get_logger()
 
     async def execute(self, **kwargs) -> ToolResult:
@@ -1137,13 +1424,14 @@ class EmailTool(BaseTool):
             return self._fail(params, start, "email requires 'action' parameter.")
 
         dispatch = {
-            "list_folders":        self._action_list_folders,
-            "list_messages":       self._action_list_messages,
-            "read_message":        self._action_read_message,
-            "search":              self._action_search,
-            "mark_read":           self._action_mark_read,
-            "mark_unread":         self._action_mark_unread,
-            "download_attachment": self._action_download_attachment,
+            "list_folders":             self._action_list_folders,
+            "list_messages":            self._action_list_messages,
+            "read_message":             self._action_read_message,
+            "search":                   self._action_search,
+            "mark_read":                self._action_mark_read,
+            "mark_unread":              self._action_mark_unread,
+            "download_attachment":      self._action_download_attachment,
+            "download_all_attachments": self._action_download_all_attachments,
         }
         handler = dispatch.get(action)
         if handler is None:
@@ -1192,16 +1480,51 @@ class EmailTool(BaseTool):
         return self._ok(params, start, data)
 
     async def _action_search(self, params, start, **kwargs):
-        if not kwargs.get("query"):
-            return self._fail(params, start, "search requires 'query'.")
+        if not kwargs.get("query") and not kwargs.get("sender_contains"):
+            return self._fail(
+                params, start,
+                "search requires 'query' or 'sender_contains' (at least "
+                "one). For 'latest mail from <person>' queries, "
+                "sender_contains alone is the fastest path — it hits "
+                "indexed sender fields and skips body scanning entirely."
+            )
         email_cfg = ConfigManager().get_section("email")
         run_params = dict(kwargs)
         run_params["_preview_chars"] = int(email_cfg.get("body_preview_chars", 500))
         run_params["_folder_blacklist"] = email_cfg.get("folder_blacklist") or []
         run_params["_max_depth"] = int(email_cfg.get("max_recursion_depth", 4))
+        # Hard wall-clock timeout. The executor is STA + max_workers=1, so
+        # a hung sync call cannot be cancelled mid-flight (Python can't
+        # interrupt a blocked COM round-trip). wait_for at least frees the
+        # awaiter so the agent gets a TimeoutError and can switch tactics
+        # instead of waiting indefinitely; the user's "stop" message also
+        # stops being blocked behind the dead future. Default 30s is far
+        # above the 99p of healthy queries (~3s) — a hit means the query
+        # landed on a row-scan path and Outlook is likely already
+        # unresponsive. Override per-call via the `timeout` kwarg or
+        # globally via email.search_timeout_seconds in handq_config.yaml.
+        timeout_s = float(
+            kwargs.get("timeout")
+            or email_cfg.get("search_timeout_seconds")
+            or 30
+        )
         loop = asyncio.get_running_loop()
         try:
-            data = await loop.run_in_executor(_outlook_executor, _sync_search, run_params)
+            data = await asyncio.wait_for(
+                loop.run_in_executor(_outlook_executor, _sync_search, run_params),
+                timeout=timeout_s,
+            )
+        except asyncio.TimeoutError:
+            return self._fail(
+                params, start,
+                f"search timed out after {timeout_s:.0f}s. The query "
+                f"likely fell into a row-scan path (recursive=True over a "
+                f"wide tree without sender filter, or a CJK substring "
+                f"query the index can't accelerate). Recover by one of: "
+                f"(1) add sender_contains, (2) recursive=False with a "
+                f"specific folder, (3) match_mode='phrase' so "
+                f"ci_phrasematch handles body matching via the index."
+            )
         except Exception as exc:
             return self._fail(params, start, f"search: {exc}")
         return self._ok(params, start, data)
@@ -1229,8 +1552,18 @@ class EmailTool(BaseTool):
     async def _action_download_attachment(self, params, start, **kwargs):
         if not kwargs.get("entry_id"):
             return self._fail(params, start, "download_attachment requires 'entry_id'.")
-        if not kwargs.get("attachment_name"):
-            return self._fail(params, start, "download_attachment requires 'attachment_name'.")
+        if not kwargs.get("attachment_name") and kwargs.get("attachment_index") is None:
+            return self._fail(
+                params, start,
+                "download_attachment requires 'attachment_index' "
+                "(preferred — use the 'index' field from read_message) "
+                "or 'attachment_name'. When the message has multiple "
+                "same-named attachments (common in forwarded .msg "
+                "chains), name-based lookup collapses them all onto the "
+                "first — switch to attachment_index to disambiguate, or "
+                "use action='download_all_attachments' to grab the whole "
+                "set in one call."
+            )
         email_cfg = ConfigManager().get_section("email")
         sandbox_raw = email_cfg.get(
             "attachment_sandbox",
@@ -1245,6 +1578,28 @@ class EmailTool(BaseTool):
             )
         except Exception as exc:
             return self._fail(params, start, f"download_attachment: {exc}")
+        return self._ok(params, start, data)
+
+    async def _action_download_all_attachments(self, params, start, **kwargs):
+        if not kwargs.get("entry_id"):
+            return self._fail(
+                params, start,
+                "download_all_attachments requires 'entry_id'."
+            )
+        email_cfg = ConfigManager().get_section("email")
+        sandbox_raw = email_cfg.get(
+            "attachment_sandbox",
+            r"%USERPROFILE%\HandQ\email_attachments",
+        )
+        run_params = dict(kwargs)
+        run_params["_sandbox"] = os.path.expandvars(sandbox_raw)
+        loop = asyncio.get_running_loop()
+        try:
+            data = await loop.run_in_executor(
+                _outlook_executor, _sync_download_all_attachments, run_params
+            )
+        except Exception as exc:
+            return self._fail(params, start, f"download_all_attachments: {exc}")
         return self._ok(params, start, data)
 
     # ── Shared result builders ────────────────────────────────────────────────

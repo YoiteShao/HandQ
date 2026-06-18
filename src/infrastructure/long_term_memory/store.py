@@ -1,4 +1,14 @@
-"""SQLite-backed store for the long-term memory subsystem.
+"""SQLite-backed store for the LTM 2.0 long-term memory subsystem.
+
+Single physical file at ``%USERPROFILE%\\HandQ\\personality\\memory.db``
+hosting three logical namespaces:
+
+    obs_*  observation layer (snapshots / OCR frames / events / sessions /
+           semantic events / pipeline runs / summaries)
+    mem_*  memory layer (mem_entries with kind ∈ memory|knowledge|skill_proposal
+           plus chunks / FTS / versions / candidates / embedding_cache /
+           recall_log / correction_proposals / dream_runs)
+    ent_*  entity graph (principals / aliases / sightings)
 
 Implementation notes
 --------------------
@@ -7,10 +17,9 @@ Implementation notes
 * All public methods are ``async`` and dispatch the synchronous SQLite work
   to a thread pool; this keeps the asyncio event loop responsive while the
   bridge serves IPC.
-* Schema migrations are defined in :mod:`schema`; ``open()`` runs them in
-  order, recording each in ``migration_log`` + ``memory_meta.schema_version``.
-* The same candidate row drives both memory and knowledge triage — see
-  ``02_handq_design.md §3.3`` for why.
+* Force-reset on open() if a legacy v1-v4 DB is detected (memory_files
+  present without obs_snapshots) — the LTM 2.0 redesign is destructive
+  on existing user data by design (see plan).
 """
 from __future__ import annotations
 
@@ -24,7 +33,6 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 from .models import (
-    ArchiveReason,
     Candidate,
     CandidateStatus,
     Chunk,
@@ -35,21 +43,23 @@ from .models import (
     EntryKind,
     KnowledgeCategory,
     MemoryDimension,
+    Principal,
+    PrincipalKind,
+    SemanticEvent,
+    SemanticStatus,
+    Session,
+    SkillProposal,
+    SkillProposalStatus,
+    Summary,
+    TriggerKind,
 )
 from .schema import DDL_BOOTSTRAP, MIGRATIONS
-from . import _constants as C
 
 _logger = logging.getLogger("handq.ltm.store")
 
 
 class _SyncConn:
-    """Thin shim that exposes the subset of the connection API a migration
-    needs (``execute``, ``commit``) as ``async`` calls.
-
-    Migrations are written ``async def m(conn): await conn.execute(...)``
-    so they look like the rest of the codebase even though the underlying
-    sqlite3 connection is synchronous.
-    """
+    """Thin shim exposing the migration-friendly subset of the connection API."""
 
     def __init__(self, raw: sqlite3.Connection) -> None:
         self._raw = raw
@@ -66,23 +76,19 @@ def _now() -> int:
 
 
 class SQLiteStore:
-    """Async-friendly wrapper over a single sqlite3 connection."""
+    """Async-friendly wrapper over a single sqlite3 connection (LTM 2.0)."""
 
     def __init__(self, raw: sqlite3.Connection, write_lock: asyncio.Lock) -> None:
         self._raw = raw
         self._write_lock = write_lock
 
-    # ── Lifecycle ───────────────────────────────────────────────────────────
+    # ── Lifecycle ──────────────────────────────────────────────────────────
 
     @classmethod
     async def open(cls, db_path: Path) -> "SQLiteStore":
         db_path.parent.mkdir(parents=True, exist_ok=True)
 
-        def _connect() -> sqlite3.Connection:
-            # check_same_thread=False so asyncio.to_thread workers can use the
-            # connection. We serialize all writes through self._write_lock,
-            # so concurrent access is safe.
-            conn = sqlite3.connect(str(db_path), check_same_thread=False, timeout=10.0)
+        def _bootstrap(conn: sqlite3.Connection) -> None:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
             conn.execute("PRAGMA foreign_keys=ON")
@@ -91,7 +97,51 @@ class SQLiteStore:
             for stmt in DDL_BOOTSTRAP:
                 conn.execute(stmt)
             conn.commit()
-            return conn
+
+        def _is_legacy_db(conn: sqlite3.Connection) -> bool:
+            """Detect a legacy v1-v4 DB by table-presence (memory_files
+            present and obs_snapshots absent → legacy → force-reset)."""
+            rows = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name IN ('memory_files', 'obs_snapshots')"
+            ).fetchall()
+            present = {r[0] for r in rows}
+            return "memory_files" in present and "obs_snapshots" not in present
+
+        def _force_reset_and_reopen() -> sqlite3.Connection:
+            for suffix in ("", "-wal", "-shm"):
+                p = Path(str(db_path) + suffix)
+                if not p.exists():
+                    continue
+                for attempt in range(5):
+                    try:
+                        p.unlink()
+                        break
+                    except PermissionError:
+                        time.sleep(0.1)
+                    except FileNotFoundError:
+                        break
+                else:
+                    raise RuntimeError(
+                        f"Force-reset failed: could not unlink {p} after 5 attempts"
+                    )
+            fresh = sqlite3.connect(str(db_path), check_same_thread=False, timeout=10.0)
+            _bootstrap(fresh)
+            return fresh
+
+        def _connect() -> sqlite3.Connection:
+            raw = sqlite3.connect(str(db_path), check_same_thread=False, timeout=10.0)
+            _bootstrap(raw)
+            if _is_legacy_db(raw):
+                _logger.warning(
+                    "LTM force-reset: legacy v1-v4 schema detected at %s "
+                    "(memory_files present, obs_snapshots absent). Wiping and "
+                    "re-bootstrapping under LTM 2.0 baseline.",
+                    db_path,
+                )
+                raw.close()
+                return _force_reset_and_reopen()
+            return raw
 
         raw = await asyncio.to_thread(_connect)
         store = cls(raw, asyncio.Lock())
@@ -124,7 +174,7 @@ class SQLiteStore:
                 )
                 await asyncio.to_thread(self._raw.commit)
 
-    # ── Tiny helpers ────────────────────────────────────────────────────────
+    # ── Tiny helpers ───────────────────────────────────────────────────────
 
     async def _execute(self, sql: str, params: tuple = ()) -> None:
         async with self._write_lock:
@@ -149,7 +199,7 @@ class SQLiteStore:
                 cur.close()
         return await asyncio.to_thread(_q)
 
-    # ── Meta ────────────────────────────────────────────────────────────────
+    # ── Meta ───────────────────────────────────────────────────────────────
 
     async def get_meta(self, key: str) -> Optional[str]:
         row = await self._fetchone(
@@ -163,7 +213,7 @@ class SQLiteStore:
             (key, value),
         )
 
-    # ── Candidates ──────────────────────────────────────────────────────────
+    # ── Candidates (non-observation submit queue) ──────────────────────────
 
     async def insert_candidate(
         self,
@@ -178,7 +228,7 @@ class SQLiteStore:
         meta_json = json.dumps(metadata or {}, ensure_ascii=False)
         now = _now()
         await self._execute(
-            """INSERT INTO memory_candidates
+            """INSERT INTO mem_candidates
                (id, source, source_ref, raw_text, hint, metadata, status,
                 retry_count, created_at, updated_at)
                VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)""",
@@ -190,7 +240,7 @@ class SQLiteStore:
         rows = await self._fetchall(
             """SELECT id, source, source_ref, raw_text, hint, metadata,
                       retry_count, created_at
-               FROM memory_candidates
+               FROM mem_candidates
                WHERE status='pending'
                ORDER BY created_at ASC
                LIMIT ?""",
@@ -200,18 +250,12 @@ class SQLiteStore:
         for r in rows:
             try:
                 meta = json.loads(r[5]) if r[5] else {}
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, TypeError, ValueError):
                 meta = {}
             out.append(Candidate(
-                id=r[0],
-                source=r[1],
-                source_ref=r[2],
-                raw_text=r[3],
-                hint=r[4],
-                metadata=meta,
-                status=CandidateStatus.PENDING,
-                retry_count=int(r[6]),
-                created_at=int(r[7]),
+                id=r[0], source=r[1], source_ref=r[2], raw_text=r[3],
+                hint=r[4], metadata=meta, status=CandidateStatus.PENDING,
+                retry_count=int(r[6]), created_at=int(r[7]),
             ))
         return out
 
@@ -220,16 +264,27 @@ class SQLiteStore:
     ) -> None:
         s = status.value if hasattr(status, "value") else str(status)
         await self._execute(
-            "UPDATE memory_candidates SET status=?, reason=?, updated_at=? WHERE id=?",
+            "UPDATE mem_candidates SET status=?, reason=?, updated_at=? WHERE id=?",
             (s, reason, _now(), cid),
         )
 
+    async def get_candidate_status(self, cid: str) -> Optional[str]:
+        row = await self._fetchone(
+            "SELECT status FROM mem_candidates WHERE id=?", (cid,),
+        )
+        return row[0] if row else None
+
+    async def heartbeat_candidate(self, cid: str) -> None:
+        await self._execute(
+            "UPDATE mem_candidates SET updated_at=? WHERE id=? AND status='triaging'",
+            (_now(), cid),
+        )
+
     async def bump_candidate_retry(self, cid: str, *, error: str) -> int:
-        """Increment retry_count, set last_error, return the new count."""
         async with self._write_lock:
             await asyncio.to_thread(
                 self._raw.execute,
-                """UPDATE memory_candidates
+                """UPDATE mem_candidates
                    SET retry_count=retry_count+1, last_error=?, status='pending', updated_at=?
                    WHERE id=?""",
                 (error[:200], _now(), cid),
@@ -237,7 +292,7 @@ class SQLiteStore:
             await asyncio.to_thread(self._raw.commit)
             cur = await asyncio.to_thread(
                 self._raw.execute,
-                "SELECT retry_count FROM memory_candidates WHERE id=?",
+                "SELECT retry_count FROM mem_candidates WHERE id=?",
                 (cid,),
             )
             try:
@@ -251,7 +306,7 @@ class SQLiteStore:
         async with self._write_lock:
             cur = await asyncio.to_thread(
                 self._raw.execute,
-                """UPDATE memory_candidates
+                """UPDATE mem_candidates
                    SET status='pending', updated_at=?
                    WHERE status='triaging' AND updated_at < ?""",
                 (_now(), cutoff),
@@ -272,7 +327,7 @@ class SQLiteStore:
     ) -> List[Candidate]:
         sql = (
             "SELECT id, source, source_ref, raw_text, hint, metadata, retry_count, created_at, status "
-            "FROM memory_candidates WHERE 1=1"
+            "FROM mem_candidates WHERE 1=1"
         )
         params: list = []
         if status:
@@ -295,20 +350,104 @@ class SQLiteStore:
             except ValueError:
                 cstatus = CandidateStatus.PENDING
             out.append(Candidate(
-                id=r[0],
-                source=r[1],
-                source_ref=r[2],
-                raw_text=r[3],
-                hint=r[4],
-                metadata=meta,
-                status=cstatus,
-                retry_count=int(r[6]),
-                created_at=int(r[7]),
+                id=r[0], source=r[1], source_ref=r[2], raw_text=r[3],
+                hint=r[4], metadata=meta, status=cstatus,
+                retry_count=int(r[6]), created_at=int(r[7]),
             ))
         return out
 
-    # ── Memory entries ──────────────────────────────────────────────────────
+    async def prune_candidate_raw_text(self, older_than_ts: int) -> int:
+        """Clear raw_text for fully-processed candidates older than cutoff."""
+        statuses = ("accepted_memory", "accepted_knowledge", "accepted_both", "rejected")
+        placeholders = ",".join("?" * len(statuses))
+        async with self._write_lock:
+            cur = await asyncio.to_thread(
+                self._raw.execute,
+                f"UPDATE mem_candidates SET raw_text='' "
+                f"WHERE status IN ({placeholders}) "
+                f"AND created_at < ? AND raw_text != ''",
+                (*statuses, older_than_ts),
+            )
+            await asyncio.to_thread(self._raw.commit)
+            return cur.rowcount
 
+    # ── mem_entries unified CRUD (memory + knowledge + skill_proposal) ─────
+
+    async def insert_entry(
+        self,
+        *,
+        kind: EntryKind,
+        summary: str,
+        content: str,
+        dimension: Optional[MemoryDimension] = None,
+        category: Optional[KnowledgeCategory] = None,
+        candidate_id: Optional[str] = None,
+        source: str = "",
+        source_ref: Optional[str] = None,
+        source_event_id: Optional[str] = None,
+        frame: Optional[dict] = None,
+        principal_ids: Optional[List[str]] = None,
+        skill_status: Optional[SkillProposalStatus] = None,
+        skill_signature: Optional[dict] = None,
+        skill_fingerprint: Optional[str] = None,
+        recurrence_count: int = 1,
+        synthesis_level: int = 0,
+        source_entry_ids: Optional[List[str]] = None,
+        entry_id: Optional[str] = None,
+    ) -> str:
+        """Insert a new mem_entries row + chunked content into mem_chunks.
+
+        ``kind`` selects the discriminator row. ``dimension`` is required for
+        kind=memory; ``category`` for kind=knowledge; skill fields for
+        kind=skill_proposal. Caller-supplied ``entry_id`` reserves the id
+        BEFORE insert (for /remember mirror files etc.).
+        """
+        from .chunking import chunk_markdown
+        eid = entry_id or str(uuid.uuid4())
+        now = _now()
+        chunks = chunk_markdown(content)
+        frame_json = json.dumps(frame, ensure_ascii=False) if frame else None
+        principal_json = json.dumps(principal_ids or [], ensure_ascii=False) if principal_ids else None
+        source_entry_json = json.dumps(source_entry_ids or [], ensure_ascii=False) if source_entry_ids else None
+        sig_json = json.dumps(skill_signature, ensure_ascii=False) if skill_signature else None
+        skill_status_val = skill_status.value if skill_status else None
+
+        def _txn() -> None:
+            try:
+                self._raw.execute("BEGIN IMMEDIATE")
+                self._raw.execute(
+                    """INSERT INTO mem_entries
+                       (id, kind, dimension, category, skill_status, skill_signature,
+                        skill_fingerprint, recurrence_count, summary, frame_json,
+                        source_event_id, source, source_ref, archived, synthesis_level,
+                        source_entry_ids, version, principal_ids, created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, 1, ?, ?, ?)""",
+                    (eid, kind.value,
+                     dimension.value if dimension else None,
+                     category.value if category else None,
+                     skill_status_val, sig_json, skill_fingerprint,
+                     recurrence_count, summary[:120], frame_json,
+                     source_event_id, source, source_ref, synthesis_level,
+                     source_entry_json, principal_json, now, now),
+                )
+                for i, c in enumerate(chunks):
+                    self._raw.execute(
+                        """INSERT INTO mem_chunks
+                           (id, entry_id, chunk_index, text, start_line, end_line, hash)
+                           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                        (str(uuid.uuid4()), eid, i, c.text,
+                         c.start_line, c.end_line, c.hash),
+                    )
+                self._raw.commit()
+            except Exception:
+                self._raw.rollback()
+                raise
+
+        async with self._write_lock:
+            await asyncio.to_thread(_txn)
+        return eid
+
+    # Backward-compat thin wrappers — preserve facade caller API surface.
     async def insert_memory_entry(
         self,
         *,
@@ -318,15 +457,12 @@ class SQLiteStore:
         candidate_id: Optional[str],
         source: str,
         source_ref: Optional[str],
+        frame: Optional[dict] = None,
     ) -> str:
-        return await self.insert_memory_entry_with_id(
-            entry_id=str(uuid.uuid4()),
-            dimension=dimension,
-            summary=summary,
-            content=content,
-            candidate_id=candidate_id,
-            source=source,
-            source_ref=source_ref,
+        return await self.insert_entry(
+            kind=EntryKind.MEMORY, dimension=dimension, summary=summary,
+            content=content, candidate_id=candidate_id, source=source,
+            source_ref=source_ref, frame=frame,
         )
 
     async def insert_memory_entry_with_id(
@@ -339,134 +475,13 @@ class SQLiteStore:
         candidate_id: Optional[str],
         source: str,
         source_ref: Optional[str],
+        frame: Optional[dict] = None,
     ) -> str:
-        """Same as ``insert_memory_entry`` but the caller supplies the
-        entry id. Used by the verbatim /remember path which needs the
-        id reserved BEFORE inserting (so the .md mirror file's name
-        and the DB row's id agree).
-        """
-        from .chunking import chunk_markdown
-        eid = entry_id
-        now = _now()
-        chunks = chunk_markdown(content)
-
-        def _txn() -> None:
-            try:
-                self._raw.execute("BEGIN IMMEDIATE")
-                self._raw.execute(
-                    """INSERT INTO memory_files
-                       (id, dimension, summary, candidate_id, source, source_ref,
-                        archived, version, created_at, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, 0, 1, ?, ?)""",
-                    (eid, dimension.value, summary[:120], candidate_id,
-                     source, source_ref, now, now),
-                )
-                for i, c in enumerate(chunks):
-                    self._raw.execute(
-                        """INSERT INTO memory_chunks
-                           (id, entry_id, chunk_index, text, start_line, end_line, hash)
-                           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                        (str(uuid.uuid4()), eid, i, c.text,
-                         c.start_line, c.end_line, c.hash),
-                    )
-                self._raw.commit()
-            except Exception:
-                self._raw.rollback()
-                raise
-
-        async with self._write_lock:
-            await asyncio.to_thread(_txn)
-        return eid
-
-    async def update_memory_entry(
-        self,
-        entry_id: str,
-        *,
-        new_summary: str,
-        new_content: str,
-    ) -> None:
-        await self._update_entry_versioned(
-            files_table="memory_files",
-            chunks_table="memory_chunks",
-            versions_table="memory_versions",
-            kind=EntryKind.MEMORY.value,
-            entry_id=entry_id,
-            new_summary=new_summary,
-            new_content=new_content,
+        return await self.insert_entry(
+            entry_id=entry_id, kind=EntryKind.MEMORY, dimension=dimension,
+            summary=summary, content=content, candidate_id=candidate_id,
+            source=source, source_ref=source_ref, frame=frame,
         )
-
-    async def archive_memory_entry(self, entry_id: str, *, reason: str) -> None:
-        await self._execute(
-            "UPDATE memory_files SET archived=1, archived_reason=?, updated_at=? WHERE id=?",
-            (reason, _now(), entry_id),
-        )
-
-    async def set_superseded_by(
-        self, *, kind: str, entry_id: str, superseded_by_id: str,
-    ) -> None:
-        """Stamp the FK that links an archived entry to whatever replaced it.
-
-        Used by L2/L3 dream synthesis to mark each source entry with the
-        synthesis entry that subsumed it. ``entry_id`` is the entry being
-        retired; ``superseded_by_id`` is the new synthesis entry. The
-        column already exists in the schema (memory_files / knowledge_files).
-        """
-        if kind == EntryKind.MEMORY.value:
-            table = "memory_files"
-        elif kind == EntryKind.KNOWLEDGE.value:
-            table = "knowledge_files"
-        else:
-            raise ValueError(f"unknown kind: {kind!r}")
-        await self._execute(
-            f"UPDATE {table} SET superseded_by=?, updated_at=? WHERE id=?",
-            (superseded_by_id, _now(), entry_id),
-        )
-
-    async def list_memory_entries(
-        self,
-        *,
-        dimension: Optional[MemoryDimension] = None,
-        archived: bool = False,
-        limit: int = 50,
-    ) -> List[Entry]:
-        sql = (
-            "SELECT id, dimension, summary, source, source_ref, version, "
-            "archived, archived_reason, created_at, updated_at "
-            "FROM memory_files WHERE archived=?"
-        )
-        params: list = [1 if archived else 0]
-        if dimension is not None:
-            sql += " AND dimension=?"
-            params.append(dimension.value)
-        sql += " ORDER BY updated_at DESC LIMIT ?"
-        params.append(limit)
-        rows = await self._fetchall(sql, tuple(params))
-        return [_row_to_memory_entry(r) for r in rows]
-
-    async def get_memory_entry_full(self, entry_id: str) -> Optional[Entry]:
-        row = await self._fetchone(
-            "SELECT id, dimension, summary, source, source_ref, version, "
-            "archived, archived_reason, created_at, updated_at "
-            "FROM memory_files WHERE id=?",
-            (entry_id,),
-        )
-        if not row:
-            return None
-        entry = _row_to_memory_entry(row)
-        chunk_rows = await self._fetchall(
-            "SELECT id, chunk_index, text, hash, start_line, end_line "
-            "FROM memory_chunks WHERE entry_id=? ORDER BY chunk_index",
-            (entry_id,),
-        )
-        entry.chunks = [
-            Chunk(id=cr[0], entry_id=entry_id, chunk_index=int(cr[1]),
-                  text=cr[2], hash=cr[3], start_line=cr[4], end_line=cr[5])
-            for cr in chunk_rows
-        ]
-        entry.content = "\n\n".join(c.text for c in entry.chunks)
-        return entry
-
-    # ── Knowledge entries (parallel to memory) ──────────────────────────────
 
     async def insert_knowledge_entry(
         self,
@@ -478,119 +493,21 @@ class SQLiteStore:
         source: str,
         source_ref: Optional[str],
     ) -> str:
-        from .chunking import chunk_markdown
-        eid = str(uuid.uuid4())
-        now = _now()
-        chunks = chunk_markdown(content)
-
-        def _txn() -> None:
-            try:
-                self._raw.execute("BEGIN IMMEDIATE")
-                self._raw.execute(
-                    """INSERT INTO knowledge_files
-                       (id, category, summary, candidate_id, source, source_ref,
-                        archived, version, created_at, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, 0, 1, ?, ?)""",
-                    (eid, category.value, summary[:120], candidate_id,
-                     source, source_ref, now, now),
-                )
-                for i, c in enumerate(chunks):
-                    self._raw.execute(
-                        """INSERT INTO knowledge_chunks
-                           (id, entry_id, chunk_index, text, start_line, end_line, hash)
-                           VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                        (str(uuid.uuid4()), eid, i, c.text,
-                         c.start_line, c.end_line, c.hash),
-                    )
-                self._raw.commit()
-            except Exception:
-                self._raw.rollback()
-                raise
-
-        async with self._write_lock:
-            await asyncio.to_thread(_txn)
-        return eid
-
-    async def update_knowledge_entry(
-        self,
-        entry_id: str,
-        *,
-        new_summary: str,
-        new_content: str,
-    ) -> None:
-        await self._update_entry_versioned(
-            files_table="knowledge_files",
-            chunks_table="knowledge_chunks",
-            versions_table="knowledge_versions",
-            kind=EntryKind.KNOWLEDGE.value,
-            entry_id=entry_id,
-            new_summary=new_summary,
-            new_content=new_content,
+        return await self.insert_entry(
+            kind=EntryKind.KNOWLEDGE, category=category, summary=summary,
+            content=content, candidate_id=candidate_id, source=source,
+            source_ref=source_ref,
         )
-
-    async def archive_knowledge_entry(self, entry_id: str, *, reason: str) -> None:
-        await self._execute(
-            "UPDATE knowledge_files SET archived=1, archived_reason=?, updated_at=? WHERE id=?",
-            (reason, _now(), entry_id),
-        )
-
-    async def list_knowledge_entries(
-        self,
-        *,
-        category: Optional[KnowledgeCategory] = None,
-        archived: bool = False,
-        limit: int = 50,
-    ) -> List[Entry]:
-        sql = (
-            "SELECT id, category, summary, source, source_ref, version, "
-            "archived, archived_reason, created_at, updated_at "
-            "FROM knowledge_files WHERE archived=?"
-        )
-        params: list = [1 if archived else 0]
-        if category is not None:
-            sql += " AND category=?"
-            params.append(category.value)
-        sql += " ORDER BY updated_at DESC LIMIT ?"
-        params.append(limit)
-        rows = await self._fetchall(sql, tuple(params))
-        return [_row_to_knowledge_entry(r) for r in rows]
-
-    async def get_knowledge_entry_full(self, entry_id: str) -> Optional[Entry]:
-        row = await self._fetchone(
-            "SELECT id, category, summary, source, source_ref, version, "
-            "archived, archived_reason, created_at, updated_at "
-            "FROM knowledge_files WHERE id=?",
-            (entry_id,),
-        )
-        if not row:
-            return None
-        entry = _row_to_knowledge_entry(row)
-        chunk_rows = await self._fetchall(
-            "SELECT id, chunk_index, text, hash, start_line, end_line "
-            "FROM knowledge_chunks WHERE entry_id=? ORDER BY chunk_index",
-            (entry_id,),
-        )
-        entry.chunks = [
-            Chunk(id=cr[0], entry_id=entry_id, chunk_index=int(cr[1]),
-                  text=cr[2], hash=cr[3], start_line=cr[4], end_line=cr[5])
-            for cr in chunk_rows
-        ]
-        entry.content = "\n\n".join(c.text for c in entry.chunks)
-        return entry
-
-    # ── Versioned update helper ─────────────────────────────────────────────
 
     async def _update_entry_versioned(
         self,
         *,
-        files_table: str,
-        chunks_table: str,
-        versions_table: str,
-        kind: str,
+        kind: EntryKind,
         entry_id: str,
         new_summary: str,
         new_content: str,
     ) -> None:
+        """Bump version: archive old chunks via mem_versions, replace with new."""
         from .chunking import chunk_markdown
         now = _now()
         new_chunks = chunk_markdown(new_content)
@@ -598,20 +515,19 @@ class SQLiteStore:
         def _txn() -> None:
             try:
                 self._raw.execute("BEGIN IMMEDIATE")
-
                 cur = self._raw.execute(
-                    f"SELECT version, summary FROM {files_table} WHERE id=?",
-                    (entry_id,),
+                    "SELECT version, summary FROM mem_entries WHERE id=? AND kind=?",
+                    (entry_id, kind.value),
                 )
                 row = cur.fetchone()
                 cur.close()
                 if not row:
-                    raise ValueError(f"entry not found in {files_table}: {entry_id}")
+                    raise ValueError(f"entry not found: {entry_id} (kind={kind.value})")
                 old_version, old_summary = int(row[0]), row[1]
 
                 cur2 = self._raw.execute(
-                    f"SELECT chunk_index, text, start_line, end_line "
-                    f"FROM {chunks_table} WHERE entry_id=? ORDER BY chunk_index",
+                    "SELECT chunk_index, text, start_line, end_line "
+                    "FROM mem_chunks WHERE entry_id=? ORDER BY chunk_index",
                     (entry_id,),
                 )
                 old_chunks = list(cur2.fetchall())
@@ -622,49 +538,39 @@ class SQLiteStore:
                 )
 
                 self._raw.execute(
-                    f"INSERT INTO {versions_table} "
-                    f"(id, entry_id, version, summary, chunks_json, archived_at) "
-                    f"VALUES (?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO mem_versions "
+                    "(id, entry_id, version, summary, chunks_json, archived_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?)",
                     (str(uuid.uuid4()), entry_id, old_version, old_summary,
                      chunks_json, now),
                 )
 
-                # ── Clean up embedding_cache for soon-to-be-deleted chunks.
-                # The cache table has no FK to chunks_table (cross-kind
-                # discriminator key + intentional decoupling so the cache
-                # is independently restartable). Without this DELETE, the
-                # rows orphan and pile up indefinitely as users update
-                # memories — slow disk leak that was easy to miss because
-                # recall still returned correct results.
                 cur3 = self._raw.execute(
-                    f"SELECT id FROM {chunks_table} WHERE entry_id=?",
-                    (entry_id,),
+                    "SELECT id FROM mem_chunks WHERE entry_id=?", (entry_id,),
                 )
                 old_chunk_ids = [r[0] for r in cur3.fetchall()]
                 cur3.close()
                 if old_chunk_ids:
                     placeholders = ",".join(["?"] * len(old_chunk_ids))
                     self._raw.execute(
-                        f"DELETE FROM embedding_cache "
+                        f"DELETE FROM mem_embedding_cache "
                         f"WHERE chunk_kind=? AND chunk_id IN ({placeholders})",
-                        (kind,) + tuple(old_chunk_ids),
+                        (kind.value,) + tuple(old_chunk_ids),
                     )
 
                 self._raw.execute(
-                    f"DELETE FROM {chunks_table} WHERE entry_id=?", (entry_id,),
+                    "DELETE FROM mem_chunks WHERE entry_id=?", (entry_id,),
                 )
                 for i, c in enumerate(new_chunks):
                     self._raw.execute(
-                        f"INSERT INTO {chunks_table} "
-                        f"(id, entry_id, chunk_index, text, start_line, end_line, hash) "
-                        f"VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        "INSERT INTO mem_chunks "
+                        "(id, entry_id, chunk_index, text, start_line, end_line, hash) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
                         (str(uuid.uuid4()), entry_id, i, c.text,
                          c.start_line, c.end_line, c.hash),
                     )
-
                 self._raw.execute(
-                    f"UPDATE {files_table} "
-                    f"SET summary=?, version=version+1, updated_at=? WHERE id=?",
+                    "UPDATE mem_entries SET summary=?, version=version+1, updated_at=? WHERE id=?",
                     (new_summary[:120], now, entry_id),
                 )
                 self._raw.commit()
@@ -675,7 +581,117 @@ class SQLiteStore:
         async with self._write_lock:
             await asyncio.to_thread(_txn)
 
-    # ── FTS search ──────────────────────────────────────────────────────────
+    async def update_memory_entry(
+        self, entry_id: str, *, new_summary: str, new_content: str,
+    ) -> None:
+        await self._update_entry_versioned(
+            kind=EntryKind.MEMORY, entry_id=entry_id,
+            new_summary=new_summary, new_content=new_content,
+        )
+
+    async def update_knowledge_entry(
+        self, entry_id: str, *, new_summary: str, new_content: str,
+    ) -> None:
+        await self._update_entry_versioned(
+            kind=EntryKind.KNOWLEDGE, entry_id=entry_id,
+            new_summary=new_summary, new_content=new_content,
+        )
+
+    async def archive_entry(
+        self, entry_id: str, *, kind: EntryKind, reason: str,
+    ) -> None:
+        await self._execute(
+            "UPDATE mem_entries SET archived=1, archived_reason=?, updated_at=? "
+            "WHERE id=? AND kind=?",
+            (reason, _now(), entry_id, kind.value),
+        )
+
+    async def archive_memory_entry(self, entry_id: str, *, reason: str) -> None:
+        await self.archive_entry(entry_id, kind=EntryKind.MEMORY, reason=reason)
+
+    async def archive_knowledge_entry(self, entry_id: str, *, reason: str) -> None:
+        await self.archive_entry(entry_id, kind=EntryKind.KNOWLEDGE, reason=reason)
+
+    async def set_superseded_by(
+        self, *, kind: str, entry_id: str, superseded_by_id: str,
+    ) -> None:
+        await self._execute(
+            "UPDATE mem_entries SET superseded_by=?, updated_at=? WHERE id=? AND kind=?",
+            (superseded_by_id, _now(), entry_id, kind),
+        )
+
+    async def list_memory_entries(
+        self,
+        *,
+        dimension: Optional[MemoryDimension] = None,
+        archived: bool = False,
+        limit: int = 50,
+    ) -> List[Entry]:
+        sql = (
+            "SELECT id, dimension, summary, source, source_ref, version, "
+            "archived, archived_reason, created_at, updated_at, frame_json "
+            "FROM mem_entries WHERE kind='memory' AND archived=?"
+        )
+        params: list = [1 if archived else 0]
+        if dimension is not None:
+            sql += " AND dimension=?"
+            params.append(dimension.value)
+        sql += " ORDER BY updated_at DESC LIMIT ?"
+        params.append(limit)
+        rows = await self._fetchall(sql, tuple(params))
+        return [_row_to_memory_entry(r) for r in rows]
+
+    async def list_knowledge_entries(
+        self,
+        *,
+        category: Optional[KnowledgeCategory] = None,
+        archived: bool = False,
+        limit: int = 50,
+    ) -> List[Entry]:
+        sql = (
+            "SELECT id, category, summary, source, source_ref, version, "
+            "archived, archived_reason, created_at, updated_at, frame_json "
+            "FROM mem_entries WHERE kind='knowledge' AND archived=?"
+        )
+        params: list = [1 if archived else 0]
+        if category is not None:
+            sql += " AND category=?"
+            params.append(category.value)
+        sql += " ORDER BY updated_at DESC LIMIT ?"
+        params.append(limit)
+        rows = await self._fetchall(sql, tuple(params))
+        return [_row_to_knowledge_entry(r) for r in rows]
+
+    async def get_memory_entry_full(self, entry_id: str) -> Optional[Entry]:
+        return await self._get_entry_full(entry_id, kind=EntryKind.MEMORY)
+
+    async def get_knowledge_entry_full(self, entry_id: str) -> Optional[Entry]:
+        return await self._get_entry_full(entry_id, kind=EntryKind.KNOWLEDGE)
+
+    async def _get_entry_full(self, entry_id: str, *, kind: EntryKind) -> Optional[Entry]:
+        row = await self._fetchone(
+            "SELECT id, dimension, category, summary, source, source_ref, version, "
+            "archived, archived_reason, created_at, updated_at, frame_json "
+            "FROM mem_entries WHERE id=? AND kind=?",
+            (entry_id, kind.value),
+        )
+        if not row:
+            return None
+        entry = _row_to_entry_full(row, kind)
+        chunk_rows = await self._fetchall(
+            "SELECT id, chunk_index, text, hash, start_line, end_line "
+            "FROM mem_chunks WHERE entry_id=? ORDER BY chunk_index",
+            (entry_id,),
+        )
+        entry.chunks = [
+            Chunk(id=cr[0], entry_id=entry_id, chunk_index=int(cr[1]),
+                  text=cr[2], hash=cr[3], start_line=cr[4], end_line=cr[5])
+            for cr in chunk_rows
+        ]
+        entry.content = "\n\n".join(c.text for c in entry.chunks)
+        return entry
+
+    # ── FTS search ─────────────────────────────────────────────────────────
 
     async def fts_search_memory(
         self,
@@ -685,10 +701,8 @@ class SQLiteStore:
         limit: int = 15,
     ) -> List[tuple]:
         return await self._fts_search(
-            kind=EntryKind.MEMORY.value,
-            query=query,
-            facet_value=dimension.value if dimension else None,
-            limit=limit,
+            kind=EntryKind.MEMORY.value, query=query,
+            facet_value=dimension.value if dimension else None, limit=limit,
         )
 
     async def fts_search_knowledge(
@@ -699,82 +713,52 @@ class SQLiteStore:
         limit: int = 15,
     ) -> List[tuple]:
         return await self._fts_search(
-            kind=EntryKind.KNOWLEDGE.value,
-            query=query,
-            facet_value=category.value if category else None,
-            limit=limit,
+            kind=EntryKind.KNOWLEDGE.value, query=query,
+            facet_value=category.value if category else None, limit=limit,
         )
 
     async def _fts_search(
-        self,
-        *,
-        kind: str,
-        query: str,
-        facet_value: Optional[str],
-        limit: int,
+        self, *, kind: str, query: str, facet_value: Optional[str], limit: int,
     ) -> List[tuple]:
-        """Returns rows shaped as (entry_id, chunk_id, text, summary, facet, created_at, rank)."""
+        """Returns (entry_id, chunk_id, text, summary, facet, created_at, rank, frame_os)."""
         safe = self._sanitize_fts_query(query)
-        if kind == EntryKind.MEMORY.value:
-            facet_col = "dimension"
-            files = "memory_files"
-            chunks = "memory_chunks"
-            fts = "memory_chunks_fts"
-        elif kind == EntryKind.KNOWLEDGE.value:
-            facet_col = "category"
-            files = "knowledge_files"
-            chunks = "knowledge_chunks"
-            fts = "knowledge_chunks_fts"
-        else:
-            raise ValueError(f"unknown kind: {kind!r}")
-
+        facet_col = "dimension" if kind == EntryKind.MEMORY.value else "category"
         sql = (
             f"SELECT e.id, c.id, c.text, e.summary, e.{facet_col}, "
-            f"       e.created_at, bm25({fts}) AS rank "
-            f"FROM {fts} fts "
-            f"JOIN {chunks} c ON c.id = fts.chunk_id "
-            f"JOIN {files} e ON e.id = c.entry_id "
-            f"WHERE {fts} MATCH ? AND e.archived=0"
+            f"       e.created_at, bm25(mem_chunks_fts) AS rank, e.frame_os "
+            f"FROM mem_chunks_fts fts "
+            f"JOIN mem_chunks c ON c.id = fts.chunk_id "
+            f"JOIN mem_entries e ON e.id = c.entry_id "
+            f"WHERE mem_chunks_fts MATCH ? AND e.archived=0 AND e.kind=?"
         )
-        params: list = [safe]
+        params: list = [safe, kind]
         if facet_value:
             sql += f" AND e.{facet_col}=?"
             params.append(facet_value)
         sql += " ORDER BY rank LIMIT ?"
         params.append(limit)
-
         try:
             return await self._fetchall(sql, tuple(params))
         except sqlite3.OperationalError as exc:
-            # An empty / weird query can still slip past sanitize when every
-            # token is an FTS reserved word — return empty rather than crash.
             _logger.debug("FTS search failed (%s); returning empty", exc)
             return []
 
     @staticmethod
     def _sanitize_fts_query(q: str) -> str:
-        """Reduce *q* to a safe FTS5 OR-of-quoted-tokens query.
-
-        FTS5 has its own mini-language (NEAR, AND, OR, parens, column refs).
-        Free-text user input regularly trips that parser, so we extract word
-        tokens with a regex and re-quote them. Cap at 32 tokens to avoid
-        runaway queries on multi-page candidates.
-        """
+        """OR-of-quoted-tokens FTS5 query, safe against reserved words."""
         import re
         tokens = re.findall(r"[\w一-鿿]+", q.lower())
-        # FTS5 reserved bareword AND/OR/NOT/NEAR get coerced into quoted tokens
-        # by virtue of the wrapping double-quotes below.
         if not tokens:
             return '""'
         return " OR ".join(f'"{t}"' for t in tokens[:32])
 
-    # ── Embedding cache ─────────────────────────────────────────────────────
+    # ── Embedding cache ────────────────────────────────────────────────────
 
     async def get_embedding(
         self, chunk_id: str, kind: str, provider: str, model: str,
     ) -> Optional[bytes]:
         row = await self._fetchone(
-            "SELECT embedding FROM embedding_cache "
+            "SELECT embedding FROM mem_embedding_cache "
             "WHERE chunk_id=? AND chunk_kind=? AND provider=? AND model=?",
             (chunk_id, kind, provider, model),
         )
@@ -792,356 +776,46 @@ class SQLiteStore:
         embedding: bytes,
     ) -> None:
         await self._execute(
-            "INSERT OR REPLACE INTO embedding_cache "
+            "INSERT OR REPLACE INTO mem_embedding_cache "
             "(chunk_id, chunk_kind, provider, model, dims, hash, embedding, updated_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
             (chunk_id, kind, provider, model, dims, hash_, embedding, _now()),
         )
 
-    # ── Dense-recall helpers (hybrid retrieval) ─────────────────────────────
-
     async def list_embedded_chunks(
-        self,
-        *,
-        kind: str,
-        provider: str,
-        model: str,
+        self, *, kind: str, provider: str, model: str,
     ) -> List[Tuple]:
-        """Return all chunks of *kind* that have a cached embedding for
-        (provider, model), joined with their parent entry's metadata.
-
-        Used by stage 1b (dense brute-force recall) of the hybrid retrieval
-        pipeline. The corpus is small enough (~hundreds of chunks) that a
-        Python-side cosine sweep per query is cheap (~50ms for 1500 × 1024).
-
-        Returned tuple shape (8-tuple, matching FTS row contract + embedding):
-            (entry_id, chunk_id, text, summary, facet, created_at, hash, embedding_bytes)
-        """
-        if kind == EntryKind.MEMORY.value:
-            files_table, chunks_table, facet_col = "memory_files", "memory_chunks", "dimension"
-        elif kind == EntryKind.KNOWLEDGE.value:
-            files_table, chunks_table, facet_col = "knowledge_files", "knowledge_chunks", "category"
-        else:
-            raise ValueError(f"unknown kind: {kind!r}")
+        """Returns (entry_id, chunk_id, text, summary, facet, created_at, hash, embedding, frame_os)."""
+        facet_col = "dimension" if kind == EntryKind.MEMORY.value else "category"
         sql = (
             f"SELECT e.id, c.id, c.text, e.summary, e.{facet_col}, e.created_at, "
-            f"       ec.hash, ec.embedding "
-            f"FROM {chunks_table} c "
-            f"JOIN {files_table} e ON e.id = c.entry_id "
-            f"JOIN embedding_cache ec ON ec.chunk_id = c.id "
+            f"       ec.hash, ec.embedding, e.frame_os "
+            f"FROM mem_chunks c "
+            f"JOIN mem_entries e ON e.id = c.entry_id "
+            f"JOIN mem_embedding_cache ec ON ec.chunk_id = c.id "
             f"  AND ec.chunk_kind=? AND ec.provider=? AND ec.model=? "
-            f"WHERE e.archived=0"
+            f"WHERE e.archived=0 AND e.kind=?"
         )
-        return await self._fetchall(sql, (kind, provider, model))
+        return await self._fetchall(sql, (kind, provider, model, kind))
 
     async def list_chunks_missing_embedding(
-        self,
-        *,
-        kind: str,
-        provider: str,
-        model: str,
-        limit: int = 100,
+        self, *, kind: str, provider: str, model: str, limit: int = 100,
     ) -> List[Tuple]:
-        """Chunks that lack a cached embedding for (provider, model).
-
-        Returns (chunk_id, entry_id, text, hash) tuples. Used by the
-        DreamWorker's startup backfill to embed legacy chunks (entries
-        inserted before P2 / when the embedder was unavailable).
-        """
-        if kind == EntryKind.MEMORY.value:
-            files_table, chunks_table = "memory_files", "memory_chunks"
-        elif kind == EntryKind.KNOWLEDGE.value:
-            files_table, chunks_table = "knowledge_files", "knowledge_chunks"
-        else:
-            raise ValueError(f"unknown kind: {kind!r}")
+        """Chunks that lack a cached embedding for (provider, model)."""
         sql = (
-            f"SELECT c.id, c.entry_id, c.text, c.hash "
-            f"FROM {chunks_table} c "
-            f"JOIN {files_table} e ON e.id = c.entry_id "
-            f"WHERE e.archived=0 "
-            f"  AND NOT EXISTS ("
-            f"     SELECT 1 FROM embedding_cache ec "
-            f"     WHERE ec.chunk_id = c.id "
-            f"       AND ec.chunk_kind=? AND ec.provider=? AND ec.model=?"
-            f"  ) "
-            f"LIMIT ?"
+            "SELECT c.id, c.entry_id, c.text, c.hash "
+            "FROM mem_chunks c "
+            "JOIN mem_entries e ON e.id = c.entry_id "
+            "WHERE e.archived=0 AND e.kind=? "
+            "  AND NOT EXISTS ("
+            "     SELECT 1 FROM mem_embedding_cache ec "
+            "     WHERE ec.chunk_id = c.id "
+            "       AND ec.chunk_kind=? AND ec.provider=? AND ec.model=?"
+            "  ) LIMIT ?"
         )
-        return await self._fetchall(sql, (kind, provider, model, limit))
+        return await self._fetchall(sql, (kind, kind, provider, model, limit))
 
-    # ── Merge / dedup scanner ───────────────────────────────────────────────
-
-    async def list_entry_centroids(
-        self,
-        *,
-        kind: str,
-        provider: str,
-        model: str,
-    ) -> List[Tuple]:
-        """One representative-chunk row per non-archived entry, with its
-        cached embedding.
-
-        Why "centroid" rather than literal mean: most entries are small
-        enough to fit in 1 chunk, and even multi-chunk entries have very
-        similar chunk embeddings (they're sentences of the same idea).
-        Using chunk 0's embedding as the entry's representative is cheap
-        and accurate enough for the dedup-pair scanner.
-
-        Returned row shape:
-            (entry_id, summary, created_at, updated_at, embedding_bytes)
-        """
-        if kind == EntryKind.MEMORY.value:
-            files_table, chunks_table = "memory_files", "memory_chunks"
-        elif kind == EntryKind.KNOWLEDGE.value:
-            files_table, chunks_table = "knowledge_files", "knowledge_chunks"
-        else:
-            raise ValueError(f"unknown kind: {kind!r}")
-        sql = (
-            f"SELECT e.id, e.summary, e.created_at, e.updated_at, ec.embedding "
-            f"FROM {files_table} e "
-            f"JOIN {chunks_table} c ON c.entry_id = e.id AND c.chunk_index = 0 "
-            f"JOIN embedding_cache ec ON ec.chunk_id = c.id "
-            f"  AND ec.chunk_kind=? AND ec.provider=? AND ec.model=? "
-            f"WHERE e.archived=0"
-        )
-        return await self._fetchall(sql, (kind, provider, model))
-
-    async def insert_merge_proposal(
-        self,
-        *,
-        kind: str,
-        entry_a_id: str,
-        entry_b_id: str,
-        similarity: float,
-    ) -> str:
-        """Record a pending merge candidate. Idempotent on ordered pair —
-        re-scanning the same pair simply updates similarity and bumps
-        scanned_at.
-        """
-        # Canonicalise pair order so (a,b) and (b,a) collapse.
-        a, b = sorted([entry_a_id, entry_b_id])
-        # Look up an existing pending proposal for this pair.
-        existing = await self._fetchone(
-            "SELECT id FROM merge_proposals "
-            "WHERE entry_a_id=? AND entry_b_id=? AND status='pending'",
-            (a, b),
-        )
-        if existing:
-            await self._execute(
-                "UPDATE merge_proposals SET similarity=?, scanned_at=? WHERE id=?",
-                (similarity, _now(), existing[0]),
-            )
-            return existing[0]
-        pid = str(uuid.uuid4())
-        await self._execute(
-            "INSERT INTO merge_proposals "
-            "(id, kind, entry_a_id, entry_b_id, similarity, status, scanned_at) "
-            "VALUES (?, ?, ?, ?, ?, 'pending', ?)",
-            (pid, kind, a, b, similarity, _now()),
-        )
-        return pid
-
-    async def list_merge_proposals(
-        self, *, status: str = "pending", limit: int = 100,
-    ) -> List[Tuple]:
-        """Return (id, kind, entry_a_id, entry_b_id, similarity, scanned_at)."""
-        return await self._fetchall(
-            "SELECT id, kind, entry_a_id, entry_b_id, similarity, scanned_at "
-            "FROM merge_proposals WHERE status=? "
-            "ORDER BY similarity DESC LIMIT ?",
-            (status, limit),
-        )
-
-    async def resolve_merge_proposal(
-        self, *, proposal_id: str, status: str,
-    ) -> None:
-        """Set status to 'merged' / 'dismissed' / 'stale'."""
-        await self._execute(
-            "UPDATE merge_proposals SET status=?, resolved_at=? WHERE id=?",
-            (status, _now(), proposal_id),
-        )
-
-    # ── L2 / L3 dream synthesis ─────────────────────────────────────────────
-
-    async def list_entries_by_synthesis_level(
-        self,
-        *,
-        kind: str,
-        synthesis_level: int,
-        provider: str,
-        model: str,
-        since_seconds: Optional[int] = None,
-        limit: int = 1000,
-    ) -> List[Tuple]:
-        """Return (entry_id, dim_or_cat, summary, content_text, embedding_bytes)
-        for non-archived entries at a given synthesis_level whose chunk-0
-        embedding is cached.
-
-        Used by both L2 (level=0 → look at raw entries) and L3
-        (level=2 → look at L2 patterns).
-
-        ``since_seconds`` (optional) filters by ``updated_at >= now - X``,
-        so the dream worker can do incremental synthesis (only look at
-        what changed since last run).
-        """
-        if kind == EntryKind.MEMORY.value:
-            files_table, chunks_table, facet_col = "memory_files", "memory_chunks", "dimension"
-        elif kind == EntryKind.KNOWLEDGE.value:
-            files_table, chunks_table, facet_col = "knowledge_files", "knowledge_chunks", "category"
-        else:
-            raise ValueError(f"unknown kind: {kind!r}")
-
-        sql = (
-            f"SELECT e.id, e.{facet_col}, e.summary, c.text, ec.embedding "
-            f"FROM {files_table} e "
-            f"JOIN {chunks_table} c ON c.entry_id = e.id AND c.chunk_index = 0 "
-            f"JOIN embedding_cache ec ON ec.chunk_id = c.id "
-            f"  AND ec.chunk_kind=? AND ec.provider=? AND ec.model=? "
-            f"WHERE e.archived=0 AND e.synthesis_level=?"
-        )
-        params: list = [kind, provider, model, synthesis_level]
-        if since_seconds is not None:
-            sql += " AND e.updated_at >= ?"
-            params.append(_now() - since_seconds)
-        sql += " ORDER BY e.updated_at DESC LIMIT ?"
-        params.append(limit)
-        return await self._fetchall(sql, tuple(params))
-
-    async def insert_synthesis_entry(
-        self,
-        *,
-        kind: str,
-        target_facet: str,                # 'agentic'/'insight' or 'domain'/'people'/...
-        summary: str,
-        content: str,
-        synthesis_level: int,             # 2 (pattern) or 3 (meta_insight)
-        source_entry_ids: List[str],
-        source_run_id: Optional[str] = None,
-    ) -> str:
-        """Insert a synthesised entry. Mirrors insert_*_entry but stamps
-        synthesis_level + source_entry_ids JSON.
-        """
-        from .chunking import chunk_markdown
-
-        if kind == EntryKind.MEMORY.value:
-            files_table, chunks_table = "memory_files", "memory_chunks"
-            facet_col = "dimension"
-        elif kind == EntryKind.KNOWLEDGE.value:
-            files_table, chunks_table = "knowledge_files", "knowledge_chunks"
-            facet_col = "category"
-        else:
-            raise ValueError(f"unknown kind: {kind!r}")
-
-        eid = str(uuid.uuid4())
-        now = _now()
-        chunks = chunk_markdown(content)
-        source_json = json.dumps(source_entry_ids, ensure_ascii=False)
-
-        def _txn() -> None:
-            try:
-                self._raw.execute("BEGIN IMMEDIATE")
-                self._raw.execute(
-                    f"INSERT INTO {files_table} "
-                    f"(id, {facet_col}, summary, candidate_id, source, source_ref, "
-                    f" archived, version, created_at, updated_at, "
-                    f" synthesis_level, source_entry_ids) "
-                    f"VALUES (?, ?, ?, ?, ?, ?, 0, 1, ?, ?, ?, ?)",
-                    (eid, target_facet, summary[:120], None,
-                     f"dream_l{synthesis_level}", source_run_id,
-                     now, now, synthesis_level, source_json),
-                )
-                for i, c in enumerate(chunks):
-                    self._raw.execute(
-                        f"INSERT INTO {chunks_table} "
-                        f"(id, entry_id, chunk_index, text, start_line, end_line, hash) "
-                        f"VALUES (?, ?, ?, ?, ?, ?, ?)",
-                        (str(uuid.uuid4()), eid, i, c.text,
-                         c.start_line, c.end_line, c.hash),
-                    )
-                self._raw.commit()
-            except Exception:
-                self._raw.rollback()
-                raise
-
-        async with self._write_lock:
-            await asyncio.to_thread(_txn)
-        return eid
-
-    async def insert_dream_run(
-        self,
-        *,
-        level: int,
-        kind: str,
-    ) -> str:
-        rid = str(uuid.uuid4())
-        await self._execute(
-            "INSERT INTO dream_runs (id, level, kind, started_at, status) "
-            "VALUES (?, ?, ?, ?, 'running')",
-            (rid, level, kind, _now()),
-        )
-        return rid
-
-    async def update_dream_run(
-        self,
-        run_id: str,
-        *,
-        status: str,
-        source_count: Optional[int] = None,
-        cluster_count: Optional[int] = None,
-        accepted_count: Optional[int] = None,
-        skipped_count: Optional[int] = None,
-        error: Optional[str] = None,
-    ) -> None:
-        await self._execute(
-            "UPDATE dream_runs "
-            "SET status=?, ended_at=?, source_count=?, cluster_count=?, "
-            "    accepted_count=?, skipped_count=?, error=? WHERE id=?",
-            (status, _now(), source_count, cluster_count,
-             accepted_count, skipped_count, error, run_id),
-        )
-
-    async def get_last_dream_run(
-        self, *, level: int, kind: str,
-    ) -> Optional[Tuple]:
-        """Return (id, started_at, ended_at, status) of the most recent
-        dream run for (level, kind), or None if none yet.
-        """
-        return await self._fetchone(
-            "SELECT id, started_at, ended_at, status FROM dream_runs "
-            "WHERE level=? AND kind=? ORDER BY started_at DESC LIMIT 1",
-            (level, kind),
-        )
-
-    async def list_in_flight_dream_run_sources(self) -> List[str]:
-        """Entry ids that an actively-running L2/L3 synthesis is touching.
-
-        Used by RetriageWorker to skip entries that the dream worker is
-        about to consume (or just consumed). Without this, retriage might
-        archive a source mid-way through synthesis and leave the new
-        synthesis entry pointing at an already-archived source. A short
-        list — at most ``DREAM_L2_MAX_CLUSTERS_PER_RUN * cluster_size``
-        ids during a worst-case run.
-        """
-        rows = await self._fetchall(
-            "SELECT source_entry_ids FROM memory_files WHERE source LIKE 'dream_l%' "
-            "AND archived=0 AND source_entry_ids IS NOT NULL",
-        )
-        rows += await self._fetchall(
-            "SELECT source_entry_ids FROM knowledge_files WHERE source LIKE 'dream_l%' "
-            "AND archived=0 AND source_entry_ids IS NOT NULL",
-        )
-        out: List[str] = []
-        for (raw,) in rows:
-            if not raw:
-                continue
-            try:
-                ids = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(ids, list):
-                out.extend(str(x) for x in ids if x)
-        return out
-
-    # ── Correction proposals (v4) ───────────────────────────────────────────
+    # ── Correction proposals (retriage outputs) ────────────────────────────
 
     async def insert_correction_proposal(
         self,
@@ -1161,186 +835,42 @@ class SQLiteStore:
         pid = str(uuid.uuid4())
         payload_json = json.dumps(payload, ensure_ascii=False) if payload else None
         await self._execute(
-            "INSERT INTO correction_proposals "
-            "(id, kind, target_kind, target_entry_id, target_version, target_archived, "
+            "INSERT INTO mem_correction_proposals "
+            "(id, kind, target_entry_id, target_version, target_archived, "
             " payload, confidence, rule_version, parent_run_id, rationale, "
             " rationale_pii_scrubbed, status, created_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
-            (pid, kind.value, target_kind.value, target_entry_id,
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
+            (pid, kind.value, target_entry_id,
              int(target_version), 1 if target_archived else 0,
              payload_json, confidence, int(rule_version), parent_run_id,
-             rationale[:2000], 1 if rationale_pii_scrubbed else 0,
-             _now()),
+             rationale[:2000], 1 if rationale_pii_scrubbed else 0, _now()),
         )
         return pid
 
-    async def get_correction_proposal(
-        self, pid: str,
-    ) -> Optional[CorrectionProposal]:
-        """Single proposal lookup. Used by ``apply_archive_correction`` to
-        re-fetch the proposal under the write lock for staleness check.
-        """
-        row = await self._fetchone(
-            "SELECT id, kind, target_kind, target_entry_id, target_version, "
-            "       target_archived, payload, confidence, rule_version, parent_run_id, "
-            "       rationale, rationale_pii_scrubbed, status, created_at, "
-            "       resolved_at, resolved_by "
-            "FROM correction_proposals WHERE id=?",
-            (pid,),
-        )
-        return _row_to_correction_proposal(row) if row else None
+    async def prune_correction_proposals(self, older_than_ts: int) -> int:
+        """Delete orphaned ``status='pending'`` correction/merge proposals
+        older than *older_than_ts* (unix seconds).
 
-    # ── Apply corrections (transactional, with staleness check) ─────────────
-
-    async def apply_archive_correction(
-        self, pid: str, *, resolved_by: str,
-    ) -> bool:
-        """Apply an ``archive`` proposal: archive target with a correction
-        reason; if payload carries ``superseded_by_id`` set the FK.
-
-        Returns False (and marks the proposal ``stale``) if the target's
-        ``version`` or ``archived`` drifted from the snapshot —
-        DreamWorker may have already changed the entry.
-        """
-        prop = await self.get_correction_proposal(pid)
-        if prop is None or prop.kind != CorrectionKind.ARCHIVE:
-            return False
-        if prop.status != CorrectionStatus.PENDING:
-            return False
-        if prop.target_kind == EntryKind.MEMORY:
-            files_table = "memory_files"
-        elif prop.target_kind == EntryKind.KNOWLEDGE:
-            files_table = "knowledge_files"
-        else:
-            return False
-
-        reason = f"correction_v{prop.rule_version}_{prop.kind.value}"
-        superseded_by_id = (
-            (prop.payload or {}).get("superseded_by_id") if prop.payload else None
-        )
-
-        async with self._write_lock:
-            try:
-                cur = await asyncio.to_thread(
-                    self._raw.execute,
-                    f"SELECT version, archived FROM {files_table} WHERE id=?",
-                    (prop.target_entry_id,),
-                )
-                row = await asyncio.to_thread(cur.fetchone)
-                await asyncio.to_thread(cur.close)
-                if not row:
-                    await asyncio.to_thread(
-                        self._raw.execute,
-                        "UPDATE correction_proposals SET status='stale', "
-                        "resolved_at=?, resolved_by=? WHERE id=?",
-                        (_now(), resolved_by[:80], pid),
-                    )
-                    await asyncio.to_thread(self._raw.commit)
-                    return False
-                cur_version, cur_archived = int(row[0]), bool(row[1])
-                if cur_version != prop.target_version or cur_archived != prop.target_archived:
-                    await asyncio.to_thread(
-                        self._raw.execute,
-                        "UPDATE correction_proposals SET status='stale', "
-                        "resolved_at=?, resolved_by=? WHERE id=?",
-                        (_now(), resolved_by[:80], pid),
-                    )
-                    await asyncio.to_thread(self._raw.commit)
-                    return False
-
-                if not cur_archived:
-                    sets = ["archived=1", "archived_reason=?", "updated_at=?"]
-                    params = [reason, _now()]
-                    if superseded_by_id:
-                        sets.append("superseded_by=?")
-                        params.append(superseded_by_id)
-                    params.append(prop.target_entry_id)
-                    await asyncio.to_thread(
-                        self._raw.execute,
-                        f"UPDATE {files_table} SET {', '.join(sets)} WHERE id=?",
-                        tuple(params),
-                    )
-                await asyncio.to_thread(
-                    self._raw.execute,
-                    "UPDATE correction_proposals SET status='applied', "
-                    "resolved_at=?, resolved_by=? WHERE id=?",
-                    (_now(), resolved_by[:80], pid),
-                )
-                await asyncio.to_thread(self._raw.commit)
-                return True
-            except Exception:
-                await asyncio.to_thread(self._raw.rollback)
-                raise
-
-    # ── Recall log (v4) ─────────────────────────────────────────────────────
-
-    async def insert_recall_log_batch(
-        self, rows: List[Tuple[str, str, int]],
-    ) -> None:
-        """Bulk insert (entry_id, kind, recalled_at) rows. ``executemany``
-        for one prepared statement → many params, much cheaper than N
-        separate writes.
-        """
-        if not rows:
-            return
-        async with self._write_lock:
-            await asyncio.to_thread(
-                self._raw.executemany,
-                "INSERT INTO recall_log (entry_id, kind, recalled_at) VALUES (?, ?, ?)",
-                rows,
-            )
-            await asyncio.to_thread(self._raw.commit)
-
-    async def count_recent_recalls(
-        self, *, entry_id: str, kind: str, since_seconds: int,
-    ) -> int:
-        cutoff = _now() - int(since_seconds)
-        row = await self._fetchone(
-            "SELECT COUNT(*) FROM recall_log "
-            "WHERE entry_id=? AND kind=? AND recalled_at >= ?",
-            (entry_id, kind, cutoff),
-        )
-        return int(row[0]) if row else 0
-
-    async def prune_candidate_raw_text(self, older_than_ts: int) -> int:
-        """Clear raw_text for fully-processed candidates older than cutoff.
-
-        Only touches accepted_* and rejected rows — pending/triaging/failed
-        rows still need their raw_text for the next triage attempt.
-        Returns the number of rows updated.
-        """
-        statuses = ("accepted_memory", "accepted_knowledge", "accepted_both", "rejected")
-        placeholders = ",".join("?" * len(statuses))
-        async with self._write_lock:
-            cur = await asyncio.to_thread(
-                self._raw.execute,
-                f"UPDATE memory_candidates SET raw_text='' "
-                f"WHERE status IN ({placeholders}) "
-                f"AND created_at < ? AND raw_text != ''",
-                (*statuses, older_than_ts),
-            )
-            await asyncio.to_thread(self._raw.commit)
-            return cur.rowcount
-
-    async def prune_recall_log(self, older_than_ts: int) -> int:
-        """Delete recall_log rows older than cutoff.
-
-        Returns the number of rows deleted.
+        Pending rows are never consumed — there is no review UI — so they
+        only accumulate. The merge no-helper fallback used to re-stage the
+        same pair every scan, and retriage leaves low-confidence 'archive'
+        proposals pending; both are dead weight. We sweep ONLY 'pending':
+        terminal rows ('merged' / 'kept_distinct') are the decided-memo the
+        merge scanner reads to skip already-judged pairs, and 'applied' /
+        'stale' are the audit trail of actions actually taken.
         """
         async with self._write_lock:
             cur = await asyncio.to_thread(
                 self._raw.execute,
-                "DELETE FROM recall_log WHERE recalled_at < ?",
+                "DELETE FROM mem_correction_proposals "
+                "WHERE status='pending' AND created_at < ?",
                 (older_than_ts,),
             )
             await asyncio.to_thread(self._raw.commit)
             return cur.rowcount
 
-    # ── Retriage progress (resumable migration scans) ───────────────────────
-
     async def get_retriage_progress(self, rule_version: int) -> Optional[str]:
         return await self.get_meta(f"retriage_progress_v{int(rule_version)}")
-
     async def set_retriage_progress(
         self, rule_version: int, last_entry_id: str,
     ) -> None:
@@ -1354,90 +884,1224 @@ class SQLiteStore:
             (f"retriage_progress_v{int(rule_version)}",),
         )
 
+    # ── Recall log ─────────────────────────────────────────────────────────
 
-# ── Row mapping helpers ─────────────────────────────────────────────────────
+    async def insert_mem_recall_log_batch(
+        self, rows: List[Tuple[str, str, int]],
+    ) -> None:
+        if not rows:
+            return
+        async with self._write_lock:
+            await asyncio.to_thread(
+                self._raw.executemany,
+                "INSERT INTO mem_recall_log (entry_id, kind, recalled_at) VALUES (?, ?, ?)",
+                rows,
+            )
+            await asyncio.to_thread(self._raw.commit)
+
+    async def count_recent_recalls(
+        self, *, entry_id: str, kind: str, since_seconds: int,
+    ) -> int:
+        cutoff = _now() - int(since_seconds)
+        row = await self._fetchone(
+            "SELECT COUNT(*) FROM mem_recall_log "
+            "WHERE entry_id=? AND kind=? AND recalled_at >= ?",
+            (entry_id, kind, cutoff),
+        )
+        return int(row[0]) if row else 0
+
+    async def prune_mem_recall_log(self, older_than_ts: int) -> int:
+        async with self._write_lock:
+            cur = await asyncio.to_thread(
+                self._raw.execute,
+                "DELETE FROM mem_recall_log WHERE recalled_at < ?",
+                (older_than_ts,),
+            )
+            await asyncio.to_thread(self._raw.commit)
+            return cur.rowcount
+
+    # ── obs_snapshots ──────────────────────────────────────────────────────
+
+    async def insert_obs_snapshot(
+        self,
+        *,
+        snapshot_id: Optional[str] = None,
+        captured_at: int,
+        monitor_index: int,
+        monitor_label: str = "",
+        window_title: Optional[str] = None,
+        process_name: Optional[str] = None,
+        browser_url: Optional[str] = None,
+        top_window_titles: Optional[List[str]] = None,
+        ax_text: Optional[str] = None,
+        parsed_json: Optional[dict] = None,
+        frame: Optional[dict] = None,
+        focus_rect: Optional[Tuple[int, int, int, int]] = None,
+        ocr_used_focus_rect: bool = False,
+        system_idle_sec: Optional[int] = None,
+        novelty_score: float = 1.0,
+        tier: str = "hot",
+    ) -> str:
+        sid = snapshot_id or str(uuid.uuid4())
+        fx, fy, fw, fh = (focus_rect or (None, None, None, None))
+        await self._execute(
+            """INSERT INTO obs_snapshots
+               (id, captured_at, monitor_index, monitor_label, window_title,
+                process_name, browser_url, top_window_titles, ax_text, parsed_json,
+                frame_json, focus_rect_x, focus_rect_y, focus_rect_w, focus_rect_h,
+                ocr_used_focus_rect, system_idle_sec, novelty_score, tier)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (sid, captured_at, monitor_index, monitor_label, window_title,
+             process_name, browser_url,
+             json.dumps(top_window_titles, ensure_ascii=False) if top_window_titles else None,
+             ax_text,
+             json.dumps(parsed_json, ensure_ascii=False) if parsed_json else None,
+             json.dumps(frame, ensure_ascii=False) if frame else None,
+             fx, fy, fw, fh, 1 if ocr_used_focus_rect else 0,
+             system_idle_sec, novelty_score, tier),
+        )
+        return sid
+
+    async def assign_snapshot_to_session(
+        self, snapshot_id: str, session_id: str,
+    ) -> None:
+        await self._execute(
+            "UPDATE obs_snapshots SET session_id=? WHERE id=?",
+            (session_id, snapshot_id),
+        )
+
+    async def list_unassigned_snapshots(self, limit: int = 200) -> List[tuple]:
+        """Snapshots with session_id IS NULL (awaiting aggregation)."""
+        return await self._fetchall(
+            "SELECT id, captured_at, monitor_index, process_name, window_title, "
+            "frame_json, system_idle_sec, tier FROM obs_snapshots "
+            "WHERE session_id IS NULL "
+            "ORDER BY captured_at ASC LIMIT ?",
+            (limit,),
+        )
+
+    async def prune_obs_snapshots(self, older_than_ms: int) -> int:
+        """Delete raw snapshots older than cutoff. captured_at is unix MS.
+
+        Cascades to obs_ocr_frames (FK ON DELETE CASCADE) and fires the
+        obs_snapshots_ad trigger to evict obs_snapshots_fts rows.
+        """
+        async with self._write_lock:
+            cur = await asyncio.to_thread(
+                self._raw.execute,
+                "DELETE FROM obs_snapshots WHERE captured_at < ?",
+                (older_than_ms,),
+            )
+            await asyncio.to_thread(self._raw.commit)
+            return cur.rowcount
+
+    # ── obs_ocr_frames ─────────────────────────────────────────────────────
+
+    async def insert_obs_ocr_frame(
+        self,
+        *,
+        snapshot_id: str,
+        text: str,
+        confidence: Optional[float] = None,
+        pipeline_version: str = "",
+        is_focus_rect: bool = False,
+        embedding: Optional[bytes] = None,
+    ) -> str:
+        fid = str(uuid.uuid4())
+        await self._execute(
+            """INSERT INTO obs_ocr_frames
+               (id, snapshot_id, text, confidence, embedding, pipeline_version,
+                captured_at, is_focus_rect)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (fid, snapshot_id, text, confidence, embedding, pipeline_version,
+             _now(), 1 if is_focus_rect else 0),
+        )
+        return fid
+
+    # ── obs_events ─────────────────────────────────────────────────────────
+
+    async def insert_obs_event(
+        self,
+        *,
+        session_id: Optional[str],
+        kind: str,
+        data: Optional[dict] = None,
+        sort_order: int = 0,
+        occurred_at: Optional[int] = None,
+    ) -> str:
+        eid = str(uuid.uuid4())
+        await self._execute(
+            """INSERT INTO obs_events (id, session_id, kind, data, sort_order, occurred_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (eid, session_id, kind,
+             json.dumps(data, ensure_ascii=False) if data else None,
+             sort_order, occurred_at or int(time.time() * 1000)),
+        )
+        return eid
+
+    async def prune_obs_events(self, older_than_ms: int) -> int:
+        """Delete state-change events older than cutoff. occurred_at is unix MS.
+
+        The only writer (SessionAggregator) stamps occurred_at from the
+        snapshot's captured_at, which is unix milliseconds; the default-write
+        path above also uses ms, so the cutoff must be ms.
+        """
+        async with self._write_lock:
+            cur = await asyncio.to_thread(
+                self._raw.execute,
+                "DELETE FROM obs_events WHERE occurred_at < ?",
+                (older_than_ms,),
+            )
+            await asyncio.to_thread(self._raw.commit)
+            return cur.rowcount
+
+    # ── obs_sessions ───────────────────────────────────────────────────────
+
+    async def insert_obs_session(
+        self,
+        *,
+        session_key: str,
+        trigger_kind: str,
+        started_at: int,
+        frame_os: Optional[str] = None,
+        frame_host: Optional[str] = None,
+        primary_process: Optional[str] = None,
+        primary_window_title: Optional[str] = None,
+    ) -> str:
+        sid = str(uuid.uuid4())
+        try:
+            await self._execute(
+                """INSERT INTO obs_sessions
+                   (id, session_key, trigger_kind, started_at, frame_os, frame_host,
+                    primary_process, primary_window_title)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (sid, session_key, trigger_kind, started_at,
+                 frame_os, frame_host, primary_process, primary_window_title),
+            )
+        except sqlite3.IntegrityError:
+            # Idempotent re-aggregation: same session_key already exists.
+            row = await self._fetchone(
+                "SELECT id FROM obs_sessions WHERE session_key=?", (session_key,),
+            )
+            return row[0] if row else sid
+        return sid
+
+    async def close_obs_session(
+        self,
+        session_id: str,
+        *,
+        ended_at: int,
+        snapshot_count: int,
+        apps_seen: List[str],
+        principal_ids: Optional[List[str]] = None,
+    ) -> None:
+        await self._execute(
+            """UPDATE obs_sessions
+               SET ended_at=?, snapshot_count=?, apps_seen=?, principal_ids=?
+               WHERE id=?""",
+            (ended_at, snapshot_count,
+             json.dumps(apps_seen, ensure_ascii=False),
+             json.dumps(principal_ids or [], ensure_ascii=False),
+             session_id),
+        )
+
+    async def set_obs_session_status(
+        self,
+        session_id: str,
+        *,
+        semantic_status: Optional[str] = None,
+    ) -> None:
+        sets, params = [], []
+        if semantic_status:
+            sets.append("semantic_status=?")
+            params.append(semantic_status)
+        if not sets:
+            return
+        params.append(session_id)
+        await self._execute(
+            f"UPDATE obs_sessions SET {', '.join(sets)} WHERE id=?",
+            tuple(params),
+        )
+
+    async def list_sessions_pending_extraction(self, limit: int = 8) -> List[tuple]:
+        return await self._fetchall(
+            "SELECT id, trigger_kind, started_at, ended_at, frame_os, frame_host, "
+            "primary_process, primary_window_title, snapshot_count, apps_seen "
+            "FROM obs_sessions "
+            "WHERE semantic_status='pending' AND ended_at IS NOT NULL "
+            "ORDER BY started_at ASC LIMIT ?",
+            (limit,),
+        )
+
+    # ── obs_semantic_events ────────────────────────────────────────────────
+
+    async def insert_obs_semantic_event(
+        self,
+        *,
+        session_id: Optional[str] = None,
+        synthetic_origin: Optional[str] = None,
+        title: str,
+        description: str = "",
+        category: Optional[str] = None,
+        entities: Optional[List[str]] = None,
+        apps: Optional[List[str]] = None,
+        time_range_start: int = 0,
+        time_range_end: int = 0,
+        task_worthy: bool = False,
+        worth_memory: bool = False,
+        worth_knowledge: bool = False,
+        worth_skill: bool = False,
+        frame_os: Optional[str] = None,
+        frame_host: Optional[str] = None,
+        frame_confidence: Optional[float] = None,
+    ) -> str:
+        eid = str(uuid.uuid4())
+        await self._execute(
+            """INSERT INTO obs_semantic_events
+               (id, session_id, synthetic_origin, extracted_at, title, description,
+                category, entities, apps, time_range_start, time_range_end,
+                task_worthy, worth_memory, worth_knowledge, worth_skill,
+                frame_os, frame_host, frame_confidence)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (eid, session_id, synthetic_origin, _now(), title[:200], description,
+             category,
+             json.dumps(entities, ensure_ascii=False) if entities else None,
+             json.dumps(apps, ensure_ascii=False) if apps else None,
+             time_range_start, time_range_end,
+             1 if task_worthy else 0,
+             1 if worth_memory else 0,
+             1 if worth_knowledge else 0,
+             1 if worth_skill else 0,
+             frame_os, frame_host, frame_confidence),
+        )
+        return eid
+
+    async def list_semantic_events_pending_triage(self, limit: int = 8) -> List[tuple]:
+        # Pending = not yet referenced from accepted_entries (proxy: triage hasn't run)
+        return await self._fetchall(
+            "SELECT id, session_id, synthetic_origin, title, description, category, "
+            "       entities, apps, frame_os, frame_host, frame_confidence, task_worthy "
+            "FROM obs_semantic_events "
+            "WHERE accepted_entries IS NULL "
+            "ORDER BY extracted_at ASC LIMIT ?",
+            (limit,),
+        )
+
+    async def set_semantic_event_accepted(
+        self, event_id: str, accepted_entries: List[dict],
+    ) -> None:
+        await self._execute(
+            "UPDATE obs_semantic_events SET accepted_entries=? WHERE id=?",
+            (json.dumps(accepted_entries, ensure_ascii=False), event_id),
+        )
+
+    # ── obs_pipeline_runs ──────────────────────────────────────────────────
+
+    async def insert_obs_pipeline_run(
+        self,
+        *,
+        parent_session_id: Optional[str] = None,
+        semantic_event_id: Optional[str] = None,
+        prefilter_pass: Optional[bool] = None,
+        prefilter_reason: Optional[str] = None,
+        triage_status: Optional[str] = None,
+        triage_reason: Optional[str] = None,
+        llm_tokens: Optional[int] = None,
+        duration_ms: Optional[int] = None,
+    ) -> str:
+        rid = str(uuid.uuid4())
+        await self._execute(
+            """INSERT INTO obs_pipeline_runs
+               (id, started_at, finished_at, parent_session_id, semantic_event_id,
+                prefilter_pass, prefilter_reason, triage_status, triage_reason,
+                llm_tokens, duration_ms)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (rid, _now(), _now(), parent_session_id, semantic_event_id,
+             None if prefilter_pass is None else (1 if prefilter_pass else 0),
+             prefilter_reason, triage_status, triage_reason,
+             llm_tokens, duration_ms),
+        )
+        return rid
+
+    async def prune_obs_pipeline_runs(self, older_than_ts: int) -> int:
+        """Delete triage audit-ledger rows older than cutoff. started_at is seconds."""
+        async with self._write_lock:
+            cur = await asyncio.to_thread(
+                self._raw.execute,
+                "DELETE FROM obs_pipeline_runs WHERE started_at < ?",
+                (older_than_ts,),
+            )
+            await asyncio.to_thread(self._raw.commit)
+            return cur.rowcount
+
+    async def prune_obs_sessions(self, older_than_ms: int) -> int:
+        """Delete FULLY-PROCESSED sessions whose work ended before cutoff.
+
+        Only ended + extracted sessions are swept (``semantic_status`` in
+        done/skipped AND ``ended_at`` NOT NULL AND ``ended_at`` < cutoff). A
+        session still pending extraction — or still open — is left alone so a
+        slow pipeline never loses unprocessed work. ``ended_at`` is unix
+        MILLISECONDS (the aggregator stamps it from a snapshot's captured_at).
+        The durable distillation already lives in mem_entries; the snapshots
+        this row points at are pruned at LTM_OBS_SNAPSHOT_TTL_DAYS, so a kept
+        session is just stale metadata.
+        """
+        async with self._write_lock:
+            cur = await asyncio.to_thread(
+                self._raw.execute,
+                "DELETE FROM obs_sessions "
+                "WHERE semantic_status IN ('done','skipped') "
+                "AND ended_at IS NOT NULL AND ended_at < ?",
+                (older_than_ms,),
+            )
+            await asyncio.to_thread(self._raw.commit)
+            return cur.rowcount
+
+    async def prune_obs_semantic_events(self, older_than_ts: int) -> int:
+        """Delete TRIAGED semantic events extracted before cutoff.
+
+        Only events triage has already consumed are swept (``accepted_entries``
+        IS NOT NULL — triage writes the accepted-entry audit list, even an
+        empty ``[]``, once it processes an event). Events still pending triage
+        (``accepted_entries`` IS NULL) are left for the queue. ``extracted_at``
+        is unix SECONDS. Whatever the event produced already lives in
+        mem_entries; this row is post-triage audit.
+        """
+        async with self._write_lock:
+            cur = await asyncio.to_thread(
+                self._raw.execute,
+                "DELETE FROM obs_semantic_events "
+                "WHERE accepted_entries IS NOT NULL AND extracted_at < ?",
+                (older_than_ts,),
+            )
+            await asyncio.to_thread(self._raw.commit)
+            return cur.rowcount
+
+    async def archive_stale_skill_proposals(self, older_than_ts: int) -> List[str]:
+        """Archive un-acted skill proposals created before cutoff.
+
+        Returns the archived entry ids so the caller can clean up their on-disk
+        staging dirs. Targets only ``kind='skill_proposal'`` rows that are
+        still archived=0 AND ``skill_status='proposed'`` (un-acted) — approved
+        / rejected proposals have already left the active set. Marks
+        ``archived=1, archived_reason='auto_expired'`` rather than deleting:
+        the audit row survives, the partial-UNIQUE dedup slot frees (so a later
+        recurrence can re-propose), and the IPC list (archived=0 filter) drops
+        it. ``created_at`` is unix SECONDS.
+        """
+        def _txn() -> List[str]:
+            rows = self._raw.execute(
+                "SELECT id FROM mem_entries "
+                "WHERE kind='skill_proposal' AND archived=0 "
+                "AND skill_status='proposed' AND created_at < ?",
+                (older_than_ts,),
+            ).fetchall()
+            ids = [r[0] for r in rows]
+            if ids:
+                self._raw.execute(
+                    "UPDATE mem_entries "
+                    "SET archived=1, archived_reason='auto_expired', updated_at=? "
+                    "WHERE kind='skill_proposal' AND archived=0 "
+                    "AND skill_status='proposed' AND created_at < ?",
+                    (_now(), older_than_ts),
+                )
+            return ids
+
+        async with self._write_lock:
+            ids = await asyncio.to_thread(_txn)
+            await asyncio.to_thread(self._raw.commit)
+            return ids
+
+    async def bump_skill_recurrence(
+        self, fingerprint: str, *, category: Optional[str], title: str,
+    ) -> int:
+        """Find-or-create a skill_recurrence row by fingerprint; increment its
+        occurrence_count. Returns the NEW count (1 on first sight).
+
+        Mirrors ``upsert_principal``'s find-or-create-increment, but uses an
+        UPSERT … RETURNING so the new count comes back in one round trip. The
+        count gates skill-proposal promotion: a task pattern must recur
+        ``SKILL_RECURRENCE_THRESHOLD`` times before ``_apply_session_skill``
+        writes a proposal — one-off tasks stay at count 1/2 forever and never
+        surface a skill.
+        """
+        now = _now()
+
+        def _txn() -> int:
+            try:
+                cur = self._raw.execute(
+                    """INSERT INTO skill_recurrence
+                           (fingerprint, occurrence_count, category, last_title,
+                            first_seen, last_seen)
+                       VALUES (?, 1, ?, ?, ?, ?)
+                       ON CONFLICT(fingerprint) DO UPDATE SET
+                           occurrence_count = occurrence_count + 1,
+                           category   = excluded.category,
+                           last_title = excluded.last_title,
+                           last_seen  = excluded.last_seen
+                       RETURNING occurrence_count""",
+                    (fingerprint, category, title[:120], now, now),
+                )
+                row = cur.fetchone()
+                cur.close()
+                self._raw.commit()
+                return int(row[0]) if row else 1
+            except Exception:
+                self._raw.rollback()
+                raise
+
+        async with self._write_lock:
+            return await asyncio.to_thread(_txn)
+
+
+    # ── obs_summaries ──────────────────────────────────────────────────────
+
+    async def upsert_obs_summary(
+        self,
+        *,
+        date: str,
+        type_: str,
+        language: str = "en",
+        moments: Optional[List[dict]] = None,
+        summary_text: str = "",
+        generated_model: str = "",
+    ) -> None:
+        await self._execute(
+            """INSERT INTO obs_summaries (date, type, language, moments_json,
+                  summary_text, generated_model, generated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(date, type, language) DO UPDATE SET
+                  moments_json=excluded.moments_json,
+                  summary_text=excluded.summary_text,
+                  generated_model=excluded.generated_model,
+                  generated_at=excluded.generated_at""",
+            (date, type_, language,
+             json.dumps(moments or [], ensure_ascii=False),
+             summary_text, generated_model, _now()),
+        )
+
+    async def get_obs_summary(
+        self, *, date: str, type_: str, language: str = "en",
+    ) -> Optional[tuple]:
+        return await self._fetchone(
+            "SELECT date, type, language, moments_json, summary_text, "
+            "       generated_model, generated_at FROM obs_summaries "
+            "WHERE date=? AND type=? AND language=?",
+            (date, type_, language),
+        )
+
+    # ── ent_principals / ent_aliases / ent_sightings ───────────────────────
+
+    async def upsert_principal(
+        self,
+        *,
+        kind: str,
+        canonical_name: str,
+        display_name: Optional[str] = None,
+        email: Optional[str] = None,
+        host_kind: Optional[str] = None,
+        os: Optional[str] = None,
+        project_root: Optional[str] = None,
+        description: Optional[str] = None,
+    ) -> str:
+        """Find-or-create a principal by (kind, canonical_name). Returns id."""
+        existing = await self._fetchone(
+            "SELECT id FROM ent_principals WHERE kind=? AND canonical_name=?",
+            (kind, canonical_name),
+        )
+        now = _now()
+        if existing:
+            pid = existing[0]
+            await self._execute(
+                "UPDATE ent_principals SET last_seen=?, sighting_count=sighting_count+1 "
+                "WHERE id=?",
+                (now, pid),
+            )
+            return pid
+        pid = str(uuid.uuid4())
+        await self._execute(
+            """INSERT INTO ent_principals
+               (id, kind, canonical_name, display_name, email, host_kind, os,
+                project_root, description, first_seen, last_seen, sighting_count)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)""",
+            (pid, kind, canonical_name, display_name, email, host_kind, os,
+             project_root, description, now, now),
+        )
+        return pid
+
+    async def add_principal_alias(self, principal_id: str, alias: str) -> None:
+        try:
+            await self._execute(
+                "INSERT INTO ent_aliases (principal_id, alias) VALUES (?, ?)",
+                (principal_id, alias),
+            )
+        except sqlite3.IntegrityError:
+            pass
+
+    async def insert_sighting(
+        self,
+        *,
+        principal_id: str,
+        source_kind: str,
+        source_id: str,
+        context: Optional[dict] = None,
+    ) -> str:
+        sid = str(uuid.uuid4())
+        await self._execute(
+            """INSERT INTO ent_sightings
+               (id, principal_id, source_kind, source_id, sighted_at, context)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (sid, principal_id, source_kind, source_id, _now(),
+             json.dumps(context, ensure_ascii=False) if context else None),
+        )
+        return sid
+
+    async def list_principals(
+        self, *, kind: Optional[str] = None, archived: bool = False,
+        limit: int = 200,
+    ) -> List[tuple]:
+        sql = (
+            "SELECT id, kind, canonical_name, display_name, email, host_kind, os, "
+            "       project_root, first_seen, last_seen, sighting_count "
+            "FROM ent_principals WHERE archived=?"
+        )
+        params: list = [1 if archived else 0]
+        if kind:
+            sql += " AND kind=?"
+            params.append(kind)
+        sql += " ORDER BY last_seen DESC LIMIT ?"
+        params.append(limit)
+        return await self._fetchall(sql, tuple(params))
+
+    # ── Dataclass getters (typed view over the same rows) ──────────────────
+    #
+    # The bulk SELECT/INSERT methods above operate on tuples for SQL speed
+    # and minimal allocation. These thin adapters materialize one row into
+    # the dataclass surface from models.py for callers that want type
+    # safety (admin tooling, IPC handlers, the future migration scripts).
+    # If you're iterating thousands of rows, prefer the tuple variants.
+
+    async def get_obs_session(self, session_id: str) -> Optional[Session]:
+        row = await self._fetchone(
+            "SELECT id, session_key, trigger_kind, started_at, ended_at, "
+            "frame_os, frame_host, primary_process, primary_window_title, "
+            "semantic_status, snapshot_count, apps_seen, "
+            "principal_ids FROM obs_sessions WHERE id=?",
+            (session_id,),
+        )
+        if not row:
+            return None
+        try:
+            tk = TriggerKind(row[2])
+        except ValueError:
+            tk = TriggerKind.APP_SWITCH
+        try:
+            ss = SemanticStatus(row[9])
+        except ValueError:
+            ss = SemanticStatus.PENDING
+        apps = []
+        if row[11]:
+            try:
+                v = json.loads(row[11])
+                if isinstance(v, list):
+                    apps = v
+            except (json.JSONDecodeError, TypeError, ValueError):
+                pass
+        principals = []
+        if row[12]:
+            try:
+                v = json.loads(row[12])
+                if isinstance(v, list):
+                    principals = v
+            except (json.JSONDecodeError, TypeError, ValueError):
+                pass
+        return Session(
+            id=row[0], session_key=row[1], trigger_kind=tk,
+            started_at=int(row[3]),
+            ended_at=int(row[4]) if row[4] is not None else None,
+            frame_os=row[5], frame_host=row[6],
+            primary_process=row[7], primary_window_title=row[8],
+            semantic_status=ss,
+            snapshot_count=int(row[10] or 0),
+            apps_seen=apps, principal_ids=principals,
+        )
+
+    async def get_obs_semantic_event(self, event_id: str) -> Optional[SemanticEvent]:
+        row = await self._fetchone(
+            "SELECT id, session_id, synthetic_origin, extracted_at, title, "
+            "description, category, entities, apps, time_range_start, "
+            "time_range_end, task_worthy, worth_memory, worth_knowledge, "
+            "worth_skill, frame_os, frame_host, frame_confidence, accepted_entries "
+            "FROM obs_semantic_events WHERE id=?",
+            (event_id,),
+        )
+        if not row:
+            return None
+        from .models import SyntheticOrigin
+        synth: Optional[SyntheticOrigin] = None
+        if row[2]:
+            try:
+                synth = SyntheticOrigin(row[2])
+            except ValueError:
+                synth = None
+        def _json_list(raw):
+            if not raw:
+                return []
+            try:
+                v = json.loads(raw)
+                return v if isinstance(v, list) else []
+            except (json.JSONDecodeError, TypeError, ValueError):
+                return []
+        return SemanticEvent(
+            id=row[0], session_id=row[1], synthetic_origin=synth,
+            extracted_at=int(row[3]), title=row[4],
+            description=row[5] or "", category=row[6],
+            entities=_json_list(row[7]), apps=_json_list(row[8]),
+            time_range_start=int(row[9]), time_range_end=int(row[10]),
+            task_worthy=bool(row[11]), worth_memory=bool(row[12]),
+            worth_knowledge=bool(row[13]), worth_skill=bool(row[14]),
+            frame_os=row[15], frame_host=row[16],
+            frame_confidence=float(row[17]) if row[17] is not None else None,
+            accepted_entries=_json_list(row[18]),
+        )
+
+    async def get_principal(self, principal_id: str) -> Optional[Principal]:
+        row = await self._fetchone(
+            "SELECT id, kind, canonical_name, display_name, email, host_kind, "
+            "os, project_root, description, first_seen, last_seen, "
+            "sighting_count, archived FROM ent_principals WHERE id=?",
+            (principal_id,),
+        )
+        if not row:
+            return None
+        try:
+            pk = PrincipalKind(row[1])
+        except ValueError:
+            pk = PrincipalKind.MACHINE
+        from .models import HostKind
+        hk: Optional[HostKind] = None
+        if row[5]:
+            try:
+                hk = HostKind(row[5])
+            except ValueError:
+                hk = None
+        return Principal(
+            id=row[0], kind=pk, canonical_name=row[2],
+            display_name=row[3], email=row[4],
+            host_kind=hk, os=row[6], project_root=row[7],
+            description=row[8],
+            first_seen=int(row[9]), last_seen=int(row[10]),
+            sighting_count=int(row[11] or 0),
+            archived=bool(row[12]),
+        )
+
+    async def get_skill_proposal(self, proposal_id: str) -> Optional[SkillProposal]:
+        row = await self._fetchone(
+            "SELECT id, skill_status, skill_signature, skill_fingerprint, "
+            "recurrence_count, summary, source_event_id, created_at, updated_at "
+            "FROM mem_entries "
+            "WHERE id=? AND kind='skill_proposal'",
+            (proposal_id,),
+        )
+        if not row:
+            return None
+        try:
+            sps = SkillProposalStatus(row[1]) if row[1] else SkillProposalStatus.PROPOSED
+        except ValueError:
+            sps = SkillProposalStatus.PROPOSED
+        signature: dict = {}
+        if row[2]:
+            try:
+                v = json.loads(row[2])
+                signature = v if isinstance(v, dict) else {}
+            except (json.JSONDecodeError, TypeError, ValueError):
+                signature = {}
+        # Pull the body content from mem_chunks
+        chunk_rows = await self._fetchall(
+            "SELECT text FROM mem_chunks WHERE entry_id=? ORDER BY chunk_index",
+            (proposal_id,),
+        )
+        body_md = "\n\n".join(r[0] for r in chunk_rows)
+        from pathlib import Path as _Path
+        staging = _Path.home() / "HandQ" / "Skill" / ".proposed" / proposal_id[:8]
+        return SkillProposal(
+            id=row[0], skill_status=sps,
+            skill_signature=signature,
+            skill_fingerprint=row[3] or "",
+            summary=row[5] or "",
+            body_md=body_md,
+            recurrence_count=int(row[4] or 1),
+            staging_path=str(staging) if staging.exists() else None,
+            source_event_id=row[6],
+            created_at=int(row[7]), updated_at=int(row[8]),
+        )
+
+    async def get_obs_summary_dataclass(
+        self, *, date: str, type_: str, language: str = "en",
+    ) -> Optional[Summary]:
+        row = await self.get_obs_summary(date=date, type_=type_, language=language)
+        if not row:
+            return None
+        moments: list = []
+        if row[3]:
+            try:
+                v = json.loads(row[3])
+                moments = v if isinstance(v, list) else []
+            except (json.JSONDecodeError, TypeError, ValueError):
+                moments = []
+        return Summary(
+            date=row[0], type=row[1], language=row[2],
+            moments=moments,
+            summary_text=row[4] or "",
+            generated_model=row[5] or "",
+            generated_at=int(row[6] or 0),
+        )
+
+    # ── L2/L3 dream synthesis: real impls (LTM 2.0) ────────────────────────
+    #
+    # The original triage.py L2/L3 path called these methods; before LTM 2.0
+    # they targeted memory_files / knowledge_files. We rebuilt them on
+    # mem_entries unified table — kind discriminator separates memory vs
+    # knowledge, synthesis_level distinguishes L0/L2/L3 levels.
+
+    async def list_in_flight_dream_run_sources(self) -> List[str]:
+        """Entry ids that an actively-running L2/L3 synthesis is touching.
+
+        Returns the union of source_entry_ids across all non-archived
+        synthesis-level entries (source='dream_l*'). RetriageWorker skips
+        these so it doesn't archive a source mid-synthesis.
+        """
+        rows = await self._fetchall(
+            "SELECT source_entry_ids FROM mem_entries "
+            "WHERE source LIKE 'dream_l%' AND archived=0 AND source_entry_ids IS NOT NULL",
+        )
+        out: List[str] = []
+        for (raw,) in rows:
+            if not raw:
+                continue
+            try:
+                ids = json.loads(raw)
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+            if isinstance(ids, list):
+                out.extend(str(x) for x in ids if x)
+        return out
+
+    async def count_entries_since(
+        self, *, kind: str, since_ts: int, synthesis_level: int = 0,
+    ) -> int:
+        """Count non-archived entries created/updated after *since_ts* at
+        the given synthesis_level. Used by the idle-aware synthesis gate
+        to decide if enough new material has accumulated.
+        """
+        row = await self._fetchone(
+            "SELECT COUNT(*) FROM mem_entries "
+            "WHERE kind=? AND archived=0 AND synthesis_level=? AND updated_at >= ?",
+            (kind, synthesis_level, since_ts),
+        )
+        return int(row[0]) if row else 0
+
+    async def list_entries_by_synthesis_level(
+        self,
+        *,
+        kind: str,
+        synthesis_level: int,
+        provider: str,
+        model: str,
+        since_seconds: Optional[int] = None,
+        limit: int = 1000,
+    ) -> List[Tuple]:
+        """Return (entry_id, dim_or_cat, summary, content_text, embedding_bytes,
+        frame_os) for non-archived entries at a given synthesis_level whose
+        chunk-0 embedding is cached. IDENTITY entries are excluded so they
+        never participate in L2/L3 (they're injected unconditionally).
+
+        The trailing ``frame_os`` element is new vs the v4 row shape — the
+        L2 clustering code uses it to partition INSIGHT entries by frame.
+        """
+        facet_col = "dimension" if kind == EntryKind.MEMORY.value else "category"
+        sql = (
+            f"SELECT e.id, e.{facet_col}, e.summary, c.text, ec.embedding, e.frame_os "
+            f"FROM mem_entries e "
+            f"JOIN mem_chunks c ON c.entry_id = e.id AND c.chunk_index = 0 "
+            f"JOIN mem_embedding_cache ec ON ec.chunk_id = c.id "
+            f"  AND ec.chunk_kind=? AND ec.provider=? AND ec.model=? "
+            f"WHERE e.kind=? AND e.archived=0 AND e.synthesis_level=?"
+        )
+        params: list = [kind, provider, model, kind, synthesis_level]
+        if kind == EntryKind.MEMORY.value:
+            sql += f" AND e.{facet_col} != ?"
+            params.append(MemoryDimension.IDENTITY.value)
+        if since_seconds is not None:
+            sql += " AND e.updated_at >= ?"
+            params.append(_now() - since_seconds)
+        sql += " ORDER BY e.updated_at DESC LIMIT ?"
+        params.append(limit)
+        return await self._fetchall(sql, tuple(params))
+
+    async def insert_synthesis_entry(
+        self,
+        *,
+        kind: str,
+        target_facet: str,
+        summary: str,
+        content: str,
+        synthesis_level: int,
+        source_entry_ids: List[str],
+        source_run_id: Optional[str] = None,
+        frame: Optional[dict] = None,
+    ) -> str:
+        """Insert a synthesised mem_entry. Mirrors insert_entry but with
+        synthesis_level + source_entry_ids + source='dream_l<N>'."""
+        kind_enum = EntryKind(kind)
+        dimension = None
+        category = None
+        if kind_enum == EntryKind.MEMORY:
+            try:
+                dimension = MemoryDimension(target_facet)
+            except ValueError:
+                dimension = None
+        elif kind_enum == EntryKind.KNOWLEDGE:
+            try:
+                category = KnowledgeCategory(target_facet)
+            except ValueError:
+                category = None
+        return await self.insert_entry(
+            kind=kind_enum,
+            dimension=dimension,
+            category=category,
+            summary=summary,
+            content=content,
+            source=f"dream_l{int(synthesis_level)}",
+            source_ref=source_run_id,
+            frame=frame,
+            synthesis_level=synthesis_level,
+            source_entry_ids=source_entry_ids,
+        )
+
+    async def list_entry_centroids(
+        self, *, kind: str, provider: str, model: str,
+    ) -> List[Tuple]:
+        """One chunk-0 row per non-archived entry with its embedding.
+
+        Returned shape: (entry_id, summary, created_at, updated_at,
+        embedding_bytes, frame_os).
+        """
+        sql = (
+            "SELECT e.id, e.summary, e.created_at, e.updated_at, ec.embedding, e.frame_os "
+            "FROM mem_entries e "
+            "JOIN mem_chunks c ON c.entry_id = e.id AND c.chunk_index = 0 "
+            "JOIN mem_embedding_cache ec ON ec.chunk_id = c.id "
+            "  AND ec.chunk_kind=? AND ec.provider=? AND ec.model=? "
+            "WHERE e.kind=? AND e.archived=0"
+        )
+        params: list = [kind, provider, model, kind]
+        if kind == EntryKind.MEMORY.value:
+            sql += " AND e.dimension != ?"
+            params.append(MemoryDimension.IDENTITY.value)
+        return await self._fetchall(sql, tuple(params))
+
+    async def insert_merge_proposal(
+        self,
+        *,
+        kind: str,
+        entry_a_id: str,
+        entry_b_id: str,
+        similarity: float,
+    ) -> str:
+        """Record a merge candidate via mem_correction_proposals.
+
+        v4 had a dedicated merge_proposals table; LTM 2.0 consolidates the
+        review surface into mem_correction_proposals (kind='merge'). The
+        canonical pair order (sorted ids) is stored in the payload (and the
+        first id in target_entry_id) purely for stable reads — there is NO
+        UNIQUE constraint on the pair, so this is a plain INSERT that can
+        write the same pair more than once. Re-scan duplication is avoided at
+        a higher level instead: ``list_decided_merge_pairs`` feeds the merge
+        scanner a set of already-judged pairs (status 'merged'/'kept_distinct')
+        so a settled pair is never re-sent to the arbiter, and the periodic
+        ``prune_correction_proposals`` sweep clears any stale 'pending' rows.
+        """
+        a, b = sorted([entry_a_id, entry_b_id])
+        pid = str(uuid.uuid4())
+        payload = {"entry_a_id": a, "entry_b_id": b, "similarity": similarity}
+        await self._execute(
+            "INSERT INTO mem_correction_proposals "
+            "(id, kind, target_entry_id, target_version, target_archived, "
+            " payload, confidence, rule_version, parent_run_id, rationale, "
+            " rationale_pii_scrubbed, status, created_at) "
+            "VALUES (?, 'merge', ?, 0, 0, ?, ?, 0, NULL, "
+            " 'merge scanner pair candidate', 0, 'pending', ?)",
+            (pid, a, json.dumps(payload, ensure_ascii=False),
+             float(similarity), _now()),
+        )
+        return pid
+
+    async def list_merge_proposals(
+        self, *, status: str = "pending", limit: int = 100,
+    ) -> List[Tuple]:
+        rows = await self._fetchall(
+            "SELECT id, payload, confidence, created_at FROM mem_correction_proposals "
+            "WHERE kind='merge' AND status=? ORDER BY confidence DESC LIMIT ?",
+            (status, limit),
+        )
+        out: List[Tuple] = []
+        for r in rows:
+            try:
+                p = json.loads(r[1]) if r[1] else {}
+            except (json.JSONDecodeError, TypeError, ValueError):
+                p = {}
+            out.append((
+                r[0], "memory" if p.get("kind") == "memory" else "memory",
+                p.get("entry_a_id", ""), p.get("entry_b_id", ""),
+                float(r[2] or 0.0), int(r[3]),
+            ))
+        return out
+
+    async def resolve_merge_proposal(
+        self, *, proposal_id: str, status: str,
+    ) -> None:
+        await self._execute(
+            "UPDATE mem_correction_proposals SET status=?, resolved_at=? "
+            "WHERE id=? AND kind='merge'",
+            (status, _now(), proposal_id),
+        )
+
+    async def list_decided_merge_pairs(self) -> set:
+        """Return ``{frozenset({a_id, b_id}), ...}`` for merge pairs already
+        given a terminal verdict (``merged`` or ``kept_distinct``).
+
+        The merge scanner uses this to skip pairs the LLM arbiter (or
+        auto-merge) has already judged, so a borderline pair is never
+        re-sent to the helper LLM on every 15-minute scan.
+        """
+        rows = await self._fetchall(
+            "SELECT payload FROM mem_correction_proposals "
+            "WHERE kind='merge' AND status IN ('merged', 'kept_distinct')",
+            (),
+        )
+        out: set = set()
+        for r in rows:
+            try:
+                p = json.loads(r[0]) if r[0] else {}
+            except (json.JSONDecodeError, TypeError, ValueError):
+                continue
+            a = p.get("entry_a_id")
+            b = p.get("entry_b_id")
+            if a and b:
+                out.add(frozenset((a, b)))
+        return out
+
+    async def insert_dream_run(self, *, level: int, kind: str) -> str:
+        rid = str(uuid.uuid4())
+        await self._execute(
+            "INSERT INTO mem_dream_runs (id, level, kind, started_at, status) "
+            "VALUES (?, ?, ?, ?, 'running')",
+            (rid, int(level), kind, _now()),
+        )
+        return rid
+
+    async def update_dream_run(
+        self,
+        run_id: str,
+        *,
+        status: str,
+        source_count: Optional[int] = None,
+        cluster_count: Optional[int] = None,
+        accepted_count: Optional[int] = None,
+        skipped_count: Optional[int] = None,
+        error: Optional[str] = None,
+    ) -> None:
+        await self._execute(
+            "UPDATE mem_dream_runs "
+            "SET status=?, ended_at=?, source_count=?, cluster_count=?, "
+            "    accepted_count=?, skipped_count=?, error=? WHERE id=?",
+            (status, _now(), source_count, cluster_count,
+             accepted_count, skipped_count, error, run_id),
+        )
+
+    async def get_last_dream_run(
+        self, *, level: int, kind: str,
+    ) -> Optional[Tuple]:
+        return await self._fetchone(
+            "SELECT id, started_at, ended_at, status FROM mem_dream_runs "
+            "WHERE level=? AND kind=? ORDER BY started_at DESC LIMIT 1",
+            (int(level), kind),
+        )
+
+    async def apply_archive_correction(
+        self, pid: str, *, resolved_by: str,
+    ) -> bool:
+        """Apply an archive correction proposal with staleness check."""
+        prop = await self.get_correction_proposal(pid)
+        if prop is None or prop.kind != CorrectionKind.ARCHIVE:
+            return False
+        if prop.status != CorrectionStatus.PENDING:
+            return False
+        reason = f"correction_v{prop.rule_version}_{prop.kind.value}"
+        superseded_by_id = (
+            (prop.payload or {}).get("superseded_by_id") if prop.payload else None
+        )
+        async with self._write_lock:
+            try:
+                cur = await asyncio.to_thread(
+                    self._raw.execute,
+                    "SELECT version, archived FROM mem_entries WHERE id=?",
+                    (prop.target_entry_id,),
+                )
+                row = await asyncio.to_thread(cur.fetchone)
+                await asyncio.to_thread(cur.close)
+                if not row:
+                    await asyncio.to_thread(
+                        self._raw.execute,
+                        "UPDATE mem_correction_proposals SET status='stale', "
+                        "resolved_at=?, resolved_by=? WHERE id=?",
+                        (_now(), resolved_by[:80], pid),
+                    )
+                    await asyncio.to_thread(self._raw.commit)
+                    return False
+                cur_version, cur_archived = int(row[0]), bool(row[1])
+                if cur_version != prop.target_version or cur_archived != prop.target_archived:
+                    await asyncio.to_thread(
+                        self._raw.execute,
+                        "UPDATE mem_correction_proposals SET status='stale', "
+                        "resolved_at=?, resolved_by=? WHERE id=?",
+                        (_now(), resolved_by[:80], pid),
+                    )
+                    await asyncio.to_thread(self._raw.commit)
+                    return False
+                sets = ["archived=1", "archived_reason=?", "updated_at=?"]
+                params = [reason, _now()]
+                if superseded_by_id:
+                    sets.append("superseded_by=?")
+                    params.append(superseded_by_id)
+                params.append(prop.target_entry_id)
+                await asyncio.to_thread(
+                    self._raw.execute,
+                    f"UPDATE mem_entries SET {', '.join(sets)} WHERE id=?",
+                    tuple(params),
+                )
+                await asyncio.to_thread(
+                    self._raw.execute,
+                    "UPDATE mem_correction_proposals SET status='applied', "
+                    "resolved_at=?, resolved_by=? WHERE id=?",
+                    (_now(), resolved_by[:80], pid),
+                )
+                await asyncio.to_thread(self._raw.commit)
+                return True
+            except Exception:
+                await asyncio.to_thread(self._raw.rollback)
+                raise
+
+    async def get_correction_proposal(
+        self, pid: str,
+    ) -> Optional[CorrectionProposal]:
+        row = await self._fetchone(
+            "SELECT id, kind, target_entry_id, target_version, "
+            "       target_archived, payload, confidence, rule_version, parent_run_id, "
+            "       rationale, rationale_pii_scrubbed, status, created_at, "
+            "       resolved_at, resolved_by "
+            "FROM mem_correction_proposals WHERE id=?",
+            (pid,),
+        )
+        if not row:
+            return None
+        try:
+            kind = CorrectionKind(row[1])
+        except ValueError:
+            kind = CorrectionKind.ARCHIVE
+        try:
+            status = CorrectionStatus(row[11])
+        except ValueError:
+            status = CorrectionStatus.PENDING
+        payload: Optional[dict] = None
+        if row[5]:
+            try:
+                payload = json.loads(row[5])
+                if not isinstance(payload, dict):
+                    payload = None
+            except (json.JSONDecodeError, TypeError, ValueError):
+                payload = None
+        return CorrectionProposal(
+            id=row[0], kind=kind,
+            target_kind=EntryKind.MEMORY,  # mem_entries unified — keep MEMORY as default
+            target_entry_id=row[2],
+            target_version=int(row[3]),
+            target_archived=bool(row[4]),
+            payload=payload,
+            confidence=float(row[6]) if row[6] is not None else None,
+            rule_version=int(row[7]),
+            parent_run_id=row[8],
+            rationale=row[9] or "",
+            rationale_pii_scrubbed=bool(row[10]),
+            status=status,
+            created_at=int(row[12]),
+            resolved_at=int(row[13]) if row[13] is not None else None,
+            resolved_by=row[14],
+        )
+
+
+# ── Row mapping helpers ────────────────────────────────────────────────────
+
+def _frame_dict(raw: Optional[str]) -> Optional[dict]:
+    if not raw:
+        return None
+    try:
+        d = json.loads(raw)
+        return d if isinstance(d, dict) else None
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+
 
 def _row_to_memory_entry(r: Tuple) -> Entry:
+    """Map (id, dimension, summary, source, source_ref, version, archived,
+    archived_reason, created_at, updated_at, frame_json) → Entry."""
     try:
-        dim = MemoryDimension(r[1])
+        dim = MemoryDimension(r[1]) if r[1] else None
     except ValueError:
         dim = None
     return Entry(
-        id=r[0],
-        kind=EntryKind.MEMORY,
-        dimension=dim,
-        summary=r[2],
-        source=r[3] or "",
-        source_ref=r[4],
-        version=int(r[5]),
-        archived=bool(r[6]),
-        archived_reason=r[7],
-        created_at=int(r[8]),
-        updated_at=int(r[9]),
+        id=r[0], kind=EntryKind.MEMORY, dimension=dim, summary=r[2],
+        source=r[3] or "", source_ref=r[4], version=int(r[5]),
+        archived=bool(r[6]), archived_reason=r[7],
+        created_at=int(r[8]), updated_at=int(r[9]),
+        frame_json=_frame_dict(r[10]) if len(r) > 10 else None,
     )
 
 
 def _row_to_knowledge_entry(r: Tuple) -> Entry:
     try:
-        cat = KnowledgeCategory(r[1])
+        cat = KnowledgeCategory(r[1]) if r[1] else None
     except ValueError:
         cat = None
     return Entry(
-        id=r[0],
-        kind=EntryKind.KNOWLEDGE,
-        category=cat,
-        summary=r[2],
-        source=r[3] or "",
-        source_ref=r[4],
-        version=int(r[5]),
-        archived=bool(r[6]),
-        archived_reason=r[7],
-        created_at=int(r[8]),
-        updated_at=int(r[9]),
+        id=r[0], kind=EntryKind.KNOWLEDGE, category=cat, summary=r[2],
+        source=r[3] or "", source_ref=r[4], version=int(r[5]),
+        archived=bool(r[6]), archived_reason=r[7],
+        created_at=int(r[8]), updated_at=int(r[9]),
+        frame_json=_frame_dict(r[10]) if len(r) > 10 else None,
     )
 
 
-def _row_to_correction_proposal(r: Tuple) -> CorrectionProposal:
-    """Map a 16-column SELECT row into the dataclass.
-
-    Column order MUST match the SELECT in ``list_correction_proposals`` /
-    ``get_correction_proposal`` — change one, change both.
-    """
-    try:
-        kind = CorrectionKind(r[1])
-    except ValueError:
-        kind = CorrectionKind.ARCHIVE  # safest fallback
-    try:
-        target_kind = EntryKind(r[2])
-    except ValueError:
-        target_kind = EntryKind.MEMORY
-    try:
-        status = CorrectionStatus(r[12])
-    except ValueError:
-        status = CorrectionStatus.PENDING
-    payload: Optional[dict] = None
-    if r[6]:
+def _row_to_entry_full(r: Tuple, kind: EntryKind) -> Entry:
+    """Map (id, dimension, category, summary, source, source_ref, version,
+    archived, archived_reason, created_at, updated_at, frame_json) → Entry."""
+    dim = None
+    cat = None
+    if kind == EntryKind.MEMORY and r[1]:
         try:
-            payload = json.loads(r[6])
-            if not isinstance(payload, dict):
-                payload = None
-        except json.JSONDecodeError:
-            payload = None
-    return CorrectionProposal(
-        id=r[0],
-        kind=kind,
-        target_kind=target_kind,
-        target_entry_id=r[3],
-        target_version=int(r[4]),
-        target_archived=bool(r[5]),
-        payload=payload,
-        confidence=float(r[7]) if r[7] is not None else None,
-        rule_version=int(r[8]),
-        parent_run_id=r[9],
-        rationale=r[10] or "",
-        rationale_pii_scrubbed=bool(r[11]),
-        status=status,
-        created_at=int(r[13]),
-        resolved_at=int(r[14]) if r[14] is not None else None,
-        resolved_by=r[15],
+            dim = MemoryDimension(r[1])
+        except ValueError:
+            pass
+    elif kind == EntryKind.KNOWLEDGE and r[2]:
+        try:
+            cat = KnowledgeCategory(r[2])
+        except ValueError:
+            pass
+    return Entry(
+        id=r[0], kind=kind, dimension=dim, category=cat, summary=r[3],
+        source=r[4] or "", source_ref=r[5], version=int(r[6]),
+        archived=bool(r[7]), archived_reason=r[8],
+        created_at=int(r[9]), updated_at=int(r[10]),
+        frame_json=_frame_dict(r[11]) if len(r) > 11 else None,
     )

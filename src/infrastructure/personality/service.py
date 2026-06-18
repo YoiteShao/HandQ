@@ -2,13 +2,13 @@
 
 Owns one asyncio task that loops every few hundred ms, polls each
 :class:`MonitorState`, captures only the monitors whose adaptive
-cadence says it's time, and forwards interesting frames into the LTM
-candidate pipeline as ``ACTIVITY_OBSERVER`` rows.
+cadence says it's time, and writes interesting frames into the LTM
+observation pipeline as ``obs_snapshots`` + ``obs_ocr_frames`` rows.
 
 Public API
 ----------
 - ``PersonalityMonitor.start(loop)``      — kick off the background task.
-- ``PersonalityMonitor.shutdown()``       — graceful cancel + final flush.
+- ``PersonalityMonitor.shutdown()``       — graceful cancel + ring spill.
 - ``PersonalityMonitor.pause()`` / ``resume()`` — let the bridge gate
   capture in response to UI commands or the bridge entering an
   exclusive activity (e.g. desktop-tool takeover).
@@ -25,26 +25,26 @@ import re
 import sys
 import time
 from collections import deque
-from datetime import datetime
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 import yaml
 
 from ..long_term_memory import _constants as C
-from ..long_term_memory.candidates import submit_activity_observer
+from ..long_term_memory.frame_inference import infer_frame
 from ..long_term_memory.models import (
-    ActivitySample, MonitorInfo, MonitorTier,
+    ActivitySample, MonitorTier,
 )
-from ..vision.ocr import LocalOCR, get_local_ocr
+from ..long_term_memory.uia_worker import get_uia_worker
+from ..vision.ocr import LocalOCR, get_local_ocr_background
 from ..vision.storage import ScreenshotStore
-from .capturer import MonitorCapturer
+from .capturer import MonitorCapturer, get_foreground_window_rect
 from .frame_diff import (
     excerpt, hamming, perceptual_hash_array, text_jaccard,
 )
 from .input_idle import (
     cursor_in_monitor, cursor_pos, enumerate_monitors,
-    foreground_app_name, foreground_window_title,
+    foreground_app_name, foreground_hwnd, foreground_window_title,
     is_session_locked, system_idle_seconds,
 )
 from .monitor_state import MonitorState
@@ -69,11 +69,45 @@ def _encode_jpeg(rgb: Any) -> bytes:
     return buf.getvalue()
 
 
-# Hard cap on ``_daily_buffer`` length so a 24h+ uptime can't accumulate
-# unbounded memory if the user happens to skip the 22:00 summary window
-# (laptop closed, RDP session paused, etc.). Once we cross 4x the daily
-# summary cap we ring-buffer — keep the latest, drop the oldest.
-_DAILY_BUFFER_HARD_CAP: int = C.ACTIVITY_DAILY_SUMMARY_MAX_SAMPLES * 4
+def _infer_sample_frame(sample: ActivitySample) -> Optional[dict]:
+    """Infer LTM 2.0 frame from one ActivitySample's foreground signals."""
+    proc = sample.foreground_app or ""
+    title = sample.foreground_window or ""
+    if not proc and not title:
+        return None
+    return infer_frame(proc, title)
+
+
+def _foreground_home_monitor_index(
+    fg_rect: Optional[Tuple[int, int, int, int]],
+    monitors: List[MonitorState],
+) -> Optional[int]:
+    """Return the index of the monitor the foreground window sits on.
+
+    "Home monitor" = the monitor whose bbox has the greatest overlap area
+    with ``fg_rect`` (left, top, right, bottom). Returns ``None`` when there
+    is no rect or no positive overlap. Used to attach UIA ``ax_text`` to
+    exactly one snapshot, regardless of how much of the monitor the window
+    covers — unlike ``used_focus_rect``, which excludes maximized windows
+    (coverage > 80%).
+    """
+    if not fg_rect:
+        return None
+    wl, wt, wr, wb = fg_rect
+    best_idx: Optional[int] = None
+    best_area = 0
+    for m in monitors:
+        ml, mt, mr, mb = m.info.bbox
+        iw = min(wr, mr) - max(wl, ml)
+        ih = min(wb, mb) - max(wt, mt)
+        if iw <= 0 or ih <= 0:
+            continue
+        area = iw * ih
+        if area > best_area:
+            best_area = area
+            best_idx = m.info.index
+    return best_idx
+
 
 # How often to re-check the display topology for hot-plug / unplug /
 # resolution changes. Cheap (one mss enumeration call) so we can afford
@@ -111,7 +145,7 @@ class PersonalityMonitor:
     The bridge entrypoint constructs one of these alongside
     :class:`LongTermMemory` and awaits :meth:`start`. The instance lives
     for the whole bridge process; ``shutdown`` cancels the loop and
-    flushes any remaining buffered samples best-effort.
+    spills any unprocessed ring frames to disk best-effort.
 
     The instance is INERT until ``start()`` returns — calling
     :meth:`pause` / :meth:`resume` before start is a no-op so the
@@ -123,7 +157,7 @@ class PersonalityMonitor:
     ``LongTermMemory.init``); we read **only** the ``screenshots:``
     section from it, which drives ``ScreenshotStore`` retention
     bounds. Everything else (sampling cadence, hash thresholds,
-    daily-summary hour, sensitive-window patterns, …) lives in
+    sensitive-window patterns, …) lives in
     ``long_term_memory/_constants.py §11`` so users cannot silently
     degrade capture quality by editing the YAML.
     """
@@ -207,12 +241,6 @@ class PersonalityMonitor:
                     "PersonalityMonitor: ignoring invalid excluded_apps regex %r",
                     pattern_str,
                 )
-        # Day rollover guard: we emit at most one daily-summary per
-        # local calendar date, regardless of how many ticks fall inside
-        # the summary hour. Stored as the local-date string we last
-        # emitted for.
-        self._last_daily_date: str = ""
-        self._daily_buffer: List[ActivitySample] = []
         # Tracks the last time we re-enumerated displays. Set in start()
         # so we don't redundantly re-enumerate on the very first tick.
         self._last_reconcile_ts: float = 0.0
@@ -265,8 +293,11 @@ class PersonalityMonitor:
                          m.info.index, m.info.label, m.info.bbox, m.info.primary)
         self._last_reconcile_ts = time.time()
         # Lazily build the OCR client; first capture pays the cold-start.
+        # Use the BACKGROUND singleton — capped ONNX thread pool so the
+        # drain doesn't peg every core back-to-back when the IDLE gate
+        # opens. desktop_tool keeps the full-fat singleton.
         try:
-            self._ocr = get_local_ocr()
+            self._ocr = get_local_ocr_background()
         except Exception:
             _logger.exception("PersonalityMonitor: OCR init failed; will retry on first frame")
         # Per-monitor rings (initialised here so vanished/added monitors
@@ -339,13 +370,14 @@ class PersonalityMonitor:
                 )
         except Exception:
             _logger.exception("shutdown: ring spill failed (frames lost)")
-        # Final best-effort flush so any tail of the day isn't lost.
-        try:
-            await self._final_flush()
-        except Exception:
-            _logger.exception("PersonalityMonitor final flush failed")
         try:
             self._capturer.close()
+        except Exception:
+            pass
+        # Reap the UIA worker's PowerShell subprocess — the personality
+        # service is its sole consumer, so it owns the lifecycle.
+        try:
+            await get_uia_worker().shutdown()
         except Exception:
             pass
         _logger.info(
@@ -371,7 +403,6 @@ class PersonalityMonitor:
                     "primary": m.info.primary,
                     "bbox": list(m.info.bbox),
                     "tier": m.tier.value,
-                    "buffer_size": len(m.buffer),
                     "ring_size": len(self._rings.get(m.info.index, ())),
                     "last_capture_ts": int(m.last_capture_ts),
                     "last_activity_ts": int(m.last_activity_ts),
@@ -385,8 +416,6 @@ class PersonalityMonitor:
             "spilled_total": int(self._spilled_total),
             "spill_recovered_total": int(self._spill_recovered_total),
             "spill_files_now": self._spill_count(),
-            "daily_buffered": len(self._daily_buffer),
-            "last_daily_date": self._last_daily_date,
         }
 
     # ── Main loop ───────────────────────────────────────────────────────────
@@ -405,12 +434,6 @@ class PersonalityMonitor:
                     await self._tick()
                 except Exception:
                     _logger.exception("PersonalityMonitor tick error")
-                # Daily summary: cheap; runs every tick because the
-                # rollover guard prevents duplicate fires.
-                try:
-                    await self._maybe_emit_daily_summary()
-                except Exception:
-                    _logger.exception("PersonalityMonitor daily summary error")
                 await asyncio.sleep(1.0)
         except asyncio.CancelledError:
             _logger.info("PersonalityMonitor loop cancelled")
@@ -425,6 +448,15 @@ class PersonalityMonitor:
         title = foreground_window_title()
         app = foreground_app_name()
         sensitive = self._is_sensitive_window(title)
+        # Read the foreground window once per tick and resolve its home
+        # monitor (greatest bbox overlap). UIA ax_text is queried only for
+        # that monitor's capture so a maximized window is still covered and
+        # the structured text is attached to exactly one snapshot.
+        fg_hwnd = foreground_hwnd()
+        fg_home_idx = _foreground_home_monitor_index(
+            get_foreground_window_rect(fg_hwnd) if fg_hwnd else None,
+            self._monitors,
+        )
         # Update tiers first so capture decisions reflect current state.
         for m in self._monitors:
             self._update_tier(m, now, cur, idle)
@@ -442,15 +474,11 @@ class PersonalityMonitor:
                 )
                 continue
             try:
-                await self._capture_and_process(m, title, app, now)
+                await self._capture_and_process(
+                    m, title, app, now, fg_hwnd, fg_home_idx,
+                )
             except Exception:
                 _logger.exception("capture/process failed monitor=%d", m.info.index)
-        # Per-monitor flush check.
-        for m in self._monitors:
-            if m.flush_due(now):
-                samples = m.drain_buffer()
-                if samples:
-                    await self._emit_candidate(samples, monitor=m)
 
     # ── Topology reconciliation ────────────────────────────────────────────
 
@@ -464,14 +492,14 @@ class PersonalityMonitor:
         user rearranges displays in Windows settings or unplugs one.
 
         Behaviour:
-          - Vanished corners → drain the monitor's pending buffer to
-            LTM, then drop the state. Drain is best-effort; a failure
-            here only loses the unflushed tail.
+          - Vanished corners → spill the monitor's unprocessed ring
+            frames to disk, then drop the state. Spill is best-effort;
+            a failure here only loses the in-flight frames.
           - New corners → append a fresh ``MonitorState`` with a new
             ``index`` (max existing + 1) so it doesn't collide with a
             stamped-but-vanished display.
           - Resolution flip on a stable corner → update bbox/label in
-            place, preserve tier/buffer/text-history, drop ``last_hash``
+            place, preserve tier/text-history, drop ``last_hash``
             (perceptual hash was computed against a different pixel
             area and would dedupe a genuinely-different frame).
           - Any topology change → close the mss client so the next
@@ -510,15 +538,6 @@ class PersonalityMonitor:
                 "monitor reconcile: removed index=%d bbox=%s label=%r",
                 m.info.index, m.info.bbox, m.info.label,
             )
-            if m.buffer:
-                samples = m.drain_buffer()
-                try:
-                    await self._emit_candidate(samples, monitor=m)
-                except Exception:
-                    _logger.exception(
-                        "monitor reconcile: flush failed for monitor %d",
-                        m.info.index,
-                    )
             # Spill any unprocessed JPEG frames to disk before dropping
             # the monitor's state. The drain worker will pick them up on
             # the next idle window — see _ocr_one's orphan path. The
@@ -625,6 +644,8 @@ class PersonalityMonitor:
         title: str,
         app: str,
         now: float,
+        fg_hwnd: Optional[int],
+        fg_home_idx: Optional[int],
     ) -> None:
         """Capture the monitor, decide if the frame is novel, and push it
         into the per-monitor ring buffer for later OCR.
@@ -633,10 +654,22 @@ class PersonalityMonitor:
         :meth:`_ocr_drain_loop` so it doesn't compete with the user's
         CPU during active work. See plan robust-gathering-shannon.md
         for the design rationale + bench numbers.
+
+        ``fg_hwnd`` / ``fg_home_idx`` are the tick-scoped foreground window
+        handle and its home-monitor index. When this monitor IS the home
+        monitor we query the UIA worker for structured ``ax_text`` and carry
+        it through the ring entry — bound to the correct window here rather
+        than at drain time, when the foreground may have changed.
         """
         loop = asyncio.get_running_loop()
-        # 1. Capture → ndarray (no disk I/O)
-        rgb = await loop.run_in_executor(None, self._capturer.capture, m.info)
+        # 1. Capture → ndarray (no disk I/O). Prefer focus-rect capture
+        #    (foreground window bbox only) so OCR runs over fewer pixels;
+        #    falls back to full monitor when foreground hwnd is unavailable
+        #    or the foreground covers >80% of the monitor anyway.
+        rgb, focus_rect, used_focus_rect = await loop.run_in_executor(
+            None,
+            lambda: self._capturer.capture_focus_rect(m.info, foreground_hwnd=fg_hwnd),
+        )
         if rgb is None:
             return
         # 2. Cheap visual novelty gate: perceptual_hash on the ndarray.
@@ -682,6 +715,19 @@ class PersonalityMonitor:
             )
             if spilled:
                 ring.popleft()
+        # 6. UIA structured text for the foreground window — only on its
+        #    home monitor, so a multi-monitor desktop attaches ax_text to a
+        #    single snapshot. Best-effort: query() returns None on any
+        #    failure / non-Windows / timeout, leaving the fields unset.
+        ax_text: Optional[str] = None
+        parsed_json: Optional[dict] = None
+        top_window_titles: Optional[List[str]] = None
+        if fg_hwnd and m.info.index == fg_home_idx:
+            uia = await get_uia_worker().query(fg_hwnd)
+            if uia:
+                ax_text = uia.get("ax_text") or None
+                parsed_json = uia.get("parsed_json") or None
+                top_window_titles = uia.get("top_window_titles") or None
         ring.append({
             "jpeg": jpeg,
             "ts": now,
@@ -689,6 +735,11 @@ class PersonalityMonitor:
             "app": app,
             "tier": m.tier,
             "monitor_index": m.info.index,
+            "focus_rect": focus_rect,
+            "ocr_used_focus_rect": used_focus_rect,
+            "ax_text": ax_text,
+            "parsed_json": parsed_json,
+            "top_window_titles": top_window_titles,
         })
 
     # ── Spillover (disk-backed bounded fallback) ────────────────────────────
@@ -1023,25 +1074,22 @@ class PersonalityMonitor:
 
     async def _ocr_one(self, entry: Dict[str, Any]) -> None:
         """Run OCR on a single ring (or spillover) entry, then run the
-        text-similarity dedup and (if accepted) push an
-        ``ActivitySample`` through the existing buffer/flush flow.
+        text-similarity dedup and (if accepted) write the observation to
+        ``obs_snapshots`` + ``obs_ocr_frames``.
 
-        Two paths:
+        The Jaccard dedup history comes from one of two sources:
           * **Live monitor** — the originating ``MonitorState`` is still
-            present. Use its ``recent_texts`` / ``last_text`` for the
-            Jaccard dedup and route the sample through
-            ``m.append_sample`` so the buffer/flush logic owns it.
+            present; use its ``recent_texts`` / ``last_text`` (and update
+            them with the accepted text so future frames dedup against it).
           * **Orphan** — the monitor disconnected between capture and
             drain (frame survived via spillover). Fall back to the
             ``recent_texts_snapshot`` shipped inside the spilled
-            meta.json for dedup, and submit the sample directly to
-            LTM as a one-shot candidate (we have no buffer to put it
-            into and no future monitor will own the in-flight sample).
+            meta.json for dedup; there is no live state to update.
         """
         loop = asyncio.get_running_loop()
         if self._ocr is None:
             try:
-                self._ocr = get_local_ocr()
+                self._ocr = get_local_ocr_background()
             except Exception:
                 _logger.exception("OCR drain: engine init failed; dropping frame")
                 return
@@ -1103,232 +1151,48 @@ class PersonalityMonitor:
             tier=tier,
             novelty=1.0 - jacc,
         )
+        # LTM 2.0 obs_snapshots + obs_ocr_frames write path — the sole
+        # sink for activity observations. Downstream the SemanticExtractor
+        # abstracts these into obs_semantic_events and the DreamWorker
+        # triages those into mem_entries.
+        try:
+            frame = _infer_sample_frame(sample)
+            focus_rect = entry.get("focus_rect") if isinstance(entry, dict) else None
+            used_focus_rect = bool(entry.get("ocr_used_focus_rect")) if isinstance(entry, dict) else False
+            # UIA structured text captured at snapshot time (home monitor
+            # only); absent for orphan/spilled frames — None-safe.
+            ax_text = entry.get("ax_text") if isinstance(entry, dict) else None
+            parsed_json = entry.get("parsed_json") if isinstance(entry, dict) else None
+            top_window_titles = entry.get("top_window_titles") if isinstance(entry, dict) else None
+            snapshot_id = await self._ltm._store.insert_obs_snapshot(
+                captured_at=int(ts * 1000),
+                monitor_index=monitor_index,
+                window_title=title or None,
+                process_name=app or None,
+                top_window_titles=top_window_titles,
+                ax_text=ax_text,
+                parsed_json=parsed_json,
+                frame=frame,
+                focus_rect=focus_rect,
+                ocr_used_focus_rect=used_focus_rect,
+                system_idle_sec=None,
+                novelty_score=1.0 - jacc,
+                tier=tier.value,
+            )
+            await self._ltm._store.insert_obs_ocr_frame(
+                snapshot_id=snapshot_id,
+                text=text,
+                confidence=getattr(ocr_result, "confidence", None),
+                pipeline_version="rapidocr_v1.x",
+                is_focus_rect=used_focus_rect,
+            )
+        except Exception:
+            # Non-fatal — one dropped frame must not kill the drain loop —
+            # but as the only sink the failure should be visible.
+            _logger.exception("obs_snapshots write failed")
         if m is not None:
-            # Live-monitor path — feed the standard buffer/flush flow.
+            # Live-monitor path — update the Jaccard dedup history so the
+            # next frame on this monitor dedups against this accepted text.
             m.last_text = text[: C.ACTIVITY_OCR_EXCERPT_MAX_CHARS * 4]
             m.recent_texts.append(text[: C.ACTIVITY_OCR_EXCERPT_MAX_CHARS * 4])
-            m.append_sample(sample, time.time())
-        else:
-            # Orphan path — submit directly as a one-shot LTM candidate.
-            # No m means no buffer to append to; we also skip
-            # _emit_candidate's per-monitor preamble and render a
-            # standalone block ourselves so the dream worker still has
-            # readable context.
-            try:
-                raw = self._render_orphan_sample(sample)
-                await submit_activity_observer(
-                    ltm=self._ltm,
-                    raw_text=raw,
-                    source_ref=f"activity:m{monitor_index}:orphan:{int(ts)}",
-                    daily_summary=False,
-                    monitor_index=monitor_index,
-                    sample_count=1,
-                )
-                _logger.info(
-                    "orphan activity sample submitted monitor=%d ts=%s",
-                    monitor_index, int(ts),
-                )
-            except Exception:
-                _logger.exception("submit_activity_observer (orphan) failed")
-        self._daily_buffer.append(sample)
-        if len(self._daily_buffer) > _DAILY_BUFFER_HARD_CAP:
-            drop = len(self._daily_buffer) - _DAILY_BUFFER_HARD_CAP
-            self._daily_buffer = self._daily_buffer[drop:]
 
-    def _render_orphan_sample(self, s: ActivitySample) -> str:
-        """Render a one-shot ActivitySample as a tiny markdown block,
-        matching the per-monitor preamble produced by
-        :meth:`_render_samples` so dream-worker prompts see the same
-        structure regardless of whether the source monitor is alive."""
-        ts = datetime.fromtimestamp(s.timestamp).strftime("%Y-%m-%d %H:%M:%S")
-        lines = [
-            f"# Activity observation (orphan — monitor disconnected)",
-            f"Monitor {s.monitor_index} (no longer attached)",
-            f"Samples: 1",
-            "",
-            f"## {ts} [{s.tier.value}] {s.foreground_app or '?'}",
-        ]
-        if s.foreground_window:
-            lines.append(f"window: {s.foreground_window}")
-        if s.text_excerpt:
-            lines.append("text excerpt:")
-            lines.append(s.text_excerpt)
-        return "\n".join(lines)
-
-    # ── Candidate emission ─────────────────────────────────────────────────
-
-    async def _emit_candidate(
-        self, samples: List[ActivitySample], *, monitor: MonitorState,
-    ) -> None:
-        if not samples:
-            return
-        raw_text = self._render_samples(samples, monitor=monitor)
-        try:
-            await submit_activity_observer(
-                ltm=self._ltm,
-                raw_text=raw_text,
-                source_ref=f"activity:m{monitor.info.index}:{int(time.time())}",
-                daily_summary=False,
-                monitor_index=monitor.info.index,
-                sample_count=len(samples),
-            )
-            _logger.info(
-                "activity candidate emitted monitor=%d samples=%d",
-                monitor.info.index, len(samples),
-            )
-        except Exception:
-            _logger.exception("submit_activity_observer failed")
-
-    def _render_samples(
-        self, samples: List[ActivitySample], *, monitor: MonitorState,
-    ) -> str:
-        lines: List[str] = [
-            f"# Activity observation",
-            f"Monitor {monitor.info.index} ({monitor.info.label})",
-            f"Samples: {len(samples)}",
-            "",
-        ]
-        for s in samples:
-            ts = datetime.fromtimestamp(s.timestamp).strftime("%Y-%m-%d %H:%M:%S")
-            lines.append(f"## {ts} [{s.tier.value}] {s.foreground_app or '?'}")
-            if s.foreground_window:
-                lines.append(f"window: {s.foreground_window}")
-            if s.text_excerpt:
-                lines.append("text excerpt:")
-                lines.append(s.text_excerpt)
-            lines.append("")
-        return "\n".join(lines)
-
-    # ── Daily summary ──────────────────────────────────────────────────────
-
-    async def _maybe_emit_daily_summary(self) -> None:
-        """Emit at most one daily-summary candidate per local calendar
-        date. Called from the main tick loop (every ~1 s).
-
-        Two interactions with the deferred-OCR pipeline make the naive
-        "fire once at 22:00 if buffer non-empty" wrong:
-
-        1. **Buffer-empty at 22:00 due to defer-OCR**: when the user
-           works straight through 22:00 with no idle break, every
-           captured frame is still sitting in the ring waiting for
-           drain, so ``_daily_buffer`` (populated only AFTER OCR) is
-           empty at the trigger moment. We must NOT mark
-           ``_last_daily_date = today`` in that case — that would
-           burn the whole 22:00–23:00 window even though drain may
-           catch up later.
-
-        2. **Drain mid-flight at 22:00**: if the user goes idle at
-           21:55 and drain starts processing the day's ring, by 22:00
-           only a fraction of frames have been OCR'd. Emitting then
-           captures only that fraction; the rest fill the buffer
-           AFTER the date_key was set and never enter today's summary.
-
-        Strategy: stay live across the whole 22:00–22:59 window;
-        in the first 30 minutes prefer to wait if drain is actively
-        consuming pending work; from 22:30 onwards send what we have;
-        at 23:00 (one-hour fallback) close the books even on an empty
-        buffer so we don't cycle into tomorrow.
-        """
-        now_dt = datetime.now()
-        date_key = now_dt.strftime("%Y-%m-%d")
-        if self._last_daily_date == date_key:
-            return  # already settled for today
-
-        summary_hour = C.ACTIVITY_DAILY_SUMMARY_HOUR_LOCAL
-        in_window = (now_dt.hour == summary_hour)
-        past_deadline = (now_dt.hour == summary_hour + 1)
-        if not (in_window or past_deadline):
-            return  # off-window — wait for tomorrow's 22:00
-
-        if not self._daily_buffer:
-            # Bug fix: do NOT mark date_key as done just because buffer
-            # is empty mid-window. Drain may catch up later in the
-            # 22:00 hour. Only at the deadline (23:00) do we accept
-            # that today truly had nothing to summarise.
-            if past_deadline:
-                self._last_daily_date = date_key
-                _logger.info(
-                    "daily activity summary skipped date=%s (no samples this day)",
-                    date_key,
-                )
-            return
-
-        # Buffer has at least one sample. Decide whether to emit now.
-        # In the first 30 minutes of the window, if the drain worker is
-        # actively consuming a substantial backlog, defer the emit so
-        # late-arriving samples get included. After 30 minutes (or at
-        # the 23:00 deadline) we send whatever we have.
-        if in_window and now_dt.minute < 30:
-            ring_size = sum(len(r) for r in self._rings.values())
-            spill_size = self._spill_count()
-            pending = ring_size + spill_size
-            # ≥10 pending frames AND drain is unblocked = "wait for it"
-            if pending >= 10 and self._gate_open_now and not self._paused:
-                _logger.debug(
-                    "daily summary deferred: pending=%d gate_open=True minute=%d",
-                    pending, now_dt.minute,
-                )
-                return
-
-        samples = self._daily_buffer[-C.ACTIVITY_DAILY_SUMMARY_MAX_SAMPLES:]
-        raw_text = self._render_daily_summary(date_key, samples)
-        try:
-            await submit_activity_observer(
-                ltm=self._ltm,
-                raw_text=raw_text,
-                source_ref=f"daily:{date_key}",
-                daily_summary=True,
-                monitor_index=-1,
-                sample_count=len(samples),
-            )
-            _logger.info(
-                "daily activity summary emitted date=%s samples=%d "
-                "(in_window=%s past_deadline=%s)",
-                date_key, len(samples), in_window, past_deadline,
-            )
-            self._last_daily_date = date_key
-            self._daily_buffer = []
-        except Exception:
-            _logger.exception("daily summary submit failed")
-
-    def _render_daily_summary(
-        self, date_key: str, samples: List[ActivitySample],
-    ) -> str:
-        # Aggregate by foreground app for a denser, more LLM-digestible
-        # summary than dumping raw samples — keeps prompt cost bounded.
-        from collections import Counter, defaultdict
-        app_counter: Counter = Counter()
-        per_app_text: dict = defaultdict(list)
-        per_app_titles: dict = defaultdict(set)
-        for s in samples:
-            app = s.foreground_app or "(unknown)"
-            app_counter[app] += 1
-            if s.text_excerpt:
-                per_app_text[app].append(s.text_excerpt[:200])
-            if s.foreground_window:
-                per_app_titles[app].add(s.foreground_window[:120])
-        top = app_counter.most_common(10)
-        lines: List[str] = [
-            f"# Daily activity summary {date_key}",
-            f"Total accepted samples: {len(samples)}",
-            f"Distinct apps: {len(app_counter)}",
-            "",
-            "## Top apps by sample count",
-        ]
-        for app, n in top:
-            lines.append(f"- {app}: {n} samples")
-            titles = sorted(per_app_titles.get(app, []))[:5]
-            if titles:
-                lines.append("  windows: " + "; ".join(titles))
-            snippets = per_app_text.get(app, [])[:3]
-            for sn in snippets:
-                lines.append(f"  excerpt: {sn}")
-        return "\n".join(lines)
-
-    # ── Final flush on shutdown ────────────────────────────────────────────
-
-    async def _final_flush(self) -> None:
-        for m in self._monitors:
-            if m.buffer:
-                samples = m.drain_buffer()
-                await self._emit_candidate(samples, monitor=m)

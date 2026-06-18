@@ -20,12 +20,11 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Optional
 
 from .logger import get_logger
-from .step_context_provider import StepContextProvider
+from ..controller_v2.context import ContextProvider, ItemContext, ProviderCache
+from ..tools.browser_tool import is_browser_available
 
 if TYPE_CHECKING:
-    from ..controller.interaction_manager import InteractionManager
-    from .memory import Memory
-    from ..models.plan import Step
+    from ..controller_v2.interaction_manager import InteractionManager
 
 
 def _build_full_hint() -> str:
@@ -71,7 +70,7 @@ def _build_brief_hint() -> str:
     )
 
 
-class WebSearchContextProvider(StepContextProvider):
+class WebSearchContextProvider(ContextProvider):
     """Activate when Planner declares ``web_search`` in tools_required."""
 
     def __init__(self) -> None:
@@ -103,25 +102,12 @@ class WebSearchContextProvider(StepContextProvider):
             'and will fail with "no session"',
         ]
 
-    async def prepare(
+    async def before_item(
         self,
-        step: "Step",
-        interaction_manager: "InteractionManager",
-        memory: "Memory",
+        ctx: ItemContext,
+        im: "InteractionManager",
+        cache: ProviderCache,
     ) -> Optional[str]:
-        try:
-            from ..tools.browser_tool import is_browser_available
-        except ImportError:
-            self.logger.warning(
-                "WebSearchContextProvider: browser_tool not importable",
-                component="WebSearchContextProvider",
-            )
-            return (
-                "[Web Search Context — UNAVAILABLE]\n"
-                "browser_tool module is not importable; web_search depends "
-                "on it. Report this to the user and skip the search path."
-            )
-
         if not is_browser_available():
             return (
                 "[Web Search Context — UNAVAILABLE]\n"
@@ -131,8 +117,8 @@ class WebSearchContextProvider(StepContextProvider):
                 "  playwright install msedge"
             )
 
-        cached = memory.get_browser_context("web_search")
+        cached = cache.get("web_search")
         if cached and cached.get("prepared"):
             return _build_brief_hint()
-        memory.set_browser_context("web_search", {"prepared": True})
+        cache.set("web_search", "default", {"prepared": True})
         return _build_full_hint()

@@ -443,6 +443,7 @@ async def call_with_fallback_stream(
     chat_kwargs: dict,
     on_fallback: Optional[Callable[[int, Exception], None]] = None,
     *,
+    on_service_selected: Optional[Callable[["LLMService"], None]] = None,
     wait_on_network_down: bool = True,
     on_network_event: Optional[Callable[[str, int, int], None]] = None,
 ) -> AsyncGenerator[Any, None]:
@@ -454,6 +455,10 @@ async def call_with_fallback_stream(
     the caller would corrupt event ordering and token accounting.
 
     Args/Raises mirror :func:`call_with_fallback`.
+
+    on_service_selected: called with the service instance once the stream
+        opens successfully. Allows callers to adapt (e.g. update context
+        budget) based on which model is actually serving.
     """
     if not services:
         raise ValueError("call_with_fallback_stream: services list is empty")
@@ -475,6 +480,11 @@ async def call_with_fallback_stream(
                 first_event = await gen.__anext__()
             except StopAsyncIteration:
                 # Empty stream — treat as success with no events.
+                if on_service_selected is not None:
+                    try:
+                        on_service_selected(service)
+                    except Exception:
+                        pass
                 return
             except Exception as exc:
                 last_exc = exc
@@ -501,6 +511,11 @@ async def call_with_fallback_stream(
                 break
             else:
                 # Stream opened successfully.
+                if on_service_selected is not None:
+                    try:
+                        on_service_selected(service)
+                    except Exception:
+                        pass
                 break
 
         if gen is not None and first_event is not None:

@@ -19,12 +19,10 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Optional
 
 from .logger import get_logger
-from .step_context_provider import StepContextProvider
+from ..controller_v2.context import ContextProvider, ItemContext, ProviderCache
 
 if TYPE_CHECKING:
-    from ..controller.interaction_manager import InteractionManager
-    from .memory import Memory
-    from ..models.plan import Step
+    from ..controller_v2.interaction_manager import InteractionManager
 
 
 def _build_full_hint() -> str:
@@ -69,7 +67,7 @@ def _build_brief_hint() -> str:
     )
 
 
-class AskHumanContextProvider(StepContextProvider):
+class AskHumanContextProvider(ContextProvider):
     """Activate when the Planner declares ``ask_human`` in tools_required."""
 
     def __init__(self) -> None:
@@ -105,15 +103,15 @@ class AskHumanContextProvider(StepContextProvider):
             "uncertainties in factual_outcome instead of blocking for input",
         ]
 
-    async def prepare(
+    async def before_item(
         self,
-        step: "Step",
-        interaction_manager: "InteractionManager",
-        memory: "Memory",
+        ctx: ItemContext,
+        im: "InteractionManager",
+        cache: ProviderCache,
     ) -> Optional[str]:
-        cached = memory.get_browser_context("ask_human")
+        cached = cache.get("ask_human")
         if cached and cached.get("prepared"):
             return _build_brief_hint()
-        memory.set_browser_context("ask_human", {"prepared": True})
+        cache.set("ask_human", "default", {"prepared": True})
         return _build_full_hint()
 

@@ -16,24 +16,22 @@ import getpass
 import re
 from typing import TYPE_CHECKING, Optional
 
-from .step_context_provider import StepContextProvider
 from .logger import get_logger
+from ..controller_v2.context import ContextProvider, ItemContext, ProviderCache
 
 if TYPE_CHECKING:
-    from ..controller.interaction_manager import InteractionManager
-    from .memory import Memory
-    from ..models.plan import Step
+    from ..controller_v2.interaction_manager import InteractionManager
 
 
 _USER_AT_RE = re.compile(r"(\w[\w.-]*)@([\w.-]+)")
 
 
-class RemoteHandQContextProvider(StepContextProvider):
+class RemoteHandQContextProvider(ContextProvider):
     """
-    StepContextProvider for remote HandQ task delegation.
+    ContextProvider for remote HandQ task delegation.
 
-    Activation: Planner declares "remote_handq" in step.tools_required.
-    FlowController invokes prepare() based purely on the declaration.
+    Activation: Planner declares "remote_handq" in tools_required.
+    FlowControllerV2 invokes before_item based purely on the declaration.
 
     Responsibility:
       1. Establish SSH credentials for the target host (via SSHSetupManager)
@@ -50,35 +48,35 @@ class RemoteHandQContextProvider(StepContextProvider):
     def tool_name(self) -> str:
         return "remote_handq"
 
-    async def prepare(
+    async def before_item(
         self,
-        step: "Step",
-        interaction_manager: "InteractionManager",
-        memory: "Memory",
+        ctx: ItemContext,
+        im: "InteractionManager",
+        cache: ProviderCache,
     ) -> Optional[str]:
         """
         Establish SSH credentials and discover remote HANDQ_DIR.
 
         Progressive disclosure:
           - First time a hostname is seen: full hint (workflow + creds + handq_dir)
-          - Subsequent steps for same host: brief hint (creds + handq_dir only)
+          - Subsequent items for same host: brief hint (creds + handq_dir only)
         """
         self.logger.info(
-            f"RemoteHandQContextProvider.prepare() for step {step.step_id!r}",
+            f"RemoteHandQContextProvider.before_item() for item {ctx.item_id!r}",
             component="RemoteHandQProvider",
         )
 
-        hostname, username = self._extract_host_user(step)
+        hostname, username = self._extract_host_user(ctx)
         if not hostname:
             self.logger.warning(
                 f"RemoteHandQContextProvider: could not extract hostname from "
-                f"step {step.step_id!r} — skipping context injection.",
+                f"item {ctx.item_id!r} — skipping context injection.",
                 component="RemoteHandQProvider",
             )
             return None
 
         # Per-hostname cache check
-        cached = memory.get_remote_handq_context(hostname)
+        cached = cache.get("remote_handq", hostname)
         if cached:
             self.logger.debug(
                 f"Using cached remote_handq context for {hostname}",
@@ -92,11 +90,10 @@ class RemoteHandQContextProvider(StepContextProvider):
             component="RemoteHandQProvider",
         )
         try:
-            from .ssh_setup import SSHSetupError
             result = await self._manager.ensure_ssh_ready(
                 hostname=hostname,
                 username=username or "",
-                interaction_manager=interaction_manager,
+                interaction_manager=im,
             )
         except Exception as exc:
             self.logger.error(
@@ -126,20 +123,24 @@ class RemoteHandQContextProvider(StepContextProvider):
 
         # Build and cache the full hint
         hint = _build_full_hint(creds_file, handq_dir)
-        memory.set_remote_handq_context(hostname, creds_file, handq_dir, hint)
+        cache.set("remote_handq", hostname, {
+            "creds_file": creds_file,
+            "handq_dir": handq_dir,
+            "hint": hint,
+        })
 
         return hint
 
-    def _extract_host_user(self, step: "Step") -> tuple:
-        """Extract (hostname, username) from step — same logic as SSHContextProvider."""
-        ssh_target = getattr(step, "ssh_target", "") or ""
+    def _extract_host_user(self, ctx: ItemContext) -> tuple:
+        """Extract (hostname, username) from item context — same logic as SSHContextProvider."""
+        ssh_target = ctx.ssh_target or ""
         if ssh_target.strip():
             m = _USER_AT_RE.match(ssh_target.strip())
             if m:
                 return m.group(2), m.group(1)
             return ssh_target.strip(), getpass.getuser()
 
-        text = f"{getattr(step, 'goal', '')} {step.description}"
+        text = ctx.instruction
         m = _USER_AT_RE.search(text)
         if m:
             return m.group(2), m.group(1)

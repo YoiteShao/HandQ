@@ -81,7 +81,6 @@ SHELL_CONTEXT_FILE         = HANDQ_DIR / "shell_context.txt"
 TERM_LOG_FILE              = HANDQ_DIR / "term.log"
 CAPTURE_START_FILE         = HANDQ_DIR / "capture_start"
 CAPTURE_STOP_FILE          = HANDQ_DIR / "capture_stop"
-SAVE_REQUEST_FILE          = HANDQ_DIR / "save_requested"  # sentinel: foreground → background
 DEFAULT_CONFIG             = _HERE / ("handq_config.yaml" if _IS_COMPILED else "./handq_config.yaml")
 _CALLER_CWD                = os.getcwd()
 HANDQ_TMUX_SESSION         = os.environ.get("HANDQ_TMUX_SESSION", f"handq-{os.environ.get('USER', 'default')}@{_HANDQ_HOST}")
@@ -656,11 +655,6 @@ OPTIONS
   --new         Stop current session, create a new workspace, enter state1
   --show-config Print the current config file and exit
   -c, --config PATH  Use specified config YAML file
-  --save [PATH] Save last completed task as a GEP template.
-                Without PATH: requires a completed task in the current session.
-                With PATH: generate a template from any session log file,
-                e.g.  handq --save ~/.handq/sessions/20250506_task.log
-  --list        List all available GEP templates
 
 INLINE GOAL (no dialog)
   handq 测试当前路径
@@ -685,84 +679,6 @@ TMUX STATUS BAR
 
 def cmd_help() -> int:
     print(_HELP_TEXT, end="")
-    return 0
-
-
-def cmd_save(save_path: Optional[str] = None) -> int:
-    """
-    Request the background child to generate a GEP template from the last
-    completed task's execution log.
-
-    When ``save_path`` is provided, the template is generated from that
-    session log instead of the current session (the background process must
-    still be running, but no completed task is required).
-
-    Without a path, a completed task in the current session (state 3) is
-    required.  States 0/1/2 (not started, idle, running) are rejected with
-    an informative message.
-    """
-    hs = _get_handq_state()
-    if hs == 0:
-        print("HandQ: not running — start a session first.", file=sys.stderr)
-        return 1
-    if save_path is None and hs == 1:
-        print("HandQ: no completed task yet — run a task first.", file=sys.stderr)
-        return 1
-    if hs in (2, 4):
-        print(
-            "HandQ: task still in progress — wait for completion before saving.",
-            file=sys.stderr,
-        )
-        return 1
-    # state 3 (completed) — but first verify the background process is alive.
-    # _get_handq_state() reads state.json which is NOT cleared on process exit
-    # (only the PID file is removed).  If the process has since exited, the
-    # sentinel file would be written but never picked up.
-    if _get_running_child_pid() is None:
-        print(
-            "HandQ: background process has exited — run 'handq' to start a new session.",
-            file=sys.stderr,
-        )
-        return 1
-    if save_path is not None:
-        p = Path(save_path)
-        if not p.exists():
-            print(f"HandQ: session log not found: {save_path}", file=sys.stderr)
-            return 1
-        sentinel_content = str(p.resolve())
-    else:
-        sentinel_content = "save"
-    _ensure_handq_dir()
-    try:
-        SAVE_REQUEST_FILE.write_text(sentinel_content, encoding="utf-8")
-        print("HandQ: save requested — generating GEP template…")
-        return 0
-    except Exception as exc:
-        print(f"HandQ: failed to write save request: {exc}", file=sys.stderr)
-        return 1
-
-
-def cmd_list_templates(config_path: Optional[str] = None) -> int:
-    """List available GEP templates directly from disk (no LLM, no background process)."""
-    try:
-        from src.infrastructure.gep_template import list_templates as _list_templates
-        templates = _list_templates()
-    except Exception as exc:
-        print(f"HandQ: error reading templates: {exc}", file=sys.stderr)
-        return 1
-
-    if not templates:
-        print(
-            "No GEP templates found yet.\n"
-            "Run 'handq --save' after completing a task to create one."
-        )
-        return 0
-
-    print(f"\nAvailable GEP templates ({len(templates)}):\n")
-    for t in templates:
-        print(f"  [{t.name}]  v{t.version}")
-        print(f"    {t.description}")
-        print()
     return 0
 
 
@@ -1301,60 +1217,6 @@ def _handle_state2_secret_input(conf_req: dict, session: str) -> None:
 # Completion result printer — uses rich for markdown rendering
 # ---------------------------------------------------------------------------
 
-def _read_metrics_summary(workspace_path: str) -> Optional[str]:
-    """
-    Read metrics_summary.json from the workspace and return a Markdown string,
-    or None if the file is absent or unreadable.
-    """
-    try:
-        metrics_file = Path(workspace_path) / "metrics_summary.json"
-        if not metrics_file.exists():
-            return None
-        data = json.loads(metrics_file.read_text(encoding="utf-8"))
-        m = data.get("metrics", {})
-
-        rows = []
-        if m.get("total_duration_seconds", 0) > 0:
-            rows.append(("Total duration", f"{m['total_duration_seconds']:.1f}s"))
-            rows.append(("Avg task duration", f"{m['avg_duration_seconds']:.1f}s"))
-            rows.append(("Min task duration", f"{m['min_duration_seconds']:.1f}s"))
-            rows.append(("Max task duration", f"{m['max_duration_seconds']:.1f}s"))
-        if m.get("step_confidence_avg", 0) > 0:
-            rows.append(("Avg confidence", f"{m['step_confidence_avg']:.2f}"))
-        if m.get("avg_iterations_per_step", 0) > 0:
-            rows.append(("Avg iters/step", f"{m['avg_iterations_per_step']:.1f}"))
-        if m.get("replan_count", 0) > 0:
-            rows.append(("Replans", str(m["replan_count"])))
-        if m.get("interrupt_count", 0) > 0:
-            rows.append(("Interrupts", str(m["interrupt_count"])))
-        if m.get("total_steps", 0) > 0:
-            rows.append(("Total steps", str(m["total_steps"])))
-        if m.get("total_tokens", 0) > 0:
-            rows.append(("Total tokens", str(m["total_tokens"])))
-            rows.append(("  Input tokens", str(m["total_input_tokens"])))
-            rows.append(("  Output tokens", str(m["total_output_tokens"])))
-        if m.get("total_cache_creation_tokens", 0) > 0 or m.get("total_cache_read_tokens", 0) > 0:
-            rows.append(("  Cache create tokens", str(m.get("total_cache_creation_tokens", 0))))
-            rows.append(("  Cache read tokens", str(m.get("total_cache_read_tokens", 0))))
-
-        if not rows:
-            return None
-
-        lines = [
-            "",
-            "---",
-            "📊 **Session Metrics**",
-            "",
-            "| Metric | Value |",
-            "|---|---|",
-        ]
-        for label, value in rows:
-            lines.append(f"| {label} | {value} |")
-        return "\n".join(lines)
-    except Exception:
-        return None
-
-
 def _display_message(message: str, tag: Optional[str] = None, tty_path: Optional[str] = None) -> None:
     """
     Print a message using rich markdown rendering.
@@ -1390,13 +1252,6 @@ def _handle_state3(config_path: Optional[str]) -> None:
     """State3 dialog: show completion result and send follow-up to receptionist."""
     state  = _read_state()
     reason = state.get("completion_reason", "Task completed.")
-
-    # Append metrics summary if available
-    workspace_path = state.get("workspace_path")
-    if workspace_path:
-        metrics_md = _read_metrics_summary(workspace_path)
-        if metrics_md:
-            reason = reason + "\n" + metrics_md
 
     _display_message(reason, tag="✅  HandQ — Task Complete")
 
@@ -1836,29 +1691,6 @@ class _BackgroundUI:
         except Exception:
             pass
 
-    def show_gep_countdown(self, remaining_secs: int, template_name: str) -> None:
-        """Update tmux status bar with GEP countdown; -1 clears it."""
-        if remaining_secs < 0:
-            try:
-                state = _read_state()
-                state.pop("status_icon", None)
-                state.pop("status_text", None)
-                _write_state(state)
-            except Exception:
-                pass
-        else:
-            icon = "⏳"
-            text = f"{template_name or 'GEP'} in {remaining_secs}s"
-            try:
-                state = _read_state()
-                state['status_icon'] = icon
-                state['status_text'] = text
-                _write_state(state)
-            except Exception:
-                pass
-
-    # ── No-op stubs for all other UI methods ─────────────────────────────
-
     def display_receptionist_reply(self, message: str) -> None:
         """Show a Receptionist reply in the terminal (no interactive follow-up)."""
         _display_message(message, tag="💬  HandQ — Receptionist Answer", tty_path=self._tty_path)
@@ -2191,48 +2023,6 @@ async def _run_flow_bg(flow, tty_path: Optional[str] = None) -> None:
                 flow_task.cancel()
                 return
 
-            # Save-session request via sentinel file (written by 'handq --save')
-            if SAVE_REQUEST_FILE.exists():
-                _save_log_file: Optional[str] = None
-                try:
-                    _save_content = SAVE_REQUEST_FILE.read_text(encoding="utf-8").strip()
-                    SAVE_REQUEST_FILE.unlink(missing_ok=True)
-                    # Content is either "save" (current session) or an absolute log file path.
-                    if _save_content and _save_content != "save":
-                        _save_log_file = _save_content
-                except Exception:
-                    pass
-                # _trigger_save_session starts an independent FlowController that
-                # takes over the InteractionManager.  We cancel the original flow
-                # task first (it is in IDLE, no work is lost) so it does not
-                # compete for messages while the save flow runs.
-                flow_task.cancel()
-                flow.cancel_all_tasks()
-                try:
-                    await asyncio.wait({flow_task}, timeout=3.0)
-                except Exception:
-                    pass
-                # Launch the save/GEP session as a sibling task so this monitor
-                # loop keeps running and continues to drain MESSAGES_DIR every
-                # 200 ms, forwarding messages to the save flow's InteractionManager.
-                save_task = asyncio.create_task(
-                    flow._trigger_save_session(log_file=_save_log_file),
-                    name="handq-save-session",
-                )
-                while not save_task.done():
-                    await asyncio.sleep(0.2)
-                    while True:
-                        msg = _read_message_file()
-                        if msg is None:
-                            break
-                        try:
-                            im.inject_user_message(msg)
-                        except Exception:
-                            pass
-                # Save flow has finished (user :exit'd or template was confirmed).
-                # Exit the monitor — the background process will terminate naturally.
-                return
-
             # Exit if the HandQ tmux session has disappeared.
             # setpgrp() means we won't receive SIGHUP, so we poll instead.
             # Check the tmux session (not the pane TTY) so that closing one
@@ -2276,13 +2066,9 @@ async def _run_flow_bg(flow, tty_path: Optional[str] = None) -> None:
     except Exception:
         pass
     finally:
-        # Do NOT cancel monitor_task here: the monitor may be inside
-        # _trigger_save_session() (kicked off by 'handq --save').  Cancelling
-        # it would silently abort the save flow mid-execution because the
-        # monitor cancelled flow_task first, which unblocks this 'await
-        # flow_task' and races us into the finally block while the monitor
-        # is still running.  The monitor always exits via 'return', so just
-        # waiting for it is safe and correct.
+        # The monitor exits via 'return' on its own (clean exit / tmux gone /
+        # interrupt). Wait for it instead of cancelling so any in-flight tmux
+        # check or message drain completes cleanly.
         try:
             await monitor_task
         except asyncio.CancelledError:
@@ -2353,10 +2139,6 @@ def _build_session(
     # (helper at the YAML/UI boundary maps to from_data internally).
     roles         = resolve_role_models(llm_cfg)
     log_level_str = config.get("session", {}).get("log_level", "INFO")
-    threshold     = float(config.get("session", {}).get(
-        "step_verification_threshold",
-        FlowController.DEFAULT_STEP_VERIFICATION_THRESHOLD,
-    ))
     workspace_base = config.get("session", {}).get("workspace_base", ".workspace")
     venv_path      = config.get("session", {}).get("venv_path")
 
@@ -2432,7 +2214,6 @@ def _build_session(
         from_data_llm_services=from_data_services,
         working_directory=str(Path(_CALLER_CWD)),
         storage_directory=str(session_dir),
-        step_verification_threshold=threshold,
         venv_path=venv_path,
         config_path=config_path or str(cfg_path.resolve()),
         shell_context_path=shell_context_path,
@@ -2816,12 +2597,6 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--models",      action="store_true", default=False, dest="cmd_models",
                         help="Show model-to-role assignment from current config")
     parser.add_argument("--prompt-state", action="store_true", default=False, dest="cmd_prompt_state")
-    parser.add_argument("--save",        nargs="?", const=True, default=False, dest="cmd_save",
-                        metavar="PATH",
-                        help="Save last completed task as a GEP template; "
-                             "optionally provide a session log PATH to save from")
-    parser.add_argument("--list",        action="store_true", default=False, dest="cmd_list",
-                        help="List available GEP templates")
     # Inline goal: remaining positional args
     parser.add_argument(
         "inline_goal",
@@ -2879,8 +2654,6 @@ _SUBCOMMAND_ALIASES = {
     "show-config":  "--show-config",
     "prompt-state": "--prompt-state",
     "config":       "--config",
-    "save":         "--save",
-    "list":         "--list",
 }
 
 
@@ -2953,11 +2726,6 @@ def main() -> None:
         sys.exit(cmd_config(config_path))
     if args.cmd_models or args.inline_goal == ["models"]:
         sys.exit(cmd_models(config_path))
-    if args.cmd_save:
-        save_path = args.cmd_save if isinstance(args.cmd_save, str) else None
-        sys.exit(cmd_save(save_path))
-    if args.cmd_list:
-        sys.exit(cmd_list_templates(config_path))
 
     # ── Foreground interactive/inline: capture shell context first ────────
     _capture_shell_context()

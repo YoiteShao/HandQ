@@ -77,6 +77,35 @@ KNOWLEDGE_CONTEXT_TAG: str = "knowledge-context"
 
 # ── Public API (used by LongTermMemory) ─────────────────────────────────────
 
+def _frame_compatible(entry_frame_os: Optional[str], current_frame: Optional[dict]) -> bool:
+    """Return True if an entry's frame_os is compatible with current_frame.
+
+    Compatibility rules (deliberately permissive — we'd rather show a
+    possibly-irrelevant entry than hide a relevant one):
+      - No current_frame supplied → always compatible.
+      - current_frame.confidence < 0.6 → bypass filter (low-confidence frame
+        is worse than no filter; would suppress real signal).
+      - entry_frame_os is NULL → frame-agnostic, always compatible.
+      - entry_frame_os in {'any', 'unknown'} → universally compatible.
+        ('unknown' is frame_inference's "couldn't classify" output — e.g.
+        a custom shell not in the heuristic tables. Treating it as
+        incompatible would silently hide those memories from recall.)
+      - entry_frame_os == current_frame['os'] → exact match.
+      - Otherwise → incompatible (filter out).
+    """
+    if not current_frame:
+        return True
+    confidence = float(current_frame.get("confidence", 1.0))
+    if confidence < 0.6:
+        return True
+    if not entry_frame_os or entry_frame_os in ("any", "unknown"):
+        return True
+    target = current_frame.get("os")
+    if not target:
+        return True
+    return entry_frame_os == target
+
+
 async def recall_memory_impl(
     store,
     embedder: EmbeddingProvider,
@@ -87,25 +116,41 @@ async def recall_memory_impl(
     k: int = 5,
     min_score: float = 0.0,
     rerank: bool = True,
+    dynamic_k: bool = False,
+    current_frame: Optional[dict] = None,
 ) -> List[Entry]:
+    effective_k = C.RECALL_PLANNER_OVERFETCH_K if dynamic_k else k
     rows = await _hybrid_recall(
         store, embedder, query,
         kind=EntryKind.MEMORY.value,
         facet_value=dimension.value if dimension else None,
-        k=k,
+        k=effective_k,
         min_score=min_score,
+        current_frame=current_frame,
     )
     if not rows:
         return []
-    # Stage 3 only when caller wants it AND a real reranker is available.
-    # Receptionist passes rerank=False to dodge the ~3s-per-call LLM
-    # roundtrip (it doesn't need that much precision per message).
+    # Identity entries are injected unconditionally via a separate block;
+    # exclude them from query-based recall so they don't waste limited slots.
+    if dimension is None:
+        rows = [r for r in rows if r[4] != MemoryDimension.IDENTITY.value]
+        if not rows:
+            return []
     if rerank and reranker.available:
         rows = await _ml_rerank(reranker, query, rows)
-    entries = [_row_to_memory_entry(r) for r in rows[:k]]
-    # Record the final-tier hits (after rerank) so the retriage pipeline
-    # has signal about what the user is actually using. Only top-k makes
-    # the log — over-fetched intermediate rows are noise.
+        rows = _rerank_gate(rows)
+        if not rows:
+            return []
+    entries = [_row_to_memory_entry(r) for r in rows[:effective_k]]
+    if dynamic_k:
+        entries = _score_gap_trim(
+            entries,
+            min_k=C.RECALL_PLANNER_MIN_K,
+            max_k=C.RECALL_PLANNER_MAX_K,
+            gap=C.RECALL_SCORE_GAP_THRESHOLD,
+        )
+    else:
+        entries = entries[:k]
     RecallLogger.get().record(
         [e.id for e in entries], kind=EntryKind.MEMORY.value,
     )
@@ -122,19 +167,35 @@ async def recall_knowledge_impl(
     k: int = 5,
     min_score: float = 0.0,
     rerank: bool = True,
+    dynamic_k: bool = False,
+    current_frame: Optional[dict] = None,
 ) -> List[Entry]:
+    effective_k = C.RECALL_PLANNER_OVERFETCH_K if dynamic_k else k
     rows = await _hybrid_recall(
         store, embedder, query,
         kind=EntryKind.KNOWLEDGE.value,
         facet_value=category.value if category else None,
-        k=k,
+        k=effective_k,
         min_score=min_score,
+        current_frame=current_frame,
     )
     if not rows:
         return []
     if rerank and reranker.available:
         rows = await _ml_rerank(reranker, query, rows)
-    entries = [_row_to_knowledge_entry(r) for r in rows[:k]]
+        rows = _rerank_gate(rows)
+        if not rows:
+            return []
+    entries = [_row_to_knowledge_entry(r) for r in rows[:effective_k]]
+    if dynamic_k:
+        entries = _score_gap_trim(
+            entries,
+            min_k=C.RECALL_PLANNER_MIN_K,
+            max_k=C.RECALL_PLANNER_MAX_K,
+            gap=C.RECALL_SCORE_GAP_THRESHOLD,
+        )
+    else:
+        entries = entries[:k]
     RecallLogger.get().record(
         [e.id for e in entries], kind=EntryKind.KNOWLEDGE.value,
     )
@@ -165,6 +226,83 @@ def format_knowledge_block(entries: List[Entry]) -> str:
     return "\n".join(lines)
 
 
+IDENTITY_CONTEXT_TAG: str = "identity"
+
+
+def format_identity_block(entries: List[Entry]) -> str:
+    if not entries:
+        return ""
+    lines = [f"<{IDENTITY_CONTEXT_TAG}>"]
+    for e in entries:
+        lines.append(f"- {_escape_xml(e.summary)}")
+    lines.append(f"</{IDENTITY_CONTEXT_TAG}>")
+    return "\n".join(lines)
+
+
+KNOWN_ENTITIES_CONTEXT_TAG: str = "known-entities"
+
+
+def format_known_entities_block(principals: List[tuple]) -> str:
+    """Render the principal graph (people / machines / projects) as a block.
+
+    Input rows come from ``store.list_principals`` (11-tuples):
+    ``(id, kind, canonical_name, display_name, email, host_kind, os,
+    project_root, first_seen, last_seen, sighting_count)``.
+
+    Frame-agnostic by design: unlike memory/knowledge recall, principals are
+    NOT filtered by ``current_frame``. An SSH ``machine`` (os='linux') is most
+    relevant *while the bridge runs on Windows*, and ``person``/``project`` are
+    cross-environment — so we mirror the permissive philosophy of
+    ``_frame_compatible`` ("rather show than hide") instead of an os-equality
+    check that would suppress exactly the useful rows.
+    """
+    if not principals:
+        return ""
+    lines = [f"<{KNOWN_ENTITIES_CONTEXT_TAG}>"]
+    for row in principals:
+        kind = row[1]
+        name = _escape_xml(row[3] or row[2] or "")
+        if not name:
+            continue
+        if kind == "person":
+            email = row[4]
+            detail = f" {_escape_xml(email)}" if email else ""
+            lines.append(f"- [person] {name}{detail}")
+        elif kind == "machine":
+            bits = [b for b in (row[5], row[6]) if b]  # host_kind, os
+            detail = f" ({_escape_xml(', '.join(bits))})" if bits else ""
+            lines.append(f"- [machine] {name}{detail}")
+        elif kind == "project":
+            root = row[7]
+            detail = f" ({_escape_xml(root)})" if root else ""
+            lines.append(f"- [project] {name}{detail}")
+        else:
+            lines.append(f"- [{_escape_xml(str(kind))}] {name}")
+    if len(lines) == 1:  # header only — every row was nameless
+        return ""
+    lines.append(f"</{KNOWN_ENTITIES_CONTEXT_TAG}>")
+    return "\n".join(lines)
+
+
+def _score_gap_trim(
+    entries: List[Entry], *, min_k: int, max_k: int, gap: float,
+) -> List[Entry]:
+    """Trim entries at the first score gap exceeding *gap*.
+
+    Respects *min_k* floor and *max_k* ceiling. Returns the original list
+    unchanged when scores are unavailable or the list is too short.
+    """
+    if len(entries) <= min_k:
+        return entries
+    entries = entries[:max_k]
+    for i in range(min_k - 1, len(entries) - 1):
+        curr = entries[i].score
+        nxt = entries[i + 1].score
+        if curr is not None and nxt is not None and (curr - nxt) > gap:
+            return entries[: i + 1]
+    return entries
+
+
 # ── Hybrid stage 1 ──────────────────────────────────────────────────────────
 
 async def _hybrid_recall(
@@ -176,6 +314,7 @@ async def _hybrid_recall(
     facet_value: Optional[str],
     k: int,
     min_score: float,
+    current_frame: Optional[dict] = None,
 ) -> List[tuple]:
     """Run BM25 and dense recall in parallel, fuse with RRF.
 
@@ -185,7 +324,7 @@ async def _hybrid_recall(
     error handling simple.
     """
     overfetch = max(k * 3, k)
-    rows_bm25 = await _bm25_recall(store, query, kind, facet_value, overfetch)
+    rows_bm25 = await _bm25_recall(store, query, kind, facet_value, overfetch, current_frame)
 
     rows_dense: List[tuple] = []
     if embedder.available:
@@ -194,6 +333,7 @@ async def _hybrid_recall(
                 store, embedder, query,
                 kind=kind, facet_value=facet_value,
                 limit=overfetch, min_score=min_score,
+                current_frame=current_frame,
             )
         except Exception:
             _logger.exception("dense recall failed; using BM25 only")
@@ -221,12 +361,18 @@ async def _bm25_recall(
     kind: str,
     facet_value: Optional[str],
     limit: int,
+    current_frame: Optional[dict] = None,
 ) -> List[tuple]:
     """Stage 1a: keyword recall via FTS5 BM25.
 
     Falls back to empty list (rather than raise) when the FTS5 query
     parser chokes on the sanitized input — recall stays usable on dense
     branch alone.
+
+    fts_search_* returns 8-tuples: (entry_id, chunk_id, text, summary,
+    facet, created_at, rank, frame_os). We filter by current_frame here,
+    then drop frame_os to maintain the 7-tuple shape downstream code
+    expects.
     """
     if kind == EntryKind.MEMORY.value:
         from .models import MemoryDimension
@@ -238,6 +384,11 @@ async def _bm25_recall(
         rows = await store.fts_search_knowledge(query, category=facet, limit=limit)
     else:
         raise ValueError(f"unknown kind: {kind!r}")
+    # Filter by current_frame (frame_os is at index 7), then drop frame_os.
+    if current_frame:
+        rows = [r for r in rows if _frame_compatible(r[7] if len(r) > 7 else None, current_frame)]
+    # Strip frame_os back to 7-tuple to preserve downstream contracts.
+    rows = [r[:7] for r in rows]
     return _dedup_by_entry(rows)
 
 
@@ -250,6 +401,7 @@ async def _dense_recall(
     facet_value: Optional[str],
     limit: int,
     min_score: float,
+    current_frame: Optional[dict] = None,
 ) -> List[tuple]:
     """Stage 1b: dense recall via brute-force cosine over cached embeddings.
 
@@ -258,6 +410,9 @@ async def _dense_recall(
     skipped — the DreamWorker backfill loop ensures coverage over time.
 
     Output rows are 8-tuples with display_score = cosine in [0, 1].
+
+    list_embedded_chunks now returns 9-tuples (added frame_os at index 8).
+    We filter by current_frame, then build the 8-tuple downstream shape.
     """
     rows = await store.list_embedded_chunks(
         kind=kind,
@@ -272,8 +427,14 @@ async def _dense_recall(
         return []
 
     scored: List[tuple] = []
-    for entry_id, chunk_id, text, summary, facet, created_at, _hash, emb_bytes in rows:
+    for row in rows:
+        # 9-tuple: (entry_id, chunk_id, text, summary, facet, created_at, hash, embedding, frame_os)
+        entry_id, chunk_id, text, summary, facet, created_at = row[0], row[1], row[2], row[3], row[4], row[5]
+        emb_bytes = row[7]
+        entry_frame_os = row[8] if len(row) > 8 else None
         if facet_value and facet != facet_value:
+            continue
+        if not _frame_compatible(entry_frame_os, current_frame):
             continue
         emb = vec_from_bytes(emb_bytes)
         if not emb:
@@ -369,6 +530,27 @@ async def _ml_rerank(
     ]
     paired.sort(key=lambda r: r[6])
     return paired
+
+
+def _rerank_gate(rows: List[tuple]) -> List[tuple]:
+    """Drop rows the reranker scored below ``RECALL_RERANK_MIN_SCORE``.
+
+    Runs only after a successful ``_ml_rerank`` (display_score at index 7 is
+    then the LLM relevance score). Two rows are kept regardless of the floor:
+
+    - ``display_score is None`` — a BM25-only hit that never received a cosine
+      or rerank score. These are exact-keyword matches; dropping them on a
+      relevance-score floor they were never measured against would silently
+      lose precise term hits.
+
+    On rerank failure ``_ml_rerank`` returns the fused rows unchanged (score =
+    dense cosine), and applying the same floor there is a sane secondary
+    cull — cosine and rerank scores share the [0, 1] relevance scale.
+    """
+    return [
+        r for r in rows
+        if r[7] is None or r[7] >= C.RECALL_RERANK_MIN_SCORE
+    ]
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────

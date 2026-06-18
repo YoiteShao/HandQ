@@ -144,16 +144,68 @@ DREAM_STARTUP_DELAY_SECONDS: int = 30
 #     produce two independent entries; triage on day-2 doesn't see day-1
 #     unless BM25 happens to match.
 #
-# Two thresholds:
+# Two thresholds, three outcomes:
 #   - EXACT  (>= MERGE_EXACT_THRESHOLD)   : auto-merge, archive older
-#   - PROPOSE(>= MERGE_PROPOSE_THRESHOLD) : write to merge_proposals,
-#                                            surface to user for review
+#   - LLM    ([0.85, 0.90))               : helper-LLM arbiter decides
+#                                            merge vs keep-distinct; verdict
+#                                            persisted so the pair is never
+#                                            re-judged (status merged /
+#                                            kept_distinct). With no helper
+#                                            LLM, falls back to a pending
+#                                            review proposal (no signal lost).
+#   - KEEP   (< 0.85)                     : both entries kept, nothing written
+# A drop is also suppressed when the older (archived) entry was recalled
+# within CORRECTION_RECALL_PRIORITY_DAYS — an actively-used entry is
+# load-bearing, so keep both (the check re-runs each scan and expires
+# naturally with the recall window).
 MERGE_SCAN_EVERY_N_CYCLES: int = 15         # 15 × 60s = once per 15min
 LTM_CLEANUP_EVERY_N_CYCLES: int = 100      # ~100 × 60s min = once per ~1.7h
 LTM_CANDIDATE_RAWTEXT_TTL_DAYS: int = 90
 LTM_RECALL_LOG_TTL_DAYS: int = 90
+# Orphaned-proposal TTL. mem_correction_proposals rows left in status
+# 'pending' are never consumed — HandQ is conversation-as-interface and has
+# no review UI for correction/merge proposals (the only IPC surface lists
+# SKILL proposals, which live in mem_entries, not this table). A 'pending'
+# row therefore only accumulates. The cleanup pass DELETEs pending rows older
+# than this; terminal rows (merged / kept_distinct / applied / stale) are the
+# load-bearing decided-memo + audit trail and are never swept.
+LTM_CORRECTION_PROPOSAL_TTL_DAYS: int = 30
+LTM_OBS_SNAPSHOT_TTL_DAYS: int = 7       # raw frames; captured_at is unix MS
+LTM_OBS_EVENT_TTL_DAYS: int = 7          # state-change stream; occurred_at unix MS
+LTM_OBS_PIPELINE_RUN_TTL_DAYS: int = 30  # triage audit ledger; started_at seconds
+# Intermediate observation rows. obs_sessions + obs_semantic_events are the
+# scratch layer between raw snapshots and durable mem_entries: the aggregator
+# groups snapshots into a session, the extractor abstracts it into a semantic
+# event, triage distills the value into mem_entries. Once a session is fully
+# processed (semantic_status done/skipped) and its event triaged
+# (accepted_entries set), the intermediate rows are pure audit — the durable
+# distillation already lives in mem_entries and the snapshots they reference
+# are pruned at LTM_OBS_SNAPSHOT_TTL_DAYS. The cleanup pass sweeps ONLY
+# fully-processed rows, so a slow/stalled pipeline never loses unprocessed
+# work. obs_sessions.ended_at is unix MS; obs_semantic_events.extracted_at
+# is seconds.
+LTM_OBS_SESSION_TTL_DAYS: int = 30
+LTM_OBS_SEMANTIC_EVENT_TTL_DAYS: int = 30
+# Stale skill-proposal backstop. A worth_skill semantic event stages a
+# mem_entries(kind='skill_proposal', skill_status='proposed') row + a chat
+# hint, but activation is user-gated (move the staging file / approve). An
+# un-acted proposal lingers archived=0 forever and holds a slot in the
+# partial-UNIQUE dedup index (idx_mem_skill_dedup). The cleanup pass ARCHIVES
+# (does not delete) proposals older than this: it keeps the audit row, frees
+# the dedup slot so a later recurrence can re-propose, and drops the row from
+# the IPC list (which filters archived=0). created_at is seconds.
+LTM_SKILL_PROPOSAL_TTL_DAYS: int = 30
+# A completed-task skill is only proposed once its pattern RECURS this many
+# times. The triage skill pass (_apply_session_skill) runs the extractor on
+# every successful SESSION_COMPLETE, clusters by the LLM-normalized
+# skill_fingerprint, and bumps skill_recurrence; only when the count reaches
+# this threshold does it write the mem_entries(skill_proposal) row. One-off
+# tasks stay below it forever and never surface a skill — which is the whole
+# point: skills come from repeated, automatable workflows, not single runs.
+SKILL_RECURRENCE_THRESHOLD: int = 3
 MERGE_EXACT_THRESHOLD: float = 0.90          # auto-merge bar
-MERGE_PROPOSE_THRESHOLD: float = 0.78        # propose bar (< exact)
+MERGE_LLM_GATE_THRESHOLD: float = 0.85       # [0.85, 0.90) → helper-LLM arbiter
+MERGE_LLM_MAX_PAIRS_PER_SCAN: int = 5        # cap helper-LLM merge calls per full scan
 MERGE_MIN_PAIR_AGE_SECONDS: int = 300        # don't dedup same-batch entries
 
 
@@ -175,6 +227,41 @@ DREAM_L2_EVERY_N_CYCLES: int = 1440
 # Run L3 less often — it operates on L2 patterns, which themselves change
 # slowly. Once a week is plenty.
 DREAM_L3_EVERY_N_CYCLES: int = 1440 * 7
+
+# ── Idle-aware synthesis gating ──────────────────────────────────────────
+#
+# L2/L3 synthesis is CPU + LLM intensive (embedding comparisons + helper
+# LLM calls per cluster). Running it while the user is active competes
+# for both network bandwidth (LLM quota) and CPU (cosine pairwise). The
+# idle gate defers synthesis until the user steps away — the same approach
+# used for OCR drain (ACTIVITY_OCR_GATE_INPUT_IDLE_SEC).
+#
+# Three conditions must all be satisfied for synthesis to fire:
+#   1. Wall-clock cadence met (DREAM_L2_EVERY_N_CYCLES, existing)
+#   2. System input idle ≥ DREAM_SYNTHESIS_IDLE_SEC
+#   3. Material gate: ≥ DREAM_SYNTHESIS_MIN_NEW_ENTRIES new source entries
+#      since the last successful run
+#
+# Hard fallback: if the user NEVER goes idle long enough (power user who
+# works 12h then shuts down), force synthesis after DREAM_SYNTHESIS_FORCE_
+# AFTER_SEC regardless of idle state — otherwise L2/L3 never fire and
+# memory grows unbounded without compression.
+
+DREAM_SYNTHESIS_IDLE_SEC: float = 300.0
+# ^ 5 minutes of input idle. Matches the WARM→COLD tier transition —
+#   if the user is "cold" they won't notice background LLM work.
+
+DREAM_SYNTHESIS_FORCE_AFTER_SEC: int = 7 * 86400
+# ^ 7 days hard cap. If L2 hasn't run in a week (user never idles 5min
+#   or bridge keeps restarting), just run it on the next eligible cycle.
+
+DREAM_L2_MIN_NEW_ENTRIES: int = 5
+# ^ Don't bother clustering if < 5 new L1 entries accumulated. Avoids
+#   wasting an LLM call on too-small clusters that can't meet MIN_CLUSTER_SIZE.
+
+DREAM_L3_MIN_NEW_ENTRIES: int = 3
+# ^ L3 operates on L2 patterns which are already sparse. 3 new patterns
+#   is a reasonable threshold before attempting meta-synthesis.
 
 # Look-back window for "recent" entries fed into L2. We re-cluster the
 # whole window every run — old entries can join new clusters as the
@@ -211,8 +298,44 @@ DREAM_L3_MAX_CLUSTERS_PER_RUN: int = 10
 
 RECALL_MEMORY_K: int = 5
 RECALL_KNOWLEDGE_K: int = 5
-RECALL_MIN_SCORE: float = 0.0
+# Dense-branch cosine floor. A coarse pre-filter that drops the obviously
+# unrelated long tail of the brute-force cosine sweep before fusion. Kept
+# the cosine pre-filter floor. Qwen3-Embedding clusters unrelated text around
+# 0.2–0.35, and activity-snapshot noise lands in the 0.34–0.41 band, so 0.25
+# was too permissive: same-domain-but-irrelevant rows slipped through into
+# recall. 0.35 trims that noise band while the rerank gate below remains the
+# authoritative relevance cutoff. Was 0.0 → 0.25 → 0.35.
+RECALL_MIN_SCORE: float = 0.35
+# Stage-3 rerank gate. The LLM reranker scores 0.0–1.0 and its own system
+# prompt declares sub-0.3 candidates to be noise (reranker.py:_LLM_RERANK_SYSTEM);
+# this is the consumer that enforces that contract. Rows scoring below this
+# after rerank are dropped entirely (recall may legitimately return nothing).
+RECALL_RERANK_MIN_SCORE: float = 0.30
 RECALL_FTS_OVERFETCH: int = 3
+
+# Dynamic K: planner over-fetches then trims by score gap after rerank.
+# Receptionist keeps fixed k=5 (no rerank, latency-sensitive).
+RECALL_PLANNER_OVERFETCH_K: int = 15
+RECALL_PLANNER_MAX_K: int = 12
+RECALL_PLANNER_MIN_K: int = 3
+RECALL_SCORE_GAP_THRESHOLD: float = 0.15
+
+# ── Identity ───────────────────────────────────────────────────────────────
+IDENTITY_MAX_ENTRIES: int = 20
+IDENTITY_TRIAGE_EXISTING_LIMIT: int = 20
+
+# IDENTITY entries change only when the async dream worker accepts an
+# identity-tagged candidate (cadence floor = DREAM_INTERVAL_MIN_SEC = 60s).
+# Aligning this cache TTL to that cadence guarantees worst-case staleness of
+# exactly one dream tick — no need for a manual invalidation hook beyond the
+# explicit archive() path. Process-level cache on the LongTermMemory singleton.
+IDENTITY_CACHE_TTL_SEC: float = 60.0
+
+# ── Known entities (principal graph) ─────────────────────────────────────────
+# Cap for the <known-entities> block rendered into the context. list_principals
+# orders last_seen DESC, so this keeps the 20 most-recently-seen principals.
+# Reuses IDENTITY_CACHE_TTL_SEC for its render cache (both change slowly).
+KNOWN_ENTITIES_MAX: int = 20
 
 # Reciprocal-rank-fusion constant (Cormack et al. 2009). Lower = top ranks
 # dominate more. 60 is the literature default; values in [40, 80] all behave
@@ -229,12 +352,12 @@ RRF_K: int = 60
 PII_ENABLED: bool = True
 
 
-# ── 6. LLM tier for the DreamWorker ─────────────────────────────────────────
-
-TIER_RECEPTIONIST: str = "receptionist"
-TIER_FROM_DATA: str = "from_data"
-
-TRIAGE_LLM_TIER: str = TIER_RECEPTIONIST
+# ── 6. LLM pool ─────────────────────────────────────────────────────────────
+#
+# Resolved at runtime from ``llm.helper_models`` / ``llm.models`` in the user
+# config (see :mod:`infrastructure.role_resolver`). LTM has no separate tier
+# knob — both the dream-worker triage pool and the retriage pool are built
+# from those two YAML lists by their respective callers.
 
 
 # ── 7. QGenie endpoint ──────────────────────────────────────────────────────
@@ -375,8 +498,9 @@ VERBATIM_MIN_LIST_ITEMS: int = 3
 # ── 11. Activity Monitor (daily / desktop activity capture) ────────────────────
 #
 # These knobs drive ``src/infrastructure/activity_monitor`` — the per-monitor
-# adaptive screen-sampler that feeds ACTIVITY_OBSERVER candidates into the
-# LTM pipeline. They live here (not in a separate config or YAML) because:
+# adaptive screen-sampler that feeds observations into the LTM pipeline
+# (obs_snapshots + obs_ocr_frames). They live here (not in a separate
+# config or YAML) because:
 #
 #   * The cadence is tightly coupled to LTM behaviour — too aggressive and
 #     the dream worker drowns; too slow and we miss everything.
@@ -446,32 +570,18 @@ ACTIVITY_FRAME_HASH_DELTA_THRESHOLD: int = 12        # Hamming distance bar
 #   1. text length too short → likely UI chrome only, skip
 #   2. text identical (Jaccard) to last forwarded sample → skip (still
 #      same window/content)
-#   3. otherwise → buffer in memory; flush to LTM when buffer fills
-#      OR when the per-monitor flush deadline elapses
+#   3. otherwise → write to obs_snapshots + obs_ocr_frames
 ACTIVITY_OCR_MIN_CHARS: int = 40
 ACTIVITY_OCR_TEXT_JACCARD_BAR: float = 0.65  # >= bar means "same screen"
 ACTIVITY_OCR_EXCERPT_MAX_CHARS: int = 600    # how much OCR text we keep
-ACTIVITY_BUFFER_FLUSH_AFTER_N: int = 8
-ACTIVITY_BUFFER_FLUSH_AFTER_SEC: int = 600   # 10 min
 
 # Per-monitor history of accepted OCR texts. Used by the dedup gate so a
 # brief alt-tab to a different window doesn't make the original screen
 # look "novel" again on its next capture (which would re-forward an
-# already-known window into LTM as a fresh activity_observer candidate).
+# already-known window into LTM as a fresh observation).
 # Set to 8 so a typical Mon→Tue alt-tab pattern stays inside the ring;
 # bigger values suppress legitimate context shifts.
 ACTIVITY_TEXT_HISTORY_SIZE: int = 8
-
-# ── Daily-summary cadence ──────────────────────────────────────────────────
-#
-# Once per day we emit a single ACTIVITY_OBSERVER candidate that summarises
-# the whole day's accepted samples. The dream worker triages it like any
-# candidate — produces 0..N INSIGHT/knowledge entries with a wider lens.
-#
-# We use a wall-clock hour-of-day rather than "every 24h after process
-# start" so the rollover is predictable and survives restarts.
-ACTIVITY_DAILY_SUMMARY_HOUR_LOCAL: int = 22  # 10pm local time
-ACTIVITY_DAILY_SUMMARY_MAX_SAMPLES: int = 80  # cap prompt size
 
 # ── Disk hygiene ──────────────────────────────────────────────────────────
 #
@@ -523,6 +633,35 @@ ACTIVITY_RING_JPEG_QUALITY: int = 85
 # wakes every ACTIVITY_OCR_DRAIN_POLL_SEC to re-check; while open it pulls
 # entries as fast as OCR completes (Semaphore(1) caps at one OCR at a time).
 ACTIVITY_OCR_DRAIN_POLL_SEC: float = 1.0
+
+# ── §11.7.2 OCR drain thread budget ────────────────────────────────────────
+#
+# ONNX Runtime defaults its thread pool to physical-core count, which lets a
+# single RapidOCR call peg 7-8 cores for ~2.5s. That latency is fine for the
+# interactive desktop_tool path (one-shot, user is waiting on a click target),
+# but it's wrong for the OCR drain: when the IDLE gate opens, drain pulls
+# back-to-back frames from the ring and consumes the entire CPU for 5-10
+# minutes after the user steps away. Worse, any in-flight call cannot be
+# cancelled, so a user who returns mid-drain perceives a ~2.5s "stuck" tail
+# before the next gate re-check shuts things down.
+#
+# We give the drain its own LocalOCR instance with these thread caps. The
+# interactive path (desktop_tool) keeps using the full-fat singleton so
+# find_element latency is unaffected. Trade-off for the drain on a typical
+# 8-physical-core box: per-frame OCR goes from ~3.4s (default) to ~3.6s
+# (intra=4) — measured against a representative 1920x1080 text-dense frame.
+# The 4-thread cap leaves 4 physical cores free for the user; CNN ops
+# saturate hard past 4 threads, so dropping to 2 cost an extra ~1.3s/frame
+# for almost no UX gain (mouse/foreground stayed responsive either way).
+# Drain window stretches only marginally — daily generation (~400-800
+# novel frames after perceptual_hash dedup) clears in any 30-60 min idle
+# window.
+#
+# ``intra_op`` is op-level parallelism (the dominant CNN convs/matmuls).
+# ``inter_op`` is op-graph parallelism, less useful for these small graphs;
+# we keep it at 1 to avoid extra thread-pool overhead.
+OCR_DRAIN_INTRA_OP_NUM_THREADS: int = 4
+OCR_DRAIN_INTER_OP_NUM_THREADS: int = 1
 
 # ── §11.7.1 Spillover (ring-overflow + monitor-disconnect bounded fallback) ──
 #
@@ -664,8 +803,6 @@ CORRECTION_RETRIAGE_CHECKPOINT_EVERY: int = 20
 # the user actively decides. Default 30d covers a normal sprint cadence.
 CORRECTION_RECALL_PRIORITY_DAYS: int = 30
 
-# Which LLM tier the RetriageWorker uses for the LLM-based audit migration.
-# User asked for the strongest model regardless of cost — agent tier hits
-# the same pool the planner uses, which is the highest-quality tier
-# available to the bridge.
-CORRECTION_RETRIAGE_LLM_TIER: str = "agent"
+# Retriage worker pool is built from ``llm.models`` (the main pool) directly;
+# see ``LongTermMemory._build_llm_services_for_retriage``. LLM-based audit
+# migrations want the strongest reasoning available, not the helper pool.

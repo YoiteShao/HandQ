@@ -23,24 +23,19 @@ Pipeline per capture::
     3. Perceptual hash; if too close to previous → unlink and skip OCR.
     4. RapidOCR (shared :class:`LocalOCR` singleton from vision package).
     5. Unlink the PNG file (privacy + disk hygiene).
-    6. If the OCR text is too short / too similar to previous accepted
+    6. If the OCR text is too short / too similar to a recently accepted
        sample → drop.
-    7. Otherwise buffer the sample. When the buffer fills or the flush
-       deadline elapses, emit one ACTIVITY_OBSERVER candidate to LTM.
-
-Daily summary
--------------
-Once per local day (at ``ACTIVITY_DAILY_SUMMARY_HOUR_LOCAL`` o'clock,
-default 22:00) the monitor flushes a single rollup candidate covering
-every accepted sample of that day. The dream worker triages it through
-the normal pipeline; AGENTIC memory is hard-blocked for this source so
-ambient observation cannot impersonate user consent.
+    7. Otherwise write the observation to ``obs_snapshots`` +
+       ``obs_ocr_frames`` — the single sink for activity capture.
+       Downstream the SemanticExtractor abstracts these into
+       ``obs_semantic_events`` and the DreamWorker triages those into
+       ``mem_entries``.
 
 Shutdown
 --------
-``PersonalityMonitor.shutdown()`` cancels the background task. Buffered
-samples are flushed best-effort on the way out so a clean exit does
-not lose the day's tail.
+``PersonalityMonitor.shutdown()`` cancels the background task. Any
+unprocessed ring frames are spilled to disk best-effort so the next
+launch's OCR-drain worker can pick them up.
 """
 from __future__ import annotations
 

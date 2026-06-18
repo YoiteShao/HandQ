@@ -15,12 +15,10 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Optional
 
 from .logger import get_logger
-from .step_context_provider import StepContextProvider
+from ..controller_v2.context import ContextProvider, ItemContext, ProviderCache
 
 if TYPE_CHECKING:
-    from ..controller.interaction_manager import InteractionManager
-    from .memory import Memory
-    from ..models.plan import Step
+    from ..controller_v2.interaction_manager import InteractionManager
 
 
 def _build_full_hint() -> str:
@@ -130,7 +128,7 @@ def _build_brief_hint() -> str:
     )
 
 
-class DesktopContextProvider(StepContextProvider):
+class DesktopContextProvider(ContextProvider):
     """Inject the desktop usage hint when the Planner declares it.
 
     No keyword scanning — activation is purely declaration-driven. Required
@@ -164,17 +162,17 @@ class DesktopContextProvider(StepContextProvider):
             '`["desktop"]` for clicking on a web page — that\'s `["browser"]`',
         ]
 
-    async def prepare(
+    async def before_item(
         self,
-        step: "Step",
-        interaction_manager: "InteractionManager",
-        memory: "Memory",
+        ctx: ItemContext,
+        im: "InteractionManager",
+        cache: ProviderCache,
     ) -> Optional[str]:
         # Progressive disclosure: full guide on first activation in this task,
         # brief reminder thereafter.
-        cached = memory.get_desktop_context("default")
+        cached = cache.get("desktop")
         if cached and cached.get("prepared"):
             return _build_brief_hint()
 
-        memory.set_desktop_context("default", {"prepared": True})
+        cache.set("desktop", "default", {"prepared": True})
         return _build_full_hint()

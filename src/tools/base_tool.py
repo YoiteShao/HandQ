@@ -4,8 +4,11 @@ Base Tool - Abstract base class for all tools.
 import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 from datetime import datetime
+
+if TYPE_CHECKING:
+    from ..controller_v2.session_context import SessionContext
 
 
 @dataclass
@@ -21,6 +24,7 @@ class ToolResult:
     diff_output: Optional[str] = None      # unified diff string from edit/write operations
     lines_written: Optional[int] = None    # line count from write operations
     exit_code: Optional[int] = None        # exit code from bash operations
+    superseded_note: Optional[str] = None  # when set, output is elided in LLM context (a newer same-action snapshot supersedes this one)
 
     def __post_init__(self):
         if self.timestamp is None:
@@ -157,6 +161,9 @@ class ToolResult:
             "params": params,
             "ok": self.success,
         }
+        if self.superseded_note is not None:
+            d["out"] = self.superseded_note  # heavy output elided; tool/params kept for traceability
+            return d
         if self.success:
             d["out"] = self.output  # full output, no truncation
         else:
@@ -184,6 +191,9 @@ class ToolResult:
         where the ``params`` echo can be very large.
         """
         d: dict = {"ok": self.success}
+        if self.superseded_note is not None:
+            d["out"] = self.superseded_note  # heavy output elided to save context
+            return d
         if self.success:
             d["out"] = self.output
         else:
@@ -237,12 +247,20 @@ class BaseTool(ABC):
     # mirrors it into a thread-safe token.
     interrupt_event = None
 
-    def __init__(self, name: str):
+    def __init__(self, name: str, ctx: Optional["SessionContext"] = None):
         """
         Args:
             name: Tool name (used as identifier).
+            ctx: Optional :class:`SessionContext` carrying per-session
+                resources (IM, file_state, ssh_pool, browser_session,
+                session_registry, desktop_state, interrupt_event). Tools
+                that don't need it can ignore the parameter; tools that
+                do read from it via ``self.ctx``. ``None`` is allowed for
+                test fixtures and for tools constructed before a session
+                has started.
         """
         self.name = name
+        self.ctx: Optional["SessionContext"] = ctx
     
     @abstractmethod
     async def execute(self, **kwargs) -> ToolResult:

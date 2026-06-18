@@ -18,8 +18,11 @@ sessions) but address different surfaces:
 
   3. **TeamsChatClient** — wrapper over Teams' internal API for the
      scopes Microsoft does not grant via Graph (Chat.Read*,
-     ChannelMessage.Read.All). Uses the chatsvcagg.teams.microsoft.com
-     audience token (and falls back to chatsvcagg for presence too).
+     ChannelMessage.Read.All). The chat roster + presence use the
+     chatsvcagg.teams.microsoft.com audience token; per-conversation
+     message history uses the ic3.teams.office.com token against the
+     region-scoped /api/chatsvc/{region}/v1 endpoint (the chatsvcagg
+     aggregator does not serve message bodies).
 
 Why one file?
 -------------
@@ -53,6 +56,7 @@ Cache file shape (``%USERPROFILE%/HandQ/teams_cache/tokens.json``)::
       "tenant_id":   "<GUID>",
       "account":     "<oid>.<tid>",
       "username":    "alice@example.com",
+      "region":      "amer",
       "tokens": {
         "https://graph.microsoft.com": {
             "access_token": "eyJ...",
@@ -73,6 +77,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote
+
+import httpx  # type: ignore[import-not-found]
 
 from .config_manager import ConfigManager
 from .logger import get_logger
@@ -174,6 +180,15 @@ class TeamsAuth:
     def signed_in_account(self) -> Optional[str]:
         return self._cache.get("username") or self._cache.get("account")
 
+    def get_region(self) -> str:
+        """Teams messaging region (e.g. ``amer``) harvested at bootstrap.
+
+        Used to build the region-scoped chatsvc message-read URL. Empty
+        string when unknown — callers should treat that as "needs
+        re-bootstrap" rather than guessing a region.
+        """
+        return self._cache.get("region") or ""
+
     def install_bootstrap(self, creds: Dict[str, Any]) -> None:
         """Persist identity + access tokens extracted by teams_web_bridge.
 
@@ -184,6 +199,7 @@ class TeamsAuth:
               "tenant_id":  str,
               "account":    str,           # homeAccountId
               "username":   str,           # may be ""
+              "region":     str,           # messaging region, e.g. "amer"
               "tokens":     {
                   "https://graph.microsoft.com": {
                       "access_token": str,
@@ -201,6 +217,7 @@ class TeamsAuth:
             "tenant_id":     creds.get("tenant_id") or "",
             "account":       creds.get("account") or "",
             "username":      creds.get("username") or "",
+            "region":        creds.get("region") or "",
             "tokens":        dict(creds.get("tokens") or {}),
         }
         self._save_cache()
@@ -304,12 +321,6 @@ class TeamsClient:
     async def _ensure_http(self):
         if self._http is not None:
             return self._http
-        try:
-            import httpx  # type: ignore[import-not-found]
-        except ImportError as exc:
-            raise TeamsClientError(
-                "httpx is not installed. Run: pip install httpx"
-            ) from exc
         # 30s default — Graph endpoints respond in < 2s normally; the
         # generous timeout absorbs the occasional cold-cache lookup.
         # verify=False mirrors the corporate-proxy fix for SSL inspection.
@@ -955,6 +966,12 @@ class TeamsClient:
 # only requires updating these and re-running the bootstrap.
 _CHATSVC_BASE = "https://teams.microsoft.com/api/csa/api/v1"
 _CHATSVC_RESOURCE = "https://chatsvcagg.teams.microsoft.com"
+# Per-conversation message reads go through Teams' message service
+# (ic3 audience), region-scoped: /api/chatsvc/{region}/v1/... . The
+# chatsvcagg aggregator above serves the chat *roster* but 404s on
+# every per-conversation message path.
+_IC3_MSG_BASE = "https://teams.microsoft.com/api/chatsvc"  # + /{region}/v1
+_IC3_RESOURCE = "https://ic3.teams.office.com"
 _PRESENCE_BASE = "https://presence.teams.microsoft.com/v1"
 _PRESENCE_RESOURCE = "https://presence.teams.microsoft.com"
 
@@ -1005,12 +1022,6 @@ class TeamsChatClient:
     async def _ensure_http(self):
         if self._http is not None:
             return self._http
-        try:
-            import httpx  # type: ignore[import-not-found]
-        except ImportError as exc:
-            raise TeamsChatClientError(
-                "httpx is not installed. Run: pip install httpx"
-            ) from exc
         # verify=False mirrors the corporate-proxy fix already applied
         # to the rest of teams_*; SSL inspection on Qualcomm's network.
         self._http = httpx.AsyncClient(timeout=30.0, verify=False)
@@ -1176,20 +1187,39 @@ class TeamsChatClient:
     async def list_chat_messages(
         self, chat_id: str, top: int = 50,
     ) -> List[Dict[str, Any]]:
-        """Read recent messages from a chat via chatsvcagg.
+        """Read recent messages from a chat.
 
-        ``chat_id`` is the Graph-style id (``19:abc...@thread.v2`` or
-        ``19:abc...@unq.gbl.spaces``) — internal API accepts it.
+        Hits Teams' message service (ic3 audience) at
+        ``/api/chatsvc/{region}/v1/users/ME/conversations/{id}/messages``
+        — the same call Teams Web makes. The chatsvcagg aggregator that
+        serves ``list_chats`` does NOT serve per-conversation message
+        bodies (every path shape 404s), so this path is region-scoped
+        and authed with the ic3.teams.office.com token; both the region
+        and the token are harvested at bootstrap.
+
+        ``chat_id`` is the Graph-style id (``19:...@thread.v2`` or
+        ``19:...@unq.gbl.spaces``).
         """
         if not chat_id:
             raise TeamsChatClientError("list_chat_messages: chat_id required")
+        region = self._auth.get_region()
+        if not region:
+            raise TeamsChatClientError(
+                "no Teams messaging region cached — re-bootstrap via "
+                "teams.microsoft.com so the region is harvested.",
+                status=401,
+            )
         top = max(1, min(int(top), 50))
         encoded = quote(chat_id, safe="")
         data = await self._request(
             "GET",
-            f"{_CHATSVC_BASE}/users/ME/conversations/{encoded}/messages",
-            resource=_CHATSVC_RESOURCE,
-            params={"pageSize": top},
+            f"{_IC3_MSG_BASE}/{region}/v1/users/ME/conversations/{encoded}/messages",
+            resource=_IC3_RESOURCE,
+            params={
+                "view": "msnp24Equivalent|supportsMessageProperties",
+                "pageSize": top,
+                "startTime": 1,
+            },
         )
         msgs = self._coerce_list(data, "messages", "value")
         return [self._shape_message(m) for m in msgs][:top]

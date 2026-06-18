@@ -301,8 +301,8 @@ class GrepTool(BaseTool):
     is_read_only = True
     is_concurrency_safe = True
 
-    def __init__(self):
-        super().__init__("grep")
+    def __init__(self, ctx=None):
+        super().__init__("grep", ctx=ctx)
 
     async def execute(
         self,

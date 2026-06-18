@@ -29,6 +29,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, List, Optional, Tuple, Union
 
+from rapidocr_onnxruntime import RapidOCR  # type: ignore[import-not-found]
+
 from ..logger import get_logger
 
 
@@ -75,27 +77,42 @@ class LocalOCR:
     not add an explicit lock here.
     """
 
-    def __init__(self, *, lang: str = "ch") -> None:
+    def __init__(
+        self,
+        *,
+        lang: str = "ch",
+        intra_op_num_threads: Optional[int] = None,
+        inter_op_num_threads: Optional[int] = None,
+    ) -> None:
         # 'ch' covers both Chinese and English; 'en' is English-only and
         # marginally faster but loses our bilingual coverage.
         self._lang = lang
+        # ONNX Runtime thread caps. ``None`` means "use ORT defaults"
+        # (one thread per physical core) — the right answer for the
+        # interactive desktop_tool singleton where each call is one-shot
+        # and the user is waiting. The activity_monitor drain instance
+        # passes explicit values from _constants.OCR_DRAIN_*_NUM_THREADS
+        # so back-to-back drain doesn't saturate the box.
+        self._intra_op_num_threads = intra_op_num_threads
+        self._inter_op_num_threads = inter_op_num_threads
         self._engine: Any = None
         self._logger = get_logger()
 
     def _ensure_engine(self) -> Optional[str]:
-        """Load the RapidOCR engine on first use. Returns an error string
-        when the dependency is missing, None on success."""
+        """Load the RapidOCR engine on first use. Returns None on success."""
         if self._engine is not None:
             return None
-        try:
-            from rapidocr_onnxruntime import RapidOCR
-        except ImportError as exc:
-            return (
-                "rapidocr_onnxruntime is not installed. Run:\n"
-                "  pip install rapidocr-onnxruntime\n"
-                f"Underlying: {exc}"
-            )
-        self._engine = RapidOCR()
+        rapid_kwargs: dict = {}
+        if self._intra_op_num_threads is not None:
+            rapid_kwargs["intra_op_num_threads"] = self._intra_op_num_threads
+        if self._inter_op_num_threads is not None:
+            rapid_kwargs["inter_op_num_threads"] = self._inter_op_num_threads
+        # RapidOCR's UpdateParameters reads only the bare (no-prefix)
+        # thread kwargs and copies Global → Det/Cls/Rec via
+        # update_global_to_module. Per-stage ``det_intra_op_num_threads``
+        # would be silently overwritten by that copy, so we pass the
+        # bare names.
+        self._engine = RapidOCR(**rapid_kwargs)
         return None
 
     def recognize(self, image: Union[str, bytes, Any]) -> OCRResult:
@@ -160,6 +177,7 @@ class LocalOCR:
 # ── Process-wide singleton ───────────────────────────────────────────────────
 
 _local_ocr: Optional[LocalOCR] = None
+_local_ocr_background: Optional[LocalOCR] = None
 
 
 def get_local_ocr(config_manager: Any = None) -> LocalOCR:
@@ -168,6 +186,12 @@ def get_local_ocr(config_manager: Any = None) -> LocalOCR:
     Builds it on first call from the optional ``vision.ocr:`` subsection of
     ``handq_config.yaml``.  Defaults are sensible (lang='ch') so most
     deployments need no config block at all.
+
+    This singleton uses ONNX Runtime's default thread pool (one thread per
+    physical core) — appropriate for interactive callers like desktop_tool
+    where the user is waiting on a single find_element result. The
+    activity_monitor's OCR drain should NOT use this singleton; see
+    :func:`get_local_ocr_background` for the thread-capped variant.
     """
     global _local_ocr
     if _local_ocr is not None:
@@ -184,15 +208,50 @@ def get_local_ocr(config_manager: Any = None) -> LocalOCR:
     return _local_ocr
 
 
+def get_local_ocr_background(config_manager: Any = None) -> LocalOCR:
+    """Return the process-wide background :class:`LocalOCR` singleton.
+
+    Distinct from :func:`get_local_ocr` so the activity_monitor's OCR drain
+    can run with capped ONNX thread pools without slowing down the
+    interactive desktop_tool path. Thread budget comes from
+    ``long_term_memory._constants.OCR_DRAIN_*_NUM_THREADS`` (default 2 / 1).
+
+    Cold-start cost is paid once at first use (~600 ms); RAM overhead vs
+    the interactive singleton is small (the RapidOCR model bundle is
+    ~10 MB; each instance allocates its own ONNX sessions).
+    """
+    global _local_ocr_background
+    if _local_ocr_background is not None:
+        return _local_ocr_background
+    from ..long_term_memory import _constants as C
+    lang = "ch"
+    if config_manager is not None:
+        try:
+            vision_section = config_manager.get_section("vision") or {}
+            section = vision_section.get("ocr") or {}
+            lang = str(section.get("lang", "ch")).strip() or "ch"
+        except Exception:
+            pass
+    _local_ocr_background = LocalOCR(
+        lang=lang,
+        intra_op_num_threads=C.OCR_DRAIN_INTRA_OP_NUM_THREADS,
+        inter_op_num_threads=C.OCR_DRAIN_INTER_OP_NUM_THREADS,
+    )
+    return _local_ocr_background
+
+
 def flush_local_ocr() -> int:
-    """Drop the singleton (if any). Returns 1 on close, 0 otherwise."""
-    global _local_ocr
-    inst = _local_ocr
-    _local_ocr = None
-    if inst is None:
-        return 0
-    try:
-        inst.close()
-    except Exception:
-        pass
-    return 1
+    """Drop both singletons (if any). Returns the count of instances closed."""
+    global _local_ocr, _local_ocr_background
+    closed = 0
+    for attr in ("_local_ocr", "_local_ocr_background"):
+        inst = globals()[attr]
+        globals()[attr] = None
+        if inst is None:
+            continue
+        try:
+            inst.close()
+            closed += 1
+        except Exception:
+            pass
+    return closed

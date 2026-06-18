@@ -54,42 +54,39 @@ import re
 import sys
 import time
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from .base_tool import BaseTool, ToolResult
 from ..infrastructure.logger import get_logger
 
+if TYPE_CHECKING:
+    from ..controller_v2.interaction_manager import InteractionManager
 
-# ── Optional Windows / input deps ────────────────────────────────────────────
-# All imports are guarded — missing libs surface as actionable errors at
-# action-call time, not at module import.
 
-try:
-    import mss  # type: ignore[import-not-found]
-    _MSS_AVAILABLE = True
-except ImportError:
-    mss = None  # type: ignore[assignment]
-    _MSS_AVAILABLE = False
+# ── Hard Windows / input deps ────────────────────────────────────────────────
+# Imported eagerly — desktop_tool is registered Windows-only and these libs
+# must be present at module load. Any missing dep fails the whole launch.
 
-try:
-    import pyautogui  # type: ignore[import-not-found]
-    pyautogui.FAILSAFE = True       # corner-of-screen panic abort
-    pyautogui.PAUSE = 0.05          # global throttle so OS UI keeps up
-    _PYAUTOGUI_AVAILABLE = True
-except ImportError:
-    pyautogui = None                # type: ignore[assignment]
-    _PYAUTOGUI_AVAILABLE = False
+import mss  # type: ignore[import-not-found]
+import pyautogui  # type: ignore[import-not-found]
+pyautogui.FAILSAFE = True       # corner-of-screen panic abort
+pyautogui.PAUSE = 0.05          # global throttle so OS UI keeps up
 
-try:
-    import win32gui                 # type: ignore[import-not-found]
-    import win32process             # type: ignore[import-not-found]
-    import win32con                 # type: ignore[import-not-found]
-    _WIN32_AVAILABLE = True
-except ImportError:
-    win32gui = None                 # type: ignore[assignment]
-    win32process = None             # type: ignore[assignment]
-    win32con = None                 # type: ignore[assignment]
-    _WIN32_AVAILABLE = False
+import win32gui                 # type: ignore[import-not-found]
+import win32process             # type: ignore[import-not-found]
+import win32con                 # type: ignore[import-not-found]
+from PIL import Image           # type: ignore[import-not-found]
+import pywinauto                # type: ignore[import-not-found]
+from pywinauto import Desktop   # type: ignore[import-not-found]
+from rapidfuzz import fuzz      # type: ignore[import-not-found]
+import psutil                   # type: ignore[import-not-found]
+
+# Availability flags retained as ``True`` so legacy ``if not _X_AVAILABLE``
+# guards downstream remain syntactically valid; the eager imports above
+# guarantee the deps are actually present.
+_MSS_AVAILABLE = True
+_PYAUTOGUI_AVAILABLE = True
+_WIN32_AVAILABLE = True
 
 
 # ── DPI awareness one-shot ───────────────────────────────────────────────────
@@ -292,6 +289,18 @@ _task_approved: bool = False
 # stronger than their earlier YAML choice "always allow".
 _task_user_rescinded: bool = False
 
+# Module-level InteractionManager handle for the takeover state-change
+# helpers. Cleared on ``new_session`` / shutdown so a stale ref can't
+# outlive its flow.
+_im_ref: Optional["InteractionManager"] = None
+
+
+def set_interaction_manager(im: Optional["InteractionManager"]) -> None:
+    """Wire (or clear with ``None``) the IM that the takeover helpers
+    forward events through. Called by the bridge per session lifecycle."""
+    global _im_ref
+    _im_ref = im
+
 
 def _start_takeover(reason: str = "input_action") -> None:
     """Mark the desktop as 'agent-driven' and emit the start event.
@@ -301,12 +310,8 @@ def _start_takeover(reason: str = "input_action") -> None:
     if _takeover_active:
         return
     _takeover_active = True
-    try:
-        from ..controller.interaction_manager import InteractionManager
-        InteractionManager.get_instance().notify_desktop_takeover_started(reason)
-    except Exception:
-        # Best-effort — InteractionManager may be missing in test contexts.
-        pass
+    if _im_ref is not None:
+        _im_ref.notify_desktop_takeover_started(reason)
 
 
 def _end_takeover(reason: str = "task_ended") -> None:
@@ -315,11 +320,8 @@ def _end_takeover(reason: str = "task_ended") -> None:
     if not _takeover_active:
         return
     _takeover_active = False
-    try:
-        from ..controller.interaction_manager import InteractionManager
-        InteractionManager.get_instance().notify_desktop_takeover_ended(reason)
-    except Exception:
-        pass
+    if _im_ref is not None:
+        _im_ref.notify_desktop_takeover_ended(reason)
 
 
 def mark_task_approved() -> None:
@@ -407,6 +409,198 @@ def reset_takeover_state() -> None:
     _snapshot_cache.clear()
 
 
+# ── Per-session desktop state class (used by SessionContext) ─────────────────
+#
+# Wraps the takeover state machine + IM ref + per-session snapshot cache + the
+# (lazy) ScreenshotStore handle into a per-instance object. ``SessionContext``
+# constructs one per session; ``ctx.close()`` calls :meth:`close` via
+# ``asyncio.to_thread`` (the close path touches the screenshot store on disk
+# but is sync).
+#
+# Process-level state that intentionally STAYS module-level:
+#   * ``_DPI_INITIALISED`` — Windows DPI awareness is per-process by OS API
+#     contract; setting it twice is harmless but flipping it per-session is
+#     meaningless.
+#   * ``_desktop_lock`` — mouse / keyboard exclusivity is per-display, hence
+#     per-process. Two sessions in the same process must never drive input
+#     concurrently regardless of who 'owns' the takeover.
+#
+# The module-level ``_takeover_active`` / ``_task_approved`` /
+# ``_task_user_rescinded`` / ``_im_ref`` / ``set_interaction_manager`` /
+# ``_start_takeover`` / ``_end_takeover`` / ``mark_task_approved`` /
+# ``is_task_approved`` / ``revoke_takeover`` / ``was_user_rescinded`` /
+# ``reset_takeover_state`` and the corresponding ``_snapshot_cache`` /
+# ``_desktop_store_instance`` / ``_ocr_prewarm_started`` globals stay
+# alongside this class for callers still routing through the module path.
+
+
+class DesktopState:
+    """Per-session desktop control state.
+
+    Owns:
+
+    * **Takeover state machine** — three bool flags + IM forwarder for the
+      ``notify_desktop_takeover_started/ended`` events the Electron overlay
+      listens on.
+    * **Snapshot cache** — ``hwnd → cached snapshot output`` so the agent's
+      common pattern (snapshot → click → snapshot) skips a UIA tree walk.
+    * **OCR prewarm guard** — one-shot flag for the background warm-up.
+    * **ScreenshotStore handle** — lazy because ConfigManager isn't ready at
+      module load time.
+
+    Construct with ``DesktopState(im=ctx.interaction_manager)`` so the
+    forwarders fire on the current session's UI delegate. ``close()`` is sync
+    and must run in a worker thread (``asyncio.to_thread``) because it touches
+    the screenshot store's disk-side sweep.
+    """
+
+    def __init__(
+        self,
+        im: Optional["InteractionManager"] = None,
+    ) -> None:
+        self._im: Optional["InteractionManager"] = im
+        # takeover state
+        self.takeover_active: bool = False
+        self.task_approved: bool = False
+        self.task_user_rescinded: bool = False
+        # snapshot cache (hwnd → entry)
+        self.snapshot_cache: Dict[int, Dict[str, Any]] = {}
+        # OCR prewarm one-shot
+        self.ocr_prewarm_started: bool = False
+        # lazy ScreenshotStore (constructed on first get_store)
+        self._store: Optional[Any] = None
+
+    # ── IM wiring ────────────────────────────────────────────────────────
+
+    def set_interaction_manager(self, im: Optional["InteractionManager"]) -> None:
+        self._im = im
+
+    @property
+    def interaction_manager(self) -> Optional["InteractionManager"]:
+        return self._im
+
+    # ── Takeover state machine ───────────────────────────────────────────
+
+    def start_takeover(self, reason: str = "input_action") -> None:
+        if self.takeover_active:
+            return
+        self.takeover_active = True
+        if self._im is not None:
+            self._im.notify_desktop_takeover_started(reason)
+
+    def end_takeover(self, reason: str = "task_ended") -> None:
+        if not self.takeover_active:
+            return
+        self.takeover_active = False
+        if self._im is not None:
+            self._im.notify_desktop_takeover_ended(reason)
+
+    def mark_task_approved(self) -> None:
+        self.task_approved = True
+        self.start_takeover("approved")
+
+    def is_task_approved(self) -> bool:
+        return self.task_approved
+
+    def revoke_takeover(self) -> bool:
+        if not self.task_approved and not self.takeover_active:
+            return False
+        self.task_approved = False
+        self.task_user_rescinded = True
+        self.end_takeover("user_revoked")
+        return True
+
+    def was_user_rescinded(self) -> bool:
+        return self.task_user_rescinded
+
+    def reset_takeover_state(self) -> None:
+        if self.takeover_active:
+            self.end_takeover("task_ended")
+        self.task_approved = False
+        self.task_user_rescinded = False
+        self.snapshot_cache.clear()
+
+    # ── ScreenshotStore (lazy) ───────────────────────────────────────────
+
+    def get_store(self):
+        """Return the (lazily-built) ScreenshotStore for desktop captures."""
+        if self._store is None:
+            from ..infrastructure.config_manager import ConfigManager
+            from ..infrastructure.vision import ScreenshotStore
+            try:
+                cfg = ConfigManager().get_section("screenshots") or {}
+            except Exception:
+                cfg = {}
+            self._store = ScreenshotStore(
+                root=os.path.join(
+                    os.environ.get("USERPROFILE") or os.path.expanduser("~"),
+                    "HandQ", "desktop_screenshots",
+                ),
+                config_section=cfg,
+            )
+        return self._store
+
+    # ── Lifecycle ────────────────────────────────────────────────────────
+
+    def close(self) -> None:
+        """End any active takeover, sweep the screenshot store, drop the
+        snapshot cache. Sync — runs in a thread under ``asyncio.to_thread``
+        because the store sweep touches disk.
+        """
+        try:
+            self.reset_takeover_state()
+        except Exception:
+            pass
+        if self._store is not None:
+            try:
+                self._store.session_close_sweep()
+            except Exception:
+                pass
+
+    # ── Snapshot cache invalidation (was a module-level helper) ──────────
+
+    def invalidate_on_state_change(self, state_after: Dict[str, Any]) -> None:
+        """Drop the snapshot cache when an input action moved the UI.
+
+        Whole-cache nuke is fine — there is at most 1-2 entries (one per
+        foreground hwnd the agent has snapshotted this task). Rebuilding
+        is the same cost as the first call.
+        """
+        if not self.snapshot_cache:
+            return
+        if (
+            state_after.get("foreground_changed")
+            or state_after.get("title_changed")
+            or state_after.get("new_windows")
+        ):
+            self.snapshot_cache.clear()
+
+    # ── OCR prewarm one-shot (was a module-level helper) ─────────────────
+
+    def prewarm_ocr_if_needed(self) -> None:
+        """Kick off a background task that loads the RapidOCR engine.
+
+        Safe no-op when no event loop is running yet (e.g. import-time use
+        in tests). Errors are swallowed — find_element surfaces its own
+        clear message if OCR is genuinely unavailable. One-shot per-state
+        instance: subsequent calls within the same session are no-ops.
+        """
+        if self.ocr_prewarm_started:
+            return
+        self.ocr_prewarm_started = True
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        def _load() -> None:
+            try:
+                from ..infrastructure.vision import get_local_ocr
+                get_local_ocr()._ensure_engine()
+            except Exception:
+                pass
+        loop.run_in_executor(None, _load)
+
+
 # ── Per-action tunables ──────────────────────────────────────────────────────
 
 _DEFAULT_MOUSE_DURATION = 0.0      # 0 = teleport; non-zero = animated drag
@@ -455,11 +649,10 @@ def _foreground_window_info() -> Dict[str, Any]:
 
 
 def _process_name_for_pid(pid: int) -> str:
-    """Best-effort — psutil is optional. Returns '' when unreachable."""
+    """Best-effort — returns '' if the PID is gone or not enumerable."""
     if not pid:
         return ""
     try:
-        import psutil  # type: ignore[import-not-found]
         return psutil.Process(pid).name() or ""
     except Exception:
         return ""
@@ -762,14 +955,6 @@ def _screenshot_hwnd_via_print_window(
         if scanlines == 0:
             raise RuntimeError(f"GetDIBits returned 0 for hwnd {hwnd}")
 
-        try:
-            from PIL import Image
-        except ImportError as exc:
-            raise RuntimeError(
-                "Pillow is required for desktop screenshot encoding. "
-                f"Run: pip install pillow ({exc})"
-            )
-
         # BGRA bytes → RGB image; ignore alpha (mstsc / most win32 windows
         # return alpha=0 which would look fully transparent if preserved).
         img = Image.frombytes("RGB", (width, height), bytes(buf), "raw", "BGRX")
@@ -898,13 +1083,6 @@ def _screenshot_region(out_path: str, region: str = "foreground",
         # mss returns a `ScreenShot` object; convert to PNG via PIL so we
         # share the encoder with the rest of the pipeline (vision_client
         # already requires Pillow).
-        try:
-            from PIL import Image
-        except ImportError as exc:
-            raise RuntimeError(
-                "Pillow is required for desktop screenshot encoding. "
-                f"Run: pip install pillow ({exc})"
-            )
         img = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
         img.save(out_path, "PNG", optimize=True)
     try:
@@ -974,10 +1152,6 @@ def _uia_enumerate(hwnd: int) -> List[Dict[str, Any]]:
     caller treats empty list as "fall back to screenshot+OCR".
     """
     if not hwnd:
-        return []
-    try:
-        import pywinauto  # type: ignore[import-not-found]
-    except ImportError:
         return []
     try:
         app = pywinauto.Application(backend="uia").connect(handle=hwnd, timeout=2)
@@ -1114,10 +1288,6 @@ def _uia_invoke_at_point(x: int, y: int) -> Optional[str]:
     to know the control type in advance.
     """
     try:
-        from pywinauto import Desktop  # type: ignore[import-not-found]
-    except ImportError:
-        return "pywinauto not installed"
-    try:
         elem = Desktop(backend="uia").from_point(x, y)
     except Exception as exc:
         return f"UIA from_point: {exc}"
@@ -1145,10 +1315,6 @@ def _uia_set_focused_value(text: str) -> Optional[str]:
     pyautogui.typewrite (which appends). Callers surface this distinction
     via the 'input_source' key in ToolResult.output.
     """
-    try:
-        from pywinauto import Desktop  # type: ignore[import-not-found]
-    except ImportError:
-        return "pywinauto not installed"
     try:
         elem = Desktop(backend="uia").get_focus()
         if elem is None:
@@ -1385,8 +1551,17 @@ class DesktopTool(BaseTool):
         "additionalProperties": False,
     }
 
-    def __init__(self) -> None:
-        super().__init__("desktop")
+    def __init__(self, ctx=None) -> None:
+        super().__init__("desktop", ctx=ctx)
+        # Per-session desktop state — takeover machine + IM + snapshot cache +
+        # OCR prewarm guard + lazy ScreenshotStore. When ctx is supplied the
+        # state lives on the SessionContext (dies with the session); when
+        # ctx is None (test fixture) we instantiate a default. ``self.state``
+        # backs every internal access — module-level helpers are only exposed
+        # for outside callers reaching the takeover state machine directly.
+        self.state: DesktopState = (
+            ctx.desktop_state if ctx is not None else DesktopState()
+        )
         self.logger = get_logger()
 
     # ── Main entry point ──────────────────────────────────────────────────────
@@ -1405,8 +1580,8 @@ class DesktopTool(BaseTool):
         # Hide the ~600ms RapidOCR cold-start: first execute() call kicks
         # off a background load. By the time the agent gets around to
         # find_element (typically after a screenshot or list_windows),
-        # the engine is warm. One-shot — see _prewarm_local_ocr_async.
-        _prewarm_local_ocr_async()
+        # the engine is warm. One-shot — see DesktopState.prewarm_ocr_if_needed.
+        self.state.prewarm_ocr_if_needed()
 
         if not action:
             return self._error(params, start, "desktop tool requires 'action'.")
@@ -1498,7 +1673,7 @@ class DesktopTool(BaseTool):
                     "sure you need it.",
                 )
 
-        store = _desktop_store()
+        store = self.state.get_store()
         if path_arg and os.path.isabs(path_arg):
             out_path = path_arg
             wrote_to_store = False
@@ -1650,7 +1825,7 @@ class DesktopTool(BaseTool):
         current_state = _capture_state_before()
         current_sig = _snapshot_sig(current_state)
         now = time.time()
-        cached = _snapshot_cache.get(hwnd)
+        cached = self.state.snapshot_cache.get(hwnd)
         if (
             cached is not None
             and cached.get("sig") == current_sig
@@ -1671,7 +1846,7 @@ class DesktopTool(BaseTool):
         # only fires when the cache went stale without an input action,
         # e.g. user moved the mouse manually.)
         if cached is not None and cached.get("sig") != current_sig:
-            _snapshot_cache.pop(hwnd, None)
+            self.state.snapshot_cache.pop(hwnd, None)
 
         loop = asyncio.get_event_loop()
         # 1. Try UIA tree.
@@ -1691,7 +1866,7 @@ class DesktopTool(BaseTool):
 
         # 2. Fallback — screenshot + OCR. Only when UIA found nothing.
         if not elements:
-            store = _desktop_store()
+            store = self.state.get_store()
             ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
             screenshot_path = os.path.join(
                 store.subdir("ephemeral"), f"snap-{ts}.png"
@@ -1766,7 +1941,7 @@ class DesktopTool(BaseTool):
         # Populate cache. Store a copy of `out` BEFORE the per-call
         # "cached"/"cache_age_ms" markers are added so future hits can
         # inject those markers freshly without compounding.
-        _snapshot_cache[hwnd] = {
+        self.state.snapshot_cache[hwnd] = {
             "output": dict(out),
             "sig":    current_sig,
             "ts":     time.time(),
@@ -1830,7 +2005,7 @@ class DesktopTool(BaseTool):
         }
 
         if capture_after:
-            store = _desktop_store()
+            store = self.state.get_store()
             ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
             shot_path = os.path.join(store.subdir("ephemeral"), f"hover-{ts}.png")
             # Fullscreen capture so a tooltip that overflows the foreground
@@ -1915,7 +2090,7 @@ class DesktopTool(BaseTool):
             )
 
         # 1) Capture to ephemeral.
-        store = _desktop_store()
+        store = self.state.get_store()
         ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
         out_path = os.path.join(store.subdir("ephemeral"), f"find-{ts}.png")
         try:
@@ -1992,16 +2167,6 @@ class DesktopTool(BaseTool):
     ) -> Optional[Tuple[int, int, float, str]]:
         """Run local OCR + rapidfuzz match. Returns (cx, cy, confidence,
         matched_text) on hit, None on miss."""
-        try:
-            from rapidfuzz import fuzz
-        except ImportError:
-            self.logger.warning(
-                "rapidfuzz not installed; falling back to substring match. "
-                "Install with: pip install rapidfuzz",
-                component="DesktopTool",
-            )
-            fuzz = None  # type: ignore[assignment]
-
         from ..infrastructure.vision import get_local_ocr
         ocr = get_local_ocr()
         result = await asyncio.get_event_loop().run_in_executor(
@@ -2017,14 +2182,10 @@ class DesktopTool(BaseTool):
             text = (box.text or "").strip()
             if not text:
                 continue
-            if fuzz is not None:
-                score = float(fuzz.token_set_ratio(description, text))
-                # Also check partial_ratio — a button label like "OK" inside
-                # a longer OCR line should still match.
-                score = max(score, float(fuzz.partial_ratio(description, text)))
-            else:
-                # Cheap substring fallback when rapidfuzz is missing.
-                score = 100.0 if desc_lower in text.lower() else 0.0
+            score = float(fuzz.token_set_ratio(description, text))
+            # Also check partial_ratio — a button label like "OK" inside
+            # a longer OCR line should still match.
+            score = max(score, float(fuzz.partial_ratio(description, text)))
             if score > best_score:
                 best_score = score
                 best_box = box
@@ -2182,7 +2343,7 @@ class DesktopTool(BaseTool):
 
         await asyncio.sleep(0.1)
         state_after = _capture_state_after(state_before)
-        _invalidate_snapshot_cache_on_state_change(state_after)
+        self.state.invalidate_on_state_change(state_after)
 
         # Combined result: the find metadata + the click outcome. Lets the
         # LLM verify the OCR/vision match without an extra screenshot.
@@ -2269,7 +2430,7 @@ class DesktopTool(BaseTool):
         # while staying well below the user-visible threshold.
         await asyncio.sleep(0.1)
         state_after = _capture_state_after(state_before)
-        _invalidate_snapshot_cache_on_state_change(state_after)
+        self.state.invalidate_on_state_change(state_after)
         output["state_after"] = state_after
         return ToolResult(
             success=True,
@@ -2340,7 +2501,7 @@ class DesktopTool(BaseTool):
 
         await asyncio.sleep(0.1)
         state_after = _capture_state_after(state_before)
-        _invalidate_snapshot_cache_on_state_change(state_after)
+        self.state.invalidate_on_state_change(state_after)
         output["state_after"] = state_after
         return ToolResult(
             success=True,
@@ -2392,7 +2553,7 @@ class DesktopTool(BaseTool):
             )
         await asyncio.sleep(0.1)
         state_after = _capture_state_after(state_before)
-        _invalidate_snapshot_cache_on_state_change(state_after)
+        self.state.invalidate_on_state_change(state_after)
         return ToolResult(
             success=True,
             output={
@@ -2433,7 +2594,7 @@ class DesktopTool(BaseTool):
             return self._error(params, start, f"scroll: {exc}")
         await asyncio.sleep(0.1)
         state_after = _capture_state_after(state_before)
-        _invalidate_snapshot_cache_on_state_change(state_after)
+        self.state.invalidate_on_state_change(state_after)
         return ToolResult(
             success=True,
             output={"x": x, "y": y, "dy": dy, "state_after": state_after},
@@ -2471,7 +2632,7 @@ class DesktopTool(BaseTool):
             return self._error(params, start, f"hotkey: {exc}")
         await asyncio.sleep(0.1)
         state_after = _capture_state_after(state_before)
-        _invalidate_snapshot_cache_on_state_change(state_after)
+        self.state.invalidate_on_state_change(state_after)
         return ToolResult(
             success=True,
             output={"keys": keys, "state_after": state_after},
@@ -2505,7 +2666,7 @@ class DesktopTool(BaseTool):
             return self._error(params, start, f"key_press: {exc}")
         await asyncio.sleep(0.1)
         state_after = _capture_state_after(state_before)
-        _invalidate_snapshot_cache_on_state_change(state_after)
+        self.state.invalidate_on_state_change(state_after)
         return ToolResult(
             success=True,
             output={"key": key, "state_after": state_after},
@@ -2543,7 +2704,7 @@ class DesktopTool(BaseTool):
                 "focus before retrying."
             )
         # Cleared all gates — emit takeover-started (idempotent).
-        _start_takeover("input_action")
+        self.state.start_takeover("input_action")
         return None
 
     def _sensitive_guard(self) -> Optional[str]:

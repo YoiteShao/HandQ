@@ -353,12 +353,21 @@ class ShellTool(BaseTool):
 
     def __init__(
         self,
+        ctx=None,
         venv_path: Optional[str] = None,
         interrupt_event: Optional[asyncio.Event] = None,
     ):
-        super().__init__("shell")
+        super().__init__("shell", ctx=ctx)
         self.venv_path = venv_path
-        self.interrupt_event: Optional[asyncio.Event] = interrupt_event
+        # Prefer the explicitly-supplied event (test fixtures); otherwise pull
+        # from the SessionContext so PersistentAgent doesn't have to do
+        # post-construction injection.
+        if interrupt_event is not None:
+            self.interrupt_event: Optional[asyncio.Event] = interrupt_event
+        elif ctx is not None:
+            self.interrupt_event = ctx.interrupt_event
+        else:
+            self.interrupt_event = None
         self._registry = BackgroundTaskRegistry()
 
     def _build_venv_env(self) -> Optional[dict]:

@@ -24,13 +24,14 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Optional
 
+import httpx  # noqa: F401  type: ignore[import-not-found]
+import playwright  # noqa: F401  type: ignore[import-not-found]
+
 from .logger import get_logger
-from .step_context_provider import StepContextProvider
+from ..controller_v2.context import ContextProvider, ItemContext, ProviderCache
 
 if TYPE_CHECKING:
-    from ..controller.interaction_manager import InteractionManager
-    from .memory import Memory
-    from ..models.plan import Step
+    from ..controller_v2.interaction_manager import InteractionManager
 
 
 def _build_full_hint() -> str:
@@ -201,7 +202,7 @@ def _build_unavailable_hint(reason: str) -> str:
     )
 
 
-class TeamsContextProvider(StepContextProvider):
+class TeamsContextProvider(ContextProvider):
     """Activate when the Planner declares ``teams`` in tools_required."""
 
     def __init__(self) -> None:
@@ -255,38 +256,20 @@ class TeamsContextProvider(StepContextProvider):
             "thing teams alone cannot.",
         ]
 
-    async def prepare(
+    async def before_item(
         self,
-        step: "Step",
-        interaction_manager: "InteractionManager",
-        memory: "Memory",
+        ctx: ItemContext,
+        im: "InteractionManager",
+        cache: ProviderCache,
     ) -> Optional[str]:
-        # 1. Library availability — same actionable error the agent gets
-        # later if it tries the tool, but surfaced earlier so the planner
-        # can route differently without burning a tool call.
-        try:
-            import httpx  # noqa: F401  type: ignore[import-not-found]
-        except ImportError:
-            return _build_unavailable_hint(
-                "httpx is not installed. Run: pip install httpx"
-            )
-        try:
-            import playwright  # noqa: F401  type: ignore[import-not-found]
-        except ImportError:
-            return _build_unavailable_hint(
-                "playwright is not installed. Required for the one-time "
-                "bootstrap that reads the user's Teams Web session. "
-                "Run: pip install playwright && playwright install chromium"
-            )
-
         # 2. Progressive disclosure. Auth is no longer triggered here —
         # it lives inside teams_tool's first-call gate (lazy bootstrap
         # via the browser_profile against teams.microsoft.com), so this
         # path stays cheap (~0ms) and resilient to mid-step environment
         # changes (e.g. agent installing playwright then immediately
         # using the tool).
-        cached = memory.get_teams_context("default")
+        cached = cache.get("teams")
         if cached and cached.get("prepared"):
             return _build_brief_hint()
-        memory.set_teams_context("default", {"prepared": True})
+        cache.set("teams", "default", {"prepared": True})
         return _build_full_hint()

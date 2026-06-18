@@ -41,7 +41,7 @@ from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from .base_tool import BaseTool, ToolResult
-from .browser_tool import acquire_browser_lock, evaluate_fetch, is_browser_available
+from .browser_tool import evaluate_fetch, is_browser_available, _module_holder
 from ..infrastructure.config_manager import ConfigManager
 from ..infrastructure.logger import get_logger
 
@@ -58,8 +58,8 @@ _DEFAULT_ORBIT_TIMEOUT_MS = 10_000
 # because its DOM-extract path may legitimately return different results
 # as the portal mutates.
 #
-# TODO(perf): cross-source parallel fan-out is gated on ``acquire_browser_lock``
-# holding the global session lock for each fetch. True parallelism needs a
+# TODO(perf): cross-source parallel fan-out is gated on the browser session
+# lock (``holder.acquire``) being held for each fetch. True parallelism needs a
 # refactor of ``evaluate_fetch`` (per-source dedicated tabs so concurrent
 # fetches don't collide on same_origin navigation).
 _QUERY_CACHE_TTL = 60.0
@@ -201,9 +201,18 @@ class WebSearchTool(BaseTool):
         "additionalProperties": False,
     }
 
-    def __init__(self) -> None:
-        super().__init__("web_search")
+    def __init__(self, ctx=None) -> None:
+        super().__init__("web_search", ctx=ctx)
         self.logger = get_logger()
+        # Share the BrowserTool's per-session live browser: same SessionContext
+        # → same holder, so same-origin fetches reuse the cookies / SSO from the
+        # session the agent already launched. Falls back to the module holder
+        # when constructed without a ctx (legacy / test path).
+        self.holder = (
+            ctx.browser_session
+            if ctx is not None and getattr(ctx, "browser_session", None) is not None
+            else _module_holder()
+        )
 
     async def execute(self, **kwargs: Any) -> ToolResult:
         start = time.time()
@@ -279,12 +288,12 @@ class WebSearchTool(BaseTool):
                 )
 
         try:
-            async with acquire_browser_lock() as session:
+            async with self.holder.acquire() as session:
                 hits = await executor(session, query, limit, src_cfg)
         except _AuthRequired as exc:
             return self._fail(params, start, str(exc))
         except RuntimeError as exc:
-            # acquire_browser_lock raises this when no session is launched.
+            # holder.acquire raises this when no session is launched.
             return self._fail(
                 params, start,
                 f"{source}: {exc}",

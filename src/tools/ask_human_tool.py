@@ -27,21 +27,18 @@ The tool delegates to ``InteractionManager.request_user_text(question)``:
 
 Concurrency
 -----------
-``request_user_text`` is intentionally blocking — the user takes seconds to
-answer. ``execute()`` runs it on the asyncio default executor so the event
-loop is not stalled while we wait for the modal.
+The V2 ``InteractionManager.request_user_text`` is a coroutine — it awaits a
+bridge-side future that resolves when the user submits the modal — so
+``execute()`` awaits it directly without an executor; the event loop stays
+free while we wait.
 
 Timeout
 -------
-``asyncio.wait_for()`` wraps the executor call with a hard ceiling of
-``_ASK_HUMAN_TIMEOUT_S`` seconds (default 300 s / 5 min).  When the timeout
-fires, the tool returns ``success=False`` with an explicit instruction to
-proceed with a sensible default — the task does not stall indefinitely.
-
-Note: ``run_in_executor`` threads cannot be cancelled mid-flight; the IM
-thread keeps running after the timeout but its eventual result is discarded.
-The UI dialog may remain visible briefly until the user dismisses it or the
-next IM call clears the confirmation queue.
+``asyncio.wait_for()`` caps the wait at ``_ASK_HUMAN_TIMEOUT_S`` seconds.
+On timeout the tool returns ``success=False`` with an explicit instruction to
+proceed with a sensible default, so an unattended task never stalls forever.
+The bridge drops the orphaned pending future on cancellation; the modal may
+linger in the UI until the user dismisses it or the next prompt replaces it.
 """
 from __future__ import annotations
 
@@ -49,7 +46,6 @@ import asyncio
 from typing import Any
 
 from .base_tool import BaseTool, ToolResult
-from ..controller.interaction_manager import InteractionManager
 from ..infrastructure.logger import get_logger
 
 # Hard ceiling for blocking on user input.
@@ -81,8 +77,8 @@ class AskHumanTool(BaseTool):
         "additionalProperties": False,
     }
 
-    def __init__(self) -> None:
-        super().__init__("ask_human")
+    def __init__(self, ctx=None) -> None:
+        super().__init__("ask_human", ctx=ctx)
         self.logger = get_logger()
 
     async def execute(self, **kwargs: Any) -> ToolResult:
@@ -96,67 +92,55 @@ class AskHumanTool(BaseTool):
                 error="ask_human requires a non-empty 'question' string.",
             )
 
-        try:
-            im = InteractionManager.get_instance()
-        except RuntimeError as exc:
-            return ToolResult(
-                success=False,
-                output=None,
-                tool_name=self.name,
-                tool_parameters=kwargs,
-                error=f"ask_human requires a running InteractionManager: {exc}",
-            )
-
-        loop = asyncio.get_running_loop()
-        try:
-            answer = await asyncio.wait_for(
-                loop.run_in_executor(None, im.request_user_text, question.strip()),
-                timeout=float(_ASK_HUMAN_TIMEOUT_S),
-            )
-        except asyncio.TimeoutError:
-            self.logger.warning(
-                f"ask_human timed out after {_ASK_HUMAN_TIMEOUT_S}s with no reply",
-                component="AskHumanTool",
-            )
+        # ctx + IM are injected by the SessionContext wiring; the per-session
+        # InteractionManager forwards to the renderer (GUI) or stderr (CLI).
+        im = getattr(self.ctx, "interaction_manager", None) if self.ctx else None
+        if im is None:
             return ToolResult(
                 success=False,
                 output=None,
                 tool_name=self.name,
                 tool_parameters=kwargs,
                 error=(
-                    f"No user response within {_ASK_HUMAN_TIMEOUT_S}s. "
-                    "Proceed with best available default — do not re-prompt."
+                    "ask_human is unavailable (no interaction manager in this "
+                    "session). Pick a sensible default and continue."
                 ),
             )
-        except Exception as exc:
-            self.logger.warning(
-                f"ask_human request failed: {exc}", component="AskHumanTool"
+
+        try:
+            answer = await asyncio.wait_for(
+                im.request_user_text(question.strip()),
+                timeout=_ASK_HUMAN_TIMEOUT_S,
             )
+        except asyncio.TimeoutError:
             return ToolResult(
                 success=False,
                 output=None,
                 tool_name=self.name,
                 tool_parameters=kwargs,
-                error=f"ask_human dialog failed: {exc}",
+                error=(
+                    f"No answer within {_ASK_HUMAN_TIMEOUT_S}s — the user may be "
+                    "away. Proceed with a sensible default."
+                ),
             )
 
-        if isinstance(answer, str) and answer.strip():
+        answer = (answer or "").strip()
+        if not answer:
             return ToolResult(
-                success=True,
-                output=answer,
+                success=False,
+                output=None,
                 tool_name=self.name,
                 tool_parameters=kwargs,
+                error=(
+                    "The user dismissed the question without answering. "
+                    "Proceed with a sensible default."
+                ),
             )
 
         return ToolResult(
-            success=False,
-            output=None,
+            success=True,
+            output=answer,
             tool_name=self.name,
             tool_parameters=kwargs,
-            error=(
-                "User dismissed the ask_human dialog without providing an "
-                "answer. Proceed without their input or pick a sensible "
-                "default; do not re-prompt."
-            ),
         )
 

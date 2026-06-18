@@ -39,12 +39,16 @@ import base64
 import io
 import json
 import os
-import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Tuple
 
+import httpx
+from openai import AsyncOpenAI
+from PIL import Image
+
 from ..logger import get_logger
+from ..utils import try_parse_json
 
 # ── Optional deps ────────────────────────────────────────────────────────────
 # We keep the imports lazy so ``import vision_client`` works on systems
@@ -126,21 +130,6 @@ class VisionClient:
     def _ensure_client(self) -> None:
         if self._client is not None:
             return
-        try:
-            from openai import AsyncOpenAI
-        except ImportError as exc:
-            raise RuntimeError(
-                "vision_client requires the openai package. Run:\n"
-                "  pip install openai\n"
-                f"Underlying: {exc}"
-            )
-        try:
-            import httpx
-        except ImportError as exc:
-            raise RuntimeError(
-                "vision_client requires httpx (already pulled in by anthropic). "
-                f"Underlying: {exc}"
-            )
         # verify=False routes around the QGenie self-signed cert chain;
         # see test_vision_gpt.py for the same pattern.
         self._http = httpx.AsyncClient(verify=self.verify_ssl, timeout=self.timeout)
@@ -162,14 +151,6 @@ class VisionClient:
         """
         if not os.path.isfile(image_path):
             raise FileNotFoundError(f"image not found: {image_path}")
-        try:
-            from PIL import Image
-        except ImportError as exc:
-            raise RuntimeError(
-                "vision_client requires Pillow for image resize. Run:\n"
-                "  pip install pillow\n"
-                f"Underlying: {exc}"
-            )
         with Image.open(image_path) as img:
             img.load()
             w, h = img.size
@@ -293,7 +274,9 @@ class VisionClient:
 
         parsed: Optional[Dict[str, Any]] = None
         if output_schema is not None and text:
-            parsed = _try_parse_json_object(text)
+            result = try_parse_json(text)
+            if isinstance(result, dict):
+                parsed = result
 
         return VisionResult(
             answer=text,
@@ -318,32 +301,6 @@ class VisionClient:
         self._http = None
         self._client = None
 
-
-# ── JSON repair helper ───────────────────────────────────────────────────────
-
-_JSON_OBJECT_RE = re.compile(r"\{.*\}", re.DOTALL)
-
-
-def _try_parse_json_object(text: str) -> Optional[Dict[str, Any]]:
-    """Best-effort JSON parse.  Strips code fences, finds the first {...} block."""
-    s = text.strip()
-    if s.startswith("```"):
-        s = s.strip("`")
-        if s.lower().startswith("json"):
-            s = s[4:].lstrip()
-    try:
-        v = json.loads(s)
-        return v if isinstance(v, dict) else None
-    except Exception:
-        pass
-    m = _JSON_OBJECT_RE.search(s)
-    if not m:
-        return None
-    try:
-        v = json.loads(m.group(0))
-        return v if isinstance(v, dict) else None
-    except Exception:
-        return None
 
 
 # ── Process-wide singleton ───────────────────────────────────────────────────

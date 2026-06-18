@@ -274,60 +274,6 @@ async def submit_post_commit(
     )
 
 
-async def submit_activity_observer(
-    *,
-    ltm,
-    raw_text: str,
-    source_ref: str,
-    daily_summary: bool = False,
-    monitor_index: Optional[int] = None,
-    sample_count: int = 0,
-) -> str:
-    """Submit an ActivityMonitor observation as a triage candidate.
-
-    Two flavours, distinguished by ``daily_summary`` in the metadata so
-    the dream worker / triage prompt can branch on it:
-
-    - ``daily_summary=False`` (default): a buffered batch of OCR'd samples
-      from a single monitor. Triage looks for stable INSIGHT memory
-      ("primary editor is VSCode", "main project lives at C:\\HandQ") or
-      knowledge ("team uses pytest -xvs"). AGENTIC memory is disallowed
-      by a hard guard in :mod:`triage` because background observation
-      isn't user consent.
-    - ``daily_summary=True``: the wider end-of-day pass over all accepted
-      samples. Triage gets a richer canvas to extract recurring habits
-      and project context.
-
-    Privacy boundary: the caller is expected to have already applied PII
-    pre-filtering (e.g. dropped frames where the foreground window matches
-    a sensitive-app pattern). This helper trusts ``raw_text`` and routes
-    it straight to the LTM submit pipeline, which still runs its OWN
-    PII filter at the candidate boundary.
-    """
-    hint_lines = [
-        "Background activity observation. Mine ONLY stable, durable signals:",
-        "- environment / project facts → INSIGHT memory or knowledge",
-        "- never promote a single observed action as a user preference",
-        "- reject anything that smells like a one-off action",
-    ]
-    if daily_summary:
-        hint_lines.insert(
-            1,
-            "This is a DAILY rollup; it spans many windows / many hours.",
-        )
-    return await ltm.submit_candidate(
-        source=CandidateSource.ACTIVITY_OBSERVER.value,
-        source_ref=source_ref,
-        raw_text=raw_text,
-        hint="\n".join(hint_lines),
-        metadata={
-            "daily_summary": bool(daily_summary),
-            "monitor_index": monitor_index if monitor_index is not None else -1,
-            "sample_count": int(sample_count),
-        },
-    )
-
-
 def _render_session(goal: str, summary: str, last_steps, success: bool) -> str:
     parts: List[str] = [
         f"# Goal\n[SELF] {goal}",

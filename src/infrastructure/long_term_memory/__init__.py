@@ -33,8 +33,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, List, Optional, Tuple
 
 import yaml
 
@@ -61,7 +62,9 @@ from .pii import PIIFilter
 from .recall import (
     LTM_BLOCK_DESCRIPTION as _LTM_DESC,
     LTM_BLOCK_HEADER as _LTM_HEADER,
+    format_identity_block as _fmt_id,
     format_knowledge_block as _fmt_kn,
+    format_known_entities_block as _fmt_ent,
     format_memory_block as _fmt_mem,
     recall_knowledge_impl,
     recall_memory_impl,
@@ -96,6 +99,10 @@ class LongTermMemory:
     """Singleton facade. Exactly one instance per process."""
 
     _instance: Optional["LongTermMemory"] = None
+    # Set when init() begins, fired when init() completes. Lets callers
+    # distinguish "no init yet" (event is None) from "init in progress"
+    # (event exists but not set) from "ready" (event is set).
+    _init_event: Optional[asyncio.Event] = None
 
     def __init__(
         self,
@@ -104,14 +111,39 @@ class LongTermMemory:
         reranker: Reranker,
         pii_filter: PIIFilter,
         config: dict,
+        emit: Optional[Callable[[dict], None]] = None,
     ) -> None:
         self._store = store
         self._embedder = embedder
         self._reranker = reranker
         self._pii = pii_filter
         self._config = config
+        # Outbound notification channel into the chat feed. Injected by the
+        # bridge at init time (stdio_bridge._emit); None in tests / headless
+        # runs. Background workers (DreamWorker) use it to surface events
+        # like a freshly-staged skill proposal that the user can act on.
+        self._emit = emit
         self._dream_task: Optional[asyncio.Task] = None
         self._retriage_task: Optional[asyncio.Task] = None
+        # Flipped True at the very start of shutdown() so any in-flight
+        # submit_candidate / archive call returning from receptionist
+        # can detect the closed state and skip the write rather than
+        # hitting "database is closed" on the SQLite handle.
+        self._shutting_down: bool = False
+        # IDENTITY block is recomputed on every recall today. The dream
+        # worker can't write a new IDENTITY entry faster than once per
+        # DREAM_INTERVAL_MIN_SEC (60s), so a TTL-cached pair
+        # (rendered_block, frozenset_of_ids) serves every caller within
+        # that window from memory. ``archive()`` nulls the cache on the
+        # explicit-removal path so user-initiated changes show up
+        # without waiting for the TTL.
+        self._identity_cache: Optional[Tuple[str, frozenset]] = None
+        self._identity_cache_ts: float = 0.0
+        # Known-entities (principal graph) render cache — same slow-change
+        # rationale as identity; reuses IDENTITY_CACHE_TTL_SEC. No id-set is
+        # needed (principals aren't in mem recall, so there's nothing to dedup).
+        self._known_entities_cache: Optional[str] = None
+        self._known_entities_cache_ts: float = 0.0
 
     # ── Lifecycle ───────────────────────────────────────────────────────────
 
@@ -121,11 +153,22 @@ class LongTermMemory:
         *,
         db_path: Path,
         config_path: Path,
+        emit: Optional[Callable[[dict], None]] = None,
     ) -> "LongTermMemory":
         if cls._instance is not None:
             return cls._instance
 
-        # We still load yaml because the LLM section (API_KEY, role pools)
+        # Mark init in progress so concurrent get_async() callers can wait
+        # rather than picking up the null fallback. Only the first caller
+        # creates the event; subsequent concurrent init() calls await it.
+        if cls._init_event is None:
+            cls._init_event = asyncio.Event()
+        elif not cls._init_event.is_set():
+            await cls._init_event.wait()
+            if cls._instance is not None:
+                return cls._instance
+
+        # We still load yaml because the LLM section (API_KEY, model pools)
         # has to come from the user. The `memory:` section no longer
         # exists — every LTM-specific knob is in :mod:`_constants`.
         cfg = _load_config(config_path)
@@ -141,15 +184,17 @@ class LongTermMemory:
             )
             inst = _NullLongTermMemory(cfg)  # type: ignore[assignment]
             cls._instance = inst  # type: ignore[assignment]
+            cls._init_event.set()
             return inst  # type: ignore[return-value]
 
         embedder = _embedder_from_config(cfg)
         reranker = _reranker_from_config(cfg)
         pii = PIIFilter()
-        ltm = cls(store, embedder, reranker, pii, cfg)
+        ltm = cls(store, embedder, reranker, pii, cfg, emit=emit)
 
         worker = DreamWorker(
             store=store, embedder=embedder, pii_filter=pii, config=cfg,
+            emit=emit,
         )
         ltm._dream_task = asyncio.create_task(worker.run(), name="ltm-dream")
 
@@ -169,11 +214,76 @@ class LongTermMemory:
             retriage.run(), name="ltm-retriage",
         )
 
+        # LTM 2.0 observation pipeline workers — spawned alongside the dream
+        # worker. SessionAggregator groups raw obs_snapshots into sessions;
+        # SemanticExtractor LLM-abstracts each closed session into a
+        # semantic event that DreamWorker then promotes to mem_entries.
+        try:
+            from .session_aggregator import SessionAggregator
+            session_agg = SessionAggregator(store=store)
+            ltm._session_agg = session_agg
+            ltm._session_agg_task = asyncio.create_task(
+                session_agg.run(), name="ltm-session-aggregator",
+            )
+        except Exception:
+            _logger.exception(
+                "SessionAggregator failed to start; obs_snapshots will not be aggregated",
+            )
+            ltm._session_agg = None
+            ltm._session_agg_task = None
+
+        try:
+            from .semantic_extractor import SemanticExtractor
+            sem_extractor = SemanticExtractor(
+                store=store,
+                llm_services=retriage_helper_services or None,
+                pii_filter=pii,
+            )
+            ltm._semantic_extractor = sem_extractor
+            ltm._semantic_extractor_task = asyncio.create_task(
+                sem_extractor.run(), name="ltm-semantic-extractor",
+            )
+        except Exception:
+            _logger.exception(
+                "SemanticExtractor failed to start; closed sessions will not be abstracted",
+            )
+            ltm._semantic_extractor = None
+            ltm._semantic_extractor_task = None
+
+        try:
+            from .summary_worker import SummaryWorker
+            summary_w = SummaryWorker(
+                store=store,
+                llm_services=retriage_helper_services or None,
+            )
+            ltm._summary_worker = summary_w
+            ltm._summary_worker_task = asyncio.create_task(
+                summary_w.run(), name="ltm-summary-worker",
+            )
+        except Exception:
+            _logger.exception(
+                "SummaryWorker failed to start; daily summaries will be skipped",
+            )
+            ltm._summary_worker = None
+            ltm._summary_worker_task = None
+
         cls._instance = ltm
+        cls._init_event.set()
         _logger.info(
             "LongTermMemory initialised: db=%s embedder=%s reranker=%s",
             db_path, embedder.provider, reranker.provider,
         )
+        # Baseline principals (machines from ~/.ssh/handq_*.yaml, self from
+        # git config user.email). Fire-and-forget — failures must not block
+        # bridge boot.
+        try:
+            from .principals import populate_baseline
+            asyncio.create_task(
+                populate_baseline(store, working_directory=None),
+                name="ltm-principals-baseline",
+            )
+        except Exception:
+            _logger.exception("principals baseline scheduling failed")
         return ltm
 
     @classmethod
@@ -183,11 +293,50 @@ class LongTermMemory:
             # tests / standalone tooling may import without init. Returning a
             # null instance keeps callers honest without forcing every call
             # site to wrap in try/except.
-            _logger.debug("LongTermMemory.get() before init; returning null instance")
+            if cls._init_event is not None and not cls._init_event.is_set():
+                _logger.warning(
+                    "LongTermMemory.get() called while init() in progress; "
+                    "returning null instance — submissions will be dropped. "
+                    "Use get_async() in async paths to wait for ready state.",
+                )
+            else:
+                _logger.debug("LongTermMemory.get() before init; returning null instance")
             return _NullLongTermMemory({})  # type: ignore[return-value]
         return cls._instance
 
+    @classmethod
+    async def get_async(cls, *, timeout: float = 30.0) -> "LongTermMemory":
+        """Async variant of get() that waits for in-progress init() to finish.
+
+        Closes the startup-race window where a caller hits get() between
+        ``init()`` starting and ``cls._instance`` being assigned, getting a
+        ``_NullLongTermMemory`` and silently dropping the submission.
+
+        Returns the null instance if init was never started (test / standalone
+        path) or if the wait times out.
+        """
+        if cls._instance is not None:
+            return cls._instance
+        if cls._init_event is None:
+            _logger.debug("get_async() before init; returning null instance")
+            return _NullLongTermMemory({})  # type: ignore[return-value]
+        try:
+            await asyncio.wait_for(cls._init_event.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            _logger.warning(
+                "get_async() waited %.1fs for init() but it never completed; "
+                "returning null instance", timeout,
+            )
+            return _NullLongTermMemory({})  # type: ignore[return-value]
+        return cls._instance if cls._instance is not None else _NullLongTermMemory({})  # type: ignore[return-value]
+
     async def shutdown(self) -> None:
+        # Set the flag FIRST so any concurrent submit_candidate / archive
+        # call sees it and bails out before touching the store. This closes
+        # the "submit during shutdown" data-loss window where the SQLite
+        # connection has already been closed by close() but the caller is
+        # mid-await on insert_candidate.
+        self._shutting_down = True
         if self._dream_task and not self._dream_task.done():
             self._dream_task.cancel()
             try:
@@ -225,6 +374,25 @@ class LongTermMemory:
                 )
             except Exception:
                 _logger.exception("retriage task shutdown error")
+        # LTM 2.0 observation pipeline workers — same cancel + bounded wait.
+        for task_attr, label in (
+            ("_session_agg_task", "session_aggregator"),
+            ("_semantic_extractor_task", "semantic_extractor"),
+            ("_summary_worker_task", "summary_worker"),
+        ):
+            task = getattr(self, task_attr, None)
+            if task and not task.done():
+                task.cancel()
+                try:
+                    await asyncio.wait_for(task, timeout=5.0)
+                except asyncio.CancelledError:
+                    pass
+                except asyncio.TimeoutError:
+                    _logger.warning(
+                        "%s task did not finish within 5s of cancel", label,
+                    )
+                except Exception:
+                    _logger.exception("%s task shutdown error", label)
         # Final flush of recall_log buffer so the very last few hits
         # (between the dream tick and shutdown) aren't lost.
         try:
@@ -259,6 +427,12 @@ class LongTermMemory:
         hint: Optional[str] = None,
         metadata: Optional[dict] = None,
     ) -> str:
+        if self._shutting_down:
+            _logger.warning(
+                "submit_candidate dropped (shutting down) source=%s ref=%s",
+                source, source_ref,
+            )
+            return ""
         if self._pii.has_secret(raw_text):
             _logger.info(
                 "submit_candidate dropped at boundary (sensitive) source=%s ref=%s",
@@ -278,9 +452,20 @@ class LongTermMemory:
     async def archive(
         self, *, entry_id: str, kind: EntryKind, reason: str,
     ) -> None:
+        if self._shutting_down:
+            _logger.warning(
+                "archive dropped (shutting down) entry_id=%s kind=%s",
+                entry_id, kind,
+            )
+            return
         try:
             if kind == EntryKind.MEMORY:
                 await self._store.archive_memory_entry(entry_id, reason=reason)
+                # IDENTITY entries are a subset of MEMORY. Invalidating on
+                # every memory archive is cheaper than reading the row to
+                # check its dimension first — the rebuild is one bounded
+                # SQLite query against an indexed column.
+                self._identity_cache = None
             elif kind == EntryKind.KNOWLEDGE:
                 await self._store.archive_knowledge_entry(entry_id, reason=reason)
             else:  # PROCEDURE — P6, ignore for now
@@ -298,11 +483,14 @@ class LongTermMemory:
         k: int = C.RECALL_MEMORY_K,
         min_score: float = C.RECALL_MIN_SCORE,
         rerank: bool = True,
+        dynamic_k: bool = False,
+        current_frame: Optional[dict] = None,
     ) -> List[Entry]:
         try:
             return await recall_memory_impl(
                 self._store, self._embedder, self._reranker, query,
                 dimension=dimension, k=k, min_score=min_score, rerank=rerank,
+                dynamic_k=dynamic_k, current_frame=current_frame,
             )
         except Exception:
             _logger.exception("recall_memory failed")
@@ -316,11 +504,14 @@ class LongTermMemory:
         k: int = C.RECALL_KNOWLEDGE_K,
         min_score: float = C.RECALL_MIN_SCORE,
         rerank: bool = True,
+        dynamic_k: bool = False,
+        current_frame: Optional[dict] = None,
     ) -> List[Entry]:
         try:
             return await recall_knowledge_impl(
                 self._store, self._embedder, self._reranker, query,
                 category=category, k=k, min_score=min_score, rerank=rerank,
+                dynamic_k=dynamic_k, current_frame=current_frame,
             )
         except Exception:
             _logger.exception("recall_knowledge failed")
@@ -332,6 +523,55 @@ class LongTermMemory:
     def format_knowledge_block(self, entries: List[Entry]) -> str:
         return _fmt_kn(entries)
 
+    async def _get_identity_cached(self) -> Tuple[str, frozenset]:
+        """Return ``(rendered_xml_block, frozenset_of_entry_ids)``.
+
+        Cached for :data:`_constants.IDENTITY_CACHE_TTL_SEC`; on miss,
+        re-reads identity entries from the store and renders the block.
+        Returning both the rendered string AND the id set lets
+        :meth:`format_context_block` skip the per-call SQLite read AND
+        the dedup-loop re-derivation of ids — both served from cache.
+
+        Cache is invalidated by:
+          - elapsed TTL (covers dream-worker writes within ~one tick)
+          - explicit :meth:`archive` of any memory entry (covers user-
+            initiated IDENTITY removal without waiting for TTL)
+        """
+        now = time.monotonic()
+        if self._identity_cache is not None and (
+            now - self._identity_cache_ts
+        ) < C.IDENTITY_CACHE_TTL_SEC:
+            return self._identity_cache
+        identity_entries = await self._store.list_memory_entries(
+            dimension=MemoryDimension.IDENTITY, archived=False,
+            limit=C.IDENTITY_MAX_ENTRIES,
+        )
+        block = _fmt_id(identity_entries)
+        ids = frozenset(e.id for e in identity_entries)
+        self._identity_cache = (block, ids)
+        self._identity_cache_ts = now
+        return self._identity_cache
+
+    async def _get_known_entities_cached(self) -> str:
+        """Return the rendered ``<known-entities>`` block, TTL-cached.
+
+        Mirrors :meth:`_get_identity_cached` but returns only the string —
+        principals aren't part of memory recall, so there's no id-set to
+        dedup against. Cached for :data:`_constants.IDENTITY_CACHE_TTL_SEC`
+        (principals change only at boot / post-commit, both slow); worst-case
+        staleness is one TTL window.
+        """
+        now = time.monotonic()
+        if self._known_entities_cache is not None and (
+            now - self._known_entities_cache_ts
+        ) < C.IDENTITY_CACHE_TTL_SEC:
+            return self._known_entities_cache
+        rows = await self._store.list_principals(limit=C.KNOWN_ENTITIES_MAX)
+        block = _fmt_ent(rows)
+        self._known_entities_cache = block
+        self._known_entities_cache_ts = now
+        return block
+
     async def format_context_block(
         self,
         query: str,
@@ -342,6 +582,10 @@ class LongTermMemory:
         knowledge_category: Optional[KnowledgeCategory] = None,
         min_score: float = C.RECALL_MIN_SCORE,
         rerank: bool = True,
+        dynamic_k: bool = False,
+        include_identity: bool = True,
+        include_known_entities: bool = True,
+        current_frame: Optional[dict] = None,
     ) -> str:
         """Recall both tracks against *query* and render a single context block.
 
@@ -354,18 +598,61 @@ class LongTermMemory:
         False on hot per-message paths (receptionist) where precision
         matters less than latency.
 
-        Returns "" when both tracks are empty so the caller can do a plain
+        ``dynamic_k`` enables score-gap trimming (planner path only).
+
+        ``include_identity`` defaults True so the IDENTITY directive block is
+        injected alongside the memory + knowledge recall. Set False when
+        IDENTITY is already present in the same prompt's other context
+        sections (e.g. PersistentAgent's stagnation refresh — IDENTITY is
+        in ``_current_ltm_block`` from item-start, no need to repeat it).
+
+        ``include_known_entities`` defaults True so the ``<known-entities>``
+        block (people / machines / projects from the principal graph) is
+        injected unconditionally, like identity. It is frame-agnostic (not
+        os-filtered — SSH machines and people are cross-environment). Set
+        False to suppress it (e.g. when already present elsewhere in the prompt).
+
+        ``current_frame`` (LTM 2.0): dict of {os, host, confidence, ...}
+        describing the caller's execution environment. When set, recall
+        filters insight entries whose frame_os doesn't match (frame-agnostic
+        AGENTIC / KNOWLEDGE / IDENTITY entries always pass through). Pass
+        None to skip frame filtering (back-compat default).
+
+        Returns "" when all tracks are empty so the caller can do a plain
         truthy check before injecting.
         """
-        mem_entries = await self.recall_memory(
-            query, dimension=memory_dimension, k=memory_k,
-            min_score=min_score, rerank=rerank,
+        if include_identity:
+            id_block, id_ids = await self._get_identity_cached()
+        else:
+            id_block, id_ids = "", frozenset()
+        # Run the two tracks concurrently. Each track's rerank=True path makes
+        # its own LLM rerank call; awaiting them sequentially stacked two LLM
+        # round-trips on the planner's critical path. gather collapses that to
+        # one round-trip of wall-clock.
+        mem_entries, kn_entries = await asyncio.gather(
+            self.recall_memory(
+                query, dimension=memory_dimension, k=memory_k,
+                min_score=min_score, rerank=rerank, dynamic_k=dynamic_k,
+                current_frame=current_frame,
+            ),
+            self.recall_knowledge(
+                query, category=knowledge_category, k=knowledge_k,
+                min_score=min_score, rerank=rerank, dynamic_k=dynamic_k,
+                current_frame=current_frame,
+            ),
         )
-        kn_entries = await self.recall_knowledge(
-            query, category=knowledge_category, k=knowledge_k,
-            min_score=min_score, rerank=rerank,
-        )
+        # Deduplicate: identity entries are unconditionally injected in their
+        # own block, so strip them from query-based recall to avoid wasting
+        # context tokens on a repeated directive.
+        if id_ids and mem_entries:
+            mem_entries = [e for e in mem_entries if e.id not in id_ids]
         parts: List[str] = []
+        if id_block:
+            parts.append(id_block)
+        if include_known_entities:
+            ent_block = await self._get_known_entities_cached()
+            if ent_block:
+                parts.append(ent_block)
         mem_block = _fmt_mem(mem_entries)
         if mem_block:
             parts.append(mem_block)
@@ -398,6 +685,111 @@ class LongTermMemory:
 
     async def list_pending_candidates(self, limit: int = 20) -> List[Candidate]:
         return await self._store.list_candidates(status="pending", limit=limit)
+
+    # ── LTM 2.0 Skill proposal IPC ──────────────────────────────────────────
+
+    async def list_skill_proposals(
+        self, *, status: str = "proposed", limit: int = 50,
+    ) -> List[dict]:
+        """Return active skill proposals for the IPC layer.
+
+        ``status`` ∈ {'proposed', 'approved', 'rejected'}. The data is
+        formatted as plain dicts (not the SkillProposal dataclass) so the
+        IPC bridge can serialize without an adapter.
+        """
+        rows = await self._store._fetchall(
+            "SELECT id, skill_status, skill_fingerprint, recurrence_count, "
+            "       summary, created_at, updated_at "
+            "FROM mem_entries "
+            "WHERE kind='skill_proposal' AND archived=0 AND skill_status=? "
+            "ORDER BY updated_at DESC LIMIT ?",
+            (status, limit),
+        )
+        out = []
+        for r in rows:
+            out.append({
+                "id": r[0], "status": r[1], "fingerprint": r[2],
+                "recurrence_count": int(r[3]),
+                "summary": r[4],
+                "staging_path": str(self._skill_staging_path(r[0])),
+                "created_at": int(r[5]),
+                "updated_at": int(r[6]),
+            })
+        return out
+
+    async def approve_skill_proposal(self, skill_id: str) -> dict:
+        """Move staging file to live Skill dir, reload SkillRegistry, mark approved."""
+        import shutil
+        staging = self._skill_staging_path(skill_id)
+        if not staging.exists():
+            return {"ok": False, "reason": "staging_not_found", "path": str(staging)}
+        # Live skill dir = HandQ/Skill/<canonical>/SKILL.md.
+        # staging = HandQ/Skill/.proposed/<id8>; staging.parent.parent
+        # is HandQ/Skill, where canonical sibling dirs live.
+        skill_root = staging.parent.parent  # HandQ/Skill
+        canonical = f"proposed-{skill_id[:8]}"
+        live_dir = skill_root / canonical  # HandQ/Skill/<canonical>
+        # SkillRegistry keys skills by DIRECTORY name (frontmatter `name:` is
+        # advisory — see skills.py:_load_skill_file). So reusing a directory
+        # that already holds a SKILL.md would silently overwrite an unrelated
+        # approved skill (possible via an 8-char id-prefix clash, a stray
+        # user-created dir, or a re-approval after the row was re-issued).
+        # Disambiguate with a numeric suffix instead of clobbering.
+        if (live_dir / "SKILL.md").exists():
+            n = 2
+            while (skill_root / f"{canonical}-{n}" / "SKILL.md").exists():
+                n += 1
+            canonical = f"{canonical}-{n}"
+            live_dir = skill_root / canonical
+        try:
+            live_dir.mkdir(parents=True, exist_ok=True)
+            await asyncio.to_thread(
+                shutil.copyfile,
+                staging / "SKILL.md", live_dir / "SKILL.md",
+            )
+            # Remove staging directory after successful copy
+            await asyncio.to_thread(shutil.rmtree, staging, True)
+        except Exception as exc:
+            _logger.exception("approve_skill copy failed sid=%s", skill_id[:8])
+            return {"ok": False, "reason": "copy_failed", "error": str(exc)}
+        # Update DB
+        await self._store._execute(
+            "UPDATE mem_entries SET skill_status='approved', updated_at=? WHERE id=?",
+            (int(time.time()), skill_id),
+        )
+        # Trigger SkillRegistry reload
+        try:
+            from ..skills import SkillRegistry
+            reg = SkillRegistry.get()
+            if hasattr(reg, "reload"):
+                await asyncio.to_thread(reg.reload)
+            elif hasattr(reg, "refresh"):
+                await asyncio.to_thread(reg.refresh)
+        except Exception:
+            _logger.exception("SkillRegistry reload after approve failed")
+        return {"ok": True, "live_path": str(live_dir / "SKILL.md")}
+
+    async def reject_skill_proposal(self, skill_id: str, reason: str = "") -> dict:
+        """Delete staging directory + mark proposal as rejected/archived."""
+        import shutil
+        staging = self._skill_staging_path(skill_id)
+        if staging.exists():
+            try:
+                await asyncio.to_thread(shutil.rmtree, staging, True)
+            except Exception:
+                _logger.exception("reject_skill staging rm failed sid=%s", skill_id[:8])
+        await self._store._execute(
+            "UPDATE mem_entries SET skill_status='rejected', archived=1, "
+            "archived_reason=?, updated_at=? WHERE id=?",
+            (f"user_rejected:{reason[:120]}" if reason else "user_rejected",
+             int(time.time()), skill_id),
+        )
+        return {"ok": True}
+
+    @staticmethod
+    def _skill_staging_path(skill_id: str):
+        from pathlib import Path
+        return Path.home() / "HandQ" / "Skill" / ".proposed" / skill_id[:8]
 
     async def triage_stats(self) -> dict:
         """Return per-source acceptance / rejection counts for observability.
@@ -457,6 +849,7 @@ class _NullLongTermMemory(LongTermMemory):
         self._embedder = None     # type: ignore[assignment]
         self._reranker = None     # type: ignore[assignment]
         self._pii = None          # type: ignore[assignment]
+        self._emit = None
         self._dream_task = None
 
     async def submit_candidate(self, **_) -> str:  # type: ignore[override]
@@ -519,12 +912,13 @@ async def _resolve_retriage_helpers(cfg: dict) -> List:
     durable entries that the user has been living with — we want the
     strongest model the bridge has.
 
-    Tier choice driven by ``CORRECTION_RETRIAGE_LLM_TIER`` (defaults to
-    "agent"). Returns ``[]`` on missing API_KEY / config so the worker's
-    LLM-based migrations halt the chain rather than silently no-op.
+    Uses the main ``llm.models`` pool because retriage rule-based
+    migrations need the higher-quality reasoning that the helper pool
+    isn't sized for. Returns ``[]`` on missing API_KEY / config so the
+    worker's LLM-based migrations halt rather than silently no-op.
     """
     try:
-        from src.infrastructure.role_resolver import resolve_role_models
+        from src.infrastructure.role_resolver import resolve_models_and_helper
         from src.infrastructure.anthropic_streaming_service import (
             AnthropicStreamingService,
         )
@@ -536,14 +930,12 @@ async def _resolve_retriage_helpers(cfg: dict) -> List:
     if not api_key:
         _logger.warning("retriage: llm.API_KEY missing; LLM migrations will halt")
         return []
-    roles = resolve_role_models(llm_cfg)
-    models = list(roles.get(C.CORRECTION_RETRIAGE_LLM_TIER) or [])
-    if not models:
+    main_models, _helper = resolve_models_and_helper(llm_cfg)
+    if not main_models:
         _logger.warning(
-            "retriage: tier=%s has no models; LLM migrations will halt",
-            C.CORRECTION_RETRIAGE_LLM_TIER,
+            "retriage: llm.models is empty; LLM migrations will halt",
         )
         return []
     return [
-        AnthropicStreamingService(model=m, api_key=api_key) for m in models
+        AnthropicStreamingService(model=m, api_key=api_key) for m in main_models
     ]

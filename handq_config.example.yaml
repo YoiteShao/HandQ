@@ -1,7 +1,10 @@
-version: '1.2.0'
+version: '1.3.0'
 llm:
-  API_KEY: 
-  models:
+  API_KEY:
+  # All model identifiers available for selection in the Agent and Helper
+  # tabs below.  One entry per model; order determines fallback priority
+  # within each role's checked subset.
+  available_models:
   - anthropic::claude-4-8-opus
   - anthropic::claude-4-7-opus
   - anthropic::claude-4-6-sonnet:1M
@@ -9,30 +12,24 @@ llm:
   - anthropic::claude-4-5-sonnet
   - anthropic::claude-4-5-haiku:thinking
   - anthropic::claude-4-5-haiku
-  roles:
-    planner:
-    - anthropic::claude-4-6-sonnet:1M
-    - anthropic::claude-4-6-sonnet
-    - anthropic::claude-4-5-sonnet
-    - anthropic::claude-4-5-haiku:thinking
-    - anthropic::claude-4-5-haiku
-    receptionist:
-    - anthropic::claude-4-5-sonnet
-    - anthropic::claude-4-5-haiku:thinking
-    - anthropic::claude-4-5-haiku
-    agent:
-    - anthropic::claude-4-6-sonnet:1M
-    - anthropic::claude-4-6-sonnet
-    - anthropic::claude-4-5-sonnet
-    - anthropic::claude-4-5-haiku:thinking
-    - anthropic::claude-4-5-haiku
-    helper:
-    - anthropic::claude-4-5-sonnet
-    - anthropic::claude-4-5-haiku:thinking
-    - anthropic::claude-4-5-haiku
+  # Agent pool — checked subset of available_models used by the agent,
+  # planner, and receptionist.  Order = fallback priority.
+  agent_models:
+  - anthropic::claude-4-8-opus
+  - anthropic::claude-4-7-opus
+  - anthropic::claude-4-6-sonnet:1M
+  - anthropic::claude-4-6-sonnet
+  - anthropic::claude-4-5-sonnet
+  - anthropic::claude-4-5-haiku:thinking
+  - anthropic::claude-4-5-haiku
+  # Helper pool — checked subset used by the scheduler's natural-language
+  # schedule inference, the long-term-memory triage / reranker workers, and
+  # other simple background classification tasks.
+  helper_models:
+  - anthropic::claude-4-5-haiku
+  - anthropic::claude-4-5-haiku:thinking
 session:
   log_level: INFO
-  step_verification_threshold: 0.8
   workspace_base: .workspace   # session artifacts written here (relative to cwd)
 interaction_switches:
   tool_write:

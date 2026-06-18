@@ -120,11 +120,6 @@
                     <span class="sc-icon" aria-hidden="true">⚙</span>
                     <span class="sc-label">Settings</span>
                 </button>
-                <button class="shortcut-btn" id="sc-templates" type="button"
-                        title="Browse saved GEP templates">
-                    <span class="sc-icon" aria-hidden="true">📋</span>
-                    <span class="sc-label">Templates</span>
-                </button>
                 <button class="shortcut-btn" id="sc-scheduler" type="button">
                     <span class="sc-icon" aria-hidden="true">⏱</span>
                     <span class="sc-label">Scheduler</span>
@@ -262,37 +257,26 @@
                             </small>
                         </label>
 
-                        <label>
-                            <span>Models</span>
-                            <div class="role-tabs" role="tablist" id="cfg-llm-role-tabs">
-                                <button type="button" class="role-tab active"
-                                        data-role="planner" role="tab"
-                                        aria-selected="true">Planner</button>
-                                <button type="button" class="role-tab"
-                                        data-role="receptionist" role="tab">Receptionist</button>
-                                <button type="button" class="role-tab"
-                                        data-role="agent" role="tab">Agent</button>
-                                <button type="button" class="role-tab"
-                                        data-role="helper" role="tab">Helper</button>
-                                <button type="button" class="role-tab"
-                                        data-role="available" role="tab">Available</button>
+                        <div class="model-selector-panel">
+                            <div class="model-selector-tabs">
+                                <button type="button" class="model-tab active" data-tab="agent">Agent</button>
+                                <button type="button" class="model-tab" data-tab="helper">Helper</button>
+                                <button type="button" class="model-tab" data-tab="available">Available</button>
                             </div>
-                            <div id="cfg-llm-role-pane-planner" class="role-model-list"
-                                 data-role-pane="planner"></div>
-                            <div id="cfg-llm-role-pane-receptionist" class="role-model-list"
-                                 data-role-pane="receptionist" hidden></div>
-                            <div id="cfg-llm-role-pane-agent" class="role-model-list"
-                                 data-role-pane="agent" hidden></div>
-                            <div id="cfg-llm-role-pane-helper" class="role-model-list"
-                                 data-role-pane="helper" hidden></div>
-                            <textarea id="cfg-llm-models" rows="6" spellcheck="false"
-                                      data-role-pane="available" hidden
-                                      placeholder="One model per line, highest priority first.&#10;e.g. anthropic::claude-4-6-sonnet:1M"></textarea>
-                            <small class="help-text">
-                                <b>Available</b>: master pool, one per line, order = priority.
-                                <b>Role tabs</b>: check which models each role uses.
-                            </small>
-                        </label>
+                            <div class="model-tab-panel" id="model-panel-agent">
+                                <small class="help-text">Models for agent, planner, and receptionist. Check order = fallback priority.</small>
+                                <div class="model-check-list" id="cfg-llm-agent-checks"></div>
+                            </div>
+                            <div class="model-tab-panel hidden" id="model-panel-helper">
+                                <small class="help-text">Models for schedule inference, LTM triage, and reranking.</small>
+                                <div class="model-check-list" id="cfg-llm-helper-checks"></div>
+                            </div>
+                            <div class="model-tab-panel hidden" id="model-panel-available">
+                                <small class="help-text">All model identifiers available for selection in the Agent and Helper tabs. One per line.</small>
+                                <textarea id="cfg-llm-available-models" rows="6" spellcheck="false"
+                                          placeholder="One model per line&#10;e.g. anthropic::claude-4-8-opus"></textarea>
+                            </div>
+                        </div>
                     </fieldset>
 
                     <!-- ============================== Session ============================== -->
@@ -312,17 +296,6 @@
                             <small class="help-text">
                                 Logging verbosity. DEBUG is the most verbose,
                                 CRITICAL the quietest. Default: INFO.
-                            </small>
-                        </label>
-
-                        <label>
-                            <span>Step Verification Threshold</span>
-                            <input type="number" id="cfg-session-step-threshold"
-                                   min="0" max="1" step="0.05"
-                                   placeholder="0.8" />
-                            <small class="help-text">
-                                Confidence below this value triggers a
-                                corrective step. Range 0.0–1.0. Default: 0.8.
                             </small>
                         </label>
 
@@ -547,6 +520,10 @@
                     <button type="button" class="admin-tab"
                             data-admin-tab="knowledge" role="tab">Knowledge</button>
                     <button type="button" class="admin-tab"
+                            data-admin-tab="skills" role="tab">Skills</button>
+                    <button type="button" class="admin-tab"
+                            data-admin-tab="summary" role="tab">Summary</button>
+                    <button type="button" class="admin-tab"
                             data-admin-tab="stats" role="tab">Stats</button>
                     <button type="button" class="admin-tab"
                             data-admin-tab="activity" role="tab">Activity</button>
@@ -564,6 +541,7 @@
                                 <option value="">All dimensions</option>
                                 <option value="agentic">Agentic</option>
                                 <option value="insight">Insight</option>
+                                <option value="identity">Identity</option>
                             </select>
                             <button type="button" id="admin-mem-refresh">Refresh</button>
                             <span class="admin-count" id="admin-mem-count"></span>
@@ -586,6 +564,45 @@
                             <span class="admin-count" id="admin-kn-count"></span>
                         </header>
                         <ul class="admin-list" id="admin-kn-list"></ul>
+                    </section>
+
+                    <!-- ── Skills tab (proposal approval queue) ────── -->
+                    <section class="admin-pane hidden" data-admin-pane="skills">
+                        <header class="admin-pane-header">
+                            <select id="admin-skill-status">
+                                <option value="proposed">Proposed</option>
+                                <option value="approved">Approved</option>
+                                <option value="rejected">Rejected</option>
+                            </select>
+                            <button type="button" id="admin-skill-refresh">Refresh</button>
+                            <span class="admin-count" id="admin-skill-count"></span>
+                            <small class="help-text">
+                                Skill proposals the dream worker staged from
+                                recurring workflows. Approve to install into the
+                                live Skill registry; reject to discard staging.
+                            </small>
+                        </header>
+                        <ul class="admin-list" id="admin-skill-list"></ul>
+                    </section>
+
+                    <!-- ── Summary tab (activity digest reader) ────── -->
+                    <section class="admin-pane hidden" data-admin-pane="summary">
+                        <header class="admin-pane-header">
+                            <input type="date" id="admin-sum-date">
+                            <select id="admin-sum-type">
+                                <option value="daily">Daily</option>
+                                <option value="weekly">Weekly</option>
+                                <option value="monthly">Monthly</option>
+                            </select>
+                            <button type="button" id="admin-sum-load">Load</button>
+                            <small class="help-text">
+                                Human-readable activity digest from the summary
+                                worker. Pick a date and period, then Load.
+                            </small>
+                        </header>
+                        <pre class="admin-stats-output" id="admin-sum-narrative">
+(pick a date and click Load)</pre>
+                        <ul class="admin-list" id="admin-sum-moments"></ul>
                     </section>
 
                     <!-- ── Stats tab ───────────────────────────────── -->
@@ -725,114 +742,6 @@
                         <button type="submit" id="sched-create">Create</button>
                     </div>
                 </form>
-            </div>
-        </div>
-
-        <!-- ============================================================ -->
-        <!-- GEP parameters panel — opens automatically when the Receptionist -->
-        <!-- detects a matching template and the planner enters the GEP    -->
-        <!-- confirmation window.  Lets the user review template steps,    -->
-        <!-- edit per-parameter values, and confirm / skip — with a live   -->
-        <!-- countdown driven by gep_countdown status events.              -->
-        <!-- ============================================================ -->
-        <div class="overlay hidden" id="overlay-gep" aria-hidden="true">
-            <div class="overlay-card gep-card" role="dialog" aria-modal="true">
-                <header class="overlay-header">
-                    <h2>
-                        <span aria-hidden="true">📋</span>
-                        <span id="gep-title">GEP Template</span>
-                    </h2>
-                    <span class="gep-countdown-pill" id="gep-countdown">--s</span>
-                    <button type="button" class="overlay-close" id="gep-close"
-                            aria-label="Close (defer to chat)">×</button>
-                </header>
-
-                <div class="gep-progress">
-                    <div class="gep-progress-bar" id="gep-progress-bar"></div>
-                </div>
-
-                <form class="settings-form gep-form" id="gep-form">
-                    <p class="gep-description help-text" id="gep-description"></p>
-
-                    <fieldset class="gep-section" id="gep-steps-section">
-                        <legend>Steps</legend>
-                        <ol class="gep-steps" id="gep-steps"></ol>
-                    </fieldset>
-
-                    <fieldset class="gep-section" id="gep-key-params-section" hidden>
-                        <legend>Key parameters — please review</legend>
-                        <div class="gep-params" id="gep-key-params"></div>
-                    </fieldset>
-
-                    <fieldset class="gep-section" id="gep-other-params-section" hidden>
-                        <legend>Other parameters</legend>
-                        <div class="gep-params" id="gep-other-params"></div>
-                    </fieldset>
-
-                    <p class="help-text gep-hint">
-                        Edit any parameter above, then click <b>Confirm now</b> —
-                        your values are sent along with the confirmation. Skip GEP
-                        to fall back to normal planning.
-                    </p>
-
-                    <div class="settings-actions gep-actions">
-                        <button type="button" id="gep-skip">Skip GEP</button>
-                        <button type="submit" id="gep-confirm" class="primary">Confirm now</button>
-                    </div>
-                </form>
-            </div>
-        </div>
-
-        <!-- ============================================================ -->
-        <!-- Templates review panel — opened from the Templates shortcut.  -->
-        <!-- Lists every GEP template in the user's templates dir with    -->
-        <!-- a clickable detail view (steps + params + problems).         -->
-        <!-- ============================================================ -->
-        <div class="overlay hidden" id="overlay-templates" aria-hidden="true">
-            <div class="overlay-card settings-card templates-card" role="dialog" aria-modal="true">
-                <header class="overlay-header">
-                    <h2>GEP Templates</h2>
-                    <button type="button" class="overlay-close" id="templates-close"
-                            aria-label="Close">×</button>
-                </header>
-                <div class="settings-toast hidden" id="templates-toast" role="status"></div>
-                <div class="templates-body">
-                    <div class="templates-list-header">
-                        <button type="button" id="templates-refresh">Refresh</button>
-                        <button type="button" id="templates-load-history" class="primary">📂 Load history…</button>
-                        <span class="templates-count muted" id="templates-count"></span>
-                    </div>
-                    <ul class="templates-list" id="templates-list"></ul>
-                    <section class="templates-detail-pane">
-                        <div class="templates-detail-empty muted" id="templates-detail-empty">
-                            Select a template above to view its steps and parameters.
-                        </div>
-                        <div class="templates-detail hidden" id="templates-detail">
-                            <header class="templates-detail-header">
-                                <h3 id="templates-detail-name"></h3>
-                                <span class="templates-detail-version" id="templates-detail-version"></span>
-                            </header>
-                            <p class="templates-detail-desc" id="templates-detail-desc"></p>
-                            <div class="templates-detail-problems hidden"
-                                 id="templates-detail-problems"></div>
-                            <section class="templates-detail-section" id="templates-detail-params-wrap">
-                                <h4>Parameters</h4>
-                                <div class="templates-detail-params" id="templates-detail-params"></div>
-                            </section>
-                            <section class="templates-detail-section" id="templates-detail-steps-wrap">
-                                <h4>Steps</h4>
-                                <ol class="templates-detail-steps" id="templates-detail-steps"></ol>
-                            </section>
-                            <dl class="templates-detail-meta">
-                                <dt>ID</dt><dd id="templates-detail-id"></dd>
-                                <dt>Created</dt><dd id="templates-detail-created"></dd>
-                            </dl>
-                            <div class="settings-actions templates-detail-actions">
-                                <button type="button" id="templates-detail-delete" class="danger">Delete</button>
-                            </div>
-                        </div>
-                    </section>
-                </div>
             </div>
         </div>
 

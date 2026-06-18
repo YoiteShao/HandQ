@@ -2,16 +2,16 @@
 
 Surface: ``infer_schedule(prompt, config) -> InferResult``.
 
-Design mirrors :mod:`long_term_memory.reranker`'s factory pattern:
+Design:
 
   * The bridge does NOT hold a long-lived LLM service for schedule
     inference — it's a rare event (only on ``cron_create``) and a
     permanent httpx pool would be wasted state.
-  * Each ``infer_schedule`` call resolves the ``from_data`` role
-    (UI label: ``helper``) via :func:`role_resolver.resolve_role_models`,
-    builds one :class:`AnthropicStreamingService` per model in that
-    role, drives them through :func:`llm_pool.call_with_fallback`, and
-    closes them all when the call returns.
+  * Each ``infer_schedule`` call resolves ``llm.helper_models`` (with
+    fallback to ``llm.models``) via :func:`role_resolver.resolve_models_and_helper`,
+    builds one :class:`AnthropicStreamingService` per model, drives them
+    through :func:`llm_pool.call_with_fallback`, and closes them all
+    when the call returns.
 
 The LLM is asked to return a JSON object ``{"schedule": "...",
 "prompt": "..."}``:
@@ -30,13 +30,13 @@ blocks, prose, json-repair quirks). The schedule is normalised
 :func:`scheduler.schedule.parse_schedule` to refuse anything we can't
 actually run.
 
-If anything goes wrong (no API key, no models in from_data/agent
-roles, parse failure, every fallback exhausted, timeout, malformed
-grammar from the LLM) we fall back to ``daily 09:00`` and the
-*original* prompt so :func:`store.create` never refuses purely because
-the LLM hiccupped. Daily 9am is a safe default — pinned to a known
-time, won't burn quota, and the user can immediately see the wrong
-schedule in the panel and recreate.
+If anything goes wrong (no API key, no helper / main models, parse
+failure, every fallback exhausted, timeout, malformed grammar from
+the LLM) we fall back to ``daily 09:00`` and the *original* prompt
+so :func:`store.create` never refuses purely because the LLM hiccupped.
+Daily 9am is a safe default — pinned to a known time, won't burn
+quota, and the user can immediately see the wrong schedule in the
+panel and recreate.
 """
 from __future__ import annotations
 
@@ -120,18 +120,14 @@ No prose, no markdown fences."""
 def _build_llm_services(config: dict) -> List[Any]:
     """Build the LLM service pool for schedule inference.
 
-    Resolution mirrors :func:`long_term_memory.reranker._build_llm_services_for_rerank`:
-      1. Need ``llm.API_KEY`` — return [] otherwise (caller falls back).
-      2. Pull models from the ``from_data`` role (UI label: ``helper``);
-         if empty, fall back to the ``agent`` role so we can still
-         answer when the user only filled in agent-tier models.
-      3. Construct one :class:`AnthropicStreamingService` per model —
-         :func:`llm_pool.call_with_fallback` will try them in order.
+    Pulls from ``llm.helper_models`` (cheap pool for simple background tasks);
+    falls back to ``llm.models`` when ``helper_models`` is empty so a config
+    without an explicit helper pool still works.
 
     The caller is responsible for closing each returned service.
     """
     try:
-        from src.infrastructure.role_resolver import resolve_role_models
+        from src.infrastructure.role_resolver import resolve_models_and_helper
         from src.infrastructure.anthropic_streaming_service import (
             AnthropicStreamingService,
         )
@@ -144,13 +140,11 @@ def _build_llm_services(config: dict) -> List[Any]:
     if not api_key:
         return []
 
-    roles = resolve_role_models(llm_cfg)
-    models = list(roles.get("from_data") or [])
-    if not models:
-        models = list(roles.get("agent") or [])
+    main_models, helper_models = resolve_models_and_helper(llm_cfg)
+    models = helper_models or main_models
     if not models:
         _logger.warning(
-            "schedule inference: from_data and agent roles both empty",
+            "schedule inference: helper_models and models both empty",
         )
         return []
 

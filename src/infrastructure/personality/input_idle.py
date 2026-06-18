@@ -23,6 +23,8 @@ import sys
 from ctypes import wintypes
 from typing import List, Optional, Tuple
 
+import psutil  # type: ignore[import-not-found]
+
 from ..long_term_memory.models import MonitorInfo
 
 _logger = logging.getLogger("handq.activity.input")
@@ -257,6 +259,23 @@ def cursor_in_monitor(pt: Tuple[int, int], info: MonitorInfo) -> bool:
 # ── Foreground window (sensitive-app gate) ─────────────────────────────────
 
 
+def foreground_hwnd() -> int:
+    """Return the foreground window's HWND as a plain int, or 0 on failure.
+
+    Companion to ``foreground_window_title`` / ``foreground_app_name`` —
+    those wrap GetForegroundWindow then derive title / process name.
+    The ``MonitorCapturer.capture_focus_rect`` path needs the raw HWND
+    so it can ask GetWindowRect for the window's bounding box.
+    """
+    if sys.platform != "win32":
+        return 0
+    try:
+        user32 = ctypes.windll.user32  # type: ignore[attr-defined]
+        return int(user32.GetForegroundWindow() or 0)
+    except Exception:
+        return 0
+
+
 def foreground_window_title() -> str:
     """Return the foreground window title, or "" on any failure.
 
@@ -295,7 +314,6 @@ def foreground_app_name() -> str:
         if not pid.value:
             return ""
         try:
-            import psutil  # type: ignore
             p = psutil.Process(pid.value)
             return p.name() or ""
         except Exception:

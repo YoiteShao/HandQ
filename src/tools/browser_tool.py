@@ -49,10 +49,13 @@ phases.
 
 Cleanup
 -------
-``flush_browser_pool()`` is called from the bridge's ``new_session``
-sequence to close the browser cleanly so the next session can re-acquire
-the user-data-dir without lock contention.  The function is idempotent
-and best-effort — exceptions are swallowed and logged.
+The live session is owned by a per-session ``BrowserSessionHolder``
+(``ctx.browser_session``).  ``SessionContext.close()`` awaits
+``holder.close()`` on session teardown so the next session can re-acquire
+the user-data-dir without lock contention.  The legacy module shim
+``flush_browser_pool()`` delegates to a process-wide fallback holder for
+ctx-less callers; both are idempotent and best-effort — exceptions are
+swallowed and logged.
 """
 from __future__ import annotations
 
@@ -69,30 +72,29 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 from urllib.parse import urlparse
 
+import yaml as _yaml  # type: ignore[import-not-found]
+
 from .base_tool import BaseTool, ToolResult
 from ..infrastructure.browser_paths import user_browser_profile_dir
 from ..infrastructure.logger import get_logger
 
-# ── Optional Playwright dependency ────────────────────────────────────────────
-# The agent must run even when playwright is not installed; the tool reports
-# a clear actionable error in that case.
+# ── Playwright dependency (eager, hard requirement) ──────────────────────────
 
-try:
-    from playwright.async_api import (  # type: ignore[import-not-found]
-        async_playwright,
-        Browser,
-        BrowserContext,
-        Page,
-        TimeoutError as _PlaywrightTimeoutError,
-    )
-    _PLAYWRIGHT_AVAILABLE = True
-except ImportError:
-    _PLAYWRIGHT_AVAILABLE = False
-    async_playwright = None      # type: ignore[assignment]
-    Browser = Any                # type: ignore[misc, assignment]
-    BrowserContext = Any         # type: ignore[misc, assignment]
-    Page = Any                   # type: ignore[misc, assignment]
-    _PlaywrightTimeoutError = Exception  # type: ignore[assignment]
+from playwright.async_api import (  # type: ignore[import-not-found]
+    async_playwright,
+    Browser,
+    BrowserContext,
+    Page,
+    TimeoutError as _PlaywrightTimeoutError,
+)
+
+
+# NOTE: browser_tool's two user-confirmation sites (attach_browser Chrome
+# restart prompt, request_user_login) read the InteractionManager from
+# ``self.ctx.interaction_manager`` (SessionContext DI), the same path
+# desktop_tool uses. There is no module-level IM handle — the bridge no
+# longer wires one; the IM arrives via tool construction.
+
 
 
 # Maximum characters returned by ``extract`` — mirrors read_tool's 100KB
@@ -143,40 +145,14 @@ _PASSWORD_REFUSAL = (
     "sessions."
 )
 
-# Browser screenshot scratch store. The actual class + retention logic
-# lives in ``infrastructure.vision.ScreenshotStore`` so the same tier
-# semantics can be reused by desktop_tool (Phase 2) and activity_monitor
-# (Phase 3) — only the root directory differs per producer. We hold a
-# lazy module-level instance because ConfigManager is not always ready
-# at import time.
+# Browser screenshot scratch store. The actual class + retention logic lives in
+# ``infrastructure.vision.ScreenshotStore``; the per-session lazy instance is
+# owned by ``BrowserSessionHolder.get_store`` so screenshots are swept at the
+# session boundary by ``BrowserSessionHolder.close``.
 #
 # Long-term keepers do NOT live here. If the agent wants to preserve a
 # capture beyond the task, it writes to its session directory (working
 # dir) instead — see ARCHITECTURE.md §1.6.
-_browser_store_instance: Optional[Any] = None
-
-
-def _browser_store():
-    global _browser_store_instance
-    if _browser_store_instance is None:
-        from ..infrastructure.config_manager import ConfigManager
-        from ..infrastructure.vision import ScreenshotStore
-        try:
-            cfg = ConfigManager().get_section("screenshots") or {}
-        except Exception:
-            cfg = {}
-        _browser_store_instance = ScreenshotStore(
-            root=os.path.join(user_browser_profile_dir(), "screenshots"),
-            config_section=cfg,
-        )
-    return _browser_store_instance
-
-
-def _default_screenshot_dir() -> str:
-    """Backward-compat shim — returns the ``task`` subdir of the browser
-    store. Most call sites should call ``_browser_store().subdir(cat)``
-    directly with an explicit category."""
-    return _browser_store().subdir("task")
 
 
 # Recognised Playwright selector engine prefixes. We only validate CSS
@@ -255,21 +231,188 @@ class BrowserSession:
         return None
 
 
-_session: Optional[BrowserSession] = None
-_session_lock = asyncio.Lock()
+# ── Per-session holder class (used by SessionContext) ────────────────────────
+#
+# Wraps the same three pieces of state (live BrowserSession, asyncio.Lock that
+# serialises every DOM operation, lazy ScreenshotStore) into a per-instance
+# object. ``SessionContext`` constructs one per session; ``ctx.close()`` awaits
+# :meth:`close` to:
+#
+#   * tear down the Playwright session in mode-aware fashion (launch mode kills
+#     our Chromium subprocess; attach mode disconnects CDP without touching the
+#     user's Chrome)
+#   * wipe ephemeral screenshots and age-sweep task screenshots
+#
+# The live ``BrowserSession`` and the lock that serialises DOM operations now
+# live on this holder, not at module scope. The module helpers below
+# (``flush_browser_pool`` / ``acquire_browser_lock``) delegate to a
+# process-wide fallback holder (:func:`_module_holder`) for the ctx=None path;
+# tools with a SessionContext use ``ctx.browser_session`` so they share the
+# per-session live browser.
+
+
+class BrowserSessionHolder:
+    """Per-session container for the singleton-Chromium / Playwright graph.
+
+    Chromium's user-data-dir locking forces "one browser per process" — that
+    constraint doesn't change with SessionContext. What changes is **lifecycle
+    ownership**: the live session is now bound to the FlowControllerV2 that
+    spawned it, and ``ctx.close()`` guarantees the next session boots with no
+    Playwright handles, no orphan Chromium, and no leftover pages.
+    """
+
+    def __init__(self) -> None:
+        self._session: Optional[BrowserSession] = None
+        self._lock: asyncio.Lock = asyncio.Lock()
+        self._store: Optional[Any] = None  # lazy ScreenshotStore
+
+    # ── Live session accessors ───────────────────────────────────────────
+
+    @property
+    def session(self) -> Optional[BrowserSession]:
+        return self._session
+
+    def set_session(self, session: Optional[BrowserSession]) -> None:
+        self._session = session
+
+    @property
+    def lock(self) -> asyncio.Lock:
+        """Global serialiser for every DOM operation across tools / agents."""
+        return self._lock
+
+    @asynccontextmanager
+    async def acquire(self) -> AsyncIterator["BrowserSession"]:
+        """Yield the live BrowserSession while holding the global lock.
+
+        Raises ``RuntimeError`` if no session is launched. Same shape as the
+        module-level :func:`acquire_browser_lock` so callers can switch trivially.
+        """
+        async with self._lock:
+            if self._session is None:
+                raise RuntimeError(
+                    "browser session is not launched. Call "
+                    "browser.launch_browser before reusing the browser session."
+                )
+            yield self._session
+
+    # ── Screenshot store (lazy) ──────────────────────────────────────────
+
+    def get_store(self):
+        """Return (lazily-built) :class:`ScreenshotStore` for this session.
+
+        Construction is deferred until first use because ConfigManager may not
+        be ready at module load. The store's root is the user's browser-profile
+        directory's ``screenshots`` subfolder; per-category subdirs (ephemeral
+        / task) are created on demand.
+        """
+        if self._store is None:
+            from ..infrastructure.config_manager import ConfigManager
+            from ..infrastructure.vision import ScreenshotStore
+            try:
+                cfg = ConfigManager().get_section("screenshots") or {}
+            except Exception:
+                cfg = {}
+            self._store = ScreenshotStore(
+                root=os.path.join(user_browser_profile_dir(), "screenshots"),
+                config_section=cfg,
+            )
+        return self._store
+
+    # ── Lifecycle ────────────────────────────────────────────────────────
+
+    async def close(self) -> int:
+        """Close any active browser session + sweep screenshots. Returns 0/1.
+
+        Mode-aware:
+          * **launch** mode: ``context.close()`` kills our owned Chromium
+            subprocess and releases the user-data-dir lock.
+          * **attach** mode: ``browser.close()`` only DISCONNECTS the CDP
+            session; the user's Chrome process keeps running and their tabs
+            are unaffected.
+
+        Best-effort: every step wrapped in try/except so a partial-broken
+        session never blocks shutdown. ``ctx.close()`` calls this directly
+        (it's already async-native; no ``to_thread`` wrap needed).
+        """
+        sess = self._session
+        self._session = None
+        if sess is None:
+            return 0
+
+        logger = get_logger()
+        if sess.mode == "attach":
+            try:
+                await sess.browser.close()
+            except Exception as exc:
+                logger.warning(
+                    f"browser holder close (attach): browser.close failed: {exc}",
+                    component="BrowserTool",
+                )
+        else:
+            try:
+                await sess.context.close()
+            except Exception as exc:
+                logger.warning(
+                    f"browser holder close (launch): context.close failed: {exc}",
+                    component="BrowserTool",
+                )
+        try:
+            await sess.playwright.stop()
+        except Exception as exc:
+            logger.warning(
+                f"browser holder close: playwright.stop failed: {exc}",
+                component="BrowserTool",
+            )
+        logger.info(
+            f"browser holder close: {sess.mode} session closed",
+            component="BrowserTool",
+        )
+
+        # Screenshot housekeeping at session boundary.
+        if self._store is not None:
+            try:
+                swept = self._store.session_close_sweep()
+                if swept.get("ephemeral") or swept.get("task"):
+                    logger.info(
+                        f"screenshots flush: purged "
+                        f"{swept.get('ephemeral', 0)} ephemeral, "
+                        f"{swept.get('task', 0)} aged-task file(s)",
+                        component="BrowserTool",
+                    )
+            except Exception as exc:
+                logger.warning(
+                    f"screenshots flush failed: {exc}",
+                    component="BrowserTool",
+                )
+        return 1
+
+
+# ── Process-wide fallback holder (ctx=None path) ─────────────────────────────
+# When a SessionContext is present, tools use ``ctx.browser_session``. Legacy /
+# test callers with no ctx — and the transitional module helpers below — fall
+# back to this lazily-created singleton so the module path keeps working.
+_module_holder_instance: Optional["BrowserSessionHolder"] = None
+
+
+def _module_holder() -> "BrowserSessionHolder":
+    global _module_holder_instance
+    if _module_holder_instance is None:
+        _module_holder_instance = BrowserSessionHolder()
+    return _module_holder_instance
 
 
 # ── Public helpers for cross-tool reuse ──────────────────────────────────────
 # web_search_tool reuses the live Playwright session to do same-origin
-# REST calls (cookies + SSO already in place via the user's profile). These
-# helpers are the public contract; downstream tools must NOT import _session
-# / _session_lock directly so the singleton can be refactored later without
-# breaking callers.
+# REST calls (cookies + SSO already in place via the user's profile). The
+# live session is owned by a ``BrowserSessionHolder`` (per-session via ctx, or
+# the module fallback); downstream tools must go through ``ctx.browser_session``
+# or these public helpers rather than reaching for holder internals, so the
+# session model can evolve without breaking callers.
 
 def is_browser_available() -> bool:
-    """True iff Playwright is importable. Used by setup providers to fail
-    fast with an actionable install hint instead of a deep stacktrace."""
-    return _PLAYWRIGHT_AVAILABLE
+    """Always True now — playwright is an eager hard dep imported at module
+    load. Kept for callers that still query the flag; remove once they stop."""
+    return True
 
 
 @asynccontextmanager
@@ -279,14 +422,13 @@ async def acquire_browser_lock() -> AsyncIterator["BrowserSession"]:
     Raises ``RuntimeError`` if no session is launched — caller must invoke
     ``browser.launch_browser`` first. Lock is global to the process; all
     actions across agents and steps queue on it.
+
+    Module-path shim: delegates to the process-wide fallback holder. Callers
+    with a SessionContext should acquire ``ctx.browser_session`` directly so
+    they share the per-session live browser instead of this fallback.
     """
-    async with _session_lock:
-        if _session is None:
-            raise RuntimeError(
-                "browser session is not launched. Call "
-                "browser.launch_browser before reusing the browser session."
-            )
-        yield _session
+    async with _module_holder().acquire() as session:
+        yield session
 
 
 # Cap on the body returned by evaluate_fetch — mirrors _EXTRACT_MAX_CHARS so
@@ -314,7 +456,8 @@ async def evaluate_fetch(
     tab happens to be in front; cross-origin fetches require the server
     to expose CORS headers and are rare for internal APIs.
 
-    Caller MUST already hold ``_session_lock`` (use ``acquire_browser_lock``).
+    Caller MUST already hold the browser session lock (use
+    ``acquire_browser_lock`` for the module path, or ``ctx.browser_session.acquire``).
 
     Returns ``{status, headers, body, url, truncated}``. On JS-side error
     (network failure, abort, malformed URL): ``{status: 0, error: ..., ...}``.
@@ -566,66 +709,17 @@ def _spawn_bat_detached(bat_path: str) -> None:
 async def flush_browser_pool() -> int:
     """Close the active browser session if any. Returns the number closed (0 or 1).
 
-    Mode-aware:
-      * launch mode → ``context.close()`` shuts down our persistent
-        Chromium subprocess and releases the user-data-dir lock so the
-        next session can re-acquire it.
-      * attach mode → ``browser.close()`` only DISCONNECTS the CDP
-        session; the user's Chrome process keeps running and their tabs
-        are unaffected. This is critical: attach mode must not destroy
-        the user's session.
+    Module-path shim retained for the bridge's legacy ``new_session`` sequence
+    and the transitional ``SessionContext.close`` flush. Delegates to the
+    process-wide fallback holder's :meth:`BrowserSessionHolder.close`, which is
+    mode-aware (launch → kills our Chromium subprocess and releases the
+    user-data-dir lock; attach → only DISCONNECTS CDP so the user's Chrome
+    stays open) and sweeps ephemeral / aged-task screenshots at the boundary.
 
-    Called from the bridge's ``new_session`` sequence. Best-effort: every
-    step is wrapped in try/except so a partially-broken session never
-    blocks shutdown. Async because Playwright's close / stop are
-    coroutines — the caller must ``await``.
+    When a SessionContext owns the live session, ``ctx.browser_session.close()``
+    is the real teardown and this becomes a no-op on the empty fallback holder.
     """
-    global _session
-    sess = _session
-    _session = None
-    if sess is None:
-        return 0
-
-    logger = get_logger()
-    if sess.mode == "attach":
-        # Disconnect CDP — does NOT terminate the user's Chrome.
-        try:
-            await sess.browser.close()
-        except Exception as exc:
-            logger.warning(f"browser flush (attach): browser.close failed: {exc}",
-                           component="BrowserTool")
-    else:
-        # Launch mode: close our owned context (kills our Chromium subprocess).
-        try:
-            await sess.context.close()
-        except Exception as exc:
-            logger.warning(f"browser flush (launch): context.close failed: {exc}",
-                           component="BrowserTool")
-    try:
-        await sess.playwright.stop()
-    except Exception as exc:
-        logger.warning(f"browser flush: playwright.stop failed: {exc}",
-                       component="BrowserTool")
-    logger.info(f"browser flush: {sess.mode} session closed",
-                component="BrowserTool")
-    # Screenshot housekeeping at the session boundary.
-    #   ephemeral/  : nuked unconditionally — vision_query work files
-    #                 should never cross sessions.
-    #   task/       : aged sweep using screenshots.task.retain_after_task_days
-    #                 (defaults to 1). Keeps a short replay window.
-    try:
-        swept = _browser_store().session_close_sweep()
-        if swept.get("ephemeral") or swept.get("task"):
-            logger.info(
-                f"screenshots flush: purged "
-                f"{swept.get('ephemeral', 0)} ephemeral, "
-                f"{swept.get('task', 0)} aged-task file(s)",
-                component="BrowserTool",
-            )
-    except Exception as exc:
-        logger.warning(f"screenshots flush failed: {exc}",
-                       component="BrowserTool")
-    return 1
+    return await _module_holder().close()
 
 
 # ── BrowserTool ──────────────────────────────────────────────────────────────
@@ -955,23 +1049,23 @@ class BrowserTool(BaseTool):
         "additionalProperties": False,
     }
 
-    def __init__(self) -> None:
-        super().__init__("browser")
+    def __init__(self, ctx=None) -> None:
+        super().__init__("browser", ctx=ctx)
         self.logger = get_logger()
+        # Per-session browser holder (SessionContext DI). Falls back to the
+        # process-wide module holder when constructed without a ctx (legacy /
+        # test path) so the tool still works standalone.
+        self.holder = (
+            ctx.browser_session
+            if ctx is not None and getattr(ctx, "browser_session", None) is not None
+            else _module_holder()
+        )
 
     # ── Main entry point ──────────────────────────────────────────────────────
 
     async def execute(self, action: str = "", **kwargs: Any) -> ToolResult:
         start = time.time()
         params: Dict[str, Any] = {"action": action, **kwargs}
-
-        if not _PLAYWRIGHT_AVAILABLE:
-            return self._error(
-                params, start,
-                "playwright is not installed. Run:\n"
-                "  pip install playwright\n"
-                "  playwright install msedge   # or: chromium",
-            )
 
         if not action:
             return self._error(params, start, "browser tool requires 'action'.")
@@ -1002,11 +1096,11 @@ class BrowserTool(BaseTool):
                 f"Valid: {', '.join(dispatch)}",
             )
 
-        # Single-action serialisation. The lock is global to the process —
-        # actions across agents and steps all queue here. Operations are
-        # short (sub-second to a few seconds), so contention is acceptable
-        # in exchange for safety.
-        async with _session_lock:
+        # Single-action serialisation. The lock lives on the per-session holder
+        # (or the module fallback when ctx is absent) — actions across agents and
+        # steps all queue here. Operations are short (sub-second to a few
+        # seconds), so contention is acceptable in exchange for safety.
+        async with self.holder.lock:
             try:
                 return await handler(params, start, **kwargs)
             except Exception as exc:
@@ -1025,22 +1119,21 @@ class BrowserTool(BaseTool):
         self, params: Dict[str, Any], start: float, **kwargs: Any,
     ) -> ToolResult:
         """Idempotent: returns the existing session if one is alive."""
-        global _session
-
-        if _session is not None:
+        existing = self.holder.session
+        if existing is not None:
             # Verify the session is still healthy. context.pages will raise
             # if the underlying browser process has exited.
             try:
-                _ = _session.context.pages
-                _session.last_used = time.time()
+                _ = existing.context.pages
+                existing.last_used = time.time()
                 return ToolResult(
                     success=True,
                     output={
                         "reused":      True,
-                        "channel":     _session.channel,
-                        "mode":        _session.mode,
-                        "profile_dir": _session.profile_dir,
-                        "tabs":        list(_session.tabs.keys()),
+                        "channel":     existing.channel,
+                        "mode":        existing.mode,
+                        "profile_dir": existing.profile_dir,
+                        "tabs":        list(existing.tabs.keys()),
                     },
                     tool_name=self.name,
                     tool_parameters=params,
@@ -1052,7 +1145,7 @@ class BrowserTool(BaseTool):
                     "browser session stale on launch_browser; relaunching",
                     component="BrowserTool",
                 )
-                _session = None
+                self.holder.set_session(None)
 
         profile_dir = user_browser_profile_dir()
         pw = await async_playwright().start()
@@ -1124,7 +1217,7 @@ class BrowserTool(BaseTool):
         tab_id = sess.mint_tab_id()
         sess.tabs[tab_id] = page
 
-        _session = sess
+        self.holder.set_session(sess)
 
         return ToolResult(
             success=True,
@@ -1170,8 +1263,6 @@ class BrowserTool(BaseTool):
         New tabs created via ``action='new_tab'`` are opened in the
         background by default so the user's focus is not stolen.
         """
-        global _session
-
         # Read attach_enabled from config. Best-effort — when config can't
         # be read we conservatively REFUSE rather than silently allow.
         try:
@@ -1191,10 +1282,10 @@ class BrowserTool(BaseTool):
                 "--remote-debugging-port=9222 before retrying.",
             )
 
-        if _session is not None:
+        if self.holder.session is not None:
             return self._error(
                 params, start,
-                f"attach_browser: a {_session.mode!r} session is already active. "
+                f"attach_browser: a {self.holder.session.mode!r} session is already active. "
                 "Start a new HandQ session (which flushes the pool) and retry.",
             )
 
@@ -1272,7 +1363,7 @@ class BrowserTool(BaseTool):
                 title = "(unavailable)"
             registered.append({"tab_id": tid, "url": page.url, "title": title})
 
-        _session = sess
+        self.holder.set_session(sess)
         self.logger.info(
             f"browser attached: cdp_url={cdp_url} tabs={len(registered)}",
             component="BrowserTool",
@@ -1316,15 +1407,9 @@ class BrowserTool(BaseTool):
                 path = os.path.expanduser(creds_file)
                 if not os.path.isfile(path):
                     return "", f"credentials_file (not found: {path})"
-                import json as _json
                 with open(path, "r", encoding="utf-8") as fh:
                     raw = fh.read()
-                # Try YAML first, fall back to JSON.
-                try:
-                    import yaml as _yaml  # type: ignore[import-not-found]
-                    data = _yaml.safe_load(raw)
-                except ImportError:
-                    data = _json.loads(raw)
+                data = _yaml.safe_load(raw)
                 if isinstance(data, dict):
                     if data.get("cdp_url"):
                         return str(data["cdp_url"]), f"credentials_file ({path})"
@@ -1402,9 +1487,6 @@ class BrowserTool(BaseTool):
                 "attach setup: Chrome/Edge already running, asking user to restart",
                 component="BrowserTool",
             )
-            from ..controller.interaction_manager import InteractionManager
-            from ..models.decision import Decision, ToolCall
-
             description = (
                 "Agent wants to ATTACH to your Chrome / Edge so it can use your\n"
                 "real cookies and login state.\n"
@@ -1421,27 +1503,14 @@ class BrowserTool(BaseTool):
                 "Reject  = Cancel attach. Agent will fall back to launch_browser\n"
                 "             (independent profile; no access to your current Chrome state)."
             )
-            decision_proxy = Decision(
-                reasoning="attach_browser auto-setup needs Chrome restart",
-                tool_calls=[ToolCall(
-                    call_id="attach_setup_restart",
-                    tool_name="browser",
-                    parameters={"action": "attach_browser", "_setup": "restart_chrome"},
-                )],
-            )
-            try:
-                im = InteractionManager.get_instance()
-            except Exception as exc:
+            im = self.ctx.interaction_manager if self.ctx is not None else None
+            if im is None:
                 return (
-                    f"attach_browser: cannot ask user about Chrome restart "
-                    f"(InteractionManager unavailable: {exc}). Close Chrome "
-                    f"manually and retry."
+                    "attach_browser: cannot ask user about Chrome restart "
+                    "(no UI bound). Close Chrome manually and retry, or use "
+                    "action='launch_browser' for an independent profile."
                 )
-            loop = asyncio.get_event_loop()
-            confirmation = await loop.run_in_executor(
-                None,
-                lambda: im.request_risk_confirmation(decision_proxy, description),
-            )
+            confirmation = await im.request_risk_confirmation(description)
             if confirmation.is_rejected() or confirmation.has_new_message():
                 msg = (
                     confirmation.message
@@ -1501,7 +1570,7 @@ class BrowserTool(BaseTool):
         launch mode: ``background`` is irrelevant (the window is off-screen);
         ``context.new_page()`` is used directly.
         """
-        sess = _session
+        sess = self.holder.session
         if sess is None:
             return self._error(params, start, "No browser session. Call action='launch_browser' or 'attach_browser' first.")
 
@@ -1561,7 +1630,7 @@ class BrowserTool(BaseTool):
     async def _action_list_tabs(
         self, params: Dict[str, Any], start: float, **kwargs: Any,
     ) -> ToolResult:
-        sess = _session
+        sess = self.holder.session
         if sess is None:
             return self._error(params, start, "No browser session. Call action='launch_browser' first.")
 
@@ -1597,7 +1666,7 @@ class BrowserTool(BaseTool):
     async def _action_navigate(
         self, params: Dict[str, Any], start: float, **kwargs: Any,
     ) -> ToolResult:
-        sess = _session
+        sess = self.holder.session
         if sess is None:
             return self._error(params, start, "No browser session. Call action='launch_browser' first.")
 
@@ -1654,7 +1723,7 @@ class BrowserTool(BaseTool):
     async def _action_extract(
         self, params: Dict[str, Any], start: float, **kwargs: Any,
     ) -> ToolResult:
-        sess = _session
+        sess = self.holder.session
         if sess is None:
             return self._error(params, start, "No browser session. Call action='launch_browser' first.")
 
@@ -1948,7 +2017,7 @@ class BrowserTool(BaseTool):
             summary: <multi-line markdown listing for the LLM>
           }
         """
-        sess = _session
+        sess = self.holder.session
         if sess is None:
             return self._error(params, start, "No browser session. Call action='launch_browser' first.")
 
@@ -2128,7 +2197,7 @@ class BrowserTool(BaseTool):
     async def _action_click(
         self, params: Dict[str, Any], start: float, **kwargs: Any,
     ) -> ToolResult:
-        sess = _session
+        sess = self.holder.session
         if sess is None:
             return self._error(params, start, "No browser session. Call action='launch_browser' first.")
 
@@ -2195,7 +2264,7 @@ class BrowserTool(BaseTool):
     async def _action_type(
         self, params: Dict[str, Any], start: float, **kwargs: Any,
     ) -> ToolResult:
-        sess = _session
+        sess = self.holder.session
         if sess is None:
             return self._error(params, start, "No browser session. Call action='launch_browser' first.")
 
@@ -2290,7 +2359,7 @@ class BrowserTool(BaseTool):
     async def _action_wait_for(
         self, params: Dict[str, Any], start: float, **kwargs: Any,
     ) -> ToolResult:
-        sess = _session
+        sess = self.holder.session
         if sess is None:
             return self._error(params, start, "No browser session. Call action='launch_browser' first.")
 
@@ -2381,7 +2450,7 @@ class BrowserTool(BaseTool):
     async def _action_screenshot(
         self, params: Dict[str, Any], start: float, **kwargs: Any,
     ) -> ToolResult:
-        sess = _session
+        sess = self.holder.session
         if sess is None:
             return self._error(params, start, "No browser session. Call action='launch_browser' first.")
 
@@ -2400,7 +2469,7 @@ class BrowserTool(BaseTool):
         # long-term keepers the agent should write into its session
         # working_directory directly via an absolute path — see
         # ARCHITECTURE.md §1.6.
-        store = _browser_store()
+        store = self.holder.get_store()
         if path_arg and os.path.isabs(path_arg):
             out_path = path_arg
             wrote_to_store = False
@@ -2617,7 +2686,7 @@ class BrowserTool(BaseTool):
                 "vision_query requires 'question' — a natural-language "
                 "instruction telling the model what to look for.",
             )
-        sess = _session
+        sess = self.holder.session
         if sess is None:
             return self._error(params, start, "No browser session. Call action='launch_browser' first.")
         page = self._resolve_tab(sess, kwargs.get("tab_id"))
@@ -2634,7 +2703,7 @@ class BrowserTool(BaseTool):
         # high-frequency task (e.g. iterating on what's on a chart) cannot
         # blow up disk usage — the store's enforce_retention runs LRU + age
         # cleanup right after the write.
-        store = _browser_store()
+        store = self.holder.get_store()
         ts = datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
         out_path = os.path.join(store.subdir("ephemeral"), f"vision-{ts}.png")
         try:
@@ -2838,7 +2907,7 @@ class BrowserTool(BaseTool):
 
         See ``_VIDEO_CONTEXT_JS`` for the exact fields returned.
         """
-        sess = _session
+        sess = self.holder.session
         if sess is None:
             return self._error(params, start, "No browser session. Call action='launch_browser' first.")
         page = self._resolve_tab(sess, kwargs.get("tab_id"))
@@ -2912,19 +2981,18 @@ class BrowserTool(BaseTool):
         navigates a tab to the URL's origin first so SameSite-restricted
         auth cookies are sent.
 
-        The tool runs inside the global ``_session_lock`` (acquired by
-        ``execute``), so direct callers reusing ``acquire_browser_lock``
-        must not call this method.
+        The tool runs inside the browser session lock (acquired by
+        ``execute`` on the holder), so direct callers reusing
+        ``acquire_browser_lock`` must not call this method.
         """
-        global _session
-
         url = (kwargs.get("url") or "").strip()
         if not url:
             return self._error(
                 params, start,
                 "fetch_json requires 'url' (absolute, with scheme).",
             )
-        if _session is None:
+        sess = self.holder.session
+        if sess is None:
             return self._error(
                 params, start,
                 "fetch_json: no browser session. "
@@ -2945,7 +3013,7 @@ class BrowserTool(BaseTool):
 
         try:
             result = await evaluate_fetch(
-                _session,
+                sess,
                 url=url,
                 method=method,
                 headers=headers,
@@ -2962,7 +3030,7 @@ class BrowserTool(BaseTool):
             )
             return self._error(params, start, f"fetch_json failed: {exc}")
 
-        _session.last_used = time.time()
+        sess.last_used = time.time()
 
         # JS-side error (network failure, timeout, malformed URL inside fetch).
         if result.get("error"):
@@ -3019,7 +3087,7 @@ class BrowserTool(BaseTool):
         Chrome's native UI — agent only observes the cookie that results
         (stored in the persistent profile and reused next session).
         """
-        sess = _session
+        sess = self.holder.session
         if sess is None:
             return self._error(params, start, "No browser session. Call action='launch_browser' first.")
 
@@ -3060,10 +3128,6 @@ class BrowserTool(BaseTool):
             )
 
         # ── 2. Build modal payload + block on user answer ───────────────
-        # Lazy imports to avoid any chance of import cycles via the tool registry.
-        from ..controller.interaction_manager import InteractionManager
-        from ..models.decision import Decision, ToolCall
-
         description = (
             "Agent needs you to log in before continuing.\n\n"
             f"Why: {reason}\n"
@@ -3075,40 +3139,20 @@ class BrowserTool(BaseTool):
             "Cookies from your login will be stored locally so you do not need "
             "to log in again for this site in future sessions."
         )
-        decision_proxy = Decision(
-            reasoning="agent requested user login",
-            tool_calls=[ToolCall(
-                call_id="request_user_login",
-                tool_name="browser",
-                parameters={
-                    "action": "request_user_login",
-                    "reason": reason,
-                    "tab_id": kwargs.get("tab_id"),
-                },
-            )],
-        )
 
-        try:
-            im = InteractionManager.get_instance()
-        except Exception as exc:
-            # No IM singleton — running in a context without UI (test). Fall
+        im = self.ctx.interaction_manager if self.ctx is not None else None
+        if im is None:
+            # No IM bound — running in a context without UI (test). Fall
             # back to auto-approving so callers can exercise the rest of the
             # flow; tests can stub this out.
             self.logger.warning(
-                f"request_user_login: no InteractionManager available ({exc}); "
+                "request_user_login: no InteractionManager bound; "
                 "auto-approving for compatibility",
                 component="BrowserTool",
             )
             confirmation = None
         else:
-            loop = asyncio.get_event_loop()
-            # Run the blocking IM call in an executor thread so the event
-            # loop is free to dispatch other work (e.g. background tasks)
-            # while we wait for the user.
-            confirmation = await loop.run_in_executor(
-                None,
-                lambda: im.request_risk_confirmation(decision_proxy, description),
-            )
+            confirmation = await im.request_risk_confirmation(description)
 
         # ── 3. Move window off-screen regardless of outcome ─────────────
         try:
@@ -3184,7 +3228,7 @@ class BrowserTool(BaseTool):
     async def _action_close_tab(
         self, params: Dict[str, Any], start: float, **kwargs: Any,
     ) -> ToolResult:
-        sess = _session
+        sess = self.holder.session
         if sess is None:
             return self._error(params, start, "No browser session.")
 

@@ -2,10 +2,10 @@
 """
 SSH Setup Manager — Automated SSH credential establishment for HandQ.
 
-When an agent step requires SSH remote work, SSHContextProvider (a
-StepContextProvider) intercepts the step, establishes credentials, and
-injects a context hint into effective_goal so the agent knows exactly
-which credentials file to use and how to call the SSH tool.
+When an agent item requires SSH remote work, SSHContextProvider (a V2
+ContextProvider) intercepts the item, establishes credentials, and
+injects a context hint into the agent's per-item host context so the agent
+knows exactly which credentials file to use and how to call the SSH tool.
 
 Authentication flow (tried in order):
   1. Key auth  — paramiko auto-discovers ~/.ssh/id_* or uses key_path
@@ -33,33 +33,17 @@ import textwrap
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
-from .step_context_provider import StepContextProvider
+from ..controller_v2.context import ContextProvider, ItemContext, ProviderCache
 from .logger import get_logger
 
 if TYPE_CHECKING:
-    from ..controller.interaction_manager import InteractionManager
-    from .memory import Memory
-    from ..models.plan import Step
+    from ..controller_v2.interaction_manager import InteractionManager
 
-# ── Optional dependency checks ────────────────────────────────────────────────
+# ── Hard dependencies ────────────────────────────────────────────────────────
 
-try:
-    import paramiko as _paramiko
-    _PARAMIKO_AVAILABLE = True
-except ImportError:
-    _PARAMIKO_AVAILABLE = False
-
-try:
-    import yaml as _yaml
-    _YAML_AVAILABLE = True
-except ImportError:
-    _YAML_AVAILABLE = False
-
-try:
-    import keyring as _keyring
-    _KEYRING_AVAILABLE = True
-except ImportError:
-    _KEYRING_AVAILABLE = False
+import paramiko as _paramiko
+import yaml as _yaml
+import keyring as _keyring
 
 
 # ── Data classes ──────────────────────────────────────────────────────────────
@@ -125,23 +109,15 @@ def _setup_keyring_backend() -> None:
     master-password prompt which blocks headless/background processes.
     The keyring file is protected by filesystem permissions (600).
     """
-    if not _KEYRING_AVAILABLE:
-        return
-
-    # Check whether a real OS keyring is already active.
-    # ChainerBackend, fail.Keyring, and EncryptedKeyring all fall through.
     backend = _keyring.get_keyring()
     module = backend.__class__.__module__.lower()
     name   = backend.__class__.__name__.lower()
     _SYSTEM_BACKENDS = ("secretservice", "kwallet", "keychain", "windows", "macos")
     if any(x in module or x in name for x in _SYSTEM_BACKENDS):
-        return  # real OS keyring — leave it alone
+        return
 
-    try:
-        from keyrings.alt.file import PlaintextKeyring  # type: ignore
-        _keyring.set_keyring(PlaintextKeyring())
-    except Exception:
-        pass
+    from keyrings.alt.file import PlaintextKeyring  # type: ignore
+    _keyring.set_keyring(PlaintextKeyring())
 
 
 def _probe_login_shell(
@@ -160,12 +136,9 @@ def _probe_login_shell(
     Returns one of: "bash" | "tcsh" | "zsh" | "sh" | "unknown".
     Never raises — returns "unknown" on any error.
     """
-    if not _PARAMIKO_AVAILABLE:
-        return "unknown"
     try:
-        import paramiko
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client = _paramiko.SSHClient()
+        client.set_missing_host_key_policy(_paramiko.AutoAddPolicy())
         kw: Dict[str, Any] = dict(
             hostname=hostname, port=port, username=username,
             timeout=10, banner_timeout=30, allow_agent=True, look_for_keys=False,
@@ -202,13 +175,8 @@ def _try_connect(hostname: str, username: str, port: int,
     Attempt a paramiko connection.  Returns True on success, False on auth failure.
     Raises on network errors (host unreachable, timeout, etc.).
     """
-    if not _PARAMIKO_AVAILABLE:
-        raise SSHSetupError(
-            "paramiko is not installed. Run: pip install paramiko"
-        )
-    import paramiko
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    client = _paramiko.SSHClient()
+    client.set_missing_host_key_policy(_paramiko.AutoAddPolicy())
     try:
         kw: Dict[str, Any] = dict(
             hostname=hostname, port=port, username=username,
@@ -222,7 +190,7 @@ def _try_connect(hostname: str, username: str, port: int,
             kw["allow_agent"] = False
         client.connect(**kw)
         return True
-    except paramiko.AuthenticationException:
+    except _paramiko.AuthenticationException:
         return False
     finally:
         try:
@@ -366,7 +334,7 @@ class SSHSetupManager:
 
         # Step 3: try keyring auth (if creds file exists with keyring_service)
         service = _keyring_service_name(hostname)
-        if _KEYRING_AVAILABLE and os.path.isfile(creds_file):
+        if os.path.isfile(creds_file):
             existing_service = self._read_keyring_service(creds_file)
             if existing_service:
                 try:
@@ -424,8 +392,7 @@ class SSHSetupManager:
                     )
         else:
             self.logger.debug(
-                f"Keyring auth skipped: available={_KEYRING_AVAILABLE}, "
-                f"creds_file_exists={os.path.isfile(creds_file)}",
+                f"Keyring auth skipped: creds_file_exists={os.path.isfile(creds_file)}",
                 component="SSHSetupManager",
             )
 
@@ -492,25 +459,16 @@ class SSHSetupManager:
             )
 
         # Store in keyring and write creds file
-        if _KEYRING_AVAILABLE:
-            try:
-                _keyring.set_password(service, username, password)
-                self.logger.info(
-                    f"SSH password stored in keyring | service={service}, user={username}",
-                    component="SSHSetupManager",
-                )
-                _write_creds_file(creds_file, hostname, username, port, keyring_service=service)
-            except Exception as _kr_exc:
-                self.logger.warning(
-                    f"Keyring set_password failed ({_kr_exc}) — saving creds without keyring",
-                    component="SSHSetupManager",
-                )
-                _write_creds_file(creds_file, hostname, username, port, keyring_service=None)
-        else:
-            # keyring unavailable — write creds file without keyring_service
-            # (password will not be persisted; user will be prompted again next time)
+        try:
+            _keyring.set_password(service, username, password)
+            self.logger.info(
+                f"SSH password stored in keyring | service={service}, user={username}",
+                component="SSHSetupManager",
+            )
+            _write_creds_file(creds_file, hostname, username, port, keyring_service=service)
+        except Exception as _kr_exc:
             self.logger.warning(
-                "keyring unavailable — password will not be persisted between sessions",
+                f"Keyring set_password failed ({_kr_exc}) — saving creds without keyring",
                 component="SSHSetupManager",
             )
             _write_creds_file(creds_file, hostname, username, port, keyring_service=None)
@@ -531,13 +489,8 @@ class SSHSetupManager:
     def _read_keyring_service(self, creds_file: str) -> Optional[str]:
         """Read keyring_service field from an existing credentials YAML file."""
         try:
-            if _YAML_AVAILABLE:
-                with open(creds_file, "r", encoding="utf-8") as fh:
-                    data = _yaml.safe_load(fh) or {}
-            else:
-                import json
-                with open(creds_file, "r", encoding="utf-8") as fh:
-                    data = json.load(fh)
+            with open(creds_file, "r", encoding="utf-8") as fh:
+                data = _yaml.safe_load(fh) or {}
             return data.get("keyring_service")
         except Exception:
             return None
@@ -626,19 +579,20 @@ _HOST_RE = re.compile(
 _USER_AT_RE = re.compile(r"(\w[\w.-]*)@([\w.-]+)")
 
 
-class SSHContextProvider(StepContextProvider):
+class SSHContextProvider(ContextProvider):
     """
-    StepContextProvider for SSH remote work.
+    ContextProvider for SSH remote work.
 
-    Activation: Planner declares "ssh" in step.tools_required (and should
-    also set step.ssh_target so prepare() knows which host to authenticate
-    against). FlowController invokes prepare() based purely on the
-    declaration — there is no keyword safety net.
+    Activation: Planner declares "ssh" in tools_required (and should
+    also set ``ssh_target`` on the item so before_item knows which host to
+    authenticate against). FlowControllerV2 invokes before_item based purely
+    on the declaration — there is no keyword safety net.
 
     Responsibility: establish SSH credentials (key/keyring/password) for
     the target host BEFORE the agent runs, so the ssh tool's connection
     pool can authenticate without prompting mid-execution. Per-hostname
-    cache in Memory ensures subsequent steps reuse the same credentials.
+    cache in the ProviderCache ensures subsequent items reuse the same
+    credentials.
     """
 
     def __init__(self) -> None:
@@ -649,44 +603,44 @@ class SSHContextProvider(StepContextProvider):
     def tool_name(self) -> str:
         return "ssh"
 
-    async def prepare(
+    async def before_item(
         self,
-        step: "Step",
-        interaction_manager: "InteractionManager",
-        memory: "Memory",
+        ctx: ItemContext,
+        im: "InteractionManager",
+        cache: ProviderCache,
     ) -> Optional[str]:
         """
         Establish SSH credentials and return a context hint string.
 
         Progressive disclosure:
           - First time a hostname is seen: full hint (workflow guide + creds path)
-          - Subsequent steps for the same hostname: brief hint (creds path only)
+          - Subsequent items for the same hostname: brief hint (creds path only)
 
         Per-hostname caching: credentials are stored keyed by hostname so
-        parallel steps targeting different hosts each receive the correct hint.
+        parallel items targeting different hosts each receive the correct hint.
         """
         self.logger.info(
-            f"SSHContextProvider.prepare() triggered for step {step.step_id!r}: "
-            f"{step.description[:80]}",
+            f"SSHContextProvider.before_item() triggered for item {ctx.item_id!r}: "
+            f"{ctx.instruction[:80]}",
             component="SSHContextProvider",
         )
 
-        # Extract hostname and username from step text first so we can do
+        # Extract hostname and username from item context first so we can do
         # a per-hostname cache lookup.
-        hostname, username = self._extract_host_user(step)
+        hostname, username = self._extract_host_user(ctx)
         if not hostname:
             # Cannot determine target host — skip injection silently.
-            # The agent will have to figure it out from the task description.
+            # The agent will have to figure it out from the instruction.
             self.logger.warning(
-                f"SSHContextProvider: could not extract hostname from step "
-                f"{step.step_id!r} — skipping SSH context injection. "
-                f"Step text (first 120): {(step.goal + ' ' + step.description)[:120]!r}",
+                f"SSHContextProvider: could not extract hostname from item "
+                f"{ctx.item_id!r} — skipping SSH context injection. "
+                f"Instruction (first 120): {ctx.instruction[:120]!r}",
                 component="SSHContextProvider",
             )
             return None
 
         # Per-hostname cache check — returns brief hint if already established.
-        cached = memory.get_ssh_context(hostname)
+        cached = cache.get("ssh", hostname)
         if cached:
             self.logger.debug(
                 f"Using cached SSH context for {hostname}: creds_file={cached['creds_file']}",
@@ -704,7 +658,7 @@ class SSHContextProvider(StepContextProvider):
             result = await self._manager.ensure_ssh_ready(
                 hostname=hostname,
                 username=username or "",
-                interaction_manager=interaction_manager,
+                interaction_manager=im,
             )
         except SSHSetupError as exc:
             # Surface the error as a hint so the agent can report it to the user.
@@ -723,22 +677,25 @@ class SSHContextProvider(StepContextProvider):
             component="SSHContextProvider",
         )
 
-        # Cache per hostname so parallel steps targeting other hosts are unaffected.
-        memory.set_ssh_context(hostname, result.creds_file, result.context_hint)
+        # Cache per hostname so parallel items targeting other hosts are unaffected.
+        cache.set("ssh", hostname, {
+            "creds_file": result.creds_file,
+            "hint": result.context_hint,
+        })
         return result.context_hint
 
-    def _extract_host_user(self, step: "Step") -> tuple[str, str]:
+    def _extract_host_user(self, ctx: ItemContext) -> tuple[str, str]:
         """
-        Extract (hostname, username) from step goal/description.
+        Extract (hostname, username) from item context.
 
         Priority:
-          1. step.ssh_target — structured field set by Planner ("user@hostname")
-          2. user@host regex in step goal/description text
+          1. ctx.ssh_target — structured field set by Planner ("user@hostname")
+          2. user@host regex in instruction text
           3. bare IPv4 / FQDN regex
         Returns ("", "") if nothing found.
         """
         # Priority 1: structured field — fastest and most reliable path.
-        ssh_target = getattr(step, "ssh_target", "") or ""
+        ssh_target = ctx.ssh_target or ""
         if ssh_target.strip():
             m = _USER_AT_RE.match(ssh_target.strip())
             if m:
@@ -747,7 +704,7 @@ class SSHContextProvider(StepContextProvider):
             host = ssh_target.strip()
             return host, getpass.getuser()
 
-        text = f"{step.goal} {step.description}"
+        text = ctx.instruction
 
         # Try user@host pattern first
         m = _USER_AT_RE.search(text)

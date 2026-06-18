@@ -20,10 +20,10 @@ Schema for both:
 """
 from __future__ import annotations
 
-import json
 import logging
 from typing import List, Optional, Tuple
 
+from ..utils import try_parse_json
 from .models import KnowledgeCategory, MemoryDimension
 
 _logger = logging.getLogger("handq.ltm.dream_prompts")
@@ -220,30 +220,14 @@ def parse_synth_verdict(json_str: str) -> dict:
     (so the caller can blanket-skip without raising). Schema-fields with
     bad / missing values get safe defaults.
     """
-    s = (json_str or "").strip()
-    if not s:
+    if not json_str or not json_str.strip():
         return {"worth_synth": False, "reason": "empty_response"}
 
-    if s.startswith("```"):
-        first_newline = s.find("\n")
-        if first_newline != -1:
-            s = s[first_newline + 1:]
-        if s.endswith("```"):
-            s = s.rsplit("```", 1)[0]
-        s = s.strip()
+    parsed = try_parse_json(json_str)
+    if not isinstance(parsed, dict):
+        return {"worth_synth": False, "reason": "no_json_in_response"}
 
-    if not s.startswith("{"):
-        i, j = s.find("{"), s.rfind("}")
-        if i == -1 or j == -1 or j <= i:
-            return {"worth_synth": False, "reason": "no_json_in_response"}
-        s = s[i:j + 1]
-
-    try:
-        d = json.loads(s)
-    except json.JSONDecodeError as exc:
-        _logger.warning("synth verdict JSON decode failed: %s", str(exc)[:80])
-        return {"worth_synth": False, "reason": "invalid_json"}
-
+    d = parsed
     worth = bool(d.get("worth_synth", False))
     facet = d.get("target_facet")
     summary = (d.get("summary") or "").strip()[:120]

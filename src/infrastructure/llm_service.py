@@ -23,7 +23,10 @@ import socket
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, AsyncGenerator, Callable, Literal, Optional
+
 import anthropic as _anthropic
+import httpx
+
 from .logger import get_logger
 from ..models.token_usage import TokenUsage
 
@@ -295,20 +298,16 @@ class LLMService(ABC):
         format, auth failure, etc.) that will not succeed on retry.
         Adapters should raise immediately without retrying.
         """
-        try:
-
-            if isinstance(error, _anthropic.BadRequestError):
-                return True
-            if isinstance(error, _anthropic.AuthenticationError):
-                return True
-            if isinstance(error, _anthropic.PermissionDeniedError):
-                return True
-            if isinstance(error, _anthropic.NotFoundError):
-                return True
-            if isinstance(error, _anthropic.UnprocessableEntityError):
-                return True
-        except ImportError:
-            pass
+        if isinstance(error, _anthropic.BadRequestError):
+            return True
+        if isinstance(error, _anthropic.AuthenticationError):
+            return True
+        if isinstance(error, _anthropic.PermissionDeniedError):
+            return True
+        if isinstance(error, _anthropic.NotFoundError):
+            return True
+        if isinstance(error, _anthropic.UnprocessableEntityError):
+            return True
         error_str = str(error)
         # Generic HTTP status check for other providers
         for code in ("400", "401", "403", "404", "422"):
@@ -338,30 +337,23 @@ class LLMService(ABC):
             return False
 
         # Anthropic SDK connection errors.
-        try:
-            if isinstance(error, _anthropic.APIConnectionError):
-                return True
-            _ApiTimeout = getattr(_anthropic, "APITimeoutError", None)
-            if _ApiTimeout is not None and isinstance(error, _ApiTimeout):
-                return True
-        except Exception:
-            pass
+        if isinstance(error, _anthropic.APIConnectionError):
+            return True
+        _ApiTimeout = getattr(_anthropic, "APITimeoutError", None)
+        if _ApiTimeout is not None and isinstance(error, _ApiTimeout):
+            return True
 
         # httpx connection errors (the underlying transport for anthropic SDK).
-        try:
-            import httpx  # noqa: PLC0415
-            if isinstance(error, (
-                httpx.ConnectError,
-                httpx.ConnectTimeout,
-                httpx.ReadTimeout,
-                httpx.WriteTimeout,
-                httpx.PoolTimeout,
-                httpx.NetworkError,
-                httpx.RemoteProtocolError,
-            )):
-                return True
-        except ImportError:
-            pass
+        if isinstance(error, (
+            httpx.ConnectError,
+            httpx.ConnectTimeout,
+            httpx.ReadTimeout,
+            httpx.WriteTimeout,
+            httpx.PoolTimeout,
+            httpx.NetworkError,
+            httpx.RemoteProtocolError,
+        )):
+            return True
 
         # Builtin / stdlib errors.
         if isinstance(error, (

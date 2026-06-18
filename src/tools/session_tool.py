@@ -106,6 +106,11 @@ class InteractiveSession:
     _data_emit_buf: str = field(default="", repr=False)
     _data_emit_last_ts: float = field(default=0.0, repr=False)
 
+    # UI bus for lifecycle events. Stamped by InteractiveSessionTool._action_open
+    # from ctx.interaction_manager so the module-level reader task / buffer
+    # helpers (which only have the session in scope) can emit through it.
+    _im: Optional[Any] = field(default=None, repr=False)
+
 
 # ── Buffer helpers ───────────────────────────────────────────────────────────
 
@@ -123,7 +128,7 @@ def _append_to_buffer(session: InteractiveSession, text: str) -> None:
         chunk = session._data_emit_buf[:_DATA_EMIT_MAX_CHARS]
         session._data_emit_buf = session._data_emit_buf[_DATA_EMIT_MAX_CHARS:]
         session._data_emit_last_ts = now
-        _emit_session_event("session_data", {
+        _emit_session_event(session, "session_data", {
             "session_id": session.session_id,
             "text": chunk,
         })
@@ -217,7 +222,7 @@ async def _kill_session_process(process: asyncio.subprocess.Process) -> None:
         pass
 
 
-# ── Session registry (module-level singleton) ────────────────────────────────
+# ── Session registry (per-session; one instance lives on each SessionContext) ─
 
 class SessionRegistry:
     def __init__(self) -> None:
@@ -271,7 +276,19 @@ class SessionRegistry:
         self._counter = 0
         return count
 
+    async def close_all(self) -> Optional[str]:
+        """Per-session-end cleanup: kill every session in this registry, return
+        a one-line summary (or ``None`` when empty). Used by
+        :meth:`SessionContext.close` so each ``SessionRegistry`` instance can be
+        torn down independently."""
+        n = await self.kill_all()
+        if n:
+            return f"{n} interactive session(s) closed"
+        return None
 
+
+# ctx=None fallback only (bare ``InteractiveSessionTool()`` in unit tests). The
+# live flow routes through ``ctx.session_registry`` and never touches this.
 _registry = SessionRegistry()
 
 
@@ -305,16 +322,6 @@ async def _close_session(session: InteractiveSession) -> Optional[str]:
     return final_output
 
 
-# ── Public cleanup API (called by FlowController + StdioBridge) ──────────────
-
-async def flush_session_pool() -> Optional[str]:
-    """Kill all active sessions. Called at task end and new_session."""
-    count = await _registry.kill_all()
-    if count:
-        return f"{count} interactive session(s) closed"
-    return None
-
-
 # ── InteractiveSessionTool ───────────────────────────────────────────────────
 
 class InteractiveSessionTool(BaseTool):
@@ -323,9 +330,23 @@ class InteractiveSessionTool(BaseTool):
     is_read_only = False
     is_concurrency_safe = False
 
-    def __init__(self) -> None:
-        super().__init__("session")
-        self.interrupt_event: Optional[asyncio.Event] = None
+    def __init__(self, ctx=None) -> None:
+        super().__init__("session", ctx=ctx)
+        # Pull interrupt_event from the SessionContext when supplied so the
+        # asyncio.wait([communicate, interrupt]) race in _action_exec wakes up
+        # on session-end.
+        self.interrupt_event: Optional[asyncio.Event] = (
+            ctx.interrupt_event if ctx is not None else None
+        )
+        # Per-session registry from the SessionContext. ctx=None test fixtures
+        # fall back to the module-level singleton so bare ``InteractiveSessionTool()``
+        # still works.
+        self.registry: SessionRegistry = (
+            ctx.session_registry if ctx is not None else _registry
+        )
+        # UI bus, stamped onto each opened session so module-level helpers can
+        # emit lifecycle events. None under ctx=None test fixtures.
+        self.im = ctx.interaction_manager if ctx is not None else None
 
     async def execute(self, **kwargs: Any) -> ToolResult:
         action = kwargs.get("action", "")
@@ -370,7 +391,7 @@ class InteractiveSessionTool(BaseTool):
 
         # Alias reuse: if an alive session with this alias exists, return it
         if alias:
-            existing = _registry.find_by_alias(alias)
+            existing = self.registry.find_by_alias(alias)
             if existing:
                 buffered = _drain_buffer(existing)
                 return ToolResult(
@@ -396,7 +417,7 @@ class InteractiveSessionTool(BaseTool):
                 execution_time=time.time() - start_time,
             )
 
-        if _registry.count() >= _MAX_SESSIONS:
+        if self.registry.count() >= _MAX_SESSIONS:
             return ToolResult(
                 success=False, output=None,
                 error=f"Maximum {_MAX_SESSIONS} concurrent sessions reached. Close one first.",
@@ -479,7 +500,7 @@ class InteractiveSessionTool(BaseTool):
                 execution_time=time.time() - start_time,
             )
 
-        session_id = _registry.create_id()
+        session_id = self.registry.create_id()
         session = InteractiveSession(
             session_id=session_id,
             command=command,
@@ -490,13 +511,14 @@ class InteractiveSessionTool(BaseTool):
             _encoding=_get_output_encoding(),
             prompt_pattern=prompt_pattern,
             alias=alias,
+            _im=self.im,
         )
 
-        _registry.register(session)
+        self.registry.register(session)
 
         # Emit session_opened BEFORE starting reader so the UI creates the
         # terminal before any session_data events arrive.
-        _emit_session_event("session_opened", {
+        _emit_session_event(session, "session_opened", {
             "session_id": session_id,
             "command": command,
             "description": description,
@@ -519,7 +541,7 @@ class InteractiveSessionTool(BaseTool):
 
         # Flush any remaining throttled data to the UI
         if session._data_emit_buf:
-            _emit_session_event("session_data", {
+            _emit_session_event(session, "session_data", {
                 "session_id": session_id,
                 "text": session._data_emit_buf,
             })
@@ -549,7 +571,7 @@ class InteractiveSessionTool(BaseTool):
         command = kwargs.get("command", "")
         timeout = float(kwargs.get("timeout", _EXEC_DEFAULT_TIMEOUT))
 
-        session = _registry.get(session_id)
+        session = self.registry.get(session_id)
         if not session:
             return ToolResult(
                 success=False, output=None,
@@ -620,7 +642,7 @@ class InteractiveSessionTool(BaseTool):
             )
 
         # Notify UI of the agent's input
-        _emit_session_event("session_input", {
+        _emit_session_event(session, "session_input", {
             "session_id": session_id,
             "text": command,
         })
@@ -714,7 +736,7 @@ class InteractiveSessionTool(BaseTool):
         output_text, truncated = _truncate_output(output_text)
 
         # Emit visualization
-        _emit_session_event("session_exec_done", {
+        _emit_session_event(session, "session_exec_done", {
             "session_id": session_id,
             "command": command,
             "timed_out": timed_out,
@@ -746,7 +768,7 @@ class InteractiveSessionTool(BaseTool):
         input_text = kwargs.get("input", "")
         append_newline = kwargs.get("append_newline", True)
 
-        session = _registry.get(session_id)
+        session = self.registry.get(session_id)
         if not session:
             return ToolResult(
                 success=False, output=None,
@@ -779,7 +801,7 @@ class InteractiveSessionTool(BaseTool):
             )
 
         # Notify UI of the agent's input
-        _emit_session_event("session_input", {
+        _emit_session_event(session, "session_input", {
             "session_id": session_id,
             "text": input_text,
         })
@@ -801,7 +823,7 @@ class InteractiveSessionTool(BaseTool):
         session_id = kwargs.get("session_id", "")
         timeout = float(kwargs.get("timeout", 0))
 
-        session = _registry.get(session_id)
+        session = self.registry.get(session_id)
         if not session:
             return ToolResult(
                 success=False, output=None,
@@ -842,7 +864,7 @@ class InteractiveSessionTool(BaseTool):
     # ── list ─────────────────────────────────────────────────────────────────
 
     async def _action_list(self, start_time: float, **kwargs: Any) -> ToolResult:
-        sessions = _registry.list_sessions()
+        sessions = self.registry.list_sessions()
         return ToolResult(
             success=True,
             output={"sessions": sessions, "count": len(sessions)},
@@ -855,7 +877,7 @@ class InteractiveSessionTool(BaseTool):
     async def _action_close(self, start_time: float, **kwargs: Any) -> ToolResult:
         session_id = kwargs.get("session_id", "")
 
-        session = _registry.get(session_id)
+        session = self.registry.get(session_id)
         if not session:
             return ToolResult(
                 success=False, output=None,
@@ -865,12 +887,12 @@ class InteractiveSessionTool(BaseTool):
             )
 
         final_output = await _close_session(session)
-        _registry.remove(session_id)
+        self.registry.remove(session_id)
 
         final_output = final_output or ""
         final_output, _ = _truncate_output(final_output)
 
-        _emit_session_event("session_closed", {
+        _emit_session_event(session, "session_closed", {
             "session_id": session_id,
             "exit_code": session.exit_code,
         })
@@ -894,16 +916,20 @@ class InteractiveSessionTool(BaseTool):
 # Electron renderer can show a live session monitor panel. If no UI is
 # attached (e.g. unit testing), events are silently dropped.
 
-def _emit_session_event(event_name: str, data: Dict[str, Any]) -> None:
-    """Best-effort emit a session lifecycle event via InteractionManager."""
+def _emit_session_event(
+    session: Optional[InteractiveSession], event_name: str, data: Dict[str, Any]
+) -> None:
+    """Best-effort emit a session lifecycle event through the InteractionManager
+    stamped on the session.
+
+    The IM is carried on the ``InteractiveSession`` (``session._im``) rather than
+    passed explicitly because the emitters live in module-level helpers (the
+    reader task, the buffer flusher) that only have the session in scope. When no
+    IM is wired (unit tests, ctx=None fixtures) the event is silently dropped.
+    """
+    if session is None or session._im is None:
+        return
     try:
-        from ..controller.interaction_manager import InteractionManager
-        im = InteractionManager.get_instance()
-        ui = getattr(im, "_ui", None)
-        if ui is None:
-            return
-        fn = getattr(ui, "notify_session_event", None)
-        if fn:
-            fn(event_name, data)
+        session._im.notify_session_event(event_name, data)
     except Exception:
         pass

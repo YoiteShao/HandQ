@@ -94,8 +94,8 @@ class EditTool(BaseTool):
     is_read_only = False
     is_concurrency_safe = False
 
-    def __init__(self):
-        super().__init__("edit")
+    def __init__(self, ctx=None):
+        super().__init__("edit", ctx=ctx)
 
     async def execute(
         self,
@@ -148,9 +148,10 @@ class EditTool(BaseTool):
                 )
 
             # Staleness check + read in one atomic open() call — eliminates TOCTOU window
+            fs = self.ctx.file_state if self.ctx is not None else FileState.get_instance()
             stale, reason, content = await loop.run_in_executor(
                 None,
-                lambda: FileState.get_instance().check_stale_and_read(path),
+                lambda: fs.check_stale_and_read(path),
             )
             if stale:
                 return ToolResult(
@@ -255,7 +256,8 @@ class EditTool(BaseTool):
 
             # Update FileState so subsequent edits in the same session don't trigger stale warning
             new_hash = hashlib.sha256(new_file_content.encode("utf-8")).hexdigest()
-            FileState.get_instance().record_read(path, new_hash)
+            fs = self.ctx.file_state if self.ctx is not None else FileState.get_instance()
+            fs.record_read(path, new_hash)
 
             output = {
                 "path": str(path_obj.absolute()),

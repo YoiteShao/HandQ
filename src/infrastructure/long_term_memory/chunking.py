@@ -102,7 +102,7 @@ def _split_paragraphs(text: str, base_line: int, max_chars: int) -> List[ChunkSp
     """Greedy pack paragraphs into chunks of <= max_chars. Always make
     forward progress: a single paragraph larger than max_chars is emitted
     on its own (rather than infinite-looped or hard-truncated)."""
-    paragraphs = text.split("\n\n")
+    paragraphs = [p for p in text.split("\n\n") if p]
     chunks: List[ChunkSpec] = []
     cur: List[str] = []
     cur_chars = 0

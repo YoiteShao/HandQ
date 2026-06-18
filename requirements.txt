@@ -58,8 +58,8 @@ keyrings.alt>=4.0.0
 
 # Playwright drives the browser tool. Edge / Chrome are detected at runtime;
 # bundled Chromium is a fallback that requires `playwright install chromium`.
-# The agent runs without this dependency — BrowserTool reports an actionable
-# install hint when imports fail.
+# Hard dependency — module import fails fast if missing so packaging surfaces
+# the gap at startup rather than at first browser action.
 playwright>=1.40.0
 
 # ── Vision (find_element + browser canvas) ────────────────────────────────────
@@ -69,9 +69,9 @@ playwright>=1.40.0
 pillow>=10.0.0
 
 # ── Desktop tool dependencies (Windows-only) ──────────────────────────────────
-# desktop_tool degrades to a clear "install X" error when these are missing,
-# so the agent runs without them — they're only needed when the Planner
-# activates the desktop tool.
+# All listed deps are imported eagerly at desktop_tool module load. The tool is
+# registered Windows-only in ToolRegistry, so Linux runs simply skip the import
+# path entirely.
 
 # Cross-platform fast screen capture (~5ms/frame on 1080p). Used by both
 # desktop_tool and the Phase 3 activity_monitor.
@@ -83,10 +83,12 @@ mss>=9.0.0
 pyautogui>=0.9.54
 
 # Win32 API bindings — desktop_tool uses win32gui for foreground-window
-# inspection + EnumWindows, win32process for PID lookups. Imported lazily;
-# missing pywin32 reduces list_windows / sensitive-window detection but
-# leaves screenshot + input working.
+# inspection + EnumWindows, win32process for PID lookups. Hard dep on Windows.
 pywin32>=306; sys_platform == 'win32'
+
+# UI Automation client — desktop_tool's primary path for pointing at controls
+# discovered via UIA tree walks (descendants/from_point).
+pywinauto>=0.6.8; sys_platform == 'win32'
 
 # Local OCR engine selected by Phase 0 benchmark. Used by desktop_tool
 # find_element (primary path) and Phase 3 activity_monitor.
@@ -94,15 +96,18 @@ pywin32>=306; sys_platform == 'win32'
 rapidocr-onnxruntime>=1.3.0
 
 # Fuzzy string matching for find_element's OCR-text → description match.
-# Falls back to substring match when missing — but install for proper
-# token_set_ratio + partial_ratio scoring.
+# Eager dep — used unconditionally for token_set_ratio + partial_ratio scoring.
 rapidfuzz>=3.0.0
 
-# Optional. desktop_tool uses psutil to resolve process names from window PIDs
-# (list_windows + sensitive-window guard); without it those fields are empty
-# but the tool still works. Imported lazily inside try/except so the agent
-# runs without it.
+# Process / window-PID resolution. Used by desktop_tool list_windows and the
+# personality monitor's input-idle window owner. Eager top-level import.
 psutil>=5.9.0
+
+# ── PDF reading ───────────────────────────────────────────────────────────────
+
+# Single canonical PDF parser used by read_tool. Supersedes the previous
+# PyPDF2/pdfplumber/pymupdf fallback chain.
+pdfplumber>=0.11.0
 
 # ── Teams tool dependencies (Windows-only) ────────────────────────────────────
 # teams_tool talks to Microsoft Graph REST API. Auth is bootstrapped from the

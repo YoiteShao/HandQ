@@ -3,11 +3,9 @@
 The system prompt is verbatim from docs/long_term_memory/05_triage_prompts.md
 — do not edit casually, every rule has a worked example.
 
-Parsing strategy mirrors :class:`Plan.from_data`:
-1. ``try_parse_json`` (sync, no LLM cost)
-2. ``llm_extract_json`` fallback when JSON is malformed (uses helper LLM
-   pool to rewrite the response into valid JSON)
-3. Final fallback to an all-skip verdict so a parse failure never
+Parsing strategy:
+1. ``try_parse_json`` (sync, handles fences, truncation, trailing commas via json_repair)
+2. Final fallback to an all-skip verdict so a parse failure never
    crashes the triage loop.
 """
 from __future__ import annotations
@@ -15,7 +13,7 @@ from __future__ import annotations
 import logging
 from typing import Any, List, Optional, Union
 
-from ..utils import llm_extract_json, try_parse_json
+from ..utils import try_parse_json
 from .models import (
     Candidate,
     Entry,
@@ -39,7 +37,7 @@ Output a SINGLE JSON object with the schema below. No prose, no markdown fences.
   "worth_knowledge":  <bool>,
 
   "memory_action":      "create" | "update" | "archive" | "skip",
-  "memory_dimension":   "agentic" | "insight" | null,
+  "memory_dimension":   "agentic" | "insight" | "identity" | null,
   "memory_summary":     "<single line, max 120 chars>",
   "memory_content":     "<markdown body, <=600 chars>",
   "memory_update_id":   "<existing entry id when action=update>" | null,
@@ -65,6 +63,28 @@ workflows, tools, recurring choices.
                ("always lint before commit", "prefer ruff over flake8")
 - "insight"  : factual context about the user / their environment
                ("main project at C:\\\\HandQ", "uses Windows 11", "prefers terse responses")
+- "identity" : CROSS-SESSION UNCONDITIONAL BEHAVIOURAL DIRECTIVES that must be
+               active on EVERY future interaction regardless of task.
+               ("respond in Chinese", "be concise", "always confirm before delete")
+
+### When to use "identity" vs "agentic"
+
+Use "identity" ONLY when ALL three conditions hold:
+  1. UNCONDITIONAL — applies regardless of task or context
+  2. CROSS-SESSION — "from now on" / "always" / "never", not "for this task"
+  3. AGENT BEHAVIOUR — about how the agent responds or acts, not about a tool/project
+
+If the directive is conditional ("when working on Python, use ruff") → "agentic".
+If it is a fact ("I use Windows 11") → "insight".
+If it is about a project ("this repo uses pytest") → KNOWLEDGE.
+
+IDENTITY is the RAREST dimension. In a typical user's history, expect 5-15
+identity entries total vs hundreds of agentic/insight entries.
+
+To revise an existing identity entry, use action="update" with the target id
+and provide the complete new content — the system converts this to a clean
+archive-old + create-new internally. To purely retire an identity entry
+without replacement, use action="archive".
 
 ### KNOWLEDGE (worth_knowledge)
 Knowledge is REUSABLE TECHNICAL INSIGHT decoupled from this specific user.
@@ -535,6 +555,25 @@ states the prior preference no longer applies.
 """
 
 
+MERGE_ARBITER_SYSTEM = """\
+You decide whether two long-term memory entries are duplicates.
+
+They already scored high embedding similarity (the 0.85-0.90 band), so a
+keyword/vector pass thinks they might be the same. Your job is the finer
+judgement a similarity score can't make.
+
+Answer with a SINGLE JSON object, no prose, no markdown fences:
+
+{"same": <bool>, "reason": "<short, max 100 chars>"}
+
+Set "same": true ONLY when one entry is fully redundant given the other —
+merging loses NO information the agent would want later. If either entry
+holds a detail, qualifier, scope, or value the other lacks, they are
+DISTINCT: answer false. When unsure, answer false (keeping both is cheap;
+silently dropping a real difference is not).
+"""
+
+
 TRIAGE_USER_TEMPLATE = """\
 ## Source: {source}{ref_part}
 
@@ -585,37 +624,15 @@ def render_user(
     )
 
 
-# ── Parse: schema, expected keys, dict → TriageVerdict ──────────────────────
+# ── Parse: expected keys, dict → TriageVerdict ──────────────────────────────
 
-# Keys the parser MUST see in the dict. Used both for validating the sync
-# parse and as the ``expected_keys`` arg to ``llm_extract_json``.
+# Keys the parser MUST see in the dict for a successful parse.
 _VERDICT_EXPECTED_KEYS: List[str] = [
     "worth_memory",
     "worth_knowledge",
     "memory_action",
     "knowledge_action",
 ]
-
-# Schema for ``llm_extract_json`` — guides the repair LLM to produce the
-# COMPLETE shape rather than the bare minimum, so downstream code doesn't
-# trip on missing optional fields.
-_VERDICT_SCHEMA = """{
-  "worth_memory":     <boolean>,
-  "worth_knowledge":  <boolean>,
-  "memory_action":      "create" | "update" | "archive" | "skip",
-  "memory_dimension":   "agentic" | "insight" | null,
-  "memory_summary":     "<single line, max 120 chars>",
-  "memory_content":     "<markdown body, <=600 chars>",
-  "memory_update_id":   "<existing entry id when action=update>" | null,
-  "memory_archive_id":  "<existing entry id when action=archive>" | null,
-  "knowledge_action":     "create" | "update" | "archive" | "skip",
-  "knowledge_category":   "domain" | "people" | "process" | "coding" | "other" | null,
-  "knowledge_summary":    "<single line, max 120 chars>",
-  "knowledge_content":    "<markdown body, <=800 chars>",
-  "knowledge_update_id":  "<existing entry id when action=update>" | null,
-  "knowledge_archive_id": "<existing entry id when action=archive>" | null,
-  "reason": "<short reason for both verdicts, max 100 chars>"
-}"""
 
 
 def _coerce_dict_to_verdict(d: dict) -> TriageVerdict:
@@ -674,6 +691,14 @@ def _coerce_dict_to_verdict(d: dict) -> TriageVerdict:
             # rather than silently corrupt state.
             m_action = VerdictAction.SKIP.value
             worth_m = False
+    elif m_action == VerdictAction.UPDATE.value:
+        if not (d.get("memory_update_id") or None):
+            # UPDATE without a target id — demote to CREATE so the signal
+            # isn't lost but we don't silently fall through to insert.
+            m_action = VerdictAction.CREATE.value
+        if worth_m and not (m_summary and m_content):
+            worth_m = False
+            m_action = VerdictAction.SKIP.value
     elif worth_m and not (m_summary and m_content):
         worth_m = False
         m_action = VerdictAction.SKIP.value
@@ -682,6 +707,12 @@ def _coerce_dict_to_verdict(d: dict) -> TriageVerdict:
         if not k_archive_id:
             k_action = VerdictAction.SKIP.value
             worth_k = False
+    elif k_action == VerdictAction.UPDATE.value:
+        if not (d.get("knowledge_update_id") or None):
+            k_action = VerdictAction.CREATE.value
+        if worth_k and not (k_summary and k_content):
+            worth_k = False
+            k_action = VerdictAction.SKIP.value
     elif worth_k and not (k_summary and k_content):
         worth_k = False
         k_action = VerdictAction.SKIP.value
@@ -723,48 +754,102 @@ async def parse_verdict(
 ) -> TriageVerdict:
     """Parse the LLM's JSON output into a TriageVerdict.
 
-    Three-tier strategy (mirrors ``Plan.from_data`` in models/plan.py):
-
-      1. ``try_parse_json`` — handles ``\\`\\`\\`json`` fences, prose
-         wrapping, etc. via the shared utility.
-      2. ``llm_extract_json`` — when (1) returns a non-dict OR a dict
-         missing required keys, ask the helper LLM to rewrite the text
-         into a valid JSON object matching ``_VERDICT_SCHEMA``. Skipped
-         when ``llm_services`` is None / empty so callers can opt out
-         of the extra LLM cost.
-      3. ``_all_skip_verdict`` — final fallback so a malformed response
+    Strategy:
+      1. ``try_parse_json`` — handles fences, truncation, json_repair.
+      2. ``_all_skip_verdict`` — final fallback so a malformed response
          degrades to "skip both tracks", never raises.
+
+    Args:
+        llm_services: Deprecated, ignored. Kept for backward compatibility.
     """
     raw = json_str or ""
 
-    # Tier 1: cheap sync parse.
     parsed: Union[dict, str] = try_parse_json(raw)
     if isinstance(parsed, dict) and all(
         k in parsed for k in _VERDICT_EXPECTED_KEYS
     ):
         return _coerce_dict_to_verdict(parsed)
 
-    # Tier 2: LLM-repair fallback. Reuses the same helper that
-    # ``Plan.from_data`` uses for planner-output recovery.
-    if llm_services:
-        try:
-            extracted = await llm_extract_json(
-                content=raw,
-                expected_keys=_VERDICT_EXPECTED_KEYS,
-                llm_services=llm_services,
-                schema=_VERDICT_SCHEMA,
-            )
-        except Exception:
-            _logger.exception("llm_extract_json raised; using all-skip verdict")
-            extracted = raw
-        if isinstance(extracted, dict):
-            return _coerce_dict_to_verdict(extracted)
-
-    # Tier 3: irrecoverable. Log a head-of-content snippet so a
-    # post-mortem can inspect what the LLM produced.
+    # Irrecoverable — log a head-of-content snippet for post-mortem.
     head = (raw[:120] + "…") if len(raw) > 120 else raw
     _logger.warning(
-        "triage verdict parse failed (sync + llm_extract); "
-        "head=%r — falling back to all-skip", head,
+        "triage verdict parse failed; head=%r — falling back to all-skip", head,
     )
     return _all_skip_verdict("parse_failed")
+
+
+# ── Skill extraction (completed-task → reusable skill) ──────────────────────
+#
+# A SEPARATE pass from TRIAGE_SYSTEM. Runs only on successful SESSION_COMPLETE
+# candidates (a finished HandQ task trajectory: goal + summary + steps). Its
+# job is NOT "did anything happen" but "is this a reusable, generalizable
+# multi-step procedure worth turning into a skill". The caller
+# (_apply_session_skill) clusters the result by a fingerprint computed over the
+# normalized ``name`` tokens, so the single most important instruction below is:
+# emit a CANONICAL, phrasing-stable name. Two runs of the same underlying task
+# must collapse to the same name → same fingerprint → recurrence counter climbs.
+
+SKILL_EXTRACTION_SYSTEM = """\
+You analyze a COMPLETED, SUCCESSFUL automation task and decide whether it is a
+reusable skill worth saving — a repeatable, generalizable procedure the agent
+could run again on a future request of the same kind.
+
+Answer with a SINGLE JSON object, no prose, no markdown fences:
+
+{"worth_skill": <bool>,
+ "name": "<canonical action name>",
+ "description": "<one line: what the skill does>",
+ "when_to_use": "<one line: the trigger/situation>",
+ "steps_md": "<markdown: the generalized, parameterized steps>",
+ "reason": "<short, max 100 chars>"}
+
+Set "worth_skill": true ONLY when ALL hold:
+- The task is a MULTI-STEP procedure (not a single trivial action).
+- It GENERALIZES: the same procedure would apply to other inputs, not just
+  this one specific file/value. Parameterize specifics (paths, names, hosts,
+  IDs) into placeholders in steps_md rather than hard-coding them.
+- It is genuinely REUSABLE: the agent (or user) would plausibly want to repeat
+  this workflow on future, similar requests.
+
+Set "worth_skill": false (the conservative default) for: one-off or trivial
+tasks, pure question-answering, anything whose only content is specific values
+that cannot be generalized, or anything that cannot be described without
+embedding a secret/credential.
+
+CRITICAL — the "name" must be CANONICAL and PHRASING-STABLE: a short, generic
+action label describing the KIND of task, NOT the user's literal wording. The
+same underlying task phrased two different ways MUST get the same name, because
+identical names are what let us detect that a task is recurring.
+  good:  "Restart the staging server"
+  bad:   "can you restart staging again pls"   (echoes the user's phrasing)
+  good:  "Bump the package version and tag a release"
+  bad:   "do the 1.2.4 release thing"          (embeds a specific value)
+Lowercase the conceptual action; drop pleasantries, filler, and specific
+values from the name (they belong in steps_md as placeholders).
+"""
+
+
+def parse_skill_extraction(json_str: str) -> dict:
+    """Parse the skill-extraction LLM output into a normalized dict.
+
+    Mirrors ``parse_verdict``'s contract: never raises. On any parse failure,
+    missing/false ``worth_skill``, or a blank ``name`` it returns the
+    conservative all-skip ``{"worth_skill": False}`` so the caller writes no
+    proposal. Only an explicit ``worth_skill: true`` WITH a usable name passes.
+    """
+    parsed = try_parse_json(json_str or "")
+    if not isinstance(parsed, dict):
+        return {"worth_skill": False}
+    if parsed.get("worth_skill") is not True:
+        return {"worth_skill": False}
+    name = str(parsed.get("name") or "").strip()
+    if not name:
+        return {"worth_skill": False}
+    return {
+        "worth_skill": True,
+        "name": name[:120],
+        "description": str(parsed.get("description") or "").strip()[:300],
+        "when_to_use": str(parsed.get("when_to_use") or "").strip()[:300],
+        "steps_md": str(parsed.get("steps_md") or "").strip()[:4000],
+        "reason": str(parsed.get("reason") or "").strip()[:200],
+    }

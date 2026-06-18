@@ -66,25 +66,11 @@ from .cancellation import (
     run_with_abort_handle,
 )
 
-# ── Dependency checks ─────────────────────────────────────────────────────────
+# ── Hard dependencies ────────────────────────────────────────────────────────
 
-try:
-    import paramiko as _paramiko
-    _PARAMIKO_AVAILABLE = True
-except ImportError:
-    _PARAMIKO_AVAILABLE = False
-
-try:
-    import yaml as _yaml
-    _YAML_AVAILABLE = True
-except ImportError:
-    _YAML_AVAILABLE = False
-
-try:
-    import keyring as _keyring
-    _KEYRING_AVAILABLE = True
-except ImportError:
-    _KEYRING_AVAILABLE = False
+import paramiko as _paramiko
+import yaml as _yaml
+import keyring as _keyring
 
 
 # ── Persistent connection pool ────────────────────────────────────────────────
@@ -102,132 +88,153 @@ except ImportError:
 #
 # The rate limiter is kept but only fires when a *new* TCP connection is
 # actually established — pool reuses bypass it entirely (no new connection).
+#
+# All live state lives on the per-session :class:`SshConnectionPool` below
+# (one instance per ``SessionContext``); there are no module-level pool dicts.
 
-_conn_pool: Dict[str, Any] = {}           # host_key → SSHClient
-_conn_pool_last_used: Dict[str, float] = {}  # host_key → monotonic time
-_conn_pool_lock = threading.Lock()        # serialises pool access
 _POOL_MAX_IDLE_SECS = 300                 # evict if idle longer than this
-
-# Rate limiter — still used when a NEW connection must be opened.
-_connect_timestamps: Dict[str, float] = {}
-_connect_lock = threading.Lock()
 _MIN_CONNECT_INTERVAL = 1.5   # seconds between NEW connections to the same host
 
-# ── OS detection cache ────────────────────────────────────────────────────────
-# The OS/shell probe (uname -s) is an extra round-trip inside every action.
-# Cache the result per host so subsequent actions on the same host skip it.
-# Thread-safe: protected by _os_cache_lock.
 
-_os_cache: Dict[str, Tuple[str, str]] = {}   # "host:port" → (os_name, login_shell)
-_os_cache_lock = threading.Lock()
+# ── Per-session pool class (used by SessionContext) ──────────────────────────
+#
+# Wraps three pieces of state (connection pool, rate limiter, OS detection
+# cache) into a per-instance object. ``SessionContext`` constructs one per
+# session; ``ctx.close()`` calls :meth:`close` via ``asyncio.to_thread`` so the
+# synchronous paramiko/threading-Lock cleanup doesn't block the asyncio loop.
+# ctx=None test fixtures fall back to the module-level ``_default_pool`` defined
+# just after the class.
+#
+# The lock type stays ``threading.Lock`` (not asyncio) because paramiko ops
+# run in executor threads — see ``cancellation.run_with_abort_handle`` —
+# and an asyncio.Lock can't be acquired from a worker thread.
 
 
-def _rate_limit(host_key: str) -> None:
-    """Block until the minimum inter-connection interval has elapsed.
+class SshConnectionPool:
+    """Per-session SSH connection pool + connect-rate-limiter + OS-detect cache.
 
-    Honors the current invocation's interrupt token (set by
-    cancellation.run_with_abort_handle on the executor thread). When the
-    bridge fires `new_session` mid-rate-limit, the wait short-circuits
-    and we raise InterruptedError so the caller bails out cleanly
-    instead of completing the now-pointless connection setup.
+    Three pieces of state are co-owned because they share a key (``host:port``)
+    and lifecycle (a session ends → all three drop together):
+
+    * **connection pool** — ``host_key → paramiko.SSHClient`` with idle TTL
+    * **rate limiter** — last-connect monotonic timestamp per host
+    * **OS detection cache** — ``host:port → (os_name, login_shell)``
+
+    All three use ``threading.Lock`` (not asyncio.Lock) because paramiko
+    operations run on executor threads.
     """
-    with _connect_lock:
-        last = _connect_timestamps.get(host_key, 0.0)
-        wait = _MIN_CONNECT_INTERVAL - (time.monotonic() - last)
-        if wait > 0:
-            if interruptible_sleep(wait):
-                raise InterruptedError("ssh: rate-limit aborted")
-        _connect_timestamps[host_key] = time.monotonic()
+
+    POOL_MAX_IDLE_SECS = _POOL_MAX_IDLE_SECS
+    MIN_CONNECT_INTERVAL = _MIN_CONNECT_INTERVAL
+
+    def __init__(self) -> None:
+        # Connection pool
+        self._pool: Dict[str, Any] = {}
+        self._pool_last_used: Dict[str, float] = {}
+        self._pool_lock = threading.Lock()
+        # Rate limiter
+        self._connect_timestamps: Dict[str, float] = {}
+        self._connect_lock = threading.Lock()
+        # OS detection cache
+        self._os_cache: Dict[str, Tuple[str, str]] = {}
+        self._os_cache_lock = threading.Lock()
+
+    # ── Connection pool API ──────────────────────────────────────────────
+
+    def get(self, host_key: str) -> Optional[Any]:
+        """Return a live SSHClient or None. Evicts dead/idle entries."""
+        with self._pool_lock:
+            client = self._pool.get(host_key)
+            if client is None:
+                return None
+            last_used = self._pool_last_used.get(host_key, 0.0)
+            if time.monotonic() - last_used > self.POOL_MAX_IDLE_SECS:
+                self._pool.pop(host_key, None)
+                self._pool_last_used.pop(host_key, None)
+                try:
+                    client.close()
+                except Exception:
+                    pass
+                return None
+            transport = client.get_transport()
+            if transport is None or not transport.is_active():
+                self._pool.pop(host_key, None)
+                self._pool_last_used.pop(host_key, None)
+                try:
+                    client.close()
+                except Exception:
+                    pass
+                return None
+            return client
+
+    def put(self, host_key: str, client: Any) -> None:
+        with self._pool_lock:
+            self._pool[host_key] = client
+            self._pool_last_used[host_key] = time.monotonic()
+
+    def update_ts(self, host_key: str) -> None:
+        with self._pool_lock:
+            if host_key in self._pool:
+                self._pool_last_used[host_key] = time.monotonic()
+
+    def evict(self, host_key: str) -> None:
+        with self._pool_lock:
+            client = self._pool.pop(host_key, None)
+            self._pool_last_used.pop(host_key, None)
+        if client is not None:
+            _linger_close(client)
+
+    # ── Rate limiter API ─────────────────────────────────────────────────
+
+    def rate_limit(self, host_key: str) -> None:
+        """Block until the minimum inter-connection interval has elapsed.
+        Honors the current invocation's interrupt token; raises
+        ``InterruptedError`` when interrupted."""
+        with self._connect_lock:
+            last = self._connect_timestamps.get(host_key, 0.0)
+            wait = self.MIN_CONNECT_INTERVAL - (time.monotonic() - last)
+            if wait > 0:
+                if interruptible_sleep(wait):
+                    raise InterruptedError("ssh: rate-limit aborted")
+            self._connect_timestamps[host_key] = time.monotonic()
+
+    # ── OS detection cache API ───────────────────────────────────────────
+
+    def get_os(self, host_key: str) -> Optional[Tuple[str, str]]:
+        with self._os_cache_lock:
+            return self._os_cache.get(host_key)
+
+    def set_os(self, host_key: str, info: Tuple[str, str]) -> None:
+        with self._os_cache_lock:
+            self._os_cache[host_key] = info
+
+    # ── Lifecycle ────────────────────────────────────────────────────────
+
+    def close(self) -> int:
+        """Close every pooled SSHClient + clear rate-limit + clear OS cache.
+
+        Synchronous because paramiko close + SO_LINGER manipulation is sync.
+        Called from ``SessionContext.close()`` via ``asyncio.to_thread`` so
+        the loop is not blocked.
+        """
+        with self._pool_lock:
+            clients = list(self._pool.values())
+            self._pool.clear()
+            self._pool_last_used.clear()
+        closed = 0
+        for client in clients:
+            _linger_close(client)
+            closed += 1
+        with self._connect_lock:
+            self._connect_timestamps.clear()
+        with self._os_cache_lock:
+            self._os_cache.clear()
+        return closed
 
 
-def _pool_get(host_key: str) -> Optional[Any]:
-    """
-    Return a live SSHClient from the pool, or None if unavailable.
-
-    Evicts the entry if:
-      - transport is no longer active (server closed / network drop)
-      - the client has been idle longer than _POOL_MAX_IDLE_SECS
-    """
-    with _conn_pool_lock:
-        client = _conn_pool.get(host_key)
-        if client is None:
-            return None
-
-        # Idle-timeout eviction
-        last_used = _conn_pool_last_used.get(host_key, 0.0)
-        if time.monotonic() - last_used > _POOL_MAX_IDLE_SECS:
-            _conn_pool.pop(host_key, None)
-            _conn_pool_last_used.pop(host_key, None)
-            try:
-                client.close()
-            except Exception:
-                pass
-            return None
-
-        # Transport health check
-        transport = client.get_transport()
-        if transport is None or not transport.is_active():
-            _conn_pool.pop(host_key, None)
-            _conn_pool_last_used.pop(host_key, None)
-            try:
-                client.close()
-            except Exception:
-                pass
-            return None
-
-        return client
-
-
-def _pool_put(host_key: str, client: Any) -> None:
-    """Store a successfully connected SSHClient in the pool."""
-    with _conn_pool_lock:
-        _conn_pool[host_key] = client
-        _conn_pool_last_used[host_key] = time.monotonic()
-
-
-def _pool_update_ts(host_key: str) -> None:
-    """Touch the last-used timestamp of an already-pooled client."""
-    with _conn_pool_lock:
-        if host_key in _conn_pool:
-            _conn_pool_last_used[host_key] = time.monotonic()
-
-
-def _pool_evict(host_key: str) -> None:
-    """Forcefully remove a client from the pool (e.g. after an error)."""
-    with _conn_pool_lock:
-        client = _conn_pool.pop(host_key, None)
-        _conn_pool_last_used.pop(host_key, None)
-    if client is not None:
-        _linger_close(client)
-
-
-def flush_connection_pool() -> int:
-    """Close every pooled SSHClient and clear the pool + rate-limit state.
-
-    Called by the bridge's new_session path so the new generation never
-    inherits paramiko clients (or rate-limit cooldowns, or OS-detection
-    cache entries) from the old flow. Returns the number of clients
-    that were closed, for diagnostic logging.
-
-    Cross-platform: paramiko.SSHClient.close() and the underlying
-    socket.close() behave identically on Windows and POSIX. The
-    SO_LINGER setsockopt path is best-effort and may be a no-op on
-    Windows if the platform rejects the option, but the close itself
-    always works.
-    """
-    closed = 0
-    with _conn_pool_lock:
-        clients = list(_conn_pool.values())
-        _conn_pool.clear()
-        _conn_pool_last_used.clear()
-    for client in clients:
-        _linger_close(client)
-        closed += 1
-    with _connect_lock:
-        _connect_timestamps.clear()
-    with _os_cache_lock:
-        _os_cache.clear()
-    return closed
+# ctx=None fallback only (bare ``StatelessSSHTool()`` in unit tests). The live
+# flow routes through ``ctx.ssh_pool`` and never touches this instance.
+_default_pool = SshConnectionPool()
 
 
 def _linger_close(client: Any) -> None:
@@ -307,20 +314,21 @@ def _detect_os_and_shell(client: Any) -> Tuple[str, str]:
         return "linux", "unknown"
 
 
-def _detect_os_and_shell_cached(client: Any, host_key: str) -> Tuple[str, str]:
+def _detect_os_and_shell_cached(
+    client: Any, host_key: str, pool: "SshConnectionPool"
+) -> Tuple[str, str]:
     """
-    Return (os_name, login_shell) for the remote host, using a module-level
-    cache keyed by "hostname:port".  The probe round-trip is skipped on every
-    call after the first for the same host.
+    Return (os_name, login_shell) for the remote host, using the per-session
+    pool's cache keyed by "hostname:port".  The probe round-trip is skipped on
+    every call after the first for the same host.
 
-    host_key must be the same string used by _rate_limit(), i.e. "host:port".
+    host_key must be the same string used by the rate limiter, i.e. "host:port".
     """
-    with _os_cache_lock:
-        if host_key in _os_cache:
-            return _os_cache[host_key]
+    cached = pool.get_os(host_key)
+    if cached is not None:
+        return cached
     result = _detect_os_and_shell(client)
-    with _os_cache_lock:
-        _os_cache[host_key] = result
+    pool.set_os(host_key, result)
     return result
 
 
@@ -329,9 +337,9 @@ def _detect_os(client: Any) -> str:
     return _detect_os_and_shell(client)[0]
 
 
-def _detect_os_cached(client: Any, host_key: str) -> str:
+def _detect_os_cached(client: Any, host_key: str, pool: "SshConnectionPool") -> str:
     """Cached wrapper — returns just the OS name."""
-    return _detect_os_and_shell_cached(client, host_key)[0]
+    return _detect_os_and_shell_cached(client, host_key, pool)[0]
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -369,16 +377,7 @@ def _load_credentials(credentials_file: str) -> Dict[str, Any]:
         raw = fh.read()
 
     # Try YAML first (superset of JSON), fall back to json.loads
-    creds: Dict[str, Any] = {}
-    if _YAML_AVAILABLE:
-        creds = _yaml.safe_load(raw) or {}
-    else:
-        try:
-            creds = json.loads(raw)
-        except json.JSONDecodeError as exc:
-            raise ValueError(
-                f"Cannot parse credentials file (pyyaml not installed, JSON parse failed): {exc}"
-            ) from exc
+    creds: Dict[str, Any] = _yaml.safe_load(raw) or {}
 
     if not isinstance(creds, dict):
         raise ValueError("Credentials file must be a YAML/JSON mapping.")
@@ -390,29 +389,15 @@ def _load_credentials(credentials_file: str) -> Dict[str, Any]:
     # Resolve keyring_service → password
     keyring_service: Optional[str] = creds.get("keyring_service")
     if keyring_service and not creds.get("password"):
-        if not _KEYRING_AVAILABLE:
-            raise ImportError(
-                "keyring_service is set but the 'keyring' package is not installed. "
-                "Install with: pip install keyring"
-            )
         username: str = creds["username"]
 
         # On headless Linux, the default backend may be fail.Keyring.
-        # Auto-upgrade to EncryptedKeyring (keyrings.alt) if available.
+        # Auto-upgrade to EncryptedKeyring (keyrings.alt) — both alt classes
+        # are imported eagerly so any packaging issue surfaces at startup.
         backend = _keyring.get_keyring()
         if "fail" in backend.__class__.__module__.lower():
-            try:
-                from keyrings.alt.file import EncryptedKeyring  # type: ignore
-                _keyring.set_keyring(EncryptedKeyring())
-            except ImportError:
-                try:
-                    from keyrings.alt.file import PlaintextKeyring  # type: ignore
-                    _keyring.set_keyring(PlaintextKeyring())
-                except ImportError:
-                    raise ImportError(
-                        "No usable keyring backend found. "
-                        "On headless Linux, install: pip install keyrings.alt pycryptodome"
-                    )
+            from keyrings.alt.file import EncryptedKeyring  # type: ignore
+            _keyring.set_keyring(EncryptedKeyring())
 
         secret = _keyring.get_password(keyring_service, username)
         if secret is None:
@@ -430,6 +415,7 @@ def _load_credentials(credentials_file: str) -> Dict[str, Any]:
 def _new_client(
     creds: Dict[str, Any],
     host_key: str,
+    pool: "SshConnectionPool",
 ) -> Any:
     """
     Open a fresh paramiko SSHClient, authenticate, configure keepalives,
@@ -449,9 +435,6 @@ def _new_client(
     Rate-limits new connections to _MIN_CONNECT_INTERVAL per host so rapid
     sequential failures cannot flood the server's MaxStartups counter.
     """
-    if not _PARAMIKO_AVAILABLE:
-        raise ImportError("paramiko is required. Install with: pip install paramiko")
-
     hostname: str = creds["hostname"]
     username: str = creds["username"]
     port: int = int(creds.get("port", 22))
@@ -481,7 +464,7 @@ def _new_client(
     client: Optional[Any] = None
 
     # Rate-limit only when actually opening a new TCP connection.
-    _rate_limit(host_key)
+    pool.rate_limit(host_key)
 
     for _attempt in range(_MAX_RETRIES + 1):
         client = _paramiko.SSHClient()
@@ -561,7 +544,7 @@ def _new_client(
 
 
 @contextlib.contextmanager
-def _connect(creds: Dict[str, Any]):
+def _connect(creds: Dict[str, Any], pool: "SshConnectionPool"):
     """
     Context manager: obtain an authenticated SSHClient (from the pool when
     possible), yield it, then return it to the pool.
@@ -581,7 +564,7 @@ def _connect(creds: Dict[str, Any]):
     discarded and a fresh connection is established automatically.
 
     If a command raises an exception that indicates the transport died
-    *during* execution, the caller should call _pool_evict(host_key) to
+    *during* execution, the caller should call ``pool.evict(host_key)`` to
     remove the stale entry before the next action retries.
 
     Connection management
@@ -595,13 +578,13 @@ def _connect(creds: Dict[str, Any]):
     host_key = f"{hostname}:{port}"
 
     # Try pool first
-    client = _pool_get(host_key)
+    client = pool.get(host_key)
     is_new = client is None
 
     if is_new:
         # _new_client() applies the rate limiter before opening TCP.
-        client = _new_client(creds, host_key)
-        _pool_put(host_key, client)
+        client = _new_client(creds, host_key, pool)
+        pool.put(host_key, client)
 
     # Register a force-terminate hook so the bridge's new_session path
     # can abort an in-flight paramiko call from another thread. Closing
@@ -621,7 +604,7 @@ def _connect(creds: Dict[str, Any]):
             # The pool entry now points at a closed client; evict it so
             # the next caller doesn't pick up a dead handle.
             try:
-                _pool_evict(host_key)
+                pool.evict(host_key)
             except Exception:
                 pass
 
@@ -630,13 +613,13 @@ def _connect(creds: Dict[str, Any]):
     try:
         yield client, host_key
         # Successful use — refresh the idle timer.
-        _pool_update_ts(host_key)
+        pool.update_ts(host_key)
     except Exception:
         # If the transport died during the action, evict so the next call
         # gets a fresh connection rather than a broken one.
         transport = client.get_transport() if client else None
         if transport is None or not transport.is_active():
-            _pool_evict(host_key)
+            pool.evict(host_key)
         raise
 
 
@@ -1088,8 +1071,14 @@ class StatelessSSHTool(BaseTool):
         "additionalProperties": False,
     }
 
-    def __init__(self) -> None:
-        super().__init__("ssh")
+    def __init__(self, ctx=None) -> None:
+        super().__init__("ssh", ctx=ctx)
+        # Per-session connection pool from the SessionContext. ctx=None test
+        # fixtures fall back to a module-level default so bare ``StatelessSSHTool()``
+        # still works; the live flow always routes through ``ctx.ssh_pool``.
+        self.pool: SshConnectionPool = (
+            ctx.ssh_pool if ctx is not None else _default_pool
+        )
 
     # ── Main entry point ──────────────────────────────────────────────────────
 
@@ -1146,7 +1135,7 @@ class StatelessSSHTool(BaseTool):
         # Run blocking SSH work in a thread pool so we don't block the event loop.
         # run_with_abort_handle additionally:
         #   1. Mirrors self.interrupt_event into a thread-safe token that
-        #      _rate_limit / retry-backoff / exec-poll helpers find via
+        #      ``pool.rate_limit`` / retry-backoff / exec-poll helpers find via
         #      cancellation.current_interrupt(); a stop signal therefore
         #      aborts those waits at their next check point.
         #   2. Allocates an AbortHandle that _connect() registers a
@@ -1209,8 +1198,8 @@ class StatelessSSHTool(BaseTool):
         timeout: float = float(kwargs.get("timeout", 30.0))
 
         try:
-            with _connect(creds) as (client, host_key):
-                remote_os, login_shell = _detect_os_and_shell_cached(client, host_key)
+            with _connect(creds, self.pool) as (client, host_key):
+                remote_os, login_shell = _detect_os_and_shell_cached(client, host_key, self.pool)
                 if workdir:
                     if remote_os == "windows":
                         command = f"cd /d {workdir} && {command}"
@@ -1280,8 +1269,8 @@ class StatelessSSHTool(BaseTool):
         timeout: float = float(kwargs.get("timeout", 30.0))
 
         try:
-            with _connect(creds) as (client, host_key):
-                remote_os = _detect_os_cached(client, host_key)
+            with _connect(creds, self.pool) as (client, host_key):
+                remote_os = _detect_os_cached(client, host_key, self.pool)
                 if remote_os == "windows":
                     stdout, stderr, exit_code = _exec_bg_windows(
                         client, command, job_id, log_path, pid_file, exit_file,
@@ -1372,8 +1361,8 @@ class StatelessSSHTool(BaseTool):
         timeout: float = float(kwargs.get("timeout", 15.0))
 
         try:
-            with _connect(creds) as (client, host_key):
-                remote_os = _detect_os_cached(client, host_key)
+            with _connect(creds, self.pool) as (client, host_key):
+                remote_os = _detect_os_cached(client, host_key, self.pool)
                 if remote_os == "windows":
                     stdout = _job_status_windows(client, pid_file, log_path, exit_file, tail_lines, timeout)
                 else:
@@ -1477,8 +1466,8 @@ class StatelessSSHTool(BaseTool):
         timeout: float = float(kwargs.get("timeout", 15.0))
 
         try:
-            with _connect(creds) as (client, host_key):
-                remote_os = _detect_os_cached(client, host_key)
+            with _connect(creds, self.pool) as (client, host_key):
+                remote_os = _detect_os_cached(client, host_key, self.pool)
                 if remote_os == "windows":
                     cmd = _tail_log_cmd_windows(log_path, lines, pattern)
                 else:
@@ -1549,8 +1538,8 @@ class StatelessSSHTool(BaseTool):
         timeout: float = float(kwargs.get("timeout", 15.0))
 
         try:
-            with _connect(creds) as (client, host_key):
-                remote_os = _detect_os_cached(client, host_key)
+            with _connect(creds, self.pool) as (client, host_key):
+                remote_os = _detect_os_cached(client, host_key, self.pool)
                 if remote_os == "windows":
                     # PowerShell: Get-Content, select line range
                     cmd = (
@@ -1613,8 +1602,8 @@ class StatelessSSHTool(BaseTool):
         data: bytes = content.encode("utf-8")
 
         try:
-            with _connect(creds) as (client, host_key):
-                remote_os = _detect_os_cached(client, host_key)
+            with _connect(creds, self.pool) as (client, host_key):
+                remote_os = _detect_os_cached(client, host_key, self.pool)
                 sftp = client.open_sftp()
                 try:
                     remote_dir = remote_path.rsplit("/", 1)[0] if "/" in remote_path else "."
@@ -1676,8 +1665,8 @@ class StatelessSSHTool(BaseTool):
         data: bytes = script_content.encode("utf-8")
 
         try:
-            with _connect(creds) as (client, host_key):
-                remote_os = _detect_os_cached(client, host_key)
+            with _connect(creds, self.pool) as (client, host_key):
+                remote_os = _detect_os_cached(client, host_key, self.pool)
 
                 if remote_os == "windows":
                     # Pure Windows (no Cygwin): use PowerShell Start-Process
@@ -1784,8 +1773,8 @@ class StatelessSSHTool(BaseTool):
         timeout: float = float(kwargs.get("timeout", 15.0))
 
         try:
-            with _connect(creds) as (client, host_key):
-                remote_os = _detect_os_cached(client, host_key)
+            with _connect(creds, self.pool) as (client, host_key):
+                remote_os = _detect_os_cached(client, host_key, self.pool)
                 if remote_os == "windows":
                     kill_all = (
                         "powershell -Command \""
@@ -1881,8 +1870,8 @@ class StatelessSSHTool(BaseTool):
         exec_timeout = timeout + 15.0
 
         try:
-            with _connect(creds) as (client, host_key):
-                remote_os = _detect_os_cached(client, host_key)
+            with _connect(creds, self.pool) as (client, host_key):
+                remote_os = _detect_os_cached(client, host_key, self.pool)
 
                 if remote_os == "windows":
                     # PowerShell polling loop

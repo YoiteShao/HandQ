@@ -13,14 +13,14 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Optional
 
+import playwright  # noqa: F401  — eager hard dep; missing installs fail at startup
+
 from .browser_paths import user_browser_profile_dir
 from .logger import get_logger
-from .step_context_provider import StepContextProvider
+from ..controller_v2.context import ContextProvider, ItemContext, ProviderCache
 
 if TYPE_CHECKING:
-    from ..controller.interaction_manager import InteractionManager
-    from .memory import Memory
-    from ..models.plan import Step
+    from ..controller_v2.interaction_manager import InteractionManager
 
 
 def _build_full_hint(profile_dir: str, attach_enabled: bool) -> str:
@@ -77,7 +77,7 @@ def _build_brief_hint() -> str:
     )
 
 
-class BrowserContextProvider(StepContextProvider):
+class BrowserContextProvider(ContextProvider):
     """Prepare the browser tool's persistent profile when the Planner declares it.
 
     No keyword scanning — activation is purely declaration-driven via
@@ -112,31 +112,12 @@ class BrowserContextProvider(StepContextProvider):
             "navigating + extracting search-result HTML wastes 5-10k tokens vs the clean JSON web_search returns",
         ]
 
-    async def prepare(
+    async def before_item(
         self,
-        step: "Step",
-        interaction_manager: "InteractionManager",
-        memory: "Memory",
+        ctx: ItemContext,
+        im: "InteractionManager",
+        cache: ProviderCache,
     ) -> Optional[str]:
-        # Verify playwright importable. If missing, surface a clear hint so
-        # the agent can report the issue rather than blindly calling the
-        # tool and getting an opaque ImportError later.
-        try:
-            import playwright  # noqa: F401
-        except ImportError:
-            self.logger.warning(
-                "BrowserContextProvider: playwright not installed — tool calls will fail",
-                component="BrowserContextProvider",
-            )
-            return (
-                "[Browser Context — UNAVAILABLE]\n"
-                "playwright is not installed. The browser tool will fail. Run:\n"
-                "  pip install playwright\n"
-                "  playwright install msedge\n"
-                "and retry. If that is not possible, report to the user that "
-                "this task requires browser automation which is unavailable."
-            )
-
         # Ensure the persistent profile dir exists. user_browser_profile_dir
         # is idempotent (mkdir parents=True, exist_ok=True).
         try:
@@ -169,11 +150,11 @@ class BrowserContextProvider(StepContextProvider):
 
         # Progressive disclosure: full guide on first activation in this task,
         # brief reminder thereafter.
-        cached = memory.get_browser_context("default")
+        cached = cache.get("browser")
         if cached and cached.get("prepared"):
             return _build_brief_hint()
 
-        memory.set_browser_context("default", {
+        cache.set("browser", "default", {
             "prepared": True,
             "profile_dir": profile_dir,
             "attach_enabled": attach_enabled,

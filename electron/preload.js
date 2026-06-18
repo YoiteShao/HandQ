@@ -5,10 +5,9 @@
 // operation routes through ipcMain in main.js.
 //
 // Event-type dispatch happens here so each renderer-side callback only sees
-// the envelopes it cares about. Per porting_design.md §(2) the backend emits
-// `token_stream`, `status`, `final`, `error` envelopes; renderer-initiated
-// requests are correlated by `id` and answered with a `final` envelope of
-// the matching id.
+// the envelopes it cares about. The backend emits `status`, `final`, and
+// `error` envelopes; renderer-initiated requests are correlated by `id` and
+// answered with a `final` envelope of the matching id.
 
 'use strict';
 
@@ -71,7 +70,6 @@ function nextId(prefix) {
 
 // --- registered listeners --------------------------------------------------
 
-const tokenStreamListeners = [];
 const finalListeners = [];
 const errorListeners = [];
 const statusListeners = [];
@@ -93,11 +91,7 @@ ipcRenderer.on('handq:event', (_evt, evt) => {
     const t = evt.type;
     preloadLog('event', { type: t, id: evt.id });
 
-    if (t === 'token_stream') {
-        for (const cb of tokenStreamListeners) {
-            try { cb(evt); } catch (_) { /* swallow */ }
-        }
-    } else if (t === 'status') {
+    if (t === 'status') {
         if (!statusReplayed && statusListeners.length === 0) {
             statusBacklog.push(evt);
         } else {
@@ -122,7 +116,7 @@ ipcRenderer.on('handq:event', (_evt, evt) => {
 });
 
 preloadLog('preload loaded', {
-    listeners: ['token_stream', 'final', 'error', 'status'],
+    listeners: ['final', 'error', 'status'],
 });
 
 // --- exposed API -----------------------------------------------------------
@@ -140,15 +134,6 @@ contextBridge.exposeInMainWorld('handq', {
         preloadLog('sendRequest', { type: out.type, id: out.id });
         ipcRenderer.invoke('handq:sendRequest', out);
         return out.id;
-    },
-
-    /**
-     * onTokenStream(cb) — cb receives every {type:"token_stream", event, ...}
-     * envelope. event ∈ {"text_delta","tool_call","done"}.
-     */
-    onTokenStream: (cb) => {
-        preloadLog('onTokenStream', { registered: typeof cb === 'function' });
-        if (typeof cb === 'function') tokenStreamListeners.push(cb);
     },
 
     /**
