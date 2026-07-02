@@ -48,6 +48,7 @@ Internal row shape (8-tuple) flowing between stages:
 from __future__ import annotations
 
 import logging
+import time
 from typing import Dict, List, Optional, Tuple
 
 from . import _constants as C
@@ -141,6 +142,20 @@ async def recall_memory_impl(
         rows = _rerank_gate(rows)
         if not rows:
             return []
+        rows = _recency_reorder(rows)
+    elif not rerank:
+        # FAST tier path: no rerank means no LLM-scored relevance cutoff.
+        # Enforce a post-fusion cosine floor so the 0.45-0.49 mid-band
+        # noise the pre-filter let through is dropped before top-K trim.
+        rows = _fast_gate(rows)
+        if not rows:
+            return []
+        rows = _recency_reorder(rows)
+    # else (rerank=True but reranker.available=False) — graceful fallback:
+    # preserve the pre-refactor behaviour (no gate, no recency reorder) so a
+    # rerank outage doesn't silently switch the QUALITY caller to aggressive
+    # FAST-tier semantics. Chat / per-item callers ask for rerank=False
+    # explicitly; only they should get the post-fusion floor.
     entries = [_row_to_memory_entry(r) for r in rows[:effective_k]]
     if dynamic_k:
         entries = _score_gap_trim(
@@ -186,6 +201,14 @@ async def recall_knowledge_impl(
         rows = _rerank_gate(rows)
         if not rows:
             return []
+        rows = _recency_reorder(rows)
+    elif not rerank:
+        # FAST tier path: post-fusion cosine floor (see recall_memory_impl).
+        rows = _fast_gate(rows)
+        if not rows:
+            return []
+        rows = _recency_reorder(rows)
+    # else: graceful fallback for rerank=True + unavailable reranker.
     entries = [_row_to_knowledge_entry(r) for r in rows[:effective_k]]
     if dynamic_k:
         entries = _score_gap_trim(
@@ -282,6 +305,33 @@ def format_known_entities_block(principals: List[tuple]) -> str:
         return ""
     lines.append(f"</{KNOWN_ENTITIES_CONTEXT_TAG}>")
     return "\n".join(lines)
+
+
+def _recency_reorder(rows: List[tuple]) -> List[tuple]:
+    """Re-sort gated rows by ``relevance × recency-decay`` — ordering ONLY.
+
+    Biases which candidates win the limited top-k slots toward fresher
+    memories; it does NOT cull (the relevance gate already ran on the raw
+    score, so a high-relevance old entry — e.g. a durable preference — is
+    never removed just for being old). ``created_at`` is at index 5 (unix
+    seconds); the raw relevance score is at index 7. A None score (BM25-only
+    exact-keyword hit) is treated as 0 for ordering — but this runs only in
+    the rerank-available path where every row already carries a score.
+    """
+    halflife = C.RECALL_DECAY_HALFLIFE_DAYS
+    if len(rows) <= 1 or halflife <= 0:
+        return rows
+    now = time.time()
+
+    def _key(r: tuple) -> float:
+        score = r[7] if (len(r) > 7 and r[7] is not None) else 0.0
+        created = r[5] if len(r) > 5 else 0
+        if not created:
+            return float(score)  # unknown age → no recency penalty
+        age_days = max(0.0, (now - float(created)) / 86400.0)
+        return float(score) * (0.5 ** (age_days / halflife))
+
+    return sorted(rows, key=_key, reverse=True)
 
 
 def _score_gap_trim(
@@ -550,6 +600,37 @@ def _rerank_gate(rows: List[tuple]) -> List[tuple]:
     return [
         r for r in rows
         if r[7] is None or r[7] >= C.RECALL_RERANK_MIN_SCORE
+    ]
+
+
+def _fast_gate(rows: List[tuple]) -> List[tuple]:
+    """Post-RRF-fusion cosine floor for the FAST tier (rerank=False path).
+
+    QUALITY tier has ``_rerank_gate`` as its final relevance cutoff — the LLM
+    rerank score enforces ``RECALL_RERANK_MIN_SCORE=0.30``. FAST tier bypasses
+    rerank to keep the chat hot path sub-second, so without this gate there is
+    NO post-fusion score enforcement — top-K by RRF surfaces whatever the pre-
+    filter let through, including the 0.45-0.49 mid-band where activity noise
+    lives.
+
+    Diverges from ``_rerank_gate`` on one point: BM25-only hits (display_score
+    is None) are DROPPED here, not kept. Rationale specific to FAST tier:
+
+    - In noise-heavy corpora (LTM v1.x on prod: 172 entries, 30% quality),
+      BM25-only matches are dominated by coincidental keyword overlap —
+      e.g. an activity-log entry "User reviews config in VS Code" matches
+      a "what checks do I run?" chat query on stopword "in"/common words,
+      RRF boosts it via BM25 rank while dense cosine sat below 0.45.
+    - Real BM25-only exact matches (file paths, uncommon technical terms)
+      almost always also produce a decent dense cosine (embeddings do
+      capture token-level similarity). Losing the truly rare exact-only
+      hit is cheap; keeping every BM25 hit is what floods the chat tier.
+    - QUALITY tier still keeps BM25-only via ``_rerank_gate`` — the rerank
+      LLM decides whether the exact-keyword match is actually relevant.
+    """
+    return [
+        r for r in rows
+        if r[7] is not None and r[7] >= C.RECALL_FAST_POST_FUSION_MIN_SCORE
     ]
 
 

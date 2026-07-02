@@ -64,29 +64,52 @@ if TYPE_CHECKING:
 
 
 # ── Hard Windows / input deps ────────────────────────────────────────────────
-# Imported eagerly — desktop_tool is registered Windows-only and these libs
-# must be present at module load. Any missing dep fails the whole launch.
+# On Windows these are eager hard deps — desktop_tool is registered Windows-only
+# and the libs must be present at module load, so any missing dep fails the
+# whole launch (fail-fast). On non-Windows (e.g. the Linux HandQ runtime) the
+# imports are skipped and the availability flags stay False; the existing
+# ``if not _X_AVAILABLE`` guards in every action then return a clean error
+# instead of the module failing to import. desktop_tool is never registered
+# off-Windows, so the native symbols below are only reached on Windows anyway.
+_IS_WINDOWS = sys.platform == "win32"
 
-import mss  # type: ignore[import-not-found]
-import pyautogui  # type: ignore[import-not-found]
-pyautogui.FAILSAFE = True       # corner-of-screen panic abort
-pyautogui.PAUSE = 0.05          # global throttle so OS UI keeps up
+if _IS_WINDOWS:
+    import mss  # type: ignore[import-not-found]
+    import pyautogui  # type: ignore[import-not-found]
+    pyautogui.FAILSAFE = True       # corner-of-screen panic abort
+    pyautogui.PAUSE = 0.05          # global throttle so OS UI keeps up
 
-import win32gui                 # type: ignore[import-not-found]
-import win32process             # type: ignore[import-not-found]
-import win32con                 # type: ignore[import-not-found]
-from PIL import Image           # type: ignore[import-not-found]
-import pywinauto                # type: ignore[import-not-found]
-from pywinauto import Desktop   # type: ignore[import-not-found]
-from rapidfuzz import fuzz      # type: ignore[import-not-found]
-import psutil                   # type: ignore[import-not-found]
+    import win32gui                 # type: ignore[import-not-found]
+    import win32process             # type: ignore[import-not-found]
+    import win32con                 # type: ignore[import-not-found]
+    from PIL import Image           # type: ignore[import-not-found]
+    import pywinauto                # type: ignore[import-not-found]
+    from pywinauto import Desktop   # type: ignore[import-not-found]
+    from rapidfuzz import fuzz      # type: ignore[import-not-found]
+    import psutil                   # type: ignore[import-not-found]
 
-# Availability flags retained as ``True`` so legacy ``if not _X_AVAILABLE``
-# guards downstream remain syntactically valid; the eager imports above
-# guarantee the deps are actually present.
-_MSS_AVAILABLE = True
-_PYAUTOGUI_AVAILABLE = True
-_WIN32_AVAILABLE = True
+    _MSS_AVAILABLE = True
+    _PYAUTOGUI_AVAILABLE = True
+    _WIN32_AVAILABLE = True
+else:
+    # Bind the native names to Any-typed None so static analysis treats the
+    # Windows-only action code (all of it guarded by ``if not _X_AVAILABLE``)
+    # as reachable-but-typed rather than "possibly unbound". None of these are
+    # touched at runtime off-Windows.
+    mss: Any = None
+    pyautogui: Any = None
+    win32gui: Any = None
+    win32process: Any = None
+    win32con: Any = None
+    Image: Any = None
+    pywinauto: Any = None
+    Desktop: Any = None
+    fuzz: Any = None
+    psutil: Any = None
+
+    _MSS_AVAILABLE = False
+    _PYAUTOGUI_AVAILABLE = False
+    _WIN32_AVAILABLE = False
 
 
 # ── DPI awareness one-shot ───────────────────────────────────────────────────
@@ -122,6 +145,44 @@ def _ensure_dpi_aware() -> None:
 
 _desktop_lock = asyncio.Lock()
 
+# Process-wide desktop ownership lock for multi-session concurrency.
+# Distinct from ``_desktop_lock`` above: that one serialises individual input
+# *actions* (release between each click / keystroke). This one is held for the
+# entire duration of a session's takeover (acquired on the first input action,
+# released by ``DesktopState.reset_takeover_state`` when the task settles), so
+# session A's multi-step desktop sequence never gets interleaved with session
+# B's actions. B's input-driving calls await here until A's task settles.
+_GLOBAL_DESKTOP_OWNERSHIP_LOCK = asyncio.Lock()
+_GLOBAL_DESKTOP_OWNER: Optional["DesktopState"] = None
+
+# Actions that drive real mouse / keyboard input and therefore must claim the
+# cross-session ownership lock. Read-only actions (screenshot / snapshot /
+# list_windows / find_element) are absent on purpose — they never take
+# ownership and stay freely concurrent across sessions. Kept in sync with the
+# handlers that call ``_input_action_guard`` (which itself remains the single
+# place that flips takeover state and re-checks the sensitive-window gate).
+_INPUT_ACTIONS = frozenset({
+    "hover_at", "find_and_click", "click_at", "type_text",
+    "drag", "scroll", "hotkey", "key_press",
+})
+
+
+def is_any_session_holding_desktop() -> bool:
+    """True iff any DesktopState currently owns the cross-session
+    desktop ownership lock.
+
+    Direct read of ``_GLOBAL_DESKTOP_OWNER`` — no refcount, no mirror
+    state. Used by :class:`PersonalityMonitor` to gate OCR capture during
+    agent input: when ANY session is driving input through the desktop
+    tool, the monitor's screenshot samples would otherwise interleave
+    with agent-driven mouse / keyboard events. Querying directly (rather
+    than mirroring via notifications) makes drift impossible — even when
+    ``_force_release_session_locks`` force-resets the owner after a
+    destroy timeout, the very next caller sees the new truth.
+    """
+    return _GLOBAL_DESKTOP_OWNER is not None
+
+
 _desktop_store_instance: Optional[Any] = None
 
 # RapidOCR cold-start (~600ms) is paid on the first find_element. To
@@ -138,7 +199,7 @@ _ocr_prewarm_started: bool = False
 # (~300-500 ms) plus, on UIA miss, an OCR pass (~700 ms). The agent
 # typically calls snapshot, picks an element, clicks it, then calls
 # snapshot AGAIN to find the next element — even though the UI hasn't
-# materially changed. The cache below short-circuits the second call.
+# materially changed. The cache short-circuits the second call.
 #
 # Key:    hwnd (int)
 # Value:  {
@@ -154,38 +215,32 @@ _ocr_prewarm_started: bool = False
 #
 # Invalidation:
 #   • Input actions whose state_after shows foreground_changed,
-#     title_changed, or new_windows clear the entire cache.
+#     title_changed, or new_windows clear the entire cache
+#     (``DesktopState.invalidate_on_state_change``).
 #   • TTL expiry (lazy — checked at hit time, no sweeper).
 #   • reset_takeover_state() clears at task boundary so a stale cache
 #     can never bleed across tasks.
-_snapshot_cache: Dict[int, Dict[str, Any]] = {}
+#
+# Storage: the live cache is ``DesktopState.snapshot_cache`` (per-session,
+# bound to the FlowControllerV2 that owns this DesktopState). There is no
+# module-level mirror — the per-session dict is the single source of truth.
+# Snapshot read/write go through ``self.state.snapshot_cache`` (see the
+# ``snapshot`` action) and invalidation runs through
+# ``self.state.invalidate_on_state_change(state_after)``.
 _SNAPSHOT_CACHE_TTL_S: float = 30.0
 
 
 def _snapshot_sig(state: Dict[str, Any]) -> Tuple[int, str, int]:
-    """Build a 3-tuple sig from a _capture_state_before/after dict."""
+    """Build a 3-tuple sig from a _capture_state_before/after dict.
+
+    Used by both the snapshot action (to validate cache hits) and the
+    per-session invalidator. Pure helper — no module state.
+    """
     return (
         int(state.get("foreground_pid", 0) or 0),
         str(state.get("foreground_title", "") or ""),
         len(state.get("visible_hwnds") or ()),
     )
-
-
-def _invalidate_snapshot_cache_on_state_change(state_after: Dict[str, Any]) -> None:
-    """Drop the cache when an input action moved the UI.
-
-    Whole-cache nuke is fine — there is at most 1-2 entries (one per
-    foreground hwnd the agent has snapshotted this task). Rebuilding
-    is the same cost as the first call.
-    """
-    if not _snapshot_cache:
-        return
-    if (
-        state_after.get("foreground_changed")
-        or state_after.get("title_changed")
-        or state_after.get("new_windows")
-    ):
-        _snapshot_cache.clear()
 
 
 def _prewarm_local_ocr_async() -> None:
@@ -393,20 +448,25 @@ def was_user_rescinded() -> bool:
 
 
 def reset_takeover_state() -> None:
-    """Wipe approval + takeover. Called from
-    :func:`flow_controller._close_session_resources` at task completion
-    and from ``stdio_bridge._do_new_session`` so the next task starts
-    clean.
+    """Wipe approval + takeover (module-level, ctx=None fallback path).
+
+    Sessions with a ``SessionContext`` use the per-instance
+    :meth:`DesktopState.reset_takeover_state` instead, which is driven by
+    :meth:`flow_controller.FlowControllerV2._forward_state_to_ui` on the
+    task-settled (``idle``) transition and by ``DesktopState.close()`` at
+    session teardown (``ctx.close()`` ← ``flow.destroy()`` ←
+    ``stdio_bridge._do_close_session``). This module-level twin only backs
+    the ctx-less path (test fixtures / direct module callers).
+
+    Snapshot cache is not cleared here — there is no module-level cache;
+    the per-session ``DesktopState.snapshot_cache`` is cleared in its own
+    ``reset_takeover_state`` instance method.
     """
     global _task_approved, _task_user_rescinded
     if _takeover_active:
         _end_takeover("task_ended")
     _task_approved = False
     _task_user_rescinded = False
-    # Snapshot cache must not bleed across tasks — a new task may target a
-    # different process living on the same hwnd, or the user may have
-    # rearranged the desktop while the agent was idle.
-    _snapshot_cache.clear()
 
 
 # ── Per-session desktop state class (used by SessionContext) ─────────────────
@@ -463,6 +523,18 @@ class DesktopState:
         self.takeover_active: bool = False
         self.task_approved: bool = False
         self.task_user_rescinded: bool = False
+        # Multi-session ownership flag — True iff this DesktopState currently
+        # holds the process-wide _GLOBAL_DESKTOP_OWNERSHIP_LOCK. Acquired
+        # lazily on the first input-driving action (idempotent); released by
+        # reset_takeover_state when the task settles.
+        self._owns_global_lock: bool = False
+        # The event loop on which the ownership lock was acquired. asyncio.Lock
+        # is NOT thread-safe: ``close()`` runs in a worker thread (to_thread)
+        # and releasing from there would not wake a waiter parked in
+        # ``acquire_global_takeover`` on the loop thread. We capture the loop at
+        # acquire and bounce the release back onto it via call_soon_threadsafe
+        # when releasing off-thread (F3).
+        self._owner_loop: Optional[asyncio.AbstractEventLoop] = None
         # snapshot cache (hwnd → entry)
         self.snapshot_cache: Dict[int, Dict[str, Any]] = {}
         # OCR prewarm one-shot
@@ -519,6 +591,71 @@ class DesktopState:
         self.task_approved = False
         self.task_user_rescinded = False
         self.snapshot_cache.clear()
+        self._release_global_takeover_if_owned()
+
+    # ── Global ownership lock (multi-session concurrency) ────────────────
+
+    async def acquire_global_takeover(self) -> None:
+        """Acquire the process-wide desktop ownership lock for the current
+        task. Idempotent — re-entrant calls on the same DesktopState return
+        immediately. Released by ``reset_takeover_state`` when the planner
+        signals task settled, or by ``close`` when the session is destroyed.
+
+        While this DesktopState owns the lock, other sessions' input-driving
+        desktop actions block here until release. Read-only actions
+        (screenshot, list_windows, find_element, snapshot) do NOT call this —
+        they remain freely concurrent.
+        """
+        global _GLOBAL_DESKTOP_OWNER
+        if self._owns_global_lock:
+            return
+        await _GLOBAL_DESKTOP_OWNERSHIP_LOCK.acquire()
+        self._owns_global_lock = True
+        self._owner_loop = asyncio.get_running_loop()
+        _GLOBAL_DESKTOP_OWNER = self
+
+    def _release_global_takeover_if_owned(self) -> None:
+        """Release the process-wide desktop ownership lock iff this
+        DesktopState currently holds it. Safe to call repeatedly.
+
+        Loop-safe (F3): ``asyncio.Lock`` must be released on the loop it was
+        acquired on, otherwise a waiter parked in ``acquire_global_takeover``
+        may never be woken. ``close()`` runs in a worker thread, so when this
+        is called off the owner loop we bounce the actual ``.release()`` onto
+        it via ``call_soon_threadsafe``. The ownership flags are cleared
+        synchronously first, so the slot reads as free the instant we return.
+        """
+        global _GLOBAL_DESKTOP_OWNER
+        if not self._owns_global_lock:
+            return
+        self._owns_global_lock = False
+        if _GLOBAL_DESKTOP_OWNER is self:
+            _GLOBAL_DESKTOP_OWNER = None
+        owner_loop = self._owner_loop
+        self._owner_loop = None
+
+        def _do_release() -> None:
+            try:
+                _GLOBAL_DESKTOP_OWNERSHIP_LOCK.release()
+            except RuntimeError:
+                # Lock wasn't held — defensive; paired acquire/release match.
+                pass
+
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+
+        if owner_loop is not None and owner_loop is not running:
+            # Off the owner loop (e.g. close() in a worker thread): schedule the
+            # release on the owner loop so its selector wakes the next waiter.
+            try:
+                owner_loop.call_soon_threadsafe(_do_release)
+            except RuntimeError:
+                # Owner loop already closed — nothing parked on it to wake.
+                _do_release()
+        else:
+            _do_release()
 
     # ── ScreenshotStore (lazy) ───────────────────────────────────────────
 
@@ -1608,6 +1745,27 @@ class DesktopTool(BaseTool):
                 f"Valid: {', '.join(dispatch)}",
             )
 
+        # Cross-session lock ordering (deadlock fix):
+        # Claim the process-wide desktop OWNERSHIP lock BEFORE taking the
+        # per-action ``_desktop_lock``. Ownership is held across a whole
+        # session's takeover, while ``_desktop_lock`` is released between
+        # individual actions. If we acquired them in the other order, two
+        # sessions could deadlock: session A owns the ownership lock (mid
+        # task) and waits for ``_desktop_lock``; session B holds
+        # ``_desktop_lock`` and waits for ownership. Acquiring ownership
+        # first means a session waiting for ownership never holds
+        # ``_desktop_lock``, so no cycle can form. Read-only actions are not
+        # in ``_INPUT_ACTIONS`` and never touch the ownership lock.
+        if action in _INPUT_ACTIONS:
+            # A sensitive-window refusal must not grab ownership, so run the
+            # side-effect-free sensitive check before acquiring. The per-handler
+            # ``_input_action_guard`` re-checks (and flips takeover state); its
+            # own ``acquire_global_takeover`` is then an idempotent no-op.
+            refusal = self._sensitive_guard()
+            if refusal:
+                return self._error(params, start, refusal)
+            await self.state.acquire_global_takeover()
+
         # Mouse and keyboard are global — actions across agents and steps
         # all queue here.
         async with _desktop_lock:
@@ -1970,7 +2128,7 @@ class DesktopTool(BaseTool):
         # hover is borderline input — it moves the cursor but does not click.
         # Run it through the takeover gate so the indicator + revoke apply,
         # matching how a tooltip-spam loop would feel to the user.
-        guard = self._input_action_guard()
+        guard = await self._input_action_guard()
         if guard:
             return self._error(params, start, guard)
 
@@ -2295,7 +2453,7 @@ class DesktopTool(BaseTool):
         # Now drive the click. The input guard (sensitive-window check +
         # _start_takeover) runs here as well — find_element never goes
         # through it because read-only.
-        guard = self._input_action_guard()
+        guard = await self._input_action_guard()
         if guard:
             return self._error(params, start, guard)
 
@@ -2371,7 +2529,7 @@ class DesktopTool(BaseTool):
     ) -> ToolResult:
         if not _PYAUTOGUI_AVAILABLE:
             return self._error(params, start, _pyautogui_install_msg())
-        guard = self._input_action_guard()
+        guard = await self._input_action_guard()
         if guard:
             return self._error(params, start, guard)
 
@@ -2447,7 +2605,7 @@ class DesktopTool(BaseTool):
     ) -> ToolResult:
         if not _PYAUTOGUI_AVAILABLE:
             return self._error(params, start, _pyautogui_install_msg())
-        guard = self._input_action_guard()
+        guard = await self._input_action_guard()
         if guard:
             return self._error(params, start, guard)
 
@@ -2518,7 +2676,7 @@ class DesktopTool(BaseTool):
     ) -> ToolResult:
         if not _PYAUTOGUI_AVAILABLE:
             return self._error(params, start, _pyautogui_install_msg())
-        guard = self._input_action_guard()
+        guard = await self._input_action_guard()
         if guard:
             return self._error(params, start, guard)
 
@@ -2572,7 +2730,7 @@ class DesktopTool(BaseTool):
     ) -> ToolResult:
         if not _PYAUTOGUI_AVAILABLE:
             return self._error(params, start, _pyautogui_install_msg())
-        guard = self._input_action_guard()
+        guard = await self._input_action_guard()
         if guard:
             return self._error(params, start, guard)
 
@@ -2610,7 +2768,7 @@ class DesktopTool(BaseTool):
     ) -> ToolResult:
         if not _PYAUTOGUI_AVAILABLE:
             return self._error(params, start, _pyautogui_install_msg())
-        guard = self._input_action_guard()
+        guard = await self._input_action_guard()
         if guard:
             return self._error(params, start, guard)
 
@@ -2648,7 +2806,7 @@ class DesktopTool(BaseTool):
     ) -> ToolResult:
         if not _PYAUTOGUI_AVAILABLE:
             return self._error(params, start, _pyautogui_install_msg())
-        guard = self._input_action_guard()
+        guard = await self._input_action_guard()
         if guard:
             return self._error(params, start, guard)
 
@@ -2677,13 +2835,16 @@ class DesktopTool(BaseTool):
 
     # ── helpers ───────────────────────────────────────────────────────────────
 
-    def _input_action_guard(self) -> Optional[str]:
+    async def _input_action_guard(self) -> Optional[str]:
         """Pre-flight gate every input action runs.
 
         Order matters:
           1. sensitive-window check — banking / password manager are
              refused regardless of any approval.
-          2. mark takeover as active so the Electron overlay shows.
+          2. acquire the process-wide desktop ownership lock (per-task
+             scope) so concurrent sessions queue here, not in the middle
+             of mouse / keyboard sequences.
+          3. mark takeover as active so the Electron overlay shows.
 
         The runtime agent (src/agent/runtime_agent.py:_check_before_act)
         is the source of truth for "may the agent operate the desktop".
@@ -2693,7 +2854,8 @@ class DesktopTool(BaseTool):
         flag, not by failing this guard.
 
         Returns an error string when the action must be refused, or
-        None when it may proceed.
+        None when it may proceed. Async because acquiring the
+        cross-session desktop ownership lock requires await.
         """
         info = _foreground_window_info()
         if info and _is_sensitive_window(info.get("title", ""), info.get("process_name", "")):
@@ -2703,7 +2865,10 @@ class DesktopTool(BaseTool):
                 "password managers / banking apps are blocked. Switch "
                 "focus before retrying."
             )
-        # Cleared all gates — emit takeover-started (idempotent).
+        # Cleared the sensitive-window gate — claim cross-session desktop
+        # ownership (idempotent — re-entrant calls in the same task return
+        # immediately) before flipping the takeover flag.
+        await self.state.acquire_global_takeover()
         self.state.start_takeover("input_action")
         return None
 

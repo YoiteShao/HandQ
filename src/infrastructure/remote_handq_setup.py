@@ -111,9 +111,9 @@ class RemoteHandQContextProvider(ContextProvider):
         # Discover HANDQ_DIR on the remote host
         handq_dir = ""
         try:
-            from ..tools.remote_handq_tool import _load_credentials, _discover_handq_dir
+            from ..tools.remote_handq_tool import _load_credentials, _discover
             creds = _load_credentials(creds_file)
-            handq_dir, _, _, _ = _discover_handq_dir(creds)
+            handq_dir = _discover(creds).get("handq_dir", "")
         except Exception as disc_exc:
             self.logger.warning(
                 f"HANDQ_DIR discovery failed for {hostname}: {disc_exc}. "
@@ -173,8 +173,14 @@ def _build_full_hint(creds_file: str, handq_dir: str) -> str:
     dir_line = f" | handq_dir={handq_dir}" if handq_dir else ""
     return (
         f"[Remote HandQ ready] credentials_file={creds_file}{dir_line}\n"
-        f"Actions: discover, submit_goal, get_status, send_message, get_result, exit_handq\n"
-        f"Workflow: submit_goal(goal=...) → get_status(wait_timeout=N) → get_result\n"
+        f"Actions: discover, submit_goal, send_message, get_status, get_result, "
+        f"get_confirmation, answer_confirmation, new_session, interrupt, exit_handq\n"
+        f"Workflow: submit_goal(goal=...) → get_status(wait_timeout=N) → get_result(message_id=...)\n"
+        f"submit_goal/send_message return a message_id; pass it to get_result to fetch that reply.\n"
+        f"Confirmations: if get_status reports pending_confirmation (a risk/tool approval or "
+        f"ask_human prompt), call answer_confirmation(confirmation_id=..., decision=yes|no|message) "
+        f"for tool/risk, or answer_confirmation(confirmation_id=..., value=...) for secret/text. "
+        f"Until answered the task stays blocked (auto-refuses after a timeout).\n"
         f"Pass credentials_file in every remote_handq tool call."
         + (f"\nPass handq_dir={handq_dir} to skip re-discovery." if handq_dir else "")
     )

@@ -115,13 +115,26 @@ class SearchHit:
 
 
 def _is_auth_failure(status: int, body: str) -> bool:
-    """True if the response looks like an SSO login wall, not real data."""
+    """True if the response looks like an SSO login wall, not real data.
+
+    Catches three patterns:
+      - explicit auth statuses (401/403)
+      - redirect statuses with no auto-follow (302/303/307/308)
+      - SSO HTML body markers
+      - empty body with non-error status (status<400 + body="" — covers
+        Playwright's evaluate_fetch returning status=0 on JS-side abort,
+        and proxies that swallow the SSO redirect into a blank 200)
+    """
     if status in (401, 403):
         return True
     if status in (302, 303, 307, 308):
         return True
     bl = (body or "").lower()
-    return any(marker in bl for marker in _SSO_BODY_MARKERS)
+    if any(marker in bl for marker in _SSO_BODY_MARKERS):
+        return True
+    if not (body or "").strip() and status < 400:
+        return True
+    return False
 
 
 def _strip_html(s: str) -> str:
@@ -184,8 +197,14 @@ class WebSearchTool(BaseTool):
                 "enum": ["confluence", "jira", "sharepoint", "orbit"],
                 "description": (
                     "Which source to query. Choose ONE per call; agent can "
-                    "fan out by issuing parallel calls. Sources can be "
-                    "individually disabled in handq_config.yaml under "
+                    "fan out by issuing parallel calls — note that calls "
+                    "serialise on the browser session lock under the hood, "
+                    "so 'parallel' fan-out is effectively sequential. Pick "
+                    "the most likely source first; recommended order when "
+                    "you do not know which: jira → sharepoint → orbit → "
+                    "confluence (confluence is the flakiest under SSO and "
+                    "should be tried last). Sources can be individually "
+                    "disabled in handq_config.yaml under "
                     "web_search.sources.<name>.enabled."
                 ),
             },
@@ -361,7 +380,13 @@ class WebSearchTool(BaseTool):
         try:
             data = json.loads(body)
         except json.JSONDecodeError:
-            raise RuntimeError(f"confluence returned non-JSON: {body[:300]}")
+            raise RuntimeError(
+                f"confluence returned non-JSON ({len(body)} bytes, status={status}): "
+                f"{(body[:200] or '<empty body>')!r}. "
+                "Likely SSO refresh needed or transient outage — try "
+                "web_search source=jira instead, or browser.navigate url="
+                f"'{base_url}' to re-auth."
+            )
 
         hits: List[SearchHit] = []
         for entry in (data.get("results") or [])[:limit]:
@@ -423,7 +448,8 @@ class WebSearchTool(BaseTool):
         try:
             data = json.loads(body)
         except json.JSONDecodeError:
-            raise RuntimeError(f"jira returned non-JSON: {body[:300]}")
+            raise RuntimeError(f"jira returned non-JSON ({len(body)} bytes): "
+                f"{(body[:200] or '<empty body>')!r}")
 
         hits: List[SearchHit] = []
         for issue in (data.get("issues") or [])[:limit]:
@@ -488,7 +514,8 @@ class WebSearchTool(BaseTool):
         try:
             data = json.loads(body)
         except json.JSONDecodeError:
-            raise RuntimeError(f"sharepoint returned non-JSON: {body[:300]}")
+            raise RuntimeError(f"sharepoint returned non-JSON ({len(body)} bytes): "
+                f"{(body[:200] or '<empty body>')!r}")
 
         rows = (
             ((data.get("PrimaryQueryResult") or {})

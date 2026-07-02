@@ -14,7 +14,7 @@
 
 'use strict';
 
-const { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, globalShortcut, Notification, dialog, shell } = require('electron');
+const { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, globalShortcut, Notification, dialog, shell, screen, desktopCapturer } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -450,7 +450,13 @@ function notifyConfirmationNeeded(evt) {
         title = '❓ HandQ — agent question';
         body  = String((evt && evt.prompt) || 'The agent has a question for you.');
     } else if (kind === 'risk_confirmation') {
-        title = '⚠️ HandQ — high-risk operation';
+        // evt.title may be an override sent by the bridge for a specific
+        // sub-flow (e.g. browser login). Fall back to the generic title
+        // otherwise so unrelated risk_confirmation callers keep their
+        // current behavior.
+        title = (evt && evt.title)
+            ? '⚠️ HandQ — ' + String(evt.title)
+            : '⚠️ HandQ — high-risk operation';
         body  = String((evt && evt.description) || 'Agent wants to run a high-risk command.');
     } else {
         const tool = String((evt && evt.tool) || 'tool');
@@ -1079,6 +1085,20 @@ function ensureTray() {
     logLine('TRAY', 'tray installed');
 }
 
+// --- Windows rounded window shape -----------------------------------------
+//
+// Tried and abandoned: DwmSetWindowAttribute (DWMWA_WINDOW_CORNER_PREFERENCE,
+// DWMWA_BORDER_COLOR=NONE, DWMWA_NCRENDERING_POLICY=DISABLED,
+// DWMWA_SYSTEMBACKDROP_TYPE=NONE) and SetWindowRgn + CreateRoundRectRgn via
+// koffi FFI. All four DWM attributes returned S_OK but had no visible effect
+// on `transparent: true` + WS_EX_LAYERED windows in this app on Win11 24H2
+// (build 26100). SetWindowRgn did clip hit-testing (clicks passed through
+// the corners) but didn't remove the residual 1px composite artifact visible
+// on white backgrounds. That artifact appears to be Chromium's
+// UpdateLayeredWindow compositor edge halo at the physical window rect
+// boundary, below the DWM level. Accepted as a limitation — barely visible
+// in practice unless the app sits over a pure-white page.
+
 function createWindow() {
     logLine('MAIN', 'creating BrowserWindow');
 
@@ -1108,12 +1128,13 @@ function createWindow() {
     const windowIcon = loadLogoImage();
 
     mainWindow = new BrowserWindow({
-        width: 1200,
-        height: 800,
+        width: 1000,
+        height: 680,
         minWidth: 720,
         minHeight: 480,
         title: 'HandQ',
         frame: false,
+        hasShadow: false,
         ...(windowIcon ? { icon: windowIcon } : {}),
         ...transparencyOpts,
         autoHideMenuBar: true,
@@ -1151,6 +1172,55 @@ function createWindow() {
         try { mainWindow.flashFrame(false); } catch (_) { /* ignore */ }
         stopTrayFlash();
     });
+
+    // Push maximize/unmaximize state to the renderer so the custom titlebar
+    // can swap its max-button icon (single square ↔ two overlapping squares).
+    // Frameless windows don't get the OS-provided glyph swap for free.
+    const pushMaxState = () => {
+        if (!mainWindow || mainWindow.isDestroyed()) return;
+        try {
+            mainWindow.webContents.send('window:maxState', {
+                isMaximized: mainWindow.isMaximized(),
+            });
+        } catch (_) { /* ignore */ }
+    };
+    mainWindow.on('maximize', pushMaxState);
+    mainWindow.on('unmaximize', pushMaxState);
+    // Seed the renderer with the initial state as soon as the page finishes
+    // loading — otherwise the icon starts stale if the window opens maximized.
+    mainWindow.webContents.once('did-finish-load', pushMaxState);
+
+    // Push window bounds to renderer on move/resize. Glass canvas subscribes
+    // to this instead of polling glass:getWindowBounds every 2 frames — the
+    // IPC round-trip was the dominant per-frame cost during window drag.
+    //
+    // Trailing-edge 60Hz coalesce: Windows fires 'move' 100+ times/sec during
+    // drag. We only need bounds at monitor refresh rate; the extra events
+    // would just be IPC noise the renderer drops anyway.
+    let pushBoundsTimer = null;
+    const pushBounds = () => {
+        if (pushBoundsTimer) return;
+        pushBoundsTimer = setTimeout(() => {
+            pushBoundsTimer = null;
+            if (!mainWindow || mainWindow.isDestroyed()) return;
+            try {
+                const b = mainWindow.getBounds();
+                const display = screen.getDisplayMatching(b);
+                mainWindow.webContents.send('glass:boundsChanged', {
+                    x: b.x - display.bounds.x,
+                    y: b.y - display.bounds.y,
+                    width: b.width,
+                    height: b.height,
+                    displayWidth: display.bounds.width,
+                    displayHeight: display.bounds.height,
+                    scaleFactor: display.scaleFactor,
+                    displayId: display.id,
+                });
+            } catch (_) { /* ignore */ }
+        }, 16);
+    };
+    mainWindow.on('move', pushBounds);
+    mainWindow.on('resize', pushBounds);
 
     // Update check — fires once after the renderer has painted, so the
     // dialog never appears over a black window. Errors are logged inside
@@ -1281,6 +1351,61 @@ ipcMain.on('window:hide', () => {
     ensureTray();
 });
 
+// Session-count-driven auto-resize. As the renderer adds session cards, the
+// window grows so the tiled row / grid stays roomy; at 6 cards the layout is
+// full grid (3×2) and we escalate to maximize. Semantics:
+//   * Grows only — a smaller session count never shrinks the window, so a
+//     user who's manually stretched the window keeps their layout.
+//   * Never touches a manually-maximized window until the count drops back
+//     under the maximize threshold and the window is unmaximized elsewhere.
+//   * Sizes are clamped to the current display's work area so the window
+//     doesn't spill onto an adjacent monitor.
+const AUTO_RESIZE_TABLE = [
+    { w: 1000, h: 680 },  // 1 card
+    { w: 1180, h: 720 },  // 2 cards
+    { w: 1360, h: 760 },  // 3 cards
+    { w: 1440, h: 820 },  // 4 cards
+    { w: 1560, h: 880 },  // 5 cards
+];
+const AUTO_RESIZE_MAXIMIZE_AT = 6;
+
+ipcMain.on('window:auto-resize', (_event, sessionCount) => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    const n = Math.max(1, Number(sessionCount) || 1);
+    // Cap at maximize threshold.
+    if (n >= AUTO_RESIZE_MAXIMIZE_AT) {
+        if (!mainWindow.isMaximized()) mainWindow.maximize();
+        return;
+    }
+    // Below the maximize threshold, never touch a window the user has
+    // already maximized manually — they picked that state on purpose.
+    if (mainWindow.isMaximized()) return;
+
+    const target = AUTO_RESIZE_TABLE[Math.min(n, AUTO_RESIZE_TABLE.length) - 1];
+    const cur = mainWindow.getBounds();
+    // Grow-only: skip if the window is already at least as big on both axes.
+    if (cur.width >= target.w && cur.height >= target.h) return;
+
+    const display = screen.getDisplayMatching(cur);
+    const wa = display.workArea;
+    const nextW = Math.min(target.w, wa.width);
+    const nextH = Math.min(target.h, wa.height);
+    // Keep the window centered on its growth: shift the top-left so the
+    // window's centre stays roughly in place (nice visual continuity).
+    const cx = cur.x + cur.width / 2;
+    const cy = cur.y + cur.height / 2;
+    let nextX = Math.round(cx - nextW / 2);
+    let nextY = Math.round(cy - nextH / 2);
+    // Clamp inside the work area so we don't spill off-screen.
+    nextX = Math.max(wa.x, Math.min(nextX, wa.x + wa.width - nextW));
+    nextY = Math.max(wa.y, Math.min(nextY, wa.y + wa.height - nextH));
+    try {
+        mainWindow.setBounds({ x: nextX, y: nextY, width: nextW, height: nextH }, true);
+    } catch (err) {
+        logLine('MAIN', 'auto-resize setBounds failed', { err: err && err.message });
+    }
+});
+
 // Global hotkey IPC — renderer can read and update the toggle shortcut.
 ipcMain.handle('hotkey:get', () => {
     return { hotkey: currentHotkey };
@@ -1299,6 +1424,51 @@ ipcMain.handle('hotkey:set', (_event, accelerator) => {
 
 ipcMain.handle('app:getVersion', () => {
     return { version: app.getVersion() };
+});
+
+// --- Liquid Glass: desktopCapturer IPC ------------------------------------
+// The renderer needs a live screen capture sourceId and window bounds to
+// crop/refract the portion of the desktop behind the window.
+
+ipcMain.handle('glass:getScreenSource', async () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return null;
+    try {
+        const bounds = mainWindow.getBounds();
+        const display = screen.getDisplayMatching(bounds);
+        const sources = await desktopCapturer.getSources({
+            types: ['screen'],
+            thumbnailSize: { width: 1, height: 1 },
+        });
+        // Match the source to the display the window is on
+        let source = sources.find((s) => String(s.display_id) === String(display.id));
+        if (!source) source = sources[0];
+        return {
+            sourceId: source?.id || null,
+            displayId: display.id,
+            displayWidth: display.bounds.width,
+            displayHeight: display.bounds.height,
+            scaleFactor: display.scaleFactor,
+        };
+    } catch (err) {
+        logLine('GLASS', 'desktopCapturer.getSources failed', { error: err.message });
+        return null;
+    }
+});
+
+ipcMain.handle('glass:getWindowBounds', () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return null;
+    const bounds = mainWindow.getBounds();
+    const display = screen.getDisplayMatching(bounds);
+    return {
+        x: bounds.x - display.bounds.x,
+        y: bounds.y - display.bounds.y,
+        width: bounds.width,
+        height: bounds.height,
+        displayWidth: display.bounds.width,
+        displayHeight: display.bounds.height,
+        scaleFactor: display.scaleFactor,
+        displayId: display.id,
+    };
 });
 
 // --- "Load history" file picker for the Templates panel -------------------

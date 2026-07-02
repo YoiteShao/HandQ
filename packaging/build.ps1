@@ -43,12 +43,23 @@
 .PARAMETER ShowProgress
     Pass --show-progress --show-memory to Nuitka for verbose build diagnostics.
 
+.PARAMETER Release
+    Enable LTO (link-time optimization) for a smaller / slightly faster shipping exe.
+    Default (off) builds with --lto=no for fast iteration: the whole-program LTCG
+    link step that LTO adds runs on every build and CANNOT be cached (clcache only
+    caches the cl.exe compile step, not the link), so it dominates incremental
+    rebuild time. Toggling LTO changes the cl.exe command line, so the first build
+    after a toggle is a full clcache miss (~10-20 min); subsequent builds are fast.
+
 .EXAMPLE
     # Full build (bridge + installer)
     .\packaging\build.ps1
 
     # Force clean rebuild
     .\packaging\build.ps1 -Clean
+
+    # Release build (LTO on → smaller/faster exe, slower uncacheable link)
+    .\packaging\build.ps1 -Release
 
     # Bridge only with explicit Python path
     .\packaging\build.ps1 -BridgeOnly -Python "C:\Python312\python.exe"
@@ -63,6 +74,7 @@ param(
     [switch]$Clean,
     [switch]$BridgeOnly,
     [switch]$ElectronOnly,
+    [switch]$Release,
     [switch]$ShowProgress
 )
 
@@ -94,6 +106,11 @@ if ($Jobs -le 0) {
     $Jobs = [math]::Min([int]$env:NUMBER_OF_PROCESSORS, 16)
 }
 
+# ── LTO mode ──────────────────────────────────────────────────────────────────
+# Off by default: the LTO link step runs every build and is not cacheable, so it
+# dominates incremental rebuilds. -Release turns it on (smaller/faster exe).
+$ltoMode = if ($Release) { 'auto' } else { 'no' }
+
 # ── Banner ────────────────────────────────────────────────────────────────────
 Write-Host @"
 
@@ -106,6 +123,7 @@ Write-Host @"
   Nuitka cache: $NUITKA_CACHE
   Python      : $Python
   Jobs        : $Jobs
+  LTO         : $ltoMode  (Release=$Release)
   Clean build : $Clean
   Bridge only : $BridgeOnly
   Electron only: $ElectronOnly
@@ -147,16 +165,18 @@ if (-not $ElectronOnly) {
     }
     Ok "Nuitka: $nuitkaVer"
 
-    # Compiler cache: Nuitka auto-downloads a ccache build with MSVC support
-    # on first run (cached under %LOCALAPPDATA%\Nuitka\Nuitka\Cache\downloads\ccache).
-    # We don't pass --clcache anymore — clcache is unmaintained and broken on
-    # Python 3.12. If you want to override the bundled ccache, install ccache
-    # 4.6+ via `choco install ccache` and Nuitka will pick it up from PATH.
+    # Compiler cache (C-compile step only): on MSVC, Nuitka auto-detects and uses
+    # clcache, stored under %LOCALAPPDATA%\Nuitka\Nuitka\Cache\clcache. No flag is
+    # needed (we do NOT pass --clcache). In practice it hits ~99%+ on incremental
+    # builds, so the .c → .obj step is effectively free. IMPORTANT: clcache does
+    # NOT cache the link step — with -Release (LTO on), the uncacheable LTCG link
+    # still dominates rebuild time. To use ccache instead, install ccache 4.6+
+    # (`choco install ccache`) and Nuitka will pick it up from PATH.
     if (Get-Command ccache -ErrorAction SilentlyContinue) {
         $ccVer = (& ccache --version 2>&1 | Select-Object -First 1)
         Ok "ccache (PATH): $ccVer"
     } else {
-        Ok 'ccache: will use Nuitka''s bundled copy (auto-downloaded on first build)'
+        Ok 'C-compile cache: clcache (auto-managed by Nuitka under %LOCALAPPDATA%\Nuitka)'
     }
 }
 
@@ -212,7 +232,7 @@ if (-not $ElectronOnly) {
 
         # ── Build performance ─────────────────────────────────────────────────
         "--jobs=$Jobs",
-        '--lto=auto',
+        "--lto=$ltoMode",     # off by default (uncacheable LTCG link); -Release → auto
 
         # ── Our source package ────────────────────────────────────────────────
         '--include-package=src',
@@ -244,6 +264,12 @@ if (-not $ElectronOnly) {
         '--include-package-data=win32com',  # gen_py cache support under Nuitka (doc §13)
         '--include-package=playwright',     # browser_tool.py + teams_setup + teams_web_bridge (eager)
         '--include-package=pywinauto',      # desktop_tool.py: UIA control discovery (eager)
+        '--include-package=comtypes',       # transitive dep of pywinauto: UIA COM bindings.
+                                            # pywinauto imports comtypes.stream lazily inside
+                                            # uia_element_info — Nuitka's static analysis misses
+                                            # it and post-pack raises ModuleNotFoundError on the
+                                            # first UIA call. Pull the whole package so all
+                                            # submodules (stream, automation, gen, ...) ship.
         '--include-package=pdfplumber',     # read_tool.py: canonical PDF parser (eager)
         '--include-package=rapidocr_onnxruntime',  # vision/ocr.py: local OCR engine (eager)
         '--include-package=rapidfuzz',      # desktop_tool.py: fuzzy text match (eager)

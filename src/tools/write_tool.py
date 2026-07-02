@@ -77,6 +77,12 @@ class WriteTool(BaseTool):
         try:
             self.validate_params(["path", "content"], {"path": path, "content": content})
 
+            # Resolve relative paths against the per-session workspace, not the
+            # process cwd (no longer mutated via os.chdir — see concurrency work).
+            # FileState keys, file I/O, and the displayed .absolute() path all
+            # derive from this single resolved value.
+            path = self.resolve_in_workspace(path)
+
             path_obj = Path(path)
 
             # Auto-create parent directories
@@ -175,7 +181,10 @@ class WriteTool(BaseTool):
                     lineterm="",
                 ))
                 if diff_lines:
-                    observation["diff"] = "".join(diff_lines)
+                    diff_text = "".join(diff_lines)
+                    if len(diff_text) > 5_000:
+                        diff_text = diff_text[:5_000] + "\n... (diff truncated at 5000 chars; full write applied)"
+                    observation["diff"] = diff_text
                 else:
                     observation["diff"] = "(no changes)"
 

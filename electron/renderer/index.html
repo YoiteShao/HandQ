@@ -9,6 +9,7 @@
     <link rel="stylesheet" href="vendor/xterm.css" />
 </head>
 <body>
+
     <div class="app">
         <!-- ============================================================ -->
         <!-- Boot overlay — covers the entire window until the bridge      -->
@@ -29,14 +30,61 @@
 
         <!-- ============================================================ -->
         <!-- Custom title bar (frameless window, drag region)              -->
-        <!-- Windows-style controls on the right.                          -->
+        <!-- Centre: Dynamic-Island-style brand pill (logo + HandQ). Hover -->
+        <!-- gives a subtle scale bounce; click morphs the pill into a     -->
+        <!-- glass menu of quick actions (New / Settings / Scheduler).     -->
+        <!-- Right: Windows-style window controls.                         -->
         <!-- ============================================================ -->
         <header class="titlebar" id="titlebar">
-            <div class="titlebar-drag">
-                <img class="titlebar-logo" src="../logo.png" alt="" aria-hidden="true" />
-                <span class="titlebar-brand">HandQ</span>
+            <div class="titlebar-center-group" id="titlebar-center-group">
+                <div class="titlebar-island" id="titlebar-island">
+                    <button class="titlebar-island-trigger" id="island-trigger" type="button"
+                            aria-haspopup="menu" aria-expanded="false" aria-label="Menu">
+                        <img class="titlebar-logo" src="../logo.png" alt="" aria-hidden="true" />
+                        <span class="titlebar-brand">HandQ</span>
+                    </button>
+                    <ul class="titlebar-island-menu" id="titlebar-island-menu" role="menu"
+                        aria-hidden="true">
+                        <li role="none">
+                            <button class="island-menu-item" id="sc-settings" role="menuitem"
+                                    type="button">
+                                <span class="im-icon" aria-hidden="true">⚙</span>
+                                <span class="im-label">Settings</span>
+                            </button>
+                        </li>
+                        <li role="none">
+                            <button class="island-menu-item" id="sc-scheduler" role="menuitem"
+                                    type="button">
+                                <span class="im-icon" aria-hidden="true">⏱</span>
+                                <span class="im-label">Scheduler</span>
+                            </button>
+                        </li>
+                    </ul>
+                </div>
+                <button class="titlebar-new-btn" id="sc-new-session" type="button"
+                        aria-label="New session" title="New session">
+                    <svg viewBox="0 0 12 12" aria-hidden="true">
+                        <line x1="6" y1="2.5" x2="6" y2="9.5"
+                              stroke="currentColor" stroke-width="1.4"
+                              stroke-linecap="round"/>
+                        <line x1="2.5" y1="6" x2="9.5" y2="6"
+                              stroke="currentColor" stroke-width="1.4"
+                              stroke-linecap="round"/>
+                    </svg>
+                </button>
             </div>
             <div class="titlebar-controls" aria-label="Window controls">
+                <button class="tb-btn tb-close" id="tb-close" type="button"
+                        aria-label="Hide to tray" title="Hide to tray">
+                    <svg viewBox="0 0 12 12" aria-hidden="true">
+                        <line x1="3" y1="3" x2="9" y2="9"
+                              stroke="currentColor" stroke-width="1.2"
+                              stroke-linecap="round"/>
+                        <line x1="9" y1="3" x2="3" y2="9"
+                              stroke="currentColor" stroke-width="1.2"
+                              stroke-linecap="round"/>
+                    </svg>
+                </button>
                 <button class="tb-btn tb-min" id="tb-min" type="button"
                         aria-label="Minimize" title="Minimize">
                     <svg viewBox="0 0 12 12" aria-hidden="true">
@@ -47,21 +95,19 @@
                 </button>
                 <button class="tb-btn tb-max" id="tb-max" type="button"
                         aria-label="Maximize" title="Maximize">
-                    <svg viewBox="0 0 12 12" aria-hidden="true">
+                    <svg class="tb-icon tb-icon-max" viewBox="0 0 12 12" aria-hidden="true">
                         <rect x="2.5" y="2.5" width="7" height="7" rx="1.5"
                               stroke="currentColor" stroke-width="1.2"
                               fill="none"/>
                     </svg>
-                </button>
-                <button class="tb-btn tb-close" id="tb-close" type="button"
-                        aria-label="Hide to tray" title="Hide to tray">
-                    <svg viewBox="0 0 12 12" aria-hidden="true">
-                        <line x1="3" y1="3" x2="9" y2="9"
+                    <svg class="tb-icon tb-icon-restore" viewBox="0 0 12 12" aria-hidden="true">
+                        <rect x="2.5" y="4" width="5.5" height="5.5" rx="1.2"
                               stroke="currentColor" stroke-width="1.2"
-                              stroke-linecap="round"/>
-                        <line x1="9" y1="3" x2="3" y2="9"
+                              fill="none"/>
+                        <path d="M4 4 L4 2.5 L9.5 2.5 L9.5 8 L8 8"
                               stroke="currentColor" stroke-width="1.2"
-                              stroke-linecap="round"/>
+                              fill="none" stroke-linecap="round"
+                              stroke-linejoin="round"/>
                     </svg>
                 </button>
             </div>
@@ -77,100 +123,12 @@
                     <!-- Message bubbles get appended here by renderer.js -->
                 </div>
             </section>
-
-            <!-- Composer: ~9% -->
-            <form class="composer" id="composer">
-                <div class="composer-input-wrap">
-                    <textarea id="composer-input"
-                              placeholder="Type a message… (Ctrl+Enter to send)"
-                              rows="2"></textarea>
-                    <button type="submit" id="composer-send" aria-label="Send" title="Ctrl+Enter">
-                        <svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true">
-                            <path d="M10 4 L10 16 M10 4 L5 9 M10 4 L15 9"
-                                  fill="none" stroke="currentColor"
-                                  stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-                        </svg>
-                    </button>
-                </div>
-            </form>
-
-            <!-- Floating expanded editor — shown when input overflows -->
-            <div class="composer-expanded hidden" id="composer-expanded">
-                <header class="composer-expanded-header">
-                    <span>Editing</span>
-                    <button type="button" class="composer-expanded-close"
-                            id="composer-expanded-close" aria-label="Close">×</button>
-                </header>
-                <div class="composer-expanded-body">
-                    <textarea id="composer-expanded-input"
-                              placeholder="Type a message… (Ctrl+Enter to send)"></textarea>
-                    <button type="button" id="composer-expanded-send" aria-label="Send" title="Ctrl+Enter">
-                        <svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true">
-                            <path d="M10 4 L10 16 M10 4 L5 9 M10 4 L15 9"
-                                  fill="none" stroke="currentColor"
-                                  stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-                        </svg>
-                    </button>
-                </div>
-            </div>
-
-            <!-- Shortcut bar: single row -->
-            <nav class="shortcuts" id="shortcuts">
-                <button class="shortcut-btn" id="sc-settings" type="button">
-                    <span class="sc-icon" aria-hidden="true">⚙</span>
-                    <span class="sc-label">Settings</span>
-                </button>
-                <button class="shortcut-btn" id="sc-scheduler" type="button">
-                    <span class="sc-icon" aria-hidden="true">⏱</span>
-                    <span class="sc-label">Scheduler</span>
-                </button>
-                <button class="shortcut-btn" id="sc-new" type="button">
-                    <span class="sc-icon" aria-hidden="true">＋</span>
-                    <span class="sc-label">New</span>
-                </button>
-                <button class="activity-strip"
-                        id="activity-strip"
-                        type="button"
-                        aria-haspopup="true"
-                        aria-expanded="false"
-                        title="Click to view recent activity">
-                    <span class="activity-gauge" id="activity-gauge" aria-hidden="true">
-                        <span class="ag-spark" id="ag-spark"></span>
-                        <span class="ag-num" id="ag-num"></span>
-                    </span>
-                    <span class="activity-current" id="activity-current">idle</span>
-                    <span class="activity-chevron" aria-hidden="true">
-                        <svg viewBox="0 0 10 10" aria-hidden="true">
-                            <path d="M2.5 6.5 L5 4 L7.5 6.5"
-                                  stroke="currentColor" stroke-width="1.2"
-                                  stroke-linecap="round" stroke-linejoin="round"
-                                  fill="none"/>
-                        </svg>
-                    </span>
-                </button>
-            </nav>
         </main>
 
-        <!-- ============================================================ -->
-        <!-- Activity popover — anchored above the activity strip.         -->
-        <!-- Toggled by clicks on the strip; auto-closes on outside click. -->
-        <!-- ============================================================ -->
-        <aside class="activity-popover hidden"
-               id="activity-popover"
-               aria-label="Agent activity feed"
-               aria-hidden="true">
-            <header class="activity-popover-header">
-                <span class="activity-title">Activity</span>
-                <button type="button"
-                        class="activity-close"
-                        id="activity-close"
-                        aria-label="Close activity panel"
-                        title="Close">×</button>
-            </header>
-            <ul class="activity-feed" id="activity-feed"></ul>
-            <div class="activity-resize-handle" id="activity-resize-handle"
-                 title="Drag to resize"></div>
-        </aside>
+        <!-- Note: the global activity strip + popover have been removed.
+             In the multi-session model, activity events are rendered
+             inline inside each session's chat pane as collapsible groups
+             between user / assistant bubbles (see renderer.js). -->
 
         <!-- ============================================================ -->
         <!-- Settings overlay                                              -->
@@ -745,35 +703,15 @@
             </div>
         </div>
 
-        <div class="overlay hidden" id="overlay-confirmation" aria-hidden="true">
-            <div class="overlay-card confirmation-card" role="dialog" aria-modal="true">
-                <header class="overlay-header">
-                    <h2 id="confirm-title">Confirm action</h2>
-                </header>
-                <div class="confirmation-body">
-                    <p class="confirmation-description" id="confirm-description"></p>
-                    <div class="confirmation-decision hidden" id="confirm-decision"></div>
-                    <label class="confirmation-secret hidden" id="confirm-secret-wrap">
-                        <span>Input</span>
-                        <input type="password" id="confirm-secret-input"
-                               autocomplete="off" spellcheck="false" />
-                    </label>
-                    <textarea class="confirmation-guidance hidden"
-                              id="confirm-guidance"
-                              placeholder="Provide guidance for the agent instead of yes/no"
-                              rows="3"></textarea>
-                </div>
-                <div class="confirmation-actions">
-                    <button type="button" id="confirm-reject">Reject</button>
-                    <button type="button" id="confirm-guidance-btn">Provide guidance</button>
-                    <button type="button" id="confirm-submit" class="primary">Approve</button>
-                </div>
-            </div>
-        </div>
+        <!-- Confirmations render inline inside each session card (UI3,        -->
+        <!-- renderer.js _ensureConfirmUI). The legacy global confirmation     -->
+        <!-- modal was removed so a popup in one session can't block another.  -->
     </div>
 
     <script src="vendor/xterm.bundle.js"></script>
     <script src="renderer.js"></script>
     <script src="admin-panel.js"></script>
+    <script src="glass-effect.js"></script>
+
 </body>
 </html>

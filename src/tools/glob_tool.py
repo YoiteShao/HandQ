@@ -119,7 +119,14 @@ class GlobTool(BaseTool):
         try:
             self.validate_params(["pattern"], {"pattern": pattern})
 
-            search_dir = path or "."
+            # Default search base is the per-session workspace, not the process
+            # cwd (no longer mutated via os.chdir — see concurrency work). An
+            # explicit relative path is resolved against the workspace too, so
+            # search never depends on the process cwd.
+            if path:
+                search_dir = self.resolve_in_workspace(path)
+            else:
+                search_dir = self.ctx.working_directory if (self.ctx and self.ctx.working_directory) else "."
 
             loop = asyncio.get_event_loop()
             result = await loop.run_in_executor(

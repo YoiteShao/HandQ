@@ -15,8 +15,6 @@ llm:
   # Agent pool — checked subset of available_models used by the agent,
   # planner, and receptionist.  Order = fallback priority.
   agent_models:
-  - anthropic::claude-4-8-opus
-  - anthropic::claude-4-7-opus
   - anthropic::claude-4-6-sonnet:1M
   - anthropic::claude-4-6-sonnet
   - anthropic::claude-4-5-sonnet

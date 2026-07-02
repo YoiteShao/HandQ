@@ -32,6 +32,7 @@ import uuid
 from pathlib import Path
 from typing import List, Optional, Tuple
 
+from . import _constants as C
 from .models import (
     Candidate,
     CandidateStatus,
@@ -735,6 +736,14 @@ class SQLiteStore:
         if facet_value:
             sql += f" AND e.{facet_col}=?"
             params.append(facet_value)
+        if C.RECALL_EXCLUDE_OBSERVATION_INSIGHTS:
+            # Drop W-tier passive-observation activity-snapshot insights — they
+            # surface as domain-similar-but-useless recall noise. Predicate is
+            # safe for knowledge rows (e.dimension is NULL there → no match).
+            sql += (
+                " AND NOT (e.kind='memory' AND e.dimension='insight' "
+                "AND e.source='semantic_event')"
+            )
         sql += " ORDER BY rank LIMIT ?"
         params.append(limit)
         try:
@@ -796,6 +805,13 @@ class SQLiteStore:
             f"  AND ec.chunk_kind=? AND ec.provider=? AND ec.model=? "
             f"WHERE e.archived=0 AND e.kind=?"
         )
+        if C.RECALL_EXCLUDE_OBSERVATION_INSIGHTS:
+            # Mirror the _fts_search exclusion on the dense branch so W-tier
+            # passive-observation insights are dropped from both recall paths.
+            sql += (
+                " AND NOT (e.kind='memory' AND e.dimension='insight' "
+                "AND e.source='semantic_event')"
+            )
         return await self._fetchall(sql, (kind, provider, model, kind))
 
     async def list_chunks_missing_embedding(

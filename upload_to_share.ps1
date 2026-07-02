@@ -8,6 +8,7 @@
     exist only at the destination are kept (use -Mirror to delete them).
 
       handq.py
+      handq_linux.py
       handq_setup.sh
       handq_config.example.yaml
       packaging/   (recursive)
@@ -47,6 +48,7 @@ if (-not $ProjectRoot) { $ProjectRoot = (Get-Location).Path }
 # Items to upload (paths relative to project root).
 $Items = @(
     'handq.py',
+    'handq_linux.py',
     'handq_setup.sh',
     'handq_config.example.yaml',
     'packaging',

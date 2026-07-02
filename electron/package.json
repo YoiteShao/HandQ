@@ -1,6 +1,6 @@
 {
   "name": "handq-electron",
-  "version": "1.3.0",
+  "version": "1.3.1",
   "description": "Your AI-driven integration engineer",
   "main": "main.js",
   "private": true,
@@ -35,17 +35,27 @@
       {
         "from": "../dist/.nuitka_cache/bridge_main.dist",
         "to": ".",
-        "filter": ["**/*"]
+        "filter": [
+          "**/*"
+        ]
       },
       {
         "from": "../scripts",
         "to": "scripts",
-        "filter": ["*.bat", "*.py"]
+        "filter": [
+          "*.bat",
+          "*.py"
+        ]
       }
     ],
     "win": {
       "target": [
-        { "target": "nsis", "arch": ["x64"] }
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
       ]
     },
     "nsis": {

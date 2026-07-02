@@ -306,6 +306,18 @@ class VisionClient:
 # ── Process-wide singleton ───────────────────────────────────────────────────
 
 _client: Optional[VisionClient] = None
+# Defensive build lock. ``get_vision_client`` is currently fully synchronous
+# — the ``if _client is not None: return`` check, the config reads, and the
+# ``VisionClient(...)`` constructor contain no ``await``, so on a single
+# asyncio loop the path is atomic and concurrent first-callers cannot
+# duplicate the singleton. The lock is belt-and-braces: it forecloses on a
+# future refactor that drops an ``await`` into this path without realising
+# the no-lock invariant would break, AND covers the (theoretical) case of
+# being called from multiple threads via ``loop.run_in_executor`` before any
+# build had completed. Threading lock, not asyncio.Lock, because the
+# function signature is sync and we don't want every caller to ``await``.
+import threading as _threading  # local import keeps top of file clean
+_BUILD_LOCK = _threading.Lock()
 
 
 _VISION_ENDPOINT = "https://qgenie-api.qualcomm.com/v1"
@@ -320,37 +332,44 @@ def get_vision_client(config_manager: Any) -> VisionClient:
     Subsequent calls return the same instance even if a different
     ConfigManager is passed — this matches the browser-pool pattern
     where a single user-data-dir lock means one process-wide handle.
+
+    Concurrency: protected by ``_BUILD_LOCK`` (double-check pattern). The
+    fast path is a single attribute read of ``_client``; the slow path
+    only fires once per process lifetime.
     """
     global _client
     if _client is not None:
         return _client
-    try:
-        section = config_manager.get_section("vision") or {}
-    except Exception as exc:
-        raise RuntimeError(
-            f"vision_client: cannot read 'vision:' section from config: {exc}"
+    with _BUILD_LOCK:
+        if _client is not None:
+            return _client
+        try:
+            section = config_manager.get_section("vision") or {}
+        except Exception as exc:
+            raise RuntimeError(
+                f"vision_client: cannot read 'vision:' section from config: {exc}"
+            )
+        if not section:
+            raise RuntimeError(
+                "vision_client: handq_config.yaml is missing the 'vision:' section. "
+                "Add it with model field. See plan §1.1."
+            )
+        try:
+            llm_section = config_manager.get_section("llm") or {}
+        except Exception as exc:
+            raise RuntimeError(
+                f"vision_client: cannot read 'llm:' section for API key: {exc}"
+            )
+        api_key = str(llm_section.get("API_KEY", "") or "").strip()
+        _client = VisionClient(
+            endpoint=_VISION_ENDPOINT,
+            api_key=api_key,
+            model=str(section.get("model", "")).strip(),
+            timeout=float(section.get("timeout", 120.0)),
+            verify_ssl=bool(section.get("verify_ssl", False)),
+            max_image_dim=int(section.get("max_image_dim", 1024)),
         )
-    if not section:
-        raise RuntimeError(
-            "vision_client: handq_config.yaml is missing the 'vision:' section. "
-            "Add it with model field. See plan §1.1."
-        )
-    try:
-        llm_section = config_manager.get_section("llm") or {}
-    except Exception as exc:
-        raise RuntimeError(
-            f"vision_client: cannot read 'llm:' section for API key: {exc}"
-        )
-    api_key = str(llm_section.get("API_KEY", "") or "").strip()
-    _client = VisionClient(
-        endpoint=_VISION_ENDPOINT,
-        api_key=api_key,
-        model=str(section.get("model", "")).strip(),
-        timeout=float(section.get("timeout", 120.0)),
-        verify_ssl=bool(section.get("verify_ssl", False)),
-        max_image_dim=int(section.get("max_image_dim", 1024)),
-    )
-    return _client
+        return _client
 
 
 async def flush_vision_client() -> int:

@@ -22,6 +22,9 @@ Sections:
 """
 from __future__ import annotations
 
+from enum import Enum
+
+
 # ── 1. Embedding ────────────────────────────────────────────────────────────
 #
 # Provider-id constants. Use these (not raw strings) when comparing or
@@ -72,6 +75,32 @@ RERANKER_INPUT_LIMIT: int = 15
 # summaries), so the LLM should respond fast — but receptionist tier
 # may still take a few seconds.
 RERANKER_TIMEOUT_SECONDS: float = 30.0
+
+
+# ── 2b. Tiered recall (rerank policy per call site) ─────────────────────────
+#
+# Rerank is expensive (3-8s LLM call, 10+s with fallback retry). Prod profiling
+# showed it dominates recall latency on chat-turn hot paths where the user is
+# actively waiting. The tiered policy splits calls into a fast lane (no rerank,
+# RRF+recency ordering only) and a quality lane (rerank on), each with its own
+# 60s cache slot keyed by (query, tier). Same query, two entries — so a chat
+# turn does not "burn" the quality slot the Planner will want.
+class RecallTier(str, Enum):
+    FAST = "fast"        # no rerank, sub-second latency, chat-turn hot path
+    QUALITY = "quality"  # rerank=True, planning + recovery, cache per-query
+
+
+# Per-role rerank flags. Wired at each call site; flip to True to elevate that
+# role back to the quality lane without touching call sites.
+#   INTENT / RECEPTIONIST — user is waiting, downstream stakes are low.
+#   PLANNER               — checklist quality decides whole-task success.
+#   PERSISTENT_AGENT_ITEM — fires 5-20× per session; rerank cost compounds.
+#   PERSISTENT_AGENT_STAGNATION — rare recovery path, quality matters more.
+RERANK_INTENT: bool = False
+RERANK_PLANNER: bool = True
+RERANK_PERSISTENT_AGENT_ITEM: bool = False
+RERANK_PERSISTENT_AGENT_STAGNATION: bool = True
+RERANK_RECEPTIONIST: bool = False
 
 
 # ── 3. DreamWorker ──────────────────────────────────────────────────────────
@@ -305,13 +334,65 @@ RECALL_KNOWLEDGE_K: int = 5
 # was too permissive: same-domain-but-irrelevant rows slipped through into
 # recall. 0.35 trims that noise band while the rerank gate below remains the
 # authoritative relevance cutoff. Was 0.0 → 0.25 → 0.35.
+#
+# ``RECALL_MIN_SCORE`` still applies to the QUALITY tier (planner path) where
+# the rerank LLM enforces the final relevance decision at ``RECALL_RERANK_MIN_
+# SCORE=0.30``. FAST tier callers (INTENT, PersistentAgent per-item) DO NOT
+# rerank — without a final gate, top-K by RRF would surface the 0.34-0.41
+# activity-snapshot band as "least bad" matches on chat turns even when the
+# query has no real match in the corpus. FAST tier callers must pass
+# ``min_score=RECALL_MIN_SCORE_FAST`` explicitly to close that hole. Empty
+# recall is strictly better than misleading recall on the chat hot path.
 RECALL_MIN_SCORE: float = 0.35
+RECALL_MIN_SCORE_FAST: float = 0.45
+
+# FAST tier post-fusion cosine floor.
+#
+# ``RECALL_MIN_SCORE_FAST=0.45`` above is the PRE-fusion dense-branch cosine
+# pre-filter — it drops entries whose embedding is obviously unrelated. But
+# entries in the 0.45-0.49 band still pass the pre-filter, get boosted by RRF
+# when BM25 also picks them up, and land in top-K without earning it.
+#
+# Observed in the 4-role live test (test_recall_quality_live.py): the noise
+# entry "User reviews config in VS Code" surfaced at rank 3-4 for a
+# ruff/pytest chat query — its dense cosine sat above 0.45 but well below any
+# real match. In prod with 172 activity-tinted entries the tail-noise ratio is
+# far worse.
+#
+# This gate runs AFTER RRF fusion on the same display_score the pre-filter
+# used (dense cosine). Rows below the floor are dropped even if RRF ranked
+# them high. Only applied on the FAST tier (rerank=False path) — QUALITY tier
+# lets the rerank LLM's ``RECALL_RERANK_MIN_SCORE`` be the authoritative
+# cutoff instead.
+#
+# BM25-only hits (display_score=None) are ALSO dropped on FAST tier — see
+# ``_fast_gate`` docstring for the noise-heavy-corpus rationale (BM25-only
+# matches in a low-quality corpus are dominated by coincidental keyword
+# overlap; the rare real exact-keyword match also usually produces a decent
+# dense cosine so nothing precise is actually lost).
+RECALL_FAST_POST_FUSION_MIN_SCORE: float = 0.50
 # Stage-3 rerank gate. The LLM reranker scores 0.0–1.0 and its own system
 # prompt declares sub-0.3 candidates to be noise (reranker.py:_LLM_RERANK_SYSTEM);
 # this is the consumer that enforces that contract. Rows scoring below this
 # after rerank are dropped entirely (recall may legitimately return nothing).
 RECALL_RERANK_MIN_SCORE: float = 0.30
 RECALL_FTS_OVERFETCH: int = 3
+
+# Recency half-life (days) for recall ordering. After the relevance gate, the
+# surviving rows are re-sorted by ``relevance * 0.5 ** (age_days / halflife)``
+# so fresh memories win the limited recall slots over equally-relevant stale
+# ones. Ordering ONLY — the relevance gate (RECALL_RERANK_MIN_SCORE) still runs
+# on the raw score, so a high-relevance old memory (e.g. a durable preference)
+# is never culled just for being old. 45d ≈ a memory needs ~2x relevance to
+# tie a fresh one after ~1.5 months.
+RECALL_DECAY_HALFLIFE_DAYS: float = 45.0
+
+# Drop passive-observation INSIGHT memories (W-tier UIA activity snapshots,
+# written with source='semantic_event' + dimension='insight') from the recall
+# candidate pool. They consistently surfaced as domain-similar-but-useless
+# noise in task/planner guidance recall. Curated memories and observation-
+# derived KNOWLEDGE are unaffected. One-line reversible kill-switch.
+RECALL_EXCLUDE_OBSERVATION_INSIGHTS: bool = True
 
 # Dynamic K: planner over-fetches then trims by score gap after rerank.
 # Receptionist keeps fixed k=5 (no rerank, latency-sensitive).
@@ -571,7 +652,16 @@ ACTIVITY_FRAME_HASH_DELTA_THRESHOLD: int = 12        # Hamming distance bar
 #   2. text identical (Jaccard) to last forwarded sample → skip (still
 #      same window/content)
 #   3. otherwise → write to obs_snapshots + obs_ocr_frames
-ACTIVITY_OCR_MIN_CHARS: int = 40
+#
+# ACTIVITY_OCR_MIN_CHARS was 40 originally, which passed dialog title bars
+# ("Save As", "File Edit View Help Tools Options") into the snapshot pipeline.
+# Even after downstream generic-observation / worth_storing guards, those
+# tiny snapshots still burned an extraction LLM call per aggregated session.
+# Raised to 100 chars — that's a small paragraph, enough to carry an actual
+# insight. Real-content sessions blow past 100 chars in one screen; only
+# chrome-only captures are filtered out. Trade-off (loses legit short
+# observations) is acceptable in noise-heavy-corpus mode.
+ACTIVITY_OCR_MIN_CHARS: int = 100
 ACTIVITY_OCR_TEXT_JACCARD_BAR: float = 0.65  # >= bar means "same screen"
 ACTIVITY_OCR_EXCERPT_MAX_CHARS: int = 600    # how much OCR text we keep
 
@@ -806,3 +896,28 @@ CORRECTION_RECALL_PRIORITY_DAYS: int = 30
 # Retriage worker pool is built from ``llm.models`` (the main pool) directly;
 # see ``LongTermMemory._build_llm_services_for_retriage``. LLM-based audit
 # migrations want the strongest reasoning available, not the helper pool.
+
+
+# ── 14. Pre-insert dedup gate (trigram Jaccard) ─────────────────────────────
+#
+# Catastrophic duplication (prod-observed: "IDLE state" ×6, "SAP Concur" ×7,
+# "multi-session" ×25) came from the LLM producing near-identical summaries on
+# adjacent triage runs about the same topic. The existing post-hoc merge scan
+# (MERGE_EXACT_THRESHOLD=0.90 cosine) eventually collapses these, but only after
+# the noise has already occupied recall slots for hours. The pre-insert gate is
+# the immediate stop, complementary to the async merge scan.
+#
+# Gate operates on the LLM's verdict after triage, before insert_entry(). It
+# BM25-fetches the top-K FTS candidates, computes trigram-Jaccard over summary
+# (and content when summary is borderline), and returns one of:
+#   >= DROP     — literal near-duplicate; verdict discarded, candidate REJECTED
+#   [UPDATE, DROP) — same topic, refresh existing entry via update_entry_versioned
+#   < UPDATE    — genuinely new, normal insert path
+#
+# Trigram Jaccard chosen over Levenshtein or token-overlap because:
+#   1. Language-agnostic (works for zh/en mixed content).
+#   2. Punctuation-robust (the LLM's summary phrasing wobbles here).
+#   3. O(n) to compute; the whole gate is <5ms overhead.
+DEDUP_JACCARD_DROP_THRESHOLD: float = 0.70
+DEDUP_JACCARD_UPDATE_THRESHOLD: float = 0.40
+DEDUP_FTS_CANDIDATES: int = 5

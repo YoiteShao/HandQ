@@ -480,7 +480,13 @@ class InteractiveSessionTool(BaseTool):
         else:
             kwargs_proc["start_new_session"] = True
 
-        effective_cwd = cwd if (cwd and os.path.isdir(cwd)) else None
+        # A relative cwd is resolved against the per-session workspace, so
+        # neither the isdir check nor the subprocess base depends on the
+        # process cwd (no longer mutated via os.chdir — see concurrency work).
+        resolved_cwd = self.resolve_in_workspace(cwd) if cwd else None
+        effective_cwd = resolved_cwd if (resolved_cwd and os.path.isdir(resolved_cwd)) else (
+            self.ctx.working_directory if (self.ctx and self.ctx.working_directory) else None
+        )
         stderr_target = asyncio.subprocess.STDOUT if merge_stderr else asyncio.subprocess.PIPE
 
         try:
@@ -549,6 +555,36 @@ class InteractiveSessionTool(BaseTool):
             session._data_emit_last_ts = time.time()
         initial_output = _drain_buffer(session)
         initial_output, _ = _truncate_output(initial_output)
+
+        # Reject one-shot commands: if the process has already exited within
+        # the settle window, the agent is using session for something the
+        # shell tool should do (e.g. ``python script.py``, a malformed
+        # ``python -c "..."`` that crashed on syntax). Without this guard
+        # the open returns success=True with status='dead', the agent
+        # doesn't notice, then ``read`` / ``exec`` fail later with confusing
+        # "session is dead" errors several iterations downstream.
+        if session.status == "dead":
+            self.registry.remove(session_id)
+            return ToolResult(
+                success=False,
+                output={
+                    "session_id": session_id,
+                    "exit_code": session.exit_code,
+                    "initial_output": initial_output,
+                },
+                error=(
+                    f"Session command exited within "
+                    f"{_OPEN_SSH_WAIT if is_ssh else _OPEN_INITIAL_WAIT:g}s "
+                    f"of launch (exit_code={session.exit_code}). The session "
+                    f"tool is for long-lived interactive processes — for "
+                    f"one-shot commands use the shell tool instead. For an "
+                    f"interactive REPL try python -i / pwsh / bash / "
+                    f"ssh -tt host. Initial output (if any) is in the "
+                    f"output payload."
+                ),
+                tool_name=self.name, tool_parameters=kwargs,
+                execution_time=time.time() - start_time,
+            )
 
         return ToolResult(
             success=True,

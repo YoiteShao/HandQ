@@ -43,6 +43,60 @@ MIN_SNAPSHOTS_FOR_LLM: int = 3
 MAX_SNAPSHOTS_PER_PROMPT: int = 20
 
 
+# System prompt for the observation → semantic-event extractor.
+#
+# Design goal: the prior prompt asked the LLM to "produce a title / description"
+# and got mechanical action logs — "User edits note about X", "User browses page
+# Y". Those describe WHAT HAPPENED on screen but carry no insight worth
+# recalling later, and they polluted recall with paraphrases of routine UI use.
+#
+# The new prompt distinguishes INSIGHT (what was DECIDED / LEARNED / PREFERRED /
+# SOLVED) from ACTION (which app was opened, which button was clicked) and adds
+# a top-level `worth_storing` gate so routine sessions are declined outright.
+# Output fields stay aligned with obs_semantic_events columns so no schema
+# migration is needed.
+SEMANTIC_EXTRACTION_SYSTEM_PROMPT = """You extract MEMORIES from desktop activity observations.
+
+## What IS a memory (extract these):
+- DECISION the user made ("chose X over Y because Z")
+- PROBLEM and its SOLUTION ("DNS failed → fixed CoreDNS configmap")
+- NEW INFORMATION learned ("model layers 28,35 need reshape [1,73]→[1,256]")
+- PREFERENCE expressed ("prefers Option A for per-session UI")
+- SKILL demonstrated (new tool usage, novel command sequence)
+- RELATIONSHIP or COMMUNICATION outcome ("discussed deadline with Zhiyu, agreed on Friday")
+
+## What is NOT a memory (do NOT extract):
+- Routine UI navigation ("opened Chrome", "switched to VS Code")
+- Repetitive actions without new information ("scrolled", "clicked submit")
+- Application boot / launch sequences
+- Expense filing, login flows, or other mechanical processes UNLESS something unexpected happened
+- A different screenshot of an activity already described elsewhere
+
+## Rules:
+- Extract the INSIGHT, not the ACTION. "learned X" not "browsed page about X".
+- Be specific. Include names, numbers, commands, file paths that would be useful later.
+- If the activity is purely routine with no new information, set worth_storing=false.
+- Prefer quality over quantity — at most one strong extraction per session.
+- Title must NOT begin with "User " / "Developer " / "Reviewing " / "Monitoring " — start with the insight itself.
+
+## Output (STRICT JSON, no prose):
+Include ALL these keys; leave unused ones as empty string / empty list / false / 0.5.
+  worth_storing: bool         (top-level gate; false ⇒ worth_memory/knowledge/skill all forced false)
+  title: str                  (≤ 120 chars, no "User..." prefix)
+  description: str            (1-3 sentences, specific facts / commands / values)
+  category: ssh_session|editing|browsing|meeting|debugging|other
+  entities: list[str]         (hostnames / project names / people)
+  apps: list[str]             (process names)
+  task_worthy: bool
+  worth_memory: bool          (durable user preference / decision / context)
+  worth_knowledge: bool       (reusable team/project fact / learned info)
+  worth_skill: bool           (could become reusable automation)
+  frame_confidence: float     (0.0-1.0; lower if OCR contradicts declared frame)
+
+Frame rule: if OCR contradicts declared os/host, LOWER confidence — do NOT switch os/host (the process signal is authoritative).
+"""
+
+
 class SemanticExtractor:
     """Async worker: obs_sessions(pending) → obs_semantic_events."""
 
@@ -269,42 +323,38 @@ class SemanticExtractor:
     ) -> Optional[dict]:
         """Call AnthropicStreamingService.chat_stream and parse JSON.
 
-        Uses the StreamDoneEvent.result.content surface that
-        :mod:`anthropic_streaming_service` exposes. Falls back to None on
-        parse failure so the caller can take the heuristic path.
+        Uses ``SEMANTIC_EXTRACTION_SYSTEM_PROMPT`` for the extraction rules;
+        the user message only carries the per-session data (metadata + OCR
+        excerpts). Falls back to None on parse failure so the caller can take
+        the heuristic path.
+
+        Post-processing: if the LLM sets ``worth_storing=false``, the three
+        ``worth_*`` flags are all forced to false so downstream promotion
+        (``_process_semantic_events_batch``) writes nothing to mem_entries.
+        The top-level gate is prompt-only — it never lands in the schema.
         """
         if not self._llm_services:
             return None
 
         ocr_blob = "\n---\n".join(ocr_excerpts[:8])
-        prompt = (
-            "You are extracting a structured semantic event from a continuous user "
-            "work session. Output STRICT JSON, no prose.\n\n"
+        user_prompt = (
             f"Session metadata:\n"
             f"  trigger: {trigger_kind}\n"
             f"  primary_process: {primary_process}\n"
             f"  primary_window: {primary_window_title}\n"
             f"  frame: os={frame_os}, host={frame_host}\n"
             f"  snapshot_count: {len(snapshots)}\n\n"
-            "OCR excerpts from the session:\n"
-            f"{ocr_blob[:4000]}\n\n"
-            "Produce JSON with these fields:\n"
-            "  title: one-line summary, present tense\n"
-            "  description: 1-3 sentence narrative\n"
-            "  category: ssh_session|editing|browsing|meeting|debugging|other\n"
-            "  entities: list of hostnames/project names mentioned\n"
-            "  apps: list of process names involved\n"
-            "  task_worthy: bool — is this work the user might want remembered\n"
-            "  worth_memory: bool — produces durable user preference / context\n"
-            "  worth_knowledge: bool — produces reusable team/project fact\n"
-            "  worth_skill: bool — could become a reusable automation/script\n"
-            "  frame_confidence: float 0.0-1.0\n\n"
-            "Frame rule: if OCR contradicts the declared frame, LOWER confidence; "
-            "do NOT switch the os/host (the process signal is authoritative).\n"
+            f"OCR excerpts from the session:\n{ocr_blob[:4000]}"
         )
 
         svc = self._llm_services[0]
-        text = await _llm_chat_text(svc, [{"role": "user", "content": prompt}])
+        text = await _llm_chat_text(
+            svc,
+            [
+                {"role": "system", "content": SEMANTIC_EXTRACTION_SYSTEM_PROMPT},
+                {"role": "user", "content": user_prompt},
+            ],
+        )
         if not text:
             return None
         text = text.strip()
@@ -312,11 +362,24 @@ class SemanticExtractor:
             text = text.strip("`").lstrip("json").strip()
         try:
             parsed = json.loads(text)
-            if isinstance(parsed, dict):
-                return parsed
         except (json.JSONDecodeError, TypeError, ValueError):
             _logger.debug("LLM output not valid JSON: %s", text[:200])
-        return None
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        # Top-level worth_storing gate: any falsy value (missing key, None,
+        # False, "") forces all three worth_* off. Prior version required an
+        # explicit ``worth_storing=False`` — that trusted the LLM's individual
+        # worth_* flags when the top-level key was omitted, which the noisy
+        # corpus history (172 entries/month, ~70% activity logs) shows is a bad
+        # default. Strict interpretation: only an explicit True keeps the
+        # extraction alive. Kept in code (not schema) because it's a prompt
+        # convenience; obs_semantic_events reads the individual worth_* fields.
+        if not parsed.get("worth_storing"):
+            parsed["worth_memory"] = False
+            parsed["worth_knowledge"] = False
+            parsed["worth_skill"] = False
+        return parsed
 
     @staticmethod
     def _heuristic_extract(

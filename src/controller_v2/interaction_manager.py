@@ -61,7 +61,13 @@ class UIDelegate(Protocol):
     ) -> None: ...
 
     # ── Async confirmations ───────────────────────────────────────────────
-    async def request_risk_confirmation(self, description: str) -> UserConfirmation: ...
+    async def request_risk_confirmation(
+        self,
+        description: str,
+        *,
+        title: Optional[str] = None,
+        approve_label: Optional[str] = None,
+    ) -> UserConfirmation: ...
     async def request_tool_confirmation(
         self, tool_name: str, params: Dict[str, Any], hint: str
     ) -> UserConfirmation: ...
@@ -189,6 +195,15 @@ class InteractionManager:
         opt in by exposing a same-named method."""
         self._ui_call("notify_session_event", str(event_name), data if isinstance(data, dict) else {})
 
+    def notify_checklist_changed(self, items: list) -> None:
+        """Live checklist snapshot for the UI task panel. ``items`` is the list
+        of ``{item_id, instruction, status}`` dicts from
+        ``SharedCheckList.get_ui_snapshot``. Fired on every checklist mutation
+        (item completed / pending tail replaced). Fire-and-forget; kept out of
+        the UIDelegate Protocol — delegates opt in by exposing a same-named
+        method, so unit tests with no delegate silently drop it."""
+        self._ui_call("notify_checklist_changed", items if isinstance(items, list) else [])
+
     # ── Async confirmation / input flows ──────────────────────────────────
 
     async def _await_delegate(
@@ -211,8 +226,21 @@ class InteractionManager:
         except Exception:
             return default
 
-    async def request_risk_confirmation(self, description: str) -> UserConfirmation:
+    async def request_risk_confirmation(
+        self,
+        description: str,
+        *,
+        title: Optional[str] = None,
+        approve_label: Optional[str] = None,
+    ) -> UserConfirmation:
         """Ask the user to approve a high-risk operation.
+
+        ``title`` and ``approve_label`` are optional UI overrides. When
+        provided they replace the modal's default title ("High-risk
+        operation") and Approve button label. Callers use this to reframe
+        the modal for non-generic flows — e.g. ``browser.request_user_login``
+        surfaces the SAME modal machinery but wants an "I've completed the
+        login" button label. ``None`` = keep the default.
 
         Default when no delegate is wired: ``UserConfirmation.no()`` (refuse
         rather than auto-approve).
@@ -221,6 +249,8 @@ class InteractionManager:
             "request_risk_confirmation",
             UserConfirmation.no(),
             str(description),
+            title=title,
+            approve_label=approve_label,
         )
 
     async def request_tool_confirmation(

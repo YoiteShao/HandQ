@@ -129,6 +129,76 @@ _BEHAVIOUR_VERBS_EN = (
     "use", "uses", "prefer", "prefers", "always", "never",
     "lint", "test", "deploy", "run", "skip", "switch",
 )
+# Word-boundary regex over the behaviour-verb list. The naive substring check
+# used by ``_is_path_inventory`` catches "user" as containing "use" and thus
+# spuriously exempts every "User ..." summary — masking exactly the generic
+# noise the ``_is_generic_observation`` guard is meant to reject. \b anchors
+# each token so "user" no longer swallows "use", "runs" no longer swallows
+# "run" (well, "runs" also matches "run" via the list anyway — the point is
+# that "user" cannot).
+_BEHAVIOUR_VERB_RE = _re.compile(
+    r"\b(?:" + "|".join(_BEHAVIOUR_VERBS_EN) + r")\b",
+    _re.IGNORECASE,
+)
+
+# Generic-observation openers. Titles beginning with these tokens (case-
+# insensitive, optional leading whitespace) are the "You actively manage
+# HandQ" / "User edits note about X" / "Reviewing config in VS Code" class of
+# summary — they describe the observation SURFACE rather than an insight, and
+# in prod they were recalled 30+ times each because their genericness matched
+# too many queries. English-only for now; the extractor prompt currently emits
+# English titles, so this covers the observed noise. Extend with zh openers
+# ("用户 ...", "开发者 ...") if the prompt language changes.
+_GENERIC_OPENERS_RE = _re.compile(
+    r"^\s*(?:"
+    r"you\s+(?:are\s+|actively\s+|currently\s+)?"
+    r"|the\s+user\s+"
+    r"|user\s+"
+    r"|developer\s+"
+    r"|reviewing\s+"
+    r"|monitoring\s+"
+    r"|browsing\s+"
+    r"|editing\s+"
+    r"|reading\s+"
+    r"|viewing\s+"
+    r")",
+    _re.IGNORECASE,
+)
+
+
+def _is_generic_observation(summary: str) -> bool:
+    """True when *summary* begins with a known noise-opener pattern AND
+    carries no behaviour-verb signal.
+
+    Prod-observed generic entries ("You actively manage HandQ" recalled 34
+    times; "User edits note about X" recalled 12+ times) inflate recall by
+    matching almost any query. The extractor prompt (Fix 3) already tells the
+    LLM to avoid these prefixes, but LLM regressions have to be caught
+    server-side — this guard runs in ``_promote_one_event`` alongside
+    ``_is_path_inventory`` to strip generic-opener summaries from BOTH the
+    memory and knowledge tracks before the row is even written.
+
+    Behaviour-verb exemption: a summary opened with a generic prefix but
+    containing a durable-preference verb ("prefers", "always", "never",
+    "uses", etc. — the ``_BEHAVIOUR_VERBS_EN`` list shared with the path-
+    inventory guard) still carries real signal. "User always runs ruff before
+    committing" is a real preference; "User edits note about X" is not.
+
+    Returns True on empty / whitespace-only titles too so a malformed extract
+    is treated as "kill both worth_* tracks" rather than silently writing an
+    empty-title entry.
+    """
+    if not summary or not summary.strip():
+        return True
+    s = summary.strip()
+    if not _GENERIC_OPENERS_RE.match(s):
+        return False
+    # Generic opener present. Grant a pass when a behaviour-verb signals
+    # durable preference — same shape as _is_path_inventory's exemption, but
+    # word-boundary'd so "user" cannot accidentally match "use".
+    if _BEHAVIOUR_VERB_RE.search(s):
+        return False
+    return True
 
 
 def _is_path_inventory(summary: str) -> bool:
@@ -158,6 +228,40 @@ def _is_path_inventory(summary: str) -> bool:
     if any(v in lower for v in _BEHAVIOUR_VERBS_EN):
         return False
     return True
+
+
+def _trigram_set(text: str) -> set:
+    """Character trigram set for language-agnostic Jaccard similarity.
+
+    Whitespace is collapsed and the string is lowercased before shingling so
+    ``"IDLE  state" `` and ``"idle state"`` produce the same trigrams. Strings
+    shorter than 3 chars degenerate to a single-token set (rare — summaries
+    are always > 3 chars in practice).
+    """
+    normalized = _re.sub(r"\s+", " ", (text or "").lower().strip())
+    if not normalized:
+        return set()
+    if len(normalized) < 3:
+        return {normalized}
+    return {normalized[i:i + 3] for i in range(len(normalized) - 2)}
+
+
+def _jaccard_similarity(a: str, b: str) -> float:
+    """Trigram-Jaccard similarity in [0.0, 1.0]. Returns 0.0 on empty inputs.
+
+    Chosen for the pre-insert dedup gate (see ``_dedup_gate``) because it is
+    language-agnostic, punctuation-robust, and O(n) — the whole gate adds
+    <5ms overhead to a triage cycle. Deliberately NOT tuned for semantic
+    similarity: the post-hoc merge scan (cosine over embeddings) handles that.
+    """
+    set_a = _trigram_set(a)
+    set_b = _trigram_set(b)
+    if not set_a or not set_b:
+        return 0.0
+    inter = len(set_a & set_b)
+    if inter == 0:
+        return 0.0
+    return inter / len(set_a | set_b)
 
 
 def _user_handq_root() -> Path:
@@ -639,6 +743,23 @@ class DreamWorker:
 
         accepted: list = []
 
+        if (worth_memory or worth_knowledge) and _is_generic_observation(title):
+            # Generic-opener titles ("You actively manage HandQ", "User edits
+            # note about X") describe the observation surface, not an insight —
+            # in prod they were recalled 30+ times each because their
+            # genericness matched too many queries. Kill BOTH tracks: a
+            # generic-observation title on the memory side is worthless, and
+            # the same title on the knowledge side would be recalled just as
+            # spuriously. Fix 3's prompt discourages this, but the guard runs
+            # server-side to catch LLM regressions.
+            _logger.info(
+                "semantic event %s: worth_memory/knowledge skipped "
+                "(generic-observation title=%r)",
+                event_id[:8], title[:60],
+            )
+            worth_memory = False
+            worth_knowledge = False
+
         if worth_memory and _is_path_inventory(title):
             # Passively-observed file paths ("HandQ project at C:\\...")
             # are not durable preference signal — the user just had an
@@ -1082,14 +1203,17 @@ class DreamWorker:
             return
         if verdict.worth_memory:
             try:
-                await self._apply_memory(c, verdict)
-                wrote_mem = True
+                # _apply_memory returns True only when it ACTUALLY wrote (insert
+                # / update / archive), False when it skipped (dedup drop, missing
+                # dimension). Without this, the dedup gate's silent drop would
+                # still show up as CandidateStatus.ACCEPTED_MEMORY — hiding the
+                # drop from audit and making dedup ineffectiveness invisible.
+                wrote_mem = await self._apply_memory(c, verdict)
             except Exception:
                 _logger.exception("apply_memory failed cid=%s", c.id)
         if verdict.worth_knowledge:
             try:
-                await self._apply_knowledge(c, verdict)
-                wrote_kn = True
+                wrote_kn = await self._apply_knowledge(c, verdict)
             except Exception:
                 _logger.exception("apply_knowledge failed cid=%s", c.id)
 
@@ -1121,7 +1245,14 @@ class DreamWorker:
             c.id, status, reason=(verdict.reason or "")[:80],
         )
 
-    async def _apply_memory(self, c: Candidate, v: TriageVerdict) -> None:
+    async def _apply_memory(self, c: Candidate, v: TriageVerdict) -> bool:
+        """Apply the memory-track verdict. Returns True iff an entry was written.
+
+        Written = insert / update / archive was actually executed. Skipped
+        (dedup drop, malformed verdict without dimension) returns False so the
+        caller can accurately set the candidate status to REJECTED instead of
+        ACCEPTED_MEMORY.
+        """
         # ARCHIVE: user explicitly contradicted an existing memory entry.
         # Soft-archive with a reason that the retroactive correction CLI
         # can target (`correction_v0_user_contradicted` — v0 because this
@@ -1142,9 +1273,12 @@ class DreamWorker:
                     c.id, v.memory_archive_id,
                 )
                 raise
-            return
+            return True
         if not v.memory_dimension:
-            return
+            # Malformed verdict: worth_memory=True but no dimension specified.
+            # Nothing to write — return False so the candidate is not falsely
+            # marked ACCEPTED_MEMORY.
+            return False
         # UPDATE with a hallucinated id is a real failure mode: the LLM
         # sometimes invents a UUID that looks like one of the existing
         # ids in the prompt. Validate the id exists before committing;
@@ -1159,7 +1293,7 @@ class DreamWorker:
                     new_summary=v.memory_summary,
                     new_content=v.memory_content,
                 )
-                return
+                return True
             _logger.info(
                 "triage memory UPDATE id=%s not found; falling back to CREATE cid=%s",
                 v.memory_update_id[:8], c.id[:8],
@@ -1194,6 +1328,38 @@ class DreamWorker:
                     v.memory_archive_id[:8], c.id[:8],
                 )
                 raise
+        # Pre-insert dedup gate. Skips only the identity-split path (there the
+        # old directive was just archived and the new one is an intentional
+        # replacement — dedup against an unrelated identity is a poor signal).
+        # For everything else (pure CREATE, UPDATE fall-through, non-identity
+        # CREATE-with-archive_id), a literal near-duplicate summary means the
+        # LLM already produced this entry earlier — silently drop or coalesce.
+        if not (
+            v.memory_archive_id
+            and v.memory_dimension == MemoryDimension.IDENTITY
+        ):
+            dedup_action, dedup_eid = await self._dedup_gate(
+                new_summary=v.memory_summary,
+                new_content=v.memory_content,
+                kind=EntryKind.MEMORY.value,
+            )
+            if dedup_action == "drop":
+                _logger.info(
+                    "dedup_gate: dropped memory CREATE cid=%s summary=%r",
+                    c.id[:8], (v.memory_summary or "")[:60],
+                )
+                return False
+            if dedup_action == "update" and dedup_eid:
+                await self._store.update_memory_entry(
+                    dedup_eid,
+                    new_summary=v.memory_summary,
+                    new_content=v.memory_content,
+                )
+                _logger.info(
+                    "dedup_gate: coalesced CREATE→UPDATE cid=%s entry=%s",
+                    c.id[:8], dedup_eid[:8],
+                )
+                return True
         entry_id = await self._store.insert_memory_entry(
             dimension=v.memory_dimension,
             summary=v.memory_summary,
@@ -1204,6 +1370,7 @@ class DreamWorker:
             frame=_extract_frame(c.metadata),
         )
         await self._maybe_warmup_embedding(entry_id, kind=EntryKind.MEMORY.value)
+        return True
 
     async def _apply_verbatim_remember(self, c: Candidate, user_text: str) -> None:
         """Insert a /remember candidate as INSIGHT memory verbatim,
@@ -1279,7 +1446,12 @@ class DreamWorker:
             c.id[:8], actual_id[:8], len(user_text), file_path,
         )
 
-    async def _apply_knowledge(self, c: Candidate, v: TriageVerdict) -> None:
+    async def _apply_knowledge(self, c: Candidate, v: TriageVerdict) -> bool:
+        """Apply the knowledge-track verdict. Returns True iff an entry was written.
+
+        Same contract as ``_apply_memory``: True on insert / update / archive,
+        False on dedup drop or missing category.
+        """
         # ARCHIVE: user explicitly contradicted an existing knowledge entry.
         if v.knowledge_action == VerdictAction.ARCHIVE.value and v.knowledge_archive_id:
             try:
@@ -1297,9 +1469,10 @@ class DreamWorker:
                     c.id, v.knowledge_archive_id,
                 )
                 raise
-            return
+            return True
         if not v.knowledge_category:
-            return
+            # Malformed verdict: worth_knowledge=True but no category.
+            return False
         # UPDATE-with-hallucinated-id fallback (see _apply_memory for
         # rationale). Validate the target exists; if not, CREATE instead
         # so the LLM's extracted signal isn't dropped.
@@ -1311,12 +1484,37 @@ class DreamWorker:
                     new_summary=v.knowledge_summary,
                     new_content=v.knowledge_content,
                 )
-                return
+                return True
             _logger.info(
                 "triage knowledge UPDATE id=%s not found; falling back to CREATE cid=%s",
                 v.knowledge_update_id[:8], c.id[:8],
             )
             # fall through to insert path
+        # Pre-insert dedup gate. Runs unconditionally on the knowledge insert
+        # path (no identity concept here). Same three-way outcome as the
+        # memory gate — see ``_dedup_gate`` docstring for details.
+        dedup_action, dedup_eid = await self._dedup_gate(
+            new_summary=v.knowledge_summary,
+            new_content=v.knowledge_content,
+            kind=EntryKind.KNOWLEDGE.value,
+        )
+        if dedup_action == "drop":
+            _logger.info(
+                "dedup_gate: dropped knowledge CREATE cid=%s summary=%r",
+                c.id[:8], (v.knowledge_summary or "")[:60],
+            )
+            return False
+        if dedup_action == "update" and dedup_eid:
+            await self._store.update_knowledge_entry(
+                dedup_eid,
+                new_summary=v.knowledge_summary,
+                new_content=v.knowledge_content,
+            )
+            _logger.info(
+                "dedup_gate: coalesced knowledge CREATE→UPDATE cid=%s entry=%s",
+                c.id[:8], dedup_eid[:8],
+            )
+            return True
         entry_id = await self._store.insert_knowledge_entry(
             category=v.knowledge_category,
             summary=v.knowledge_summary,
@@ -1326,6 +1524,7 @@ class DreamWorker:
             source_ref=c.source_ref,
         )
         await self._maybe_warmup_embedding(entry_id, kind=EntryKind.KNOWLEDGE.value)
+        return True
 
     async def _maybe_warmup_embedding(self, entry_id: str, *, kind: str) -> None:
         if not self._embedder.available:
@@ -1464,6 +1663,66 @@ class DreamWorker:
                 ))
             return entries
         return []
+
+    # ── Pre-insert dedup gate ───────────────────────────────────────────────
+
+    async def _dedup_gate(
+        self,
+        *,
+        new_summary: str,
+        new_content: str,
+        kind: str,
+    ) -> tuple:
+        """Trigram-Jaccard gate over the top-K FTS candidates.
+
+        Runs immediately BEFORE ``insert_memory_entry`` / ``insert_knowledge_entry``
+        (see ``_apply_memory`` / ``_apply_knowledge``). Purpose: stop the
+        catastrophic duplication class ("IDLE state" ×6, "SAP Concur" ×7) at
+        the write path, where the LLM has emitted a fresh CREATE verdict for a
+        topic that already has an entry. Complementary to the async merge scan
+        (which is cosine-based, embedding-driven, and only runs every 15 min).
+
+        Returns one of:
+          - ``("new", None)``  — no near-duplicate; caller proceeds with insert
+          - ``("drop", None)`` — literal near-duplicate; caller returns without writing
+          - ``("update", entry_id)`` — same topic; caller updates ``entry_id``
+
+        Fails open: any FTS error returns ``("new", None)`` so a gate hiccup
+        never blocks legitimate writes. Thresholds live in ``_constants.py``.
+        """
+        if not new_summary:
+            return ("new", None)
+        try:
+            if kind == EntryKind.MEMORY.value:
+                rows = await self._store.fts_search_memory(
+                    new_summary, limit=C.DEDUP_FTS_CANDIDATES,
+                )
+            elif kind == EntryKind.KNOWLEDGE.value:
+                rows = await self._store.fts_search_knowledge(
+                    new_summary, limit=C.DEDUP_FTS_CANDIDATES,
+                )
+            else:
+                return ("new", None)
+        except Exception:
+            _logger.debug("dedup_gate FTS lookup failed kind=%s", kind, exc_info=True)
+            return ("new", None)
+
+        for row in rows:
+            # fts_search_* returns (entry_id, chunk_id, chunk_text, summary, facet,
+            # created_at, rank, frame_os); first chunk text is a reasonable
+            # proxy for full content (chunks are sequential slices of the same entry).
+            eid = row[0]
+            chunk_text = row[2] or ""
+            summary = row[3] or ""
+            s_sim = _jaccard_similarity(new_summary, summary)
+            if s_sim >= C.DEDUP_JACCARD_DROP_THRESHOLD:
+                return ("drop", None)
+            if s_sim >= C.DEDUP_JACCARD_UPDATE_THRESHOLD:
+                c_sim = _jaccard_similarity(new_content, chunk_text)
+                if c_sim >= C.DEDUP_JACCARD_DROP_THRESHOLD:
+                    return ("drop", None)
+                return ("update", eid)
+        return ("new", None)
 
     # ── LLM ─────────────────────────────────────────────────────────────────
 

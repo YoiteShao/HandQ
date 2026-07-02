@@ -91,7 +91,7 @@ agent 完成 item 后写入。
 | `factual_outcome` | List[str] | 可验证事实陈述 | agent | planner（drift 评估）/ verifier / `_compose_completion_reply` 组合最终回复 |
 | `key_findings` | List[str] | 离散事实（API 名、路径、版本等） | agent | planner（epistemic concretization）/ verifier |
 | `artifacts` | List[str] | 写过/改过的文件路径 | agent | planner / verifier |
-| `issues` | List[str] | 失败原因；interrupt 形如 `"Interrupted by planner: <reason>"` | agent | planner（结构守卫识别 interrupt）/ verifier |
+| `issues` | List[str] | 失败原因；interrupt 形如 `"Interrupted by planner: <reason>"` | agent | planner（失败末项顾问识别 interrupt）/ verifier |
 | `iterations` | int | 该 item 用了多少 iter | agent | 日志 |
 | `token_usage` | TokenUsage | LLM token 累计 | agent | session 计数 |
 | `completed_at` | datetime | `mark_current_done` 时打时间戳 | CheckList | 仅记录 |
@@ -331,7 +331,6 @@ user:   INTENT_TEMPLATE.format(full_context_block=intent_context, message=messag
 |-----|------|------|
 | `ltm` | LTM 召回 block（`format_context_block(query=最近一条 user 消息)`），失败/空时 `""` | `_build_long_term_block` |
 | `conversation` | `[Recent Conversation History]\n{conv_raw}\n`（slice off 当前消息，因为它在 prompt 模板末尾另渲染）| `_format_conversation_history` |
-| `shell` | `[Shell History]\n{file_content}\n`，无 path/读失败时 `""` | `_read_shell_history` |
 | `checklist` | `[Current CheckList]\n{body}\n`，body 为空 checklist 时是 `(empty — no active task)` | `_checklist.get_checklist_context_for_planner()` |
 
 ### 5.6 INTENT 顺序 vs PLAN 顺序
@@ -465,20 +464,15 @@ _PLAN_MODIFY_HEAD
 - 流末 `try_parse_json(full_text)` 解析所有字段。
 - 异常时 fallback 到非流式 `_call_and_parse`。
 
-### 6.4 结构守卫：`_apply_structural_guards`
+### 6.4 失败末项顾问：`_build_failed_tail_warning`
 
-`PlannerMixin._apply_structural_guards`。
+`PlannerMixin._build_failed_tail_warning`（`_detect_loops` 的兄弟方法，**顾问而非执行者**）。
 
-**Guard 1**：planner 输出空 `post_current_items`（暗示任务收尾），但最近一个完成 item 是失败的且**不是 interrupt 引发**——这就是"在失败状态上偷偷宣布胜利"。守卫强制注入一条 verification item：
+当最近一个完成 item 失败、且**不是 interrupt 引发**时——这是"可能在失败状态上偷偷收尾"的信号。顾问返回一段**注入 planner prompt 的建议串**（与 `loop_warning`/`epistemic_preamble` 同一机制），提醒 planner 收尾前刻意判断：若是真正的终止性障碍（缺凭据 / 用户拒绝 / 工具不可用 / 用户要求停止）就明确记录后收尾；否则换一种方法补做。
 
-```json
-{
-  "item_id": "<8-char uuid>",
-  "instruction": "The previous item failed but the planner attempted to end the task. ...",
-  "expected_outcomes": ["Failure root cause identified", "Either ... redone successfully, or ... documented"],
-  "planner_reasoning": "Structural guard: previous item (<id>) failed; ending the task on a failure would silently drop the user's request."
-}
-```
+它**不改写** `post_current_items`——决定权留给 planner；planner 若选择收尾，真正的有界兜底是 §6.6 → §8 的接受门（info-gain 终止 + `_ACCEPTANCE_SEATBELT_ROUNDS` 安全带）。这样避免了旧 Guard 1"强制注入矫正 item"在不可恢复障碍上无限打转（活锁）的问题。
+
+无已完成结果 / 末项干净成功 / 末项失败但为 interrupt 引发 → 返回 `""`（不唠叨）。
 
 ### 6.5 应用输出：`_apply_planner_output`
 
@@ -498,7 +492,7 @@ _PLAN_MODIFY_HEAD
 ### 6.7 PLAN_MODIFY_TEMPLATE
 
 ```
-{full_context_block}{epistemic_preamble}{loop_warning}[User Original Message]
+{full_context_block}{epistemic_preamble}{loop_warning}{failure_tail_warning}[User Original Message]
 "{user_message}"
 
 ---
@@ -506,7 +500,7 @@ Before emitting operations, reason through: drift check ..., what "done" require
 epistemic state (observed vs assumed), checkpoint design, tool needs.
 ```
 
-注意三段顺序：context → preamble（epistemic + loop） → user message → 思考骨架。
+注意顺序：context → preamble（epistemic + loop + failed-tail 顾问） → user message → 思考骨架。
 
 ---
 
@@ -1293,7 +1287,6 @@ _SKILL_MENTION_RE = r"(?<![\w/.])@([a-zA-Z0-9_\-]{1,64})"
 | `_format_conversation_history` | slice off 当前消息的前置对话 |
 | `_build_long_term_block` | LTM 召回（query=最近 user 消息）|
 | `_submit_user_turn_to_ltm_triage` | fire-and-forget triage |
-| `_read_shell_history` | 读外部 shell context 文件 |
 | `_on_item_done_sync` | 触发 planner_trigger |
 | `_rewind_user_turn` | 网络失败时回滚 user 消息 |
 | `_normalize_deferred_actions` | 强制成 List[str] |
@@ -1344,7 +1337,7 @@ _SKILL_MENTION_RE = r"(?<![\w/.])@([a-zA-Z0-9_\-]{1,64})"
 
 | 名字 | 用途 |
 |------|------|
-| `INTERRUPTED_BY_PLANNER` | 中断 issue 字符串前缀（agent 写、planner 守卫读） |
+| `INTERRUPTED_BY_PLANNER` | 中断 issue 字符串前缀（agent 写、失败末项顾问读） |
 | `CheckListItem`（`from_planner_dict / to_agent_message`） | item 模型 |
 | `ItemResult` | result 模型 |
 | `SharedCheckList.__init__` | 初始化各种集合、event、callback list |
@@ -1366,7 +1359,7 @@ _SKILL_MENTION_RE = r"(?<![\w/.])@([a-zA-Z0-9_\-]{1,64})"
 | `PlannerMixin._init_planner` | 初始化 on_demand_* 三个空字符串 |
 | `_detect_loops` | 扫描重复失败 instruction 渲染 LOOP DETECTED 警告 |
 | `_build_epistemic_inventory_warning` | 首次扫 ASSUMED 实体 / 首个 item 后注入 grounding requirement |
-| `_apply_structural_guards` | Guard 1：失败上偷偷收尾 → 注入矫正 item |
+| `_build_failed_tail_warning` | 失败末项顾问：将要在失败上收尾 → 注入 prompt 建议（不改写 items，planner 保权威） |
 | `synthesize_acceptance` | B1 LLM 验证调用 |
 | `_render_conversation_block / _render_completed_items_block / _render_acceptance_history_line` | 验证 prompt 段渲染 |
 
@@ -1457,7 +1450,7 @@ _SKILL_MENTION_RE = r"(?<![\w/.])@([a-zA-Z0-9_\-]{1,64})"
 
 ## 20. 一句话索引（review 自查）
 
-启动后用户输入 → **preprocess_mentions（去 @ 引号 / UNC / skill prescan）→ ltm triage 异步 → prescan skill 立刻激活 → INTENT 流式分类 → task 路径锁内 PLAN_MODIFY 流式 → 结构守卫 → activate_skills/tools → replace_post_current → optional interrupt** → agent 拉 item → **set 三个 static block → item_loop**：检查 interrupt → 收割后台 + compact → reminder + stagnation LTM refresh（可选）→ **think_streaming（流式 dispatch，写编辑同路径强制串行）**→ PTL 6 级恢复 → 完成判定 / 工具结果记录 / advisor 更新 → mark_done → planner_trigger → 后台 planner 锁内再次 PLAN_MODIFY → 任务收尾 → **B1 验证门 5-verdict（PASS/TRIVIAL/EXTEND/VALIDATE/ACCEPT）** → emit completion reply or inject acceptance_* item。
+启动后用户输入 → **preprocess_mentions（去 @ 引号 / UNC / skill prescan）→ ltm triage 异步 → prescan skill 立刻激活 → INTENT 流式分类 → task 路径锁内 PLAN_MODIFY 流式（prompt 内含 loop/failed-tail 顾问）→ activate_skills/tools → replace_post_current → optional interrupt** → agent 拉 item → **set 三个 static block → item_loop**：检查 interrupt → 收割后台 + compact → reminder + stagnation LTM refresh（可选）→ **think_streaming（流式 dispatch，写编辑同路径强制串行）**→ PTL 6 级恢复 → 完成判定 / 工具结果记录 / advisor 更新 → mark_done → planner_trigger → 后台 planner 锁内再次 PLAN_MODIFY → 任务收尾 → **B1 验证门 5-verdict（PASS/TRIVIAL/EXTEND/VALIDATE/ACCEPT）** → emit completion reply or inject acceptance_* item。
 
 每段都能定位到具体文件：函数索引在 §18，inject 路径在 §11，schema 在 §2 与 §3，prompt block 在 §5.7 / §6.2 / §8.3 / §10.2 system 段。
 

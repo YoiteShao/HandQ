@@ -25,14 +25,6 @@ from ..infrastructure.config_manager import ConfigManager
 from ..infrastructure.execution_recorder import ExecutionRecorder
 from ..infrastructure.ssh_setup import SSHContextProvider
 from ..infrastructure.coding_setup import CodingContextProvider
-from ..infrastructure.browser_setup import BrowserContextProvider
-from ..infrastructure.remote_handq_setup import RemoteHandQContextProvider
-from ..infrastructure.web_search_setup import WebSearchContextProvider
-from ..infrastructure.email_setup import EmailContextProvider
-from ..infrastructure.teams_setup import TeamsContextProvider
-from ..infrastructure.desktop_setup import DesktopContextProvider
-from ..infrastructure.ask_human_setup import AskHumanContextProvider
-from ..infrastructure.session_setup import SessionContextProvider
 from ..tools.browser_tool import BrowserSessionHolder
 from ..tools.desktop_tool import DesktopState
 from ..tools.file_state import FileState
@@ -64,20 +56,35 @@ class FlowControllerV2:
         storage_directory: Optional[str] = None,
         config_path: Optional[str] = None,
         on_reply_to_user: Optional[Callable[[str], None]] = None,
-        shell_context_path: Optional[str] = None,
         expose_session_storage_in_prompt: bool = True,
+        helper_llm_services: Optional[List[LLMService]] = None,
+        session_id: Optional[str] = None,
     ):
         if not llm_services:
             raise ValueError("llm_services must contain at least one LLMService")
 
+        # session_id is the per-flow identifier the bridge dispatch layer
+        # uses to route IPC. We thread it down to per-session resources
+        # whose isolation key depends on it — currently the
+        # BrowserSessionHolder, which uses it to pick a per-session
+        # Chromium user-data-dir under
+        # ``%USERPROFILE%\HandQ\browser_profile\sessions\<sid>\``. ``None``
+        # falls back to the legacy single profile (test / ctx-less callers).
+        self._session_id: Optional[str] = session_id
+
         self._llm_services: List[LLMService] = llm_services
+        # Cheap auxiliary pool (llm.helper_models). Used by the Tier-1 progress
+        # watcher in PersistentAgent — a fire-and-forget divergence check that
+        # must NOT share service objects with the main streaming stack (no
+        # shared stream state) and should run on cheap models. None/empty
+        # disables the watcher entirely (Tier-0 sense still works).
+        self._helper_llm_services: Optional[List[LLMService]] = helper_llm_services
         self.working_directory: Optional[str] = working_directory
         self.storage_directory: str = storage_directory or working_directory or "."
         self.config_manager = ConfigManager(config_path)
         self.logger = get_logger()
 
         self._on_reply_to_user = on_reply_to_user
-        self._shell_context_path: Optional[str] = shell_context_path
         # When False, PersistentAgent's prompt env block lists only
         # working_directory and omits the session-storage root. Used by the
         # Windows GUI bridge so the agent's mental model is "workspace =
@@ -167,7 +174,7 @@ class FlowControllerV2:
             interaction_manager=self.interaction_manager,
             file_state=FileState(),
             ssh_pool=SshConnectionPool(),
-            browser_session=BrowserSessionHolder(),
+            browser_session=BrowserSessionHolder(session_id=self._session_id),
             session_registry=SessionRegistry(),
             desktop_state=DesktopState(im=self.interaction_manager),
             execution_recorder=execution_recorder,
@@ -182,8 +189,9 @@ class FlowControllerV2:
             on_response_done=self._seal_reply_to_ui,
             on_state_changed=self._forward_state_to_ui,
             on_recall_started=self._forward_recall_started_to_ui,
-            shell_history_path=self._shell_context_path,
+            on_task_complete=self._on_task_complete_cleanup,
             session_dir=self.storage_directory,
+            helper_services=self._helper_llm_services,
         )
 
         # Push the platform-aware tool table from registered providers into
@@ -201,6 +209,7 @@ class FlowControllerV2:
             pre_item_hint_provider=self._gather_pre_item_hints,
             ctx=self._ctx,
             expose_session_storage_in_prompt=self._expose_session_storage_in_prompt,
+            helper_services=self._helper_llm_services,
         )
 
         # Register the provider-side tool-activation hook AFTER PersistentAgent
@@ -208,6 +217,12 @@ class FlowControllerV2:
         # makes the agent load the tool implementation first, then the provider
         # gets a chance to do session-once setup against the new tool.
         self._checklist.on_tools_changed(self._on_tools_activated)
+
+        # Bridge checklist mutations → UI. FlowController owns both the
+        # checklist and the InteractionManager, so it is the natural place to
+        # forward the live task-panel snapshot (same role it plays for state
+        # transitions via _forward_state_to_ui).
+        self._checklist.on_checklist_changed(self._forward_checklist_to_ui)
 
         self._agent_task = asyncio.create_task(
             self._agent.run_loop(),
@@ -373,7 +388,7 @@ class FlowControllerV2:
                 pass
 
     def _forward_reply_chunk_to_ui(self, fragment: str) -> None:
-        """Stream one reply fragment (receptionist/planner ``response_to_user``)
+        """Stream one reply fragment (the receptionist/INTENT ``response_to_user``)
         to the UI as it arrives from the LLM. Renderer appends it to the live
         assistant bubble (``reply_delta``)."""
         if self.interaction_manager and fragment:
@@ -391,15 +406,36 @@ class FlowControllerV2:
                 pass
 
     def _forward_state_to_ui(self, state: str) -> None:
-        """Forward an orchestrator activity-strip state (``planning`` /
-        ``idle``) to the UI. The agent emits ``thinking`` / ``executing``
-        directly via the InteractionManager; this covers the planner phase
-        and the task-settled transition, which only the orchestrator sees."""
+        """Forward an orchestrator state transition (``planning`` / ``idle``)
+        to the UI. The agent emits ``thinking`` / ``executing`` directly via
+        the InteractionManager; this covers the planner phase and the
+        task-settled transition, which only the orchestrator sees.
+
+        Multi-session task-level queueing for desktop: when the orchestrator
+        reaches ``idle`` (task settled, final reply sent), proactively
+        release this session's cross-session desktop ownership lock so any
+        other session blocked waiting on desktop can immediately acquire it.
+        The session itself stays alive and can re-acquire on its next
+        desktop call (``acquire_global_takeover`` is idempotent). Without
+        this, a single long-lived session could indefinitely starve all
+        other sessions of desktop access purely because the user hasn't
+        clicked its X button. Browser is NOT released here — per-session
+        browser instances mean there is no cross-session lock to release;
+        the browser's user-data-dir is held until ``ctx.close()``.
+        """
         if self.interaction_manager:
             try:
                 self.interaction_manager.notify_state_changed(state)
             except Exception:
                 pass
+        if state == "idle" and self._ctx is not None:
+            try:
+                self._ctx.desktop_state.reset_takeover_state()
+            except Exception as exc:
+                self.logger.warning(
+                    "desktop reset on idle failed (best-effort): %s" % exc,
+                    component="FlowControllerV2",
+                )
 
     def _forward_recall_started_to_ui(self) -> None:
         """Forward an LTM-recall-in-flight signal from the orchestrator's
@@ -411,15 +447,58 @@ class FlowControllerV2:
             except Exception:
                 pass
 
+    async def _on_task_complete_cleanup(self) -> None:
+        """Close on-demand tool resources at the task-complete boundary.
+
+        Wired into ``Orchestrator.on_task_complete``. Fires when the acceptance
+        gate reaches a terminal verdict (PASS / TRIVIAL / ACCEPT / unknown) —
+        NOT on EXTEND / VALIDATE where more work is queued. Currently closes
+        the browser session so Chromium doesn't linger between tasks; add
+        further on-demand-tool teardown here (SSH sessions, remote HandQ, etc.)
+        rather than growing the callback surface on Orchestrator.
+
+        Best-effort: any per-resource failure is logged and swallowed so a
+        broken cleanup never blocks completion delivery. Skipped if the ctx
+        was never constructed (start() failed or destroy() already ran)."""
+        if self._ctx is None:
+            return
+        try:
+            closed = await self._ctx.browser_session.close()
+            if closed:
+                self.logger.info(
+                    "[FlowControllerV2] task-complete cleanup: browser holder closed",
+                    component="FlowControllerV2",
+                )
+        except Exception as e:
+            self.logger.warning(
+                f"[FlowControllerV2] task-complete cleanup: browser close failed "
+                f"({type(e).__name__}: {e}); ignoring.",
+                component="FlowControllerV2",
+            )
+
+    def _forward_checklist_to_ui(self, items: List[Dict[str, Any]]) -> None:
+        """Forward a checklist snapshot (from ``on_checklist_changed``) to the
+        UI, which paints a live task panel. ``items`` is the list of
+        ``{item_id, instruction, status}`` dicts. Fire-and-forget."""
+        if self.interaction_manager:
+            try:
+                self.interaction_manager.notify_checklist_changed(items)
+            except Exception:
+                pass
+
     # ── Provider system ──────────────────────────────────────────────────────
 
     def _collect_default_providers(self) -> None:
         """Collect built-in ContextProviders into self._item_context_providers.
 
         SSH and Coding providers are cross-platform; the rest are Windows-only
-        and skipped on Linux. All provider modules are imported eagerly at the
-        top of this file so packaging tools can statically discover them and
-        any missing dependency surfaces at startup, not at registration time.
+        and skipped on Linux. The Windows-only setup modules are imported
+        lazily inside the win32 branch (not at module top level) because they
+        pull eager hard deps — playwright, pywin32, pyautogui — that are absent
+        on the headless Linux daemon; a top-level import would crash Linux boot
+        before the runtime gate runs. The imports are still plain ``from ...``
+        statements, so PyInstaller's bytecode scan discovers them for Windows
+        packaging, and any missing dep surfaces here at session construction.
         """
         self._item_context_providers.append(SSHContextProvider())
         self._item_context_providers.append(CodingContextProvider())
@@ -430,6 +509,15 @@ class FlowControllerV2:
                 component="FlowControllerV2",
             )
             return
+
+        from ..infrastructure.browser_setup import BrowserContextProvider
+        from ..infrastructure.remote_handq_setup import RemoteHandQContextProvider
+        from ..infrastructure.web_search_setup import WebSearchContextProvider
+        from ..infrastructure.email_setup import EmailContextProvider
+        from ..infrastructure.teams_setup import TeamsContextProvider
+        from ..infrastructure.desktop_setup import DesktopContextProvider
+        from ..infrastructure.ask_human_setup import AskHumanContextProvider
+        from ..infrastructure.session_setup import SessionContextProvider
 
         self._item_context_providers.append(BrowserContextProvider())
         self._item_context_providers.append(RemoteHandQContextProvider())
@@ -491,6 +579,14 @@ class FlowControllerV2:
         invoked; the default implementation returns ``None`` so non-overriding
         providers are silently filtered out when collecting hints.
 
+        Special case: when ``item.ssh_target`` is set, ``SSHContextProvider``
+        is invoked even if the ``ssh`` tool itself was not activated. The
+        planner often (correctly) declines to activate ``ssh`` for single
+        remote commands — the agent just runs ``shell`` with ``ssh host 'cmd'``.
+        Without the SSH context hint, the agent has to rediscover the
+        credential layout (``~/.ssh/handq_<host>.yaml`` + keyring service)
+        from scratch every session.
+
         Called by PersistentAgent before each item execution. Session-once
         provider setup runs separately via ``_on_tools_activated``.
 
@@ -499,10 +595,15 @@ class FlowControllerV2:
         if self._checklist is None or self.interaction_manager is None:
             return ""
         active_tools = self._checklist.active_tools
-        eligible = [
+        eligible: List[ContextProvider] = [
             p for p in self._item_context_providers
             if p.tool_name in active_tools
         ]
+        if (item.ssh_target or "").strip():
+            for p in self._item_context_providers:
+                if p.tool_name == "ssh" and p not in eligible:
+                    eligible.append(p)
+                    break
         if not eligible:
             return ""
 

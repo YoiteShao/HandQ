@@ -144,6 +144,16 @@ class LongTermMemory:
         # needed (principals aren't in mem recall, so there's nothing to dedup).
         self._known_entities_cache: Optional[str] = None
         self._known_entities_cache_ts: float = 0.0
+        # Guards the render-cache check→fetch→write sequences below (N1). The
+        # LTM singleton is shared by every session; with concurrent per-session
+        # dispatch two recalls can interleave a stale write over an
+        # ``archive()`` invalidation. Holding this across the check, the store
+        # read, and the write makes each refresh atomic w.r.t. invalidation:
+        # archive's null can only land before or after a complete refresh,
+        # never mid-flight, so the visible cache only flips between consistent
+        # snapshots. Contention is negligible — both caches are TTL'd and
+        # change slowly, so the guarded store read is rare.
+        self._cache_lock = asyncio.Lock()
 
     # ── Lifecycle ───────────────────────────────────────────────────────────
 
@@ -464,8 +474,13 @@ class LongTermMemory:
                 # IDENTITY entries are a subset of MEMORY. Invalidating on
                 # every memory archive is cheaper than reading the row to
                 # check its dimension first — the rebuild is one bounded
-                # SQLite query against an indexed column.
-                self._identity_cache = None
+                # SQLite query against an indexed column. Null UNDER the cache
+                # lock (N1) so it can't land between a concurrent refresh's
+                # store read and its write — that would otherwise leave the
+                # just-archived entry visible in the cache until the TTL.
+                async with self._cache_lock:
+                    self._identity_cache = None
+                    self._identity_cache_ts = 0.0
             elif kind == EntryKind.KNOWLEDGE:
                 await self._store.archive_knowledge_entry(entry_id, reason=reason)
             else:  # PROCEDURE — P6, ignore for now
@@ -538,19 +553,28 @@ class LongTermMemory:
             initiated IDENTITY removal without waiting for TTL)
         """
         now = time.monotonic()
-        if self._identity_cache is not None and (
+        cached = self._identity_cache
+        if cached is not None and (
             now - self._identity_cache_ts
         ) < C.IDENTITY_CACHE_TTL_SEC:
+            return cached
+        async with self._cache_lock:
+            # Re-check under the lock: a concurrent recall may have refreshed
+            # while we awaited the lock (N1 double-checked locking).
+            now = time.monotonic()
+            if self._identity_cache is not None and (
+                now - self._identity_cache_ts
+            ) < C.IDENTITY_CACHE_TTL_SEC:
+                return self._identity_cache
+            identity_entries = await self._store.list_memory_entries(
+                dimension=MemoryDimension.IDENTITY, archived=False,
+                limit=C.IDENTITY_MAX_ENTRIES,
+            )
+            block = _fmt_id(identity_entries)
+            ids = frozenset(e.id for e in identity_entries)
+            self._identity_cache = (block, ids)
+            self._identity_cache_ts = now
             return self._identity_cache
-        identity_entries = await self._store.list_memory_entries(
-            dimension=MemoryDimension.IDENTITY, archived=False,
-            limit=C.IDENTITY_MAX_ENTRIES,
-        )
-        block = _fmt_id(identity_entries)
-        ids = frozenset(e.id for e in identity_entries)
-        self._identity_cache = (block, ids)
-        self._identity_cache_ts = now
-        return self._identity_cache
 
     async def _get_known_entities_cached(self) -> str:
         """Return the rendered ``<known-entities>`` block, TTL-cached.
@@ -562,15 +586,22 @@ class LongTermMemory:
         staleness is one TTL window.
         """
         now = time.monotonic()
-        if self._known_entities_cache is not None and (
+        cached = self._known_entities_cache
+        if cached is not None and (
             now - self._known_entities_cache_ts
         ) < C.IDENTITY_CACHE_TTL_SEC:
-            return self._known_entities_cache
-        rows = await self._store.list_principals(limit=C.KNOWN_ENTITIES_MAX)
-        block = _fmt_ent(rows)
-        self._known_entities_cache = block
-        self._known_entities_cache_ts = now
-        return block
+            return cached
+        async with self._cache_lock:
+            now = time.monotonic()
+            if self._known_entities_cache is not None and (
+                now - self._known_entities_cache_ts
+            ) < C.IDENTITY_CACHE_TTL_SEC:
+                return self._known_entities_cache
+            rows = await self._store.list_principals(limit=C.KNOWN_ENTITIES_MAX)
+            block = _fmt_ent(rows)
+            self._known_entities_cache = block
+            self._known_entities_cache_ts = now
+            return block
 
     async def format_context_block(
         self,
@@ -585,6 +616,7 @@ class LongTermMemory:
         dynamic_k: bool = False,
         include_identity: bool = True,
         include_known_entities: bool = True,
+        include_header: bool = True,
         current_frame: Optional[dict] = None,
     ) -> str:
         """Recall both tracks against *query* and render a single context block.
@@ -611,6 +643,13 @@ class LongTermMemory:
         injected unconditionally, like identity. It is frame-agnostic (not
         os-filtered — SSH machines and people are cross-environment). Set
         False to suppress it (e.g. when already present elsewhere in the prompt).
+
+        ``include_header`` defaults True (adds the ``[Long-Term Context]``
+        wrapper + description prefix). Set False when the caller is going to
+        concatenate multiple recall blocks under a single shared header
+        (dual-recall path in Orchestrator: primary block carries the header,
+        the "extra" block does not, so the planner sees one coherent LTM
+        section instead of two duplicated headers).
 
         ``current_frame`` (LTM 2.0): dict of {os, host, confidence, ...}
         describing the caller's execution environment. When set, recall
@@ -661,11 +700,10 @@ class LongTermMemory:
             parts.append(kn_block)
         if not parts:
             return ""
-        return (
-            f"{_LTM_HEADER}\n"
-            f"{_LTM_DESC}\n"
-            + "\n".join(parts) + "\n"
-        )
+        body = "\n".join(parts) + "\n"
+        if not include_header:
+            return body
+        return f"{_LTM_HEADER}\n{_LTM_DESC}\n{body}"
 
     # ── Admin / debug ───────────────────────────────────────────────────────
 

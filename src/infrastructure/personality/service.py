@@ -9,9 +9,13 @@ Public API
 ----------
 - ``PersonalityMonitor.start(loop)``      — kick off the background task.
 - ``PersonalityMonitor.shutdown()``       — graceful cancel + ring spill.
-- ``PersonalityMonitor.pause()`` / ``resume()`` — let the bridge gate
-  capture in response to UI commands or the bridge entering an
-  exclusive activity (e.g. desktop-tool takeover).
+- ``PersonalityMonitor.pause_by_user()`` / ``resume_by_user()`` — manual
+  IPC button gates an independent ``_user_paused`` flag.
+- Desktop takeover gates ``_paused`` automatically by querying
+  ``desktop_query()`` (injected at construction; in production wired to
+  ``desktop_tool.is_any_session_holding_desktop``). No notifications or
+  refcounts — the global desktop owner state is the single authoritative
+  source so the monitor cannot drift out of sync with the real lock.
 - ``PersonalityMonitor.snapshot_status()`` — JSON-friendly dict for the
   ``personality_status`` IPC message.
 """
@@ -26,7 +30,7 @@ import sys
 import time
 from collections import deque
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
 import yaml
 
@@ -168,6 +172,7 @@ class PersonalityMonitor:
         ltm,
         screenshot_root: str,
         config_path: Optional[Path] = None,
+        desktop_query: Optional[Callable[[], bool]] = None,
     ) -> None:
         self._ltm = ltm
         self._config_path = config_path
@@ -179,7 +184,28 @@ class PersonalityMonitor:
         self._capturer = MonitorCapturer()
         self._ocr: Optional[LocalOCR] = None
         self._task: Optional[asyncio.Task] = None
-        self._paused: bool = False
+        # Pause model — direct query, not refcount.
+        #
+        # The activity monitor must pause whenever ANY session is driving
+        # input through the desktop tool (the OCR samples would otherwise
+        # capture agent-driven mouse / keyboard events). The authoritative
+        # source for "is anyone holding desktop right now" is the global
+        # owner reference in ``desktop_tool``; ``desktop_query`` is a
+        # callable injected at construction (typically
+        # ``desktop_tool.is_any_session_holding_desktop``) that returns its
+        # truth-value on demand. Because we *query* rather than mirror, the
+        # monitor cannot drift out of sync with the real lock — even if a
+        # destroy timed out and the global owner was force-reset, the very
+        # next ``_paused`` check sees the new truth.
+        #
+        # The manual IPC "pause" button is an independent dimension: a
+        # plain ``_user_paused`` boolean that the IPC handler flips. The
+        # monitor is paused iff EITHER user pause is set, OR a desktop
+        # session is active (logical OR — see the ``_paused`` property).
+        self._user_paused: bool = False
+        self._desktop_query: Callable[[], bool] = (
+            desktop_query if desktop_query is not None else (lambda: False)
+        )
         self._monitors: List[MonitorState] = []
 
         # ── Deferred-OCR plumbing ─────────────────────────────────────
@@ -386,16 +412,46 @@ class PersonalityMonitor:
             sum(len(r) for r in self._rings.values()),
         )
 
-    def pause(self) -> None:
-        self._paused = True
+    @property
+    def _paused(self) -> bool:
+        """Paused iff a manual user-pause is set OR any session currently
+        holds the cross-session desktop ownership lock. The desktop side is
+        computed via ``_desktop_query()`` — a direct read of
+        ``desktop_tool._GLOBAL_DESKTOP_OWNER`` — so the monitor can never
+        drift out of sync with the real lock state. Read-only.
+        """
+        if self._user_paused:
+            return True
+        try:
+            return bool(self._desktop_query())
+        except Exception:
+            # Fail-open: if the query callable raised (shouldn't happen,
+            # it's a module-level global read), prefer NOT pausing so
+            # capture continues. The alternative — pausing on every error —
+            # could indefinitely starve the monitor process-wide.
+            return False
 
-    def resume(self) -> None:
-        self._paused = False
+    def pause_by_user(self) -> None:
+        """Set the manual user-pause flag. Idempotent."""
+        self._user_paused = True
+
+    def resume_by_user(self) -> None:
+        """Clear the manual user-pause flag. Idempotent. Note that this
+        does NOT override an active desktop takeover — the monitor stays
+        paused while any session holds desktop, regardless of this flag.
+        """
+        self._user_paused = False
 
     def snapshot_status(self) -> Dict[str, Any]:
+        try:
+            desktop_active = bool(self._desktop_query())
+        except Exception:
+            desktop_active = False
         return {
             "enabled": bool(self._task and not self._task.done()),
             "paused": bool(self._paused),
+            "user_paused": bool(self._user_paused),
+            "desktop_active": desktop_active,
             "monitors": [
                 {
                     "index": m.info.index,

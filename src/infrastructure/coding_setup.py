@@ -19,8 +19,13 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Optional
 
-from ..controller_v2.coding_hint import CODING_HINT
+from ..controller_v2.coding_hint import CODING_HINT, HINT_ONLY_PROVIDER_NAMES
 from ..controller_v2.context import ContextProvider, ItemContext, ProviderCache
+
+
+# Re-exported from coding_hint for backward import discoverability —
+# downstream modules may import from either site.
+__all__ = ["CodingContextProvider", "HINT_ONLY_PROVIDER_NAMES"]
 
 if TYPE_CHECKING:
     from ..controller_v2.interaction_manager import InteractionManager

@@ -1,8 +1,15 @@
 #!/usr/bin/env bash
-# Version: 3.0
+# Version: 4.0
 # =============================================================================
-# handq_setup.sh — HandQ Setup Script
+# handq_setup.sh — Linux HandQ (sub-agent daemon) setup script
 # =============================================================================
+#
+# Installs the `handq_linux` command — the Linux "sub HandQ" entry point.
+# One Windows HandQ controls many Linux HandQ over SSH (the remote_handq tool);
+# each Linux box runs handq_linux.py as a resident, setsid-detached
+# FlowControllerV2 daemon with a local emergency console. There is no tmux,
+# no systemd, no state bar — Windows drives the daemon through a file pipe
+# under ~/.handq/<user>@<host>/, and the local console shares the same pipe.
 #
 # Usage:
 #   bash handq_setup.sh                        # Install + verify
@@ -10,25 +17,29 @@
 #   bash handq_setup.sh --test                 # Re-run verification only (no install)
 #
 # What this script does:
-#   1. Verifies Python, tmux, required files and config
-#   2. Installs 'handq' as a standalone executable in ~/.local/bin/
-#   3. Adds ~/.local/bin to PATH in your shell profile (~/.bashrc or ~/.zshrc)
-#   4. Configures tmux status bar to show HandQ state (state0/1/2/3)
+#   1. Verifies the handq_linux entry point (binary or .py) and config
+#   2. Installs `handq_linux` as a standalone command in /usr/local/bin
+#      (preferred) or ~/.local/bin, plus `handq` and `hi` aliases
+#   3. Adds the install dir to PATH in your shell profile, if needed
 #
-# First-time install (two steps):
-#   bash handq_setup.sh --config ./myconfig.yaml
-#   source ~/.bashrc        # bash/zsh; tcsh: source ~/.tcshrc
+# After install:
+#   handq_linux              # open the local console (starts the daemon)
+#   handq                    # alias — same thing
+#   hi                       # short alias — same thing
+#   handq_linux "fix the build and run the tests"   # one-shot goal
+#   handq_linux --status     # print the daemon's state.json
+#   handq_linux --exit       # stop the daemon
+#
+# The Windows side discovers this command via `command -v handq_linux`
+# (or ~/.local/bin/handq_linux) and wakes the daemon with `--_daemon`.
 #
 # Exit codes:
-#   0 — Success
-#   1 — Fatal error
-#   2 — Bad arguments
+#   0 — Success     1 — Fatal error     2 — Bad arguments
 # =============================================================================
 
 set -euo pipefail
 
 # Guard: this script must be executed, not sourced.
-# Sourcing it pollutes the caller's shell with internal variables and functions.
 if [[ "${BASH_SOURCE[0]}" != "${0}" ]]; then
     echo "handq_setup.sh: ERROR — do not source this script." >&2
     echo "  Run:  bash handq_setup.sh [--config PATH]" >&2
@@ -46,7 +57,7 @@ fi
 print_header() {
     echo ""
     printf "${C_BOLD}${C_CYAN}╔══════════════════════════════════════════════════╗${C_RESET}\n"
-    printf "${C_BOLD}${C_CYAN}║          HandQ Setup                             ║${C_RESET}\n"
+    printf "${C_BOLD}${C_CYAN}║          HandQ (Linux) Setup                     ║${C_RESET}\n"
     printf "${C_BOLD}${C_CYAN}╚══════════════════════════════════════════════════╝${C_RESET}\n"
     echo ""
 }
@@ -63,24 +74,16 @@ warn() { printf "  ${C_YELLOW}⚠️   $*${C_RESET}\n"; }
 err()  { printf "  ${C_RED}❌  $*${C_RESET}\n" >&2; }
 info() { printf "  ${C_CYAN}ℹ️   $*${C_RESET}\n"; }
 
-_finish() {
-    local code="${1:-0}"
-    exit "$code"
-}
+_finish() { exit "${1:-0}"; }
 die() { err "$*"; _finish 1; }
 
-# Short hostname (no domain suffix) — used to construct per-host .handq/ dirs
+# Short hostname (no domain suffix) — used to construct the per-host .handq/ dir.
+# Mirrors handq_linux.py's `socket.gethostname().split(".")[0]` and the remote
+# probe's `hostname -s`, so all three resolve the SAME ~/.handq/<user>@<host>.
 HOSTNAME_SHORT="$(hostname -s 2>/dev/null || hostname | cut -d. -f1)"
-
-# ── Legacy session cleanup helper ─────────────────────────────────────────────
-# Outputs a shell snippet that removes old HandQ functions/vars from the current
-# session.  Usage:  eval "$(handq_setup_cleanup)"
-handq_setup_cleanup() {
-    cat <<'CLEANUP'
-unset -f handq _handq_update_prompt _handq_capture_check _handq_install_prompt hi 2>/dev/null || true
-unset HANDQ_PS1_PATCHED HANDQ_PROMPT 2>/dev/null || true
-CLEANUP
-}
+WHO="$(whoami)"
+# HOME-based IPC dir (handq_linux.py uses Path.home(), NOT the script dir).
+HANDQ_DIR="${HOME}/.handq/${WHO}@${HOSTNAME_SHORT}"
 
 # ── Resolve script directory ──────────────────────────────────────────────────
 SOURCE="${BASH_SOURCE[0]}"
@@ -97,10 +100,14 @@ INSTALL_DIR="${SCRIPT_DIR}"
 SYSTEM_INSTALL_DIR="/usr/local/bin"
 FALLBACK_INSTALL_DIR="${HOME}/.local/bin"
 HOST_CONF_DIR="${HOME}/.config/handq/hosts"   # per-host exec config (one file per hostname)
-COMMAND_NAME="handq"
+COMMAND_NAME="handq_linux"
+ALIASES=("handq" "hi")                        # convenience symlinks → handq_linux
 REQUIRED_KEYS=("version" "llm" "session" "interaction_switches")
-REQUIRED_LLM_KEYS=("models")
-REQUIRED_SESSION_KEYS=()
+# llm model pool. New schema uses agent_models / available_models (checked
+# subsets of the pool); a flat `models` list is still accepted for legacy
+# configs. validate_config requires at least one, in this preference order —
+# matches role_resolver.resolve_models_and_helper.
+LLM_POOL_KEYS=("agent_models" "available_models" "models")
 
 # =============================================================================
 # Argument parsing
@@ -138,35 +145,39 @@ else
 fi
 
 # =============================================================================
-# check_required_files
+# check_required_files — locate the handq_linux entry point + config
 # =============================================================================
 check_required_files() {
     print_step "Checking required files"
-    local py_main="${SCRIPT_DIR}/handq.py"
-    local bin_main="${SCRIPT_DIR}/handq.bin"
+    local py_main="${SCRIPT_DIR}/handq_linux.py"
+    local bin_main="${SCRIPT_DIR}/handq_linux.bin"
+    local standalone_bin="${SCRIPT_DIR}/handq_linux.dist/handq_linux.bin"
     local all_ok=true
 
     MAIN_EXEC="" USE_PYTHON=false
-    # Standalone layout: binary inside handq.dist/
-    local standalone_bin="${SCRIPT_DIR}/handq.dist/handq.bin"
+    # Standalone (Nuitka) layout: binary inside handq_linux.dist/
     if [[ -f "$standalone_bin" ]]; then
         [[ ! -x "$standalone_bin" ]] && { chmod +x "$standalone_bin"; info "Set executable bit on ${standalone_bin}"; }
         MAIN_EXEC="$standalone_bin"; ok "Found standalone binary: ${standalone_bin}"
     fi
-    # Legacy / onefile layout: binary at top level
+    # Onefile / top-level binary layout
     if [[ -z "$MAIN_EXEC" && -f "$bin_main" ]]; then
         [[ ! -x "$bin_main" ]] && { chmod +x "$bin_main"; info "Set executable bit on ${bin_main}"; }
         MAIN_EXEC="$bin_main"; ok "Found binary: ${bin_main}"
     fi
+    # Source layout: handq_linux.py next to src/
     if [[ -f "$py_main" ]]; then
         if [[ -z "$MAIN_EXEC" ]]; then
             MAIN_EXEC="$py_main"; USE_PYTHON=true
             ok "Found Python entry-point: ${py_main}"
+            if [[ ! -d "${SCRIPT_DIR}/src" ]]; then
+                warn "src/ not found next to handq_linux.py — the daemon imports src.* and will fail to start."
+            fi
         else
             ok "Found Python entry-point (backup): ${py_main}"
         fi
     fi
-    [[ -z "$MAIN_EXEC" ]] && { err "Neither handq.py nor handq.bin found in ${SCRIPT_DIR}"; all_ok=false; }
+    [[ -z "$MAIN_EXEC" ]] && { err "No handq_linux entry point found in ${SCRIPT_DIR} (looked for handq_linux.dist/handq_linux.bin, handq_linux.bin, handq_linux.py)"; all_ok=false; }
 
     if [[ -f "$CONFIG_PATH" ]]; then
         ok "Config file found: ${CONFIG_PATH}"
@@ -184,27 +195,16 @@ check_dependencies() {
     print_step "Checking dependencies"
     local all_ok=true
 
-    # Python
     if [[ "$USE_PYTHON" == true ]]; then
         local python_exe
         python_exe="$(_resolve_python_exe)"
         if [[ -n "$python_exe" ]]; then
             ok "Python: ${python_exe}"
         else
-            err "Python 3 not found"; all_ok=false
+            err "Python 3 not found (required to run handq_linux.py from source)"; all_ok=false
         fi
-    fi
-
-    # tmux
-    TMUX_AVAILABLE=false
-    if command -v tmux &>/dev/null; then
-        local tmux_ver
-        tmux_ver="$(tmux -V 2>/dev/null || echo 'unknown')"
-        ok "tmux: ${tmux_ver} — status bar integration enabled"
-        TMUX_AVAILABLE=true
     else
-        warn "tmux not found — HandQ state bar unavailable"
-        warn "  Install tmux for the best experience: apt install tmux"
+        ok "Standalone binary — no external Python required"
     fi
 
     [[ "$all_ok" == false ]] && return 1 || return 0
@@ -217,12 +217,7 @@ validate_config() {
     print_step "Validating config file" "${CONFIG_PATH}"
     local all_ok=true
 
-    # ── Real YAML parse via PyYAML ────────────────────────────────────────
-    # The grep checks below only confirm key names appear on a line; they
-    # don't catch syntax errors like a missing space after a colon
-    # (e.g. "API_KEY:abc" instead of "API_KEY: abc"), which silently
-    # invalidates the entire `llm:` block and leaves all LLM roles empty
-    # at runtime. Best-effort: skipped if python3 or PyYAML aren't present.
+    # ── Real YAML parse via PyYAML (best-effort; skipped if unavailable) ──
     if command -v python3 &>/dev/null; then
         local yaml_out
         yaml_out="$(CFG="$CONFIG_PATH" python3 -c '
@@ -258,24 +253,30 @@ except yaml.YAMLError as e:
             err "Missing key: '${key}'"; all_ok=false
         fi
     done
-    for key in "${REQUIRED_LLM_KEYS[@]}"; do
-        if grep -qE "^[[:space:]]+${key}:" "$CONFIG_PATH"; then
-            ok "llm.${key} present"
-        else
-            err "Missing llm.${key}"; all_ok=false
-        fi
-    done
-    for key in "${REQUIRED_SESSION_KEYS[@]+"${REQUIRED_SESSION_KEYS[@]}"}"; do
-        if grep -qE "^[[:space:]]+${key}:" "$CONFIG_PATH"; then
-            ok "session.${key} present"
-        else
-            err "Missing session.${key}"; all_ok=false
-        fi
-    done
 
-    local model_val
-    model_val="$(awk '/^[[:space:]]+models:/{found=1; next} found && /^[[:space:]]*#/{next} found && /^[[:space:]]+-/{gsub(/^[[:space:]]+-[[:space:]]*/,""); gsub(/[[:space:]]*$/,""); print; exit} found && /^[[:space:]]+[^-]/{exit}' "$CONFIG_PATH" | tr -d '"'"'")"
-    [[ -z "$model_val" || "$model_val" == "null" ]] && warn "llm.models appears empty" || ok "llm.models[0] = ${model_val}"
+    # ── llm model pool ────────────────────────────────────────────────────
+    # Accept the first present of agent_models / available_models / models.
+    local pool_key=""
+    for key in "${LLM_POOL_KEYS[@]}"; do
+        if grep -qE "^[[:space:]]+${key}:" "$CONFIG_PATH"; then
+            pool_key="$key"; break
+        fi
+    done
+    if [[ -n "$pool_key" ]]; then
+        ok "llm model pool present (llm.${pool_key})"
+        local model_val
+        model_val="$(awk -v key="$pool_key" '
+            $0 ~ "^[[:space:]]+" key ":" {found=1; next}
+            found && /^[[:space:]]*#/ {next}
+            found && /^[[:space:]]+-/ {gsub(/^[[:space:]]+-[[:space:]]*/,""); gsub(/[[:space:]]*$/,""); print; exit}
+            found && /^[[:space:]]+[^-]/ {exit}
+        ' "$CONFIG_PATH" | tr -d '"'"'")"
+        [[ -z "$model_val" || "$model_val" == "null" ]] \
+            && warn "llm.${pool_key} appears empty" \
+            || ok "llm.${pool_key}[0] = ${model_val}"
+    else
+        err "Missing llm model pool (need one of: ${LLM_POOL_KEYS[*]})"; all_ok=false
+    fi
 
     # Support both API_KEY (direct value) and api_key_env (env var name) formats.
     local api_key_env_val
@@ -283,18 +284,17 @@ except yaml.YAMLError as e:
     if [[ -n "$api_key_env_val" && "$api_key_env_val" != "null" ]]; then
         if [[ "$api_key_env_val" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]]; then
             local api_key_resolved="${!api_key_env_val:-}"
-            [[ -n "$api_key_resolved" ]] && ok "\$${api_key_env_val} is set" || warn "\$${api_key_env_val} is NOT set — set it before running handq"
+            [[ -n "$api_key_resolved" ]] && ok "\$${api_key_env_val} is set" || warn "\$${api_key_env_val} is NOT set — set it before running handq_linux"
         else
             ok "llm.api_key_env contains a direct key value"
         fi
     else
-        # Check for direct API_KEY value
         local api_key_direct
         api_key_direct="$(grep -E "^[[:space:]]+API_KEY:" "$CONFIG_PATH" | head -1 | sed 's/.*API_KEY:[[:space:]]*//' | sed 's/[[:space:]]*#.*//' | tr -d '"'"'" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
         if [[ -n "$api_key_direct" && "$api_key_direct" != "null" ]]; then
             ok "llm.API_KEY is set"
         else
-            warn "llm.API_KEY is empty — fill in your API key before running handq"
+            warn "llm.API_KEY is empty — fill in your API key before running handq_linux"
         fi
     fi
 
@@ -315,26 +315,32 @@ _resolve_python_exe() {
         local _venv_python="${_venv_path}/bin/python3"
         [[ -x "$_venv_python" ]] && echo "$_venv_python" && return
     fi
-    # 2. active VIRTUAL_ENV
+    # 2. a .venv/venv co-located with the script (matches the remote probe)
+    for c in "${SCRIPT_DIR}/.venv/bin/python3" "${SCRIPT_DIR}/.venv/bin/python" \
+             "${SCRIPT_DIR}/venv/bin/python3" "${SCRIPT_DIR}/venv/bin/python"; do
+        [[ -x "$c" ]] && echo "$c" && return
+    done
+    # 3. active VIRTUAL_ENV
     if [[ -n "${VIRTUAL_ENV:-}" ]]; then
         local _venv_python="${VIRTUAL_ENV}/bin/python3"
         [[ -x "$_venv_python" ]] && echo "$_venv_python" && return
     fi
-    # 3. PATH
+    # 4. PATH
     command -v python3 2>/dev/null && return
     echo ""
 }
 
 # =============================================================================
-# install_command — write standalone executable wrapper
+# install_command — write the handq_linux dispatcher + aliases
 # =============================================================================
 install_command() {
     print_step "Installing '${COMMAND_NAME}' command"
 
     # Install priority:
-    #   1. /usr/local/bin  — system-wide, accessible to all users (preferred)
-    #   2. ~/.local/bin    — current user only (fallback when no write access)
-    # SCRIPT_DIR is never used as install target to avoid PATH pollution.
+    #   1. /usr/local/bin  — system-wide, on the PATH of non-interactive SSH
+    #      sessions (so `command -v handq_linux` works for the Windows probe).
+    #   2. ~/.local/bin    — current-user fallback; the Windows probe checks
+    #      this path explicitly since it is usually NOT on the SSH PATH.
     local target_dir=""
     for candidate in "$SYSTEM_INSTALL_DIR" "$FALLBACK_INSTALL_DIR"; do
         mkdir -p "$candidate" 2>/dev/null || true
@@ -344,43 +350,43 @@ install_command() {
     done
     [[ -z "$target_dir" ]] && { err "No writable install directory found (tried ${SYSTEM_INSTALL_DIR}, ${FALLBACK_INSTALL_DIR})"; return 1; }
 
-    # Remove stale wrappers from all OTHER candidate locations to prevent PATH confusion
+    # Remove stale wrappers/aliases from all OTHER candidate locations.
     for stale_dir in "$SYSTEM_INSTALL_DIR" "$FALLBACK_INSTALL_DIR" "$INSTALL_DIR"; do
         [[ "$stale_dir" == "$target_dir" ]] && continue
-        for stale_name in "$COMMAND_NAME" "hi"; do
+        for stale_name in "$COMMAND_NAME" "${ALIASES[@]}"; do
             local stale="${stale_dir}/${stale_name}"
-            [[ -f "$stale" || -L "$stale" ]] && ( rm -f "$stale" 2>/dev/null && warn "Removed stale: ${stale}" ) || true
+            [[ -e "$stale" || -L "$stale" ]] && ( rm -f "$stale" 2>/dev/null && warn "Removed stale: ${stale}" ) || true
         done
     done
 
     local cmd_path="${target_dir}/${COMMAND_NAME}"
-    local exec_line prompt_state_line
+    local exec_line
 
     if [[ "$USE_PYTHON" == true ]]; then
         local python_exe
         python_exe="$(_resolve_python_exe)"
         [[ -z "$python_exe" ]] && { err "Python 3 not found"; return 1; }
         exec_line="\"${python_exe}\" \"${MAIN_EXEC}\" --config \"${CONFIG_PATH}\""
-        prompt_state_line="\"${python_exe}\" \"${MAIN_EXEC}\" --config \"${CONFIG_PATH}\" prompt-state"
     else
         exec_line="\"${MAIN_EXEC}\" --config \"${CONFIG_PATH}\""
-        prompt_state_line="\"${MAIN_EXEC}\" --config \"${CONFIG_PATH}\" prompt-state"
     fi
 
     # ── 1. Write per-host exec config ────────────────────────────────────────
     # Each host writes ONLY its own file; other hosts' files are untouched.
+    # The dispatcher sources this and forwards "$@", so the Windows side can
+    # append --_daemon / --status / a goal and the config is always injected.
     mkdir -p "$HOST_CONF_DIR"
     local host_conf="${HOST_CONF_DIR}/${HOSTNAME_SHORT}"
     printf 'exec %s "$@"\n' "$exec_line" > "$host_conf"
     chmod +x "$host_conf"
     ok "Host config  : ${host_conf}"
 
-    # ── 2. Write static hostname dispatcher ──────────────────────────────────
-    # Content is identical regardless of host/installation — safe to overwrite.
-    # Routes 'handq' to the correct binary for the current machine at runtime.
+    # ── 2. Write the static hostname dispatcher ──────────────────────────────
+    # Identical on every host — routes to the correct binary at runtime via the
+    # per-host config above.
     cat > "$cmd_path" <<'DISPATCHER'
 #!/usr/bin/env bash
-# handq — HandQ AI task execution agent
+# handq_linux — Linux HandQ sub-agent daemon launcher / console.
 # Hostname dispatcher — do NOT edit manually; managed by handq_setup.sh.
 _HANDQ_HOST="$(hostname -s 2>/dev/null || hostname | cut -d. -f1)"
 _HANDQ_CONF="${HOME}/.config/handq/hosts/${_HANDQ_HOST}"
@@ -396,33 +402,18 @@ DISPATCHER
     chmod +x "$cmd_path"
     ok "Installed dispatcher: ${cmd_path}"
 
-    # Install 'hi' as a symlink alias for 'handq'
-    local hi_path="${target_dir}/hi"
-    ln -sf "$cmd_path" "$hi_path" 2>/dev/null && ok "Installed alias: ${hi_path} → handq" \
-        || warn "Could not create hi symlink at ${hi_path}"
+    # ── 3. Install convenience aliases as symlinks → handq_linux ─────────────
+    for alias_name in "${ALIASES[@]}"; do
+        local alias_path="${target_dir}/${alias_name}"
+        ln -sf "$cmd_path" "$alias_path" 2>/dev/null \
+            && ok "Installed alias: ${alias_path} → ${COMMAND_NAME}" \
+            || warn "Could not create alias at ${alias_path}"
+    done
 
-    # Detect whether legacy shell functions are live in the current session.
-    # If the old wrapper was ever sourced/eval'd, handq() or _handq_update_prompt
-    # may still exist as shell functions.  Emit a one-time cleanup snippet.
-    local _needs_cleanup=false
-    if declare -f handq &>/dev/null 2>&1; then _needs_cleanup=true; fi
-    if declare -f _handq_update_prompt &>/dev/null 2>&1; then _needs_cleanup=true; fi
-    if [[ -n "${HANDQ_PS1_PATCHED:-}" ]]; then _needs_cleanup=true; fi
-
-    if [[ "$_needs_cleanup" == true ]]; then
-        warn "Legacy HandQ shell functions detected in current session."
-        info "Run the following to clean up this session (one-time):"
-        printf "\n    ${C_CYAN}eval \"\$(handq_setup_cleanup)\"${C_RESET}\n\n"
-        info "Or paste directly:"
-        printf "    ${C_CYAN}unset -f handq _handq_update_prompt _handq_capture_check _handq_install_prompt hi 2>/dev/null; unset HANDQ_PS1_PATCHED HANDQ_PROMPT 2>/dev/null${C_RESET}\n\n"
-    fi
-
-    # Ensure it's on PATH — write export line into shell profile if needed,
-    # and emit the export to stdout so eval applies it to the current session.
+    # ── 4. Ensure the install dir is on PATH ─────────────────────────────────
     if echo ":${PATH}:" | grep -q ":${target_dir}:"; then
         ok "${target_dir} is already on PATH"
     else
-        # Detect the user's shell profile file and correct syntax
         local profile_file="" export_line="" source_cmd=""
         local shell_name
         shell_name="$(basename "${SHELL:-bash}")"
@@ -463,78 +454,6 @@ DISPATCHER
     INSTALLED_CMD_PATH="$cmd_path"
     INSTALLED_HOST_CONF_PATH="$host_conf"
     _EXEC_LINE="$exec_line"
-    _PROMPT_STATE_LINE="$prompt_state_line"
-    return 0
-}
-
-# =============================================================================
-# configure_tmux — insert HandQ state into tmux status bar
-# =============================================================================
-configure_tmux() {
-    [[ "$TMUX_AVAILABLE" == false ]] && return 0
-
-    print_step "Configuring HandQ tmux (isolated config)"
-
-    local handq_dir="${SCRIPT_DIR}/.handq/${USER}@${HOSTNAME_SHORT}"
-    local handq_conf="${handq_dir}/tmux.conf"
-    local handq_status_script="${handq_dir}/tmux_status.py"
-    mkdir -p "$handq_dir"
-
-    # ── Remove any legacy HandQ block from ~/.tmux.conf ───────────────────
-    local user_tmux_conf="${HOME}/.tmux.conf"
-    if [[ -f "$user_tmux_conf" ]] && grep -q "HANDQ_TMUX_STATUS" "$user_tmux_conf" 2>/dev/null; then
-        sed -i '/HANDQ_TMUX_STATUS/,/End HandQ/d' "$user_tmux_conf"
-        # Also clean up any leftover HandQ-managed lines
-        sed -i '/^\s*set-environment -gu PS[1234]/d' "$user_tmux_conf"
-        ok "Removed legacy HandQ block from ${user_tmux_conf}"
-    fi
-
-    # ── Ensure tmux_status.py placeholder exists ──────────────────────────
-    if [[ ! -f "$handq_status_script" ]]; then
-        printf '# HandQ tmux status placeholder — replaced on first handq run\n' \
-            > "$handq_status_script"
-        ok "Created tmux_status.py placeholder: ${handq_status_script}"
-    fi
-
-    local python_exe
-    python_exe="$(_resolve_python_exe)"
-    [[ -z "$python_exe" ]] && python_exe="python3"
-
-    local status_left="#(${python_exe} ${handq_status_script}) #[default] ◈ #S "
-
-    # ── Write isolated HandQ tmux config ─────────────────────────────────
-    {
-        printf '# HandQ isolated tmux config — generated by handq_setup.sh\n'
-        printf '# This file is loaded via -f and does NOT affect ~/.tmux.conf\n'
-        printf '\n'
-        printf 'set -g status-left "%s"\n' "${status_left}"
-        printf 'set -g status-left-length 60\n'
-        printf 'set -g status-right "#[dim]Alt+↑↓ scroll  #[default]%%H:%%M %%d-%%b"\n'
-        printf 'set -g status-interval 1\n'
-        printf 'set -g status-style bg=default\n'
-        printf '\n'
-        printf '# Alt+Up/Down: scroll without stealing focus\n'
-        printf 'bind-key -n M-Up copy-mode \; send-keys -X scroll-up\n'
-        printf 'bind-key -n M-Down send-keys -X scroll-down\n'
-        printf '\n'
-        printf '# Remove PS1/PS2 from tmux environment (prevents zsh startup errors)\n'
-        printf 'set-environment -gu PS1\n'
-        printf 'set-environment -gu PS2\n'
-        printf 'set-environment -gu PS3\n'
-        printf 'set-environment -gu PS4\n'
-    } > "$handq_conf"
-
-    ok "HandQ tmux config written: ${handq_conf}"
-    info "This config is loaded only by the HandQ tmux server (isolated from your ~/.tmux.conf)"
-
-    # ── Apply to running HandQ tmux server if active ──────────────────────
-    local _handq_sock="handq-${USER}@${HOSTNAME_SHORT}"
-    if tmux -L "$_handq_sock" has-session 2>/dev/null; then
-        tmux -L "$_handq_sock" source-file "$handq_conf" 2>/dev/null \
-            && ok "Applied to running HandQ tmux server" \
-            || warn "Could not apply to running HandQ tmux server (will apply on next start)"
-    fi
-
     return 0
 }
 
@@ -547,15 +466,12 @@ _t_fail() { _T_FAIL=$((_T_FAIL+1)); err "FAIL  $*"; }
 _t_skip() { _T_SKIP=$((_T_SKIP+1)); warn "SKIP  $*"; }
 
 assert_eq()         { [[ "$2" == "$3" ]] && _t_pass "$1" || _t_fail "$1  (got: $(printf '%q' "$2")  want: $(printf '%q' "$3"))"; }
-assert_empty()      { [[ -z "$2" ]]      && _t_pass "$1" || _t_fail "$1  (expected empty, got: $(printf '%q' "$2"))"; }
-assert_nonempty()   { [[ -n "$2" ]]      && _t_pass "$1" || _t_fail "$1  (expected non-empty)"; }
 assert_file_exists(){ [[ -f "$2" ]]      && _t_pass "$1" || _t_fail "$1  (file not found: $2)"; }
-assert_file_absent(){ [[ ! -f "$2" ]]    && _t_pass "$1" || _t_fail "$1  (file should not exist: $2)"; }
 
 _resolve_exec_line() {
-    local py_main="${SCRIPT_DIR}/handq.py"
-    local bin_main="${SCRIPT_DIR}/handq.bin"
-    local standalone_bin="${SCRIPT_DIR}/handq.dist/handq.bin"
+    local py_main="${SCRIPT_DIR}/handq_linux.py"
+    local bin_main="${SCRIPT_DIR}/handq_linux.bin"
+    local standalone_bin="${SCRIPT_DIR}/handq_linux.dist/handq_linux.bin"
     if [[ -f "$standalone_bin" && -x "$standalone_bin" ]]; then
         echo "\"${standalone_bin}\" --config \"${CONFIG_PATH}\""
     elif [[ -f "$bin_main" && -x "$bin_main" ]]; then
@@ -569,31 +485,10 @@ _resolve_exec_line() {
     fi
 }
 
-_write_test_state() {
-    local status="${1:-}" active="${2:-true}"
-    mkdir -p "${SCRIPT_DIR}/.handq/${USER}@${HOSTNAME_SHORT}"
-    if [[ -n "$status" ]]; then
-        printf '{"handq_active":%s,"task_status":"%s","session_id":"test"}\n' "$active" "$status" > "${SCRIPT_DIR}/.handq/${USER}@${HOSTNAME_SHORT}/state.json"
-    else
-        printf '{"handq_active":%s,"session_id":"test"}\n' "$active" > "${SCRIPT_DIR}/.handq/${USER}@${HOSTNAME_SHORT}/state.json"
-    fi
-}
-
-_clean_handq_state() {
-    rm -f "${SCRIPT_DIR}/.handq/${USER}@${HOSTNAME_SHORT}/state.json" "${SCRIPT_DIR}/.handq/${USER}@${HOSTNAME_SHORT}/handq.pid" \
-          "${SCRIPT_DIR}/.handq/${USER}@${HOSTNAME_SHORT}/prompt_daemon.pid" \
-          "${SCRIPT_DIR}/.handq/${USER}@${HOSTNAME_SHORT}/confirmation_request.json" \
-          "${SCRIPT_DIR}/.handq/${USER}@${HOSTNAME_SHORT}/confirmation_response.txt"
-    rm -f "${SCRIPT_DIR}/.handq/${USER}@${HOSTNAME_SHORT}/messages"/*.txt 2>/dev/null || true
-}
-
-# ── Suite A: static checks ────────────────────────────────────────────────────
+# ── Suite A: static install checks ─────────────────────────────────────────────
 _suite_a_static() {
     print_step "Suite A — Static checks"
 
-    # Check the actually-installed wrapper written by install_command.
-    # Prefer INSTALLED_CMD_PATH (set by install_command) over command -v,
-    # which may find a stale copy in a different PATH directory.
     local wrapper
     if [[ -n "${INSTALLED_CMD_PATH:-}" ]]; then
         wrapper="$INSTALLED_CMD_PATH"
@@ -605,7 +500,7 @@ _suite_a_static() {
     assert_file_exists "A1: dispatcher file exists" "$wrapper"
     [[ -x "$wrapper" ]] && _t_pass "A1: dispatcher is executable" || _t_fail "A1: dispatcher not executable"
 
-    # A2/A3: config path and main executable are in the per-host config, not the dispatcher
+    # A2/A3: config path + main executable live in the per-host config.
     local host_conf="${INSTALLED_HOST_CONF_PATH:-${HOST_CONF_DIR}/${HOSTNAME_SHORT}}"
     assert_file_exists "A2a: per-host config exists" "$host_conf"
 
@@ -619,30 +514,35 @@ _suite_a_static() {
         _t_fail "A2: host config missing --config argument"
     fi
 
-    local py_main="${SCRIPT_DIR}/handq.py"
-    local bin_main="${SCRIPT_DIR}/handq.bin"
-    local standalone_bin="${SCRIPT_DIR}/handq.dist/handq.bin"
+    local py_main="${SCRIPT_DIR}/handq_linux.py"
+    local bin_main="${SCRIPT_DIR}/handq_linux.bin"
+    local standalone_bin="${SCRIPT_DIR}/handq_linux.dist/handq_linux.bin"
     { grep -qF "$py_main" "$host_conf" 2>/dev/null || grep -qF "$bin_main" "$host_conf" 2>/dev/null \
       || grep -qF "$standalone_bin" "$host_conf" 2>/dev/null; } \
-        && _t_pass "A3: host config references main executable" \
-        || _t_fail "A3: host config missing main executable"
+        && _t_pass "A3: host config references the handq_linux entry point" \
+        || _t_fail "A3: host config missing the handq_linux entry point"
 
     assert_file_exists "A4: config file exists" "$CONFIG_PATH"
 
-    if [[ -f "$py_main" ]]; then
-        command -v python3 &>/dev/null && _t_pass "A5: python3 available" || _t_fail "A5: python3 not found"
+    # A5: aliases resolve to the dispatcher.
+    local _alias_dir; _alias_dir="$(dirname "$wrapper")"
+    for alias_name in "${ALIASES[@]}"; do
+        local alias_path="${_alias_dir}/${alias_name}"
+        if [[ -L "$alias_path" || -f "$alias_path" ]]; then
+            _t_pass "A5: alias '${alias_name}' installed"
+        else
+            _t_fail "A5: alias '${alias_name}' missing"
+        fi
+    done
+
+    # A6: dispatcher must be a clean launcher — no PS1/PROMPT_COMMAND/tmux.
+    if grep -qE "PROMPT_COMMAND|PS1|prompt-state|tmux" "$wrapper" 2>/dev/null; then
+        _t_fail "A6: dispatcher contains legacy shell/tmux integration"
     else
-        _t_skip "A5: python3 check (using binary)"
+        _t_pass "A6: dispatcher is a clean launcher (no shell/tmux integration)"
     fi
 
-    # A6: wrapper must NOT contain PROMPT_COMMAND or PS1 patching
-    if grep -qE "PROMPT_COMMAND|PS1|source.*handq" "$wrapper" 2>/dev/null; then
-        _t_fail "A6: wrapper contains shell integration (should be clean executable)"
-    else
-        _t_pass "A6: wrapper is a clean executable (no shell integration)"
-    fi
-
-    # A7: shell rc files must NOT source handq (legacy shell integration)
+    # A7: shell rc files must NOT source handq (legacy auto-attach).
     local _found_legacy=false
     for _rc in "${HOME}/.bashrc" "${HOME}/.tcshrc" "${HOME}/.cshrc.local" "${HOME}/.zshrc"; do
         if [[ -f "$_rc" ]] && grep -qE "source.*handq|\..*handq" "$_rc" 2>/dev/null; then
@@ -653,123 +553,46 @@ _suite_a_static() {
     [[ "$_found_legacy" == false ]] && _t_pass "A7: no legacy handq source in shell rc files"
 }
 
-# ── Suite B: state machine ────────────────────────────────────────────────────
-_suite_b_state_machine() {
-    print_step "Suite B — State machine"
+# ── Suite B: console-client smoke ──────────────────────────────────────────────
+# handq_linux has no --prompt-state / tmux state machine (the old Suites B/C);
+# instead we smoke-test that the resolved entry point actually launches.
+_suite_b_smoke() {
+    print_step "Suite B — Console-client smoke"
 
     local exec_line; exec_line="$(_resolve_exec_line)"
-    [[ -z "$exec_line" ]] && { _t_skip "B: all tests (handq.py not found)"; return; }
+    [[ -z "$exec_line" ]] && { _t_skip "B: all tests (handq_linux entry not found / no python)"; return; }
 
-    local conf_req="${SCRIPT_DIR}/.handq/${USER}@${HOSTNAME_SHORT}/confirmation_request.json"
-    local out
-
-    _clean_handq_state
-    out="$(eval "$exec_line --prompt-state" 2>/dev/null)"
-    assert_empty "B1: state0 → prompt-state empty" "$out"
-
-    _clean_handq_state; _write_test_state ""
-    out="$(eval "$exec_line --prompt-state" 2>/dev/null)"
-    assert_eq "B2: state1 → [HandQ]" "$out" "[HandQ]"
-
-    _clean_handq_state; _write_test_state "running"
-    out="$(eval "$exec_line --prompt-state" 2>/dev/null)"
-    assert_eq "B3: state2 → [HandQ Running]" "$out" "[HandQ Running]"
-
-    _clean_handq_state; _write_test_state "completed"
-    out="$(eval "$exec_line --prompt-state" 2>/dev/null)"
-    assert_eq "B4: state3 → [HandQ Complete]" "$out" "[HandQ Complete]"
-
-    _clean_handq_state; _write_test_state "running"
-    echo '{"type":"tool","tool_name":"bash"}' > "$conf_req"
-    out="$(eval "$exec_line --prompt-state" 2>/dev/null)"
-    assert_eq "B5: state4 → [HandQ Confirm?]" "$out" "[HandQ Confirm?]"
-    rm -f "$conf_req"
-
-    _clean_handq_state; _write_test_state "running" "false"
-    out="$(eval "$exec_line --prompt-state" 2>/dev/null)"
-    assert_empty "B6: handq_active=false → state0 empty" "$out"
-
-    _clean_handq_state
-    echo '{"type":"tool","tool_name":"bash"}' > "$conf_req"
-    eval "$exec_line --new" >/dev/null 2>&1 || true
-    out="$(eval "$exec_line --prompt-state" 2>/dev/null)"
-    assert_eq "B7: --new → state1 [HandQ]" "$out" "[HandQ]"
-    assert_file_absent "B7: --new removes stale confirmation_request" "$conf_req"
-
-    _clean_handq_state; _write_test_state "running"
-    eval "$exec_line --exit" >/dev/null 2>&1 || true
-    out="$(eval "$exec_line --prompt-state" 2>/dev/null)"
-    assert_empty "B8: --exit → state0 empty" "$out"
-
-    _clean_handq_state
-}
-
-# ── Suite C: tmux integration ─────────────────────────────────────────────────
-_suite_c_tmux() {
-    print_step "Suite C — tmux integration"
-
-    if [[ "$TMUX_AVAILABLE" == false ]]; then
-        _t_skip "C: all tmux tests (tmux not installed)"
-        return
+    # B1: --help launches and prints usage — proves the binary/script is intact
+    # (no missing shared objects, argparse loads, console path imports cleanly).
+    local help_out help_rc
+    help_out="$(eval "$exec_line --help" 2>&1)"; help_rc=$?
+    if [[ $help_rc -eq 0 && "$help_out" == *handq_linux* ]]; then
+        _t_pass "B1: --help launches and prints usage"
+    else
+        _t_fail "B1: --help failed (rc=${help_rc})"
     fi
 
-    local tmux_conf="${SCRIPT_DIR}/.handq/${USER}@${HOSTNAME_SHORT}/tmux.conf"
-
-    # C1: HandQ isolated tmux.conf exists
-    [[ -f "$tmux_conf" ]] \
-        && _t_pass "C1: HandQ isolated tmux.conf exists" \
-        || _t_fail "C1: HandQ isolated tmux.conf missing (run handq_setup.sh)"
-
-    # C2: status-right uses %H:%M
-    grep -qE "status-right.*%H:%M" "$tmux_conf" 2>/dev/null \
-        && _t_pass "C2: status-right has clean time format" \
-        || _t_fail "C2: status-right missing time format"
-
-    # C3: status-interval is set to 1 (spinner animation)
-    grep -qE "status-interval\s+1" "$tmux_conf" 2>/dev/null \
-        && _t_pass "C3: status-interval 1 (spinner animation)" \
-        || _t_fail "C3: status-interval not set to 1"
-
-    # C4: prompt-state returns correct value for state1
-    local exec_line; exec_line="$(_resolve_exec_line)"
-    if [[ -n "$exec_line" ]]; then
-        _clean_handq_state; _write_test_state ""
-        local out; out="$(eval "$exec_line --prompt-state" 2>/dev/null)"
-        assert_eq "C4: prompt-state output for state1" "$out" "[HandQ]"
-        _clean_handq_state
+    # B2: --status runs without crashing. With no daemon up it reports
+    # "daemon not running" (rc 1); with one up it prints state.json (rc 0).
+    # Either is fine — we only guard against a crash (segfault / missing .so).
+    local st_out st_rc
+    st_out="$(eval "$exec_line --status" 2>&1)"; st_rc=$?
+    if [[ $st_rc -eq 0 || $st_rc -eq 1 ]]; then
+        _t_pass "B2: --status runs cleanly (rc=${st_rc})"
     else
-        _t_skip "C4: prompt-state test (handq.py not found)"
-    fi
-
-    # C5: handq tmux session has session-closed hook set (prevents orphan sessions)
-    local _handq_user="${USER:-default}@${HOSTNAME_SHORT}"
-    local _handq_sock="handq-${_handq_user}"
-    if tmux -L "$_handq_sock" has-session -t "handq-${_handq_user}" 2>/dev/null; then
-        local hook_val
-        hook_val="$(tmux -L "$_handq_sock" show-hooks -t "handq-${_handq_user}" 2>/dev/null | grep session-closed || true)"
-        if [[ -n "$hook_val" ]]; then
-            _t_pass "C5: handq tmux session has session-closed hook"
-        else
-            _t_fail "C5: handq tmux session missing session-closed hook — orphan session risk"
-        fi
-    else
-        _t_skip "C5: session-closed hook (no handq session running)"
+        _t_fail "B2: --status crashed (rc=${st_rc}): ${st_out}"
     fi
 }
 
 run_test_mode() {
     print_step "Test suite"
-    TMUX_AVAILABLE=false
-    command -v tmux &>/dev/null && TMUX_AVAILABLE=true
-
-    local exec_line; exec_line="$(_resolve_exec_line)"
-    [[ -n "$exec_line" ]] && { _EXEC_LINE="$exec_line"; _PROMPT_STATE_LINE="$exec_line --prompt-state"; }
+    # Tests intentionally probe non-zero exit codes (e.g. --status with no
+    # daemon), so relax errexit for the duration.
+    set +e
 
     _suite_a_static
     echo ""
-    _suite_b_state_machine
-    echo ""
-    _suite_c_tmux
+    _suite_b_smoke
 
     local total=$((_T_PASS + _T_FAIL + _T_SKIP))
     echo ""
@@ -814,20 +637,18 @@ main() {
         die "Command installation failed."
     fi
 
-    configure_tmux
-
     echo ""
     printf "${C_BOLD}══════════════════════════════════════════════════════════════${C_RESET}\n"
-    printf "  ${C_BOLD}HandQ Setup — Complete${C_RESET}\n"
+    printf "  ${C_BOLD}HandQ (Linux) Setup — Complete${C_RESET}\n"
     printf "${C_BOLD}══════════════════════════════════════════════════════════════${C_RESET}\n"
     printf "  Script dir : ${SCRIPT_DIR}\n"
     printf "  Config     : ${CONFIG_PATH}\n"
-    printf "  Executable : ${INSTALLED_CMD_PATH:-<not installed>}\n"
-    printf "  tmux       : %s\n" "$([[ "$TMUX_AVAILABLE" == true ]] && echo "configured" || echo "not available")"
+    printf "  Command    : ${INSTALLED_CMD_PATH:-<not installed>}  (aliases: ${ALIASES[*]})\n"
+    printf "  IPC dir    : ${HANDQ_DIR}\n"
     printf "${C_BOLD}══════════════════════════════════════════════════════════════${C_RESET}\n"
     echo ""
-    info "Run 'handq' from any directory to start."
-    [[ "$TMUX_AVAILABLE" == true ]] && info "HandQ state appears in your tmux status bar."
+    info "Run 'handq_linux' (or 'handq' / 'hi') from any directory to open the console."
+    info "The Windows HandQ controls this host via SSH and wakes the daemon automatically."
     echo ""
 
     run_test_mode
@@ -835,7 +656,7 @@ main() {
 
     echo ""
     if [[ $test_rc -eq 0 ]]; then
-        info "Installation verified — run 'handq' to start."
+        info "Installation verified — run 'handq_linux' to start."
     else
         warn "Installation complete but some tests failed — check output above."
     fi

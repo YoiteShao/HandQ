@@ -57,7 +57,12 @@ INSTALL_DIR =
     spillover\                         PersonalityMonitor 的 ring 溢出兜底
       m<idx>_<ts>_<seq>.jpg            JPEG 字节（quality=85，~300KB/帧）
       m<idx>_<ts>_<seq>.meta.json      元数据（title/app/tier/recent_texts 快照）
-  browser_profile\screenshots\       browser_tool 截图（vision §1.6）
+  browser_profile\                   browser_tool 状态根（多 session 模型 §1.7）
+    sessions\                          per-flow Chromium user-data-dir
+      <sid>\                           每个 FlowControllerV2 一个独立 profile
+                                       （cookies / 登录 / 扩展状态独立；session 关闭后保留为
+                                        孤儿目录，未来加清理任务）
+    screenshots\                       browser_tool 截图（vision §1.6，三级分级共享 scratch）
   desktop_shots\                     desktop_tool 截图（vision §1.6）
   email_attachments\                 email_tool 附件沙箱
   logs\                              ← 框架日志（跨 session），每次 launch 一个目录
@@ -98,6 +103,7 @@ INSTALL_DIR =
 | Session 历史 | `%USERPROFILE%\HandQ\History\<id>\` | 否 | 是 | 跨升级，可手动清理 |
 | Per-session engine log | `%USERPROFILE%\HandQ\History\<id>\handq-engine.log` | 否 | 是 | 跟随 session |
 | Per-session 执行轨迹 | `%USERPROFILE%\HandQ\History\<id>\session_<TS>_persiste.log` | 否 | 是 | 跟随 session（ExecutionRecorder 写） |
+| Per-session 浏览器 profile | `%USERPROFILE%\HandQ\browser_profile\sessions\<sid>\` | 否 | 是 | 每个 flow 独立的 Chromium user-data-dir；详见 §1.7 多 session 模型 |
 | LTM SQLite | `%USERPROFILE%\HandQ\personality\memory.db` | 否 | 是 | 跨升级；详见 LTM 设计文档 |
 | 长 /remember 镜像 | `%USERPROFILE%\HandQ\personality\memory_notes\<id>.md` | 否 | 是 | 跨升级；用户可编辑器打开 |
 | Ring 溢出 buffer | `%USERPROFILE%\HandQ\personality\spillover\` | 否 | 是 | RAM ring 满 / 监视器断开时落盘；OCR 完立删；启动时清理 >24h 残留 |
@@ -186,6 +192,39 @@ screenshots:
 > `activity` 分级**不**在 yaml 里 —— 它是 activity_monitor 的纯 debug backstop（正常路径上 OCR 完立刻 unlink），常量定义于 `src/infrastructure/long_term_memory/_constants.py` 的 `ACTIVITY_SCREENSHOT_MAX_FILES` / `ACTIVITY_SCREENSHOT_MAX_AGE_DAYS`。
 
 数值刻意取保守值。要 bump 上限请有具体证据（看到 agent 因 retention 丢上下文）。
+
+---
+
+## 1.7 多 session 并发模型
+
+单个 `handq-bridge` 进程承载 N 个并发的 `FlowControllerV2` 实例，以
+`session_id` 为键路由 IPC。Renderer 把每个 session 渲染为一张永远可见的
+卡片，用户可像同时打开多个 application 实例一样并发使用。
+
+**关键不变式**：
+
+| 维度 | 模型 | 实现 |
+|------|------|------|
+| Agent 推理、文件、SSH、终端、shell | **真并发** | 每 session 独立 FlowControllerV2 + SessionContext |
+| **浏览器** | **真并发** | 每 session 独立 Chromium 进程 + 独立 user-data-dir（`browser_profile\sessions\<sid>\`） |
+| **桌面（鼠标键盘）** | **任务级 FIFO 排队** | 物理约束：一块屏幕不能两个 session 同时驱动输入。orchestrator 完成 task 时 `_forward_state_to_ui("idle")` 释放 `_GLOBAL_DESKTOP_OWNERSHIP_LOCK`，等待中的 session 立即获取 |
+| **LTM / Scheduler / PersonalityMonitor** | **进程级单例** | 共享知识库 / 调度 / 活动监控；并发安全靠各自的 lock |
+| **PersonalityMonitor pause** | **直接查询 `_GLOBAL_DESKTOP_OWNER`** | 不用 refcount，无漂移；任何 session 持有桌面时自动 pause，全部释放时自动 resume |
+
+**生命周期**：
+
+- 创建：renderer 生成 UUID → 发 `request` 带 session_id → bridge `_ensure_flow`
+  构建 per-sid 状态（flow / services / UI / generation 计数 / engine.log handler）
+- 销毁：renderer 点 X 发 `close_session` → bridge `_do_close_session` 抢占
+  in-flight request → flow.destroy → ctx.close → 释放 desktop 全局锁
+- 关闭最后一个 session：renderer 自动 `createSession()`，用户永不处于
+  "无 session" 状态
+
+**调度器与 session 解耦**：cron 任务触发时新建 `sched-{uuid4().hex[:12]}`
+session 派发，与 renderer-driven session 完全等价并发。
+
+**完整设计**：见 `MULTI_SESSION_DESIGN.md`（IPC 协议、并发派发、跨会话
+资源协调、UI 模型、不变式速查、测试覆盖）。
 
 ---
 
@@ -291,15 +330,23 @@ HandQ/                              ← 仓库根，也是直接运行时的 INS
 | 用户根目录 | `bridge_main.py` | `_user_handq_root` |
 | Bridge 配置 env 注入 | `bridge_main.py` | `os.environ["HANDQ_CONFIG"]` |
 | 升级合并（PRESERVE/OVERRIDE） | `bridge_main.py` | `_PRESERVE_PATHS`、`_merge_config`、`_merge_user_config_with_seed` |
+| Personality desktop_query 注入 | `bridge_main.py` | `_get_desktop_query`（lazy import 桥到 desktop_tool） |
 | Electron bridge 启动 | `electron/main.js` | `resolveBridgeLaunch()` |
 | Electron 日志目录路由 | `electron/main.js` | `LOG_BASE`、`platformLogBase()` |
 | Electron 更新检查 | `electron/updater.js` | `checkForUpdates()` |
 | Bridge 配置消费 | `src/bridge/stdio_bridge.py` | `run()` 读 `HANDQ_CONFIG` |
+| 并发派发 | `src/bridge/stdio_bridge.py` | `_dispatch`、`_session_dispatch_locks`、`_inflight_by_sid`、`_cancel_inflight`、`_drain_inflight` |
+| 会话生命周期 | `src/bridge/stdio_bridge.py` | `_ensure_flow`、`_do_close_session`、`_do_shutdown`、`_force_release_session_locks` |
 | Session 目录分配 | `src/bridge/stdio_bridge.py` | `_allocate_session_dir`、`_session_history_root` |
 | YAML 读写 | `src/bridge/stdio_bridge.py` | `_load_config_dict`、`_save_config_dict` |
 | Git hook 安装 / 卸载 | `src/bridge/stdio_bridge.py` | `_install_post_commit_hook`、`_uninstall_post_commit_hook` |
 | Hook 脚本 | `scripts/handq_post_commit.py` | `_memory_db_path`、`_insert_candidate` |
-| Vision LLM 客户端 | `src/infrastructure/vision/llm.py` | `VisionClient`、`get_vision_client`、`flush_vision_client` |
+| 桌面跨会话所有权 | `src/tools/desktop_tool.py` | `_GLOBAL_DESKTOP_OWNERSHIP_LOCK`、`is_any_session_holding_desktop`、`DesktopState.acquire_global_takeover` / `_release_global_takeover_if_owned` / `reset_takeover_state` |
+| 浏览器 per-session profile | `src/infrastructure/browser_paths.py` | `user_browser_profile_dir(sid)`、`_safe_sid` |
+| 浏览器 holder | `src/tools/browser_tool.py` | `BrowserSessionHolder(session_id=...)` |
+| Personality 查询模型 | `src/infrastructure/personality/service.py` | `PersonalityMonitor(desktop_query=...)`、`_paused`、`pause_by_user` / `resume_by_user` |
+| Idle 桌面释放钩子 | `src/controller_v2/flow_controller.py` | `FlowControllerV2._forward_state_to_ui("idle")` |
+| Vision LLM 客户端 | `src/infrastructure/vision/llm.py` | `VisionClient`、`get_vision_client`、`_BUILD_LOCK`、`flush_vision_client` |
 | Vision 本地 OCR | `src/infrastructure/vision/ocr.py` | `LocalOCR`（RapidOCR）、`get_local_ocr` |
 | Vision 截图分级 | `src/infrastructure/vision/storage.py` | `ScreenshotStore` |
 
@@ -517,7 +564,7 @@ Linux HandQ 不需要委托给自己。
 
 | 文件 | 职责 |
 |---|---|
-| `src/tools/remote_handq_tool.py` | RemoteHandQTool — SSH 通信层（6 actions） |
+| `src/tools/remote_handq_tool.py` | RemoteHandQTool — SSH 通信层（8 actions：discover/submit_goal/send_message/get_status/get_result/new_session/interrupt/exit_handq） |
 | `src/infrastructure/remote_handq_setup.py` | RemoteHandQContextProvider — 凭据建立 + HANDQ_DIR 发现 |
 | `src/infrastructure/memory.py` | per-host 缓存（`_remote_handq_contexts`） |
 | `src/tools/tool_registry.py` | on-demand 注册（Windows-only, line ~954） |
@@ -567,3 +614,5 @@ python -m pytest tests/v2/ -m live --timeout=600 -v
 | 2 | 渲染层"手动检查更新"按钮（`updater.checkForUpdates` 已就绪，仅缺 UI 触发） | ⬜ |
 | 3 | `handq_config.yaml` schema 校验（YAML 写坏时给用户友好提示） | ⬜ |
 | 4 | Bridge 启动失败时的用户可见诊断 | ✅ §5.8 |
+| 5 | 多 session 并发模型 | ✅ §1.7 + `MULTI_SESSION_DESIGN.md` |
+| 6 | 孤儿 browser_profile\sessions\<sid>\ 目录清理（用户关 session 后留下） | ⬜（孤儿目录不影响运行，未来加后台清理） |

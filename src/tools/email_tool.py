@@ -449,6 +449,58 @@ def _sync_list_folders(params: Dict[str, Any]) -> Dict[str, Any]:
     return {"folders": folders}
 
 
+def _sync_status(params: Dict[str, Any]) -> Dict[str, Any]:
+    """Zero-friction readiness probe — open Outlook, resolve Inbox, count
+    today's messages.
+
+    Returns a small payload the LLM can use as a "the tool works" signal
+    before issuing a full ``list_messages`` call. Counting is bounded so
+    a 50k-message inbox does not stall the call: iterate newest-first and
+    stop once we walk past today's start.
+    """
+    app = _get_app()
+    namespace = app.GetNamespace("MAPI")
+    inbox = _resolve_folder(namespace, "Inbox")
+
+    today_start = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    today_count = 0
+    cap = 500  # newest-first walk; an inbox with >500 messages today is implausible
+    items = inbox.Items
+    try:
+        items.Sort("[ReceivedTime]", True)  # newest first
+    except Exception:
+        pass
+    seen = 0
+    for item in items:
+        seen += 1
+        if seen > cap:
+            break
+        try:
+            received = item.ReceivedTime
+            if received is None:
+                continue
+            received_dt = datetime(
+                received.year, received.month, received.day,
+                received.hour, received.minute, received.second,
+            )
+        except Exception:
+            continue
+        if received_dt < today_start:
+            break
+        today_count += 1
+
+    return {
+        "outlook_ready": True,
+        "default_folder": "Inbox",
+        "today_start": today_start.isoformat(),
+        "today_count": today_count,
+        "next_step": (
+            "Call action='list_messages' with since='today' to retrieve "
+            "today's messages."
+        ),
+    }
+
+
 def _build_dasl_prefilter(
     since_dt: Optional[datetime],
     unread_only: bool,
@@ -585,6 +637,43 @@ def _scan_folder_messages(
     return out, hit_cap
 
 
+def _parse_since(value: Any) -> Optional[datetime]:
+    """Resolve ``since`` to a datetime; accepts ISO strings and magic words.
+
+    Magic values (case-insensitive):
+      - ``today`` / ``now`` — start of today, local time
+      - ``yesterday`` — start of yesterday
+      - ``24h`` / ``1d`` / ``last_24h`` — 24 hours ago
+      - ``this_week`` / ``week`` — start of the current ISO week (Monday)
+
+    Returns ``None`` for empty / unparseable input so callers can apply their
+    own default. The magic-word handling exists so the LLM does not have to
+    compute ISO timestamps for the common "emails since today" case — which
+    was the failure mode in session 20260618-234346 where the agent skipped
+    the email tool entirely rather than synthesise an ISO string.
+    """
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    low = s.lower()
+    now = datetime.now()
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if low in ("today", "now"):
+        return midnight
+    if low == "yesterday":
+        return midnight - timedelta(days=1)
+    if low in ("24h", "1d", "last_24h"):
+        return now - timedelta(hours=24)
+    if low in ("this_week", "week"):
+        return midnight - timedelta(days=now.weekday())
+    try:
+        return datetime.fromisoformat(s.replace("Z", ""))
+    except (ValueError, TypeError):
+        return None
+
+
 def _sync_list_messages(params: Dict[str, Any]) -> Dict[str, Any]:
     app = _get_app()
     namespace = app.GetNamespace("MAPI")
@@ -603,12 +692,7 @@ def _sync_list_messages(params: Dict[str, Any]) -> Dict[str, Any]:
 
     root_folder = _resolve_folder(namespace, folder_name)
 
-    since_dt: Optional[datetime] = None
-    if params.get("since"):
-        try:
-            since_dt = datetime.fromisoformat(str(params["since"]).replace("Z", ""))
-        except (ValueError, TypeError):
-            pass
+    since_dt: Optional[datetime] = _parse_since(params.get("since"))
 
     sender_filter = (params.get("sender_contains") or "").lower()
     subject_filter = (params.get("subject_contains") or "").lower()
@@ -824,13 +908,7 @@ def _sync_search(params: Dict[str, Any]) -> Dict[str, Any]:
     # is not responding". 365d covers the vast majority of "find recent
     # mail from X" queries; an agent that needs older mail must pass
     # `since` explicitly.
-    since_str = params.get("since")
-    since_dt: Optional[datetime] = None
-    if since_str:
-        try:
-            since_dt = datetime.fromisoformat(str(since_str).replace("Z", ""))
-        except (ValueError, TypeError):
-            since_dt = None
+    since_dt: Optional[datetime] = _parse_since(params.get("since"))
     if since_dt is None:
         since_dt = datetime.now() - timedelta(days=365)
     dasl_parts.append(
@@ -1187,11 +1265,15 @@ class EmailTool(BaseTool):
             "action": {
                 "type": "string",
                 "description": (
-                    "Email action. One of: list_folders, list_messages, "
+                    "Email action. Start with 'status' if you have not used "
+                    "this tool yet — it confirms Outlook is reachable and "
+                    "returns today's inbox count, with no required parameters. "
+                    "One of: status, list_folders, list_messages, "
                     "read_message, search, mark_read, mark_unread, "
                     "download_attachment, download_all_attachments."
                 ),
                 "enum": [
+                    "status",
                     "list_folders",
                     "list_messages",
                     "read_message",
@@ -1255,8 +1337,13 @@ class EmailTool(BaseTool):
                 "type": "string",
                 "description": (
                     "[list_messages / search] Only messages received on or "
-                    "after this date. ISO format: '2026-01-15' or "
-                    "'2026-01-15T09:00:00'."
+                    "after this point in time. Accepts magic words "
+                    "(case-insensitive): 'today' / 'now' (start of today), "
+                    "'yesterday', '24h' / '1d' (24 hours ago), 'this_week' "
+                    "(start of current ISO week). Or ISO format: "
+                    "'2026-01-15' / '2026-01-15T09:00:00'. Prefer the magic "
+                    "words for common cases — they are local-time relative "
+                    "and do not require you to compute timestamps."
                 ),
             },
             "sender_contains": {
@@ -1424,6 +1511,7 @@ class EmailTool(BaseTool):
             return self._fail(params, start, "email requires 'action' parameter.")
 
         dispatch = {
+            "status":                   self._action_status,
             "list_folders":             self._action_list_folders,
             "list_messages":            self._action_list_messages,
             "read_message":             self._action_read_message,
@@ -1445,6 +1533,14 @@ class EmailTool(BaseTool):
             return await handler(params, start, **kwargs)
 
     # ── Action handlers ───────────────────────────────────────────────────────
+
+    async def _action_status(self, params, start, **kwargs):
+        loop = asyncio.get_running_loop()
+        try:
+            data = await loop.run_in_executor(_outlook_executor, _sync_status, kwargs)
+        except Exception as exc:
+            return self._fail(params, start, f"status: {exc}")
+        return self._ok(params, start, data)
 
     async def _action_list_folders(self, params, start, **kwargs):
         loop = asyncio.get_running_loop()
@@ -1571,6 +1667,13 @@ class EmailTool(BaseTool):
         )
         run_params = dict(kwargs)
         run_params["_sandbox"] = os.path.expandvars(sandbox_raw)
+        # Anchor a relative output_dir to the per-session workspace before the
+        # sync helper's _safe_attachment_path runs Path(output_dir).resolve()
+        # (which otherwise resolves against the process cwd — no longer the
+        # session workspace; see concurrency work).
+        _out_dir = run_params.get("output_dir")
+        if _out_dir:
+            run_params["output_dir"] = self.resolve_in_workspace(_out_dir)
         loop = asyncio.get_running_loop()
         try:
             data = await loop.run_in_executor(
@@ -1593,6 +1696,9 @@ class EmailTool(BaseTool):
         )
         run_params = dict(kwargs)
         run_params["_sandbox"] = os.path.expandvars(sandbox_raw)
+        _out_dir = run_params.get("output_dir")
+        if _out_dir:
+            run_params["output_dir"] = self.resolve_in_workspace(_out_dir)
         loop = asyncio.get_running_loop()
         try:
             data = await loop.run_in_executor(

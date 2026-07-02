@@ -19,6 +19,14 @@ from typing import Optional
 # concurrent agents easy to distinguish.
 _agent_id_var: ContextVar[str] = ContextVar("agent_id", default="")
 
+# Per-async-task session identifier. Set via set_session_context() at the top
+# of each session's dispatch task in the bridge so that every log record
+# emitted while serving that session (and all child tasks it spawns — asyncio
+# copies the context per Task) is attributable to one session. Per-session
+# file handlers (see add_root_file_handler) filter on this so concurrent
+# sessions don't cross-contaminate each other's handq-engine.log.
+_session_id_var: ContextVar[str] = ContextVar("session_id", default="")
+
 
 class LogLevel(Enum):
     """Log level enumeration."""
@@ -411,11 +419,49 @@ def get_logger() -> HandQLogger:
     return _global_logger
 
 
+def set_session_context(session_id: str) -> None:
+    """Bind *session_id* to the current async-task context.
+
+    asyncio copies the context for every new Task, so calling this at the top
+    of a session's dispatch coroutine tags that coroutine and everything it
+    awaits (including child agent tasks) with the session id, while other
+    sessions running concurrently on the same loop are unaffected. Per-session
+    file handlers added via :func:`add_root_file_handler` filter on this so a
+    record only reaches the engine.log of the session whose task emitted it.
+
+    Pass an empty string to clear the binding.
+    """
+    _session_id_var.set(session_id)
+
+
+class _SessionLogFilter(logging.Filter):
+    """Pass a record only when the current task's session context matches.
+
+    Attached to a per-session root file handler so concurrent sessions don't
+    cross-contaminate. Records emitted outside any session task (boot,
+    bridge-meta, scheduler setup before a session is bound) carry an empty
+    session id and are dropped by every per-session handler — they belong in
+    handq-bridge.log, not in any one session's engine.log.
+    """
+
+    _HANDQ_PREFIXES = ("handq", "HandQ", "src", "__main__")
+
+    def __init__(self, session_id: str) -> None:
+        super().__init__()
+        self._session_id = session_id
+
+    def filter(self, record: logging.LogRecord) -> bool:  # noqa: A003
+        if not record.name.startswith(self._HANDQ_PREFIXES):
+            return False
+        return _session_id_var.get() == self._session_id
+
+
 def add_root_file_handler(
     log_path: str,
     level: LogLevel = LogLevel.INFO,
     max_bytes: int = 10 * 1024 * 1024,
     backup_count: int = 5,
+    session_id: Optional[str] = None,
 ) -> logging.Handler:
     """
     Attach a session-scoped file handler to the ROOT logger and return it.
@@ -433,11 +479,18 @@ def add_root_file_handler(
     with remove_root_file_handler() at session teardown, making
     handq-engine.log a clean "everything that happened in this session" view.
 
+    Multi-session isolation: when *session_id* is given, the handler is fitted
+    with a :class:`_SessionLogFilter` so it only records lines emitted within
+    that session's dispatch-task context (see set_session_context). Without it,
+    every concurrent session's records would land in every session's file,
+    because all the handlers share the one root logger.
+
     Args:
         log_path:     Absolute path of the per-session log file.
         level:        Minimum level the handler records.
         max_bytes:    Rotation threshold per file (default: 10MB).
         backup_count: Number of rotated backups to keep (default: 5).
+        session_id:   When set, restrict the handler to this session's records.
     """
     log_path_obj = Path(log_path)
     log_path_obj.parent.mkdir(parents=True, exist_ok=True)
@@ -452,6 +505,8 @@ def add_root_file_handler(
         datefmt='%Y-%m-%d %H:%M:%S',
     ))
     handler.setLevel(getattr(logging, level.value))
+    if session_id:
+        handler.addFilter(_SessionLogFilter(session_id))
     logging.getLogger().addHandler(handler)
     return handler
 

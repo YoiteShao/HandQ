@@ -7,17 +7,25 @@ Planner: writes items, modifies future items, reads results, signals completion;
          writes to active_skills (append-only; never deactivates).
 """
 import asyncio
+import collections
 import uuid as _uuid
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import AbstractSet, Any, Callable, Dict, Iterable, List, Optional, Set
+from typing import AbstractSet, Any, Callable, Deque, Dict, Iterable, List, Optional, Set
 
 from ..models.token_usage import TokenUsage
+from .agent_utils import ProgressConcern, TurnDigest
 
 
 # Canonical interrupt tag — used by PersistentAgent when writing ItemResult.issues
 # and by PlannerMixin structural guard when detecting interrupt-driven exits.
 INTERRUPTED_BY_PLANNER = "Interrupted by planner"
+
+# Cap on how many completed ItemResults are rendered into the planner context.
+# _results itself stays append-only (other readers depend on the full list);
+# only the rendered tail is bounded so planner context does not grow O(n) with
+# item count on long sessions.
+PLANNER_RESULT_RENDER_LIMIT = 20
 
 
 @dataclass
@@ -29,7 +37,8 @@ class CheckListItem:
     expected_outcomes: List[str] = field(default_factory=list)
     supplement: str = ""
     planner_reasoning: str = ""
-    # Planner-only metadata (agent does not see these)
+    # Planner-only metadata (agent does not see these via to_agent_message;
+    # ssh_target is surfaced separately via the per-item host hint provider)
     risk_assessment: str = ""
     ssh_target: str = ""
 
@@ -55,13 +64,22 @@ class CheckListItem:
 
     def to_agent_message(self) -> str:
         """Format this item as a user message for the agent."""
-        content = f"[New Task]\n{self.instruction}"
+        # Surface the planner's decision rationale FIRST so the agent reads it
+        # before forming a plan from the instruction. Anchoring on a previous
+        # item's behaviour is the most common drift source — putting the
+        # planner's "do/do-not" guidance at the top (instead of trailing the
+        # instruction) gives it the best chance of being honoured.
+        parts: List[str] = []
+        reasoning = (self.planner_reasoning or "").strip()
+        if reasoning:
+            parts.append(f"[Planner Note — READ FIRST]\n{reasoning}")
+        parts.append(f"[New Task]\n{self.instruction}")
         if self.supplement:
-            content += f"\n\n[Input]\n{self.supplement}"
+            parts.append(f"[Input]\n{self.supplement}")
         if self.expected_outcomes:
             outcomes = "\n".join(f"  - {e}" for e in self.expected_outcomes)
-            content += f"\n\n[Expected Outcomes]\n{outcomes}"
-        return content
+            parts.append(f"[Expected Outcomes]\n{outcomes}")
+        return "\n\n".join(parts)
 
 
 @dataclass
@@ -104,6 +122,13 @@ class SharedCheckList:
         self._interrupt_reason: str = ""  # set alongside _interrupt_event
         self._on_item_done_callbacks: List[Callable[[ItemResult], Any]] = []
 
+        # UI-facing checklist snapshot bus. Fired on every checklist mutation
+        # (item completed, pending tail replaced) so a UI delegate can render a
+        # live task panel. Callbacks receive the rendered snapshot (list of
+        # {item_id, instruction, status}) — see get_ui_snapshot. Append-only
+        # fan-out with per-callback exception isolation, same as on_item_done.
+        self._on_checklist_changed_callbacks: List[Callable[[List[Dict[str, Any]]], Any]] = []
+
         # Skills are append-only session state. Planner (Stage 2) adds names
         # via activate_skills(); agent reads active_skills to detect deltas
         # and injects bodies as observations. There is no deactivate path.
@@ -116,6 +141,25 @@ class SharedCheckList:
         # specific ssh_target) is item-driven separately.
         self._active_tools: Set[str] = set()
         self._on_tools_changed_callbacks: List[Callable[[List[str]], Any]] = []
+
+        # Latest user message — verbatim. Written by Orchestrator on every
+        # user turn; read by PersistentAgent to inject a `[User Original
+        # Request]` grounding block so the agent can resolve translation
+        # nuance the planner's item instruction may have flattened. Single-
+        # slot, last-write-wins; no history is needed because the planner
+        # already owns the full conversation_history.
+        self._latest_user_message: str = ""
+
+        # ── Progress-sense bus (Tier-0 digests + Tier-1 concern) ─────────────
+        # Bounded ring of per-turn mechanical digests written by the agent each
+        # turn; the planner reads the in-flight tail and the watcher snapshots
+        # it. maxlen caps memory regardless of how long an item runs.
+        self._turn_digests: Deque[TurnDigest] = collections.deque(maxlen=24)
+        # Single-slot watcher verdict, last-write-wins (same lock-free rationale
+        # as mark_current_done). Cleared at each item boundary so a stale verdict
+        # never leaks into the next item.
+        self._progress_concern: Optional[ProgressConcern] = None
+        self._on_progress_concern_callbacks: List[Callable[[ProgressConcern], Any]] = []
 
     # ── Properties ───────────────────────────────────────────────────────────
 
@@ -196,6 +240,25 @@ class SharedCheckList:
                 pass
         return new
 
+    # ── Latest user message (orchestrator writes, agent reads) ──────────────
+
+    def set_latest_user_message(self, text: str) -> None:
+        """Record the latest verbatim user message.
+
+        Sync, lock-free — same single-threaded asyncio assumption as
+        ``mark_current_done``. Called by Orchestrator on every user turn.
+        Empty string is a valid input (clears the field).
+        """
+        self._latest_user_message = text or ""
+
+    def get_latest_user_message(self) -> str:
+        """Return the most recently recorded user message verbatim.
+
+        Empty string when no user message has been recorded yet (e.g. agent
+        driven without a user turn in tests).
+        """
+        return self._latest_user_message
+
     # ── Agent interface ──────────────────────────────────────────────────────
 
     async def wait_for_current_item(self) -> CheckListItem:
@@ -236,6 +299,9 @@ class SharedCheckList:
 
         # Signal item_available in case agent is re-entering wait
         self._item_available.set()
+
+        # UI snapshot — item just transitioned done → next item becomes current.
+        self._notify_checklist_changed()
 
     def check_interrupt(self) -> bool:
         """Non-blocking check if interrupt is pending."""
@@ -294,6 +360,10 @@ class SharedCheckList:
             if self._items and self._current_index < len(self._items):
                 self._item_available.set()
 
+        # UI snapshot — fire outside the lock so callback work (snapshot render
+        # + UI forwarding) never extends the critical section or risks re-entry.
+        self._notify_checklist_changed()
+
     async def interrupt_agent(self, reason: str = "") -> None:
         """Send interrupt signal to agent. Waits for ack before returning."""
         # Rate limit: wait for previous interrupt to be acked
@@ -308,6 +378,41 @@ class SharedCheckList:
         """Get all completed item results (for planner evaluation)."""
         return list(self._results)
 
+    # ── Progress-sense bus ────────────────────────────────────────────────────
+
+    def append_turn_digest(self, digest: TurnDigest) -> None:
+        """Agent writes one mechanical digest per turn (cheap, synchronous)."""
+        self._turn_digests.append(digest)
+
+    def get_turn_digests(self) -> List[TurnDigest]:
+        """Snapshot of the in-flight digest ring (safe to iterate after).
+
+        Returns a plain list copy so a caller that awaits between reads is not
+        exposed to concurrent appends mutating a live deque mid-iteration.
+        """
+        return list(self._turn_digests)
+
+    def set_progress_concern(self, concern: ProgressConcern) -> None:
+        """Watcher writes a verdict (last-write-wins) + fires callbacks.
+
+        Mirrors mark_current_done's dispatch: lock-free single-slot write, then
+        best-effort callback fan-out with per-callback exception isolation so a
+        throwing subscriber can't break the watcher coroutine.
+        """
+        self._progress_concern = concern
+        for cb in self._on_progress_concern_callbacks:
+            try:
+                cb(concern)
+            except Exception:
+                pass
+
+    def get_progress_concern(self) -> Optional[ProgressConcern]:
+        return self._progress_concern
+
+    def clear_progress_concern(self) -> None:
+        """Drop the current verdict (called at each item boundary)."""
+        self._progress_concern = None
+
     def get_pending_items(self) -> List[CheckListItem]:
         """Get all items not yet started (for planner to modify/view)."""
         return self._items[self._current_index + 1:]
@@ -318,8 +423,13 @@ class SharedCheckList:
         lines.append(f"## CheckList Status ({self.completed_count}/{self.total_items} done)")
         lines.append("")
 
-        # Completed items
-        for result in self._results:
+        # Completed items — render only the most recent tail so the planner
+        # context stays bounded on long sessions (_results itself is full).
+        rendered = self._results[-PLANNER_RESULT_RENDER_LIMIT:]
+        omitted = len(self._results) - len(rendered)
+        if omitted > 0:
+            lines.append(f"... ({omitted} earlier completed items omitted)")
+        for result in rendered:
             status_tag = "Done" if result.success else "Failed"
             lines.append(f"[{status_tag}] item={result.item_id}")
             if result.factual_outcome:
@@ -336,6 +446,25 @@ class SharedCheckList:
         if current:
             lines.append(f"\n[In Progress] item={current.item_id}")
             lines.append(f"  Instruction: {current.instruction}")
+            # In-flight mechanical view — the planner's only window into a
+            # running item (it is otherwise woken only at item boundaries).
+            recent = [d for d in self._turn_digests if d.item_id == current.item_id][-5:]
+            for d in recent:
+                tools = ",".join(d.tool_names) if d.tool_names else "none"
+                lines.append(
+                    f"  · iter {d.iteration}: tools={tools} "
+                    f"ok={d.success_count} fail={d.fail_count} "
+                    f"new_artifact={d.produced_new_artifact} "
+                    f"goal_hit={d.goal_signal_hit} "
+                    f"no_progress_streak={d.no_progress_streak}"
+                )
+            concern = self._progress_concern
+            if concern is not None and concern.item_id == current.item_id:
+                lines.append(f"  ⚠ PROGRESS CONCERN [{concern.verdict}]: {concern.rationale}")
+                if concern.suggest_replan:
+                    lines.append("    → watcher suggests re-planning the remaining steps")
+                if concern.suggest_interrupt:
+                    lines.append("    → watcher suggests interrupting the current item")
 
         # Future items
         future = self.get_pending_items()
@@ -372,10 +501,86 @@ class SharedCheckList:
             lines.append(f"{tag} [{r.item_id}] {detail}")
         return "\n".join(lines)
 
+    # ── UI snapshot ──────────────────────────────────────────────────────────
+
+    def get_ui_snapshot(self) -> List[Dict[str, Any]]:
+        """Render the checklist as a flat list for a live UI task panel.
+
+        Status is derived from the index-aligned (_items, _current_index,
+        _results) triple — len(_results) == _current_index, and
+        replace_post_current never touches completed or in-progress slots:
+
+          - i < len(_results)        → completed: "interrupted" when the result
+                                       was an interrupt exit, else "done"/"failed"
+          - i == _current_index      → "running"
+          - otherwise                → "pending"
+
+        Each entry: {"item_id", "instruction", "status"}.
+        """
+        snapshot: List[Dict[str, Any]] = []
+        done_count = len(self._results)
+        for i, item in enumerate(self._items):
+            if i < done_count:
+                result = self._results[i]
+                if result.issues and result.issues[0].startswith(INTERRUPTED_BY_PLANNER):
+                    status = "interrupted"
+                elif result.success:
+                    status = "done"
+                else:
+                    status = "failed"
+            elif i == self._current_index:
+                status = "running"
+            else:
+                status = "pending"
+            snapshot.append({
+                "item_id": item.item_id,
+                "instruction": item.instruction,
+                "status": status,
+            })
+        return snapshot
+
+    def _notify_checklist_changed(self) -> None:
+        """Build the UI snapshot once and fan it out to subscribers.
+
+        Best-effort with per-callback exception isolation (mirrors the
+        on_item_done fan-out). Called from mark_current_done and from
+        replace_post_current (outside the lock).
+        """
+        if not self._on_checklist_changed_callbacks:
+            return
+        snapshot = self.get_ui_snapshot()
+        for cb in self._on_checklist_changed_callbacks:
+            try:
+                cb(snapshot)
+            except Exception:
+                pass
+
     # ── Callbacks ────────────────────────────────────────────────────────────
 
     def on_item_done(self, callback: Callable[[ItemResult], Any]) -> None:
         self._on_item_done_callbacks.append(callback)
+
+    def on_checklist_changed(
+        self, callback: Callable[[List[Dict[str, Any]]], Any]
+    ) -> None:
+        """Register a callback fired on every checklist mutation.
+
+        Callback receives the rendered UI snapshot (see get_ui_snapshot) so a
+        UI delegate can paint a live task panel. Fired from mark_current_done
+        and replace_post_current. Best-effort, exception-isolated — a throwing
+        subscriber cannot break the agent/planner coroutines.
+        """
+        self._on_checklist_changed_callbacks.append(callback)
+
+    def on_progress_concern(self, callback: Callable[[ProgressConcern], Any]) -> None:
+        """Register a callback fired when the watcher sets a concern.
+
+        Symmetric to on_item_done: the Orchestrator subscribes to set its
+        planner trigger, so a divergence verdict wakes the planner loop the same
+        way an item completion does — without giving the watcher (or the agent)
+        any direct handle on the orchestrator.
+        """
+        self._on_progress_concern_callbacks.append(callback)
 
     def on_skills_changed(self, callback: Callable[[List[str]], Any]) -> None:
         """Register callback fired when new skills are activated.

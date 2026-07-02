@@ -168,29 +168,18 @@
     // ----- DOM refs --------------------------------------------------------
 
     const conversation = document.getElementById('conversation');
-    const composer = document.getElementById('composer');
-    const composerInput = document.getElementById('composer-input');
-    const composerExpanded = document.getElementById('composer-expanded');
-    const composerExpandedInput = document.getElementById('composer-expanded-input');
-    const composerExpandedClose = document.getElementById('composer-expanded-close');
 
     // Shortcut bar
     const scSettings = document.getElementById('sc-settings');
     const scScheduler = document.getElementById('sc-scheduler');
-    const scNew      = document.getElementById('sc-new');
+    // (Legacy scNew "New" button removed — sessions are created via the
+    // "+" button in the session tab bar.)
+
 
     // Titlebar
     const tbMin   = document.getElementById('tb-min');
     const tbMax   = document.getElementById('tb-max');
     const tbClose = document.getElementById('tb-close');
-
-    // Activity strip (lives inline in the shortcuts bar) + popover (anchored
-    // above it, holds the full feed and opens on click).
-    const activityStrip   = document.getElementById('activity-strip');
-    const activityCurrent = document.getElementById('activity-current');
-    const activityPopover = document.getElementById('activity-popover');
-    const activityClose   = document.getElementById('activity-close');
-    const activityFeed    = document.getElementById('activity-feed');
 
     // Boot overlay — visible by default; we hide it on first real status
     // event (or bridge_exit if boot crashed).
@@ -316,17 +305,9 @@
 
     // Overlays
     const overlaySettings  = document.getElementById('overlay-settings');
-    const overlayConfirm   = document.getElementById('overlay-confirmation');
     const settingsCancel   = document.getElementById('settings-cancel');
-    const confirmTitle     = document.getElementById('confirm-title');
-    const confirmDescEl    = document.getElementById('confirm-description');
-    const confirmDecisionEl= document.getElementById('confirm-decision');
-    const confirmSecretWrap= document.getElementById('confirm-secret-wrap');
-    const confirmSecretIn  = document.getElementById('confirm-secret-input');
-    const confirmGuidanceEl= document.getElementById('confirm-guidance');
-    const confirmGuidBtn   = document.getElementById('confirm-guidance-btn');
-    const confirmRejectBtn = document.getElementById('confirm-reject');
-    const confirmSubmitBtn = document.getElementById('confirm-submit');
+    // (The legacy global #overlay-confirmation modal is retired — confirmations
+    //  now render inline per session card; see _ensureConfirmUI / UI3.)
 
     // Settings form
     const settingsForm     = document.getElementById('settings-form');
@@ -382,47 +363,733 @@
         if (settingsLoadingEl) settingsLoadingEl.classList.add('hidden');
     }
 
-    // ----- session/state tracking (drives Status overlay + pill) -----------
-
-    const session = {
-        state:      'idle',
-    };
-
-    // Session generation watermark. The bridge tags every outbound envelope
-    // with a `gen` field (see stdio_bridge.py: _StdioUI._generation). When
-    // New is clicked, the renderer optimistically bumps `currentGen` BEFORE
-    // sending new_session — so any in-flight emit from the OLD flow that
-    // arrives during cleanup carries an older gen and gets dropped here.
-    // This is the only mechanism that protects the new conversation from
-    // a wedged old subtask whose blocking syscall (e.g. ssh_tool's
-    // run_in_executor + time.sleep retry, ssh_setup getpass) prevents
-    // Python from killing the OS thread on Windows.
+    // ----- Multi-session state -------------------------------------------
     //
-    // Bridge confirms with `final {generation}`; we sync to it (max-rule)
-    // so rapid double-clicks stay consistent.
-    let currentGen = 0;
+    // The bridge supports many concurrent FlowController instances keyed by
+    // session_id. The renderer mints a UUID per tab and stamps it on every
+    // outbound IPC envelope; inbound envelopes carry session_id and we
+    // route them to the matching tab's state bucket.
+    //
+    // All sessions are visible at once as tiled `.session-card` items in the
+    // horizontal `#conversation` row (UI1) — there is no show/hide. Every
+    // card holds its own bubble DOM, inline confirmation host, and per-pane
+    // composer; switching the "active" session is only a focus/scroll aid
+    // (border highlight + unread clear), not a CSS display toggle.
+
+    function _uuid() {
+        // Crypto-strong if available; falls back to math.random for safety.
+        try {
+            if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+                return window.crypto.randomUUID();
+            }
+        } catch (_) { /* ignore */ }
+        // RFC4122 v4-ish fallback
+        return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+            const r = Math.random() * 16 | 0;
+            const v = c === 'x' ? r : (r & 0x3 | 0x8);
+            return v.toString(16);
+        });
+    }
+
+    function _newSessionState(sid, name) {
+        return {
+            sid,
+            name,
+            // Outer tiled card (grid item) for this session.
+            card: null,
+            // DOM scroll container holding this session's chat bubbles.
+            // (the card's body — bubble helpers append here via _dispatchPane).
+            pane: null,
+            // Per-card header bits.
+            titleEl: null,
+            pillEl: null,
+            // Per-card composer textarea (UI2 — each pane sends on its own sid).
+            composerInput: null,
+            // Inline confirmation host inside the card (UI3 — a popup in one
+            // session renders in its own pane and never blocks another).
+            confirmEl: null,
+            // Lazily-built confirmation control refs (see _ensureConfirmUI).
+            confirmUI: null,
+            // Currently-pending confirmation for this session: {id, kind} or
+            // null. The owning sid IS this session, so the answer is always
+            // stamped with `sid` (never the globally-active tab).
+            pendingConfirm: null,
+            // Per-session activity feed (cap 30 items, mirrors the legacy
+            // global `activityItems` ring buffer semantics).
+            activityItems: [],
+            // Per-session activity-strip state ("idle"|"planning"|...).
+            sessionState: 'idle',
+            // Current pill text (separate from sessionState so tooltips
+            // can carry richer text without overwriting state).
+            pillText: 'idle',
+            // Most-recent decision_made reasoning, used by the strip.
+            lastThinking: '',
+            // Last tool dispatch ("write: path", etc.).
+            lastCalledTool: '',
+            // Count of in-flight tool executions; drives isTaskRunning().
+            activeExecCount: 0,
+            // First-send tracking — controls request vs user_input.
+            firstSendDone: false,
+            // Streaming bubbles + thinking placeholder.
+            activeReceptionistBubble: null,
+            thinkingBubble: null,
+            // Boundary state for the checklist popover.
+            checklistItems: null,
+            checklistExpanded: false,
+            // Workspace info from session_started event.
+            sessionDir: '',
+            workspaceDir: '',
+            // Has unseen activity since the user last looked at this tab.
+            unread: false,
+        };
+    }
+
+    /** @type {Map<string, ReturnType<typeof _newSessionState>>} */
+    const sessions = new Map();
+    let activeSid = null;
+    // Sids explicitly closed by the user. Prevents straggler events from
+    // resurrecting a closed tab via lazy-mount (zombie tab).
+    const closedSessions = new Set();
+
+    // macOS-style card open/close: run the DOM mutation inside a View
+    // Transition so the closing card scales+fades (::view-transition-old)
+    // and remaining cards FLIP into their new slots (::view-transition-group).
+    // The `data-vt-scope` attribute scopes the pseudo styles in styles.css so
+    // unrelated future transitions won't inherit them.
+    async function _runVT(mutate) {
+        const supported = typeof document.startViewTransition === 'function';
+        const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+        if (!supported || reduced) {
+            mutate();
+            return;
+        }
+        document.documentElement.dataset.vtScope = 'session';
+        let transition;
+        try {
+            transition = document.startViewTransition(mutate);
+        } catch (err) {
+            window.__handqLog('WARN', 'startViewTransition threw', { err: err && err.message });
+            mutate();
+            delete document.documentElement.dataset.vtScope;
+            return;
+        }
+        try { await transition.finished; } catch (_) { /* aborted transitions are ok */ }
+        delete document.documentElement.dataset.vtScope;
+    }
+
+    function sessionState(sid) {
+        return sessions.get(sid);
+    }
+
+    function active() {
+        return sessions.get(activeSid);
+    }
+
+    function getActivePane() {
+        const s = active();
+        return s ? s.pane : null;
+    }
+
+    function getPaneFor(sid) {
+        const s = sessionState(sid);
+        return s ? s.pane : null;
+    }
+
+    // Build the DOM scaffolding for a new session: its tiled session card
+    // (header + scrollable body + inline confirmation host + per-pane
+    // composer) and its tab button. Does NOT switch to it — caller decides.
+    function _mountSession(sid, name) {
+        const s = _newSessionState(sid, name);
+
+        // ── Outer card (a flex item in the tiled #conversation row) ──────
+        const card = document.createElement('div');
+        card.className = 'session-card';
+        card.dataset.sid = sid;
+        // Unique VT name so this card gets its own snapshot pair when it
+        // enters/leaves the DOM — required for per-element FLIP on the
+        // remaining cards. Static per card lifetime.
+        card.style.viewTransitionName = 'session-' + sid;
+
+        // Header: name · status pill · close.
+        const head = el('div', 'session-card-head');
+        const title = el('span', 'session-card-title', name);
+        title.addEventListener('dblclick', () => _startRenameSession(sid));
+        const pill = el('span', 'session-card-pill', 'idle');
+        const cardClose = el('button', 'session-card-close', '×');
+        cardClose.type = 'button';
+        cardClose.setAttribute('aria-label', 'Close session');
+        cardClose.title = 'Close session';
+        head.appendChild(title);
+        head.appendChild(pill);
+        head.appendChild(cardClose);
+
+        // Body: the scroll container where chat bubbles + activity groups go.
+        const body = el('div', 'session-card-body');
+        body.dataset.sid = sid;
+
+        // Inline confirmation host (UI3) — populated lazily on first prompt.
+        const confirm = el('div', 'session-card-confirm hidden');
+
+        // Per-pane composer (UI2) — its own textarea + send, stamps this sid.
+        const form = document.createElement('form');
+        form.className = 'session-card-composer';
+        const wrap = el('div', 'composer-input-wrap');
+        const ta = document.createElement('textarea');
+        ta.className = 'session-card-input';
+        ta.rows = 2;
+        ta.placeholder = 'Type a message… (Ctrl+Enter to send)';
+        const send = document.createElement('button');
+        send.type = 'submit';
+        send.setAttribute('aria-label', 'Send');
+        send.title = 'Ctrl+Enter';
+        send.innerHTML =
+            '<svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true">' +
+            '<path d="M10 4 L10 16 M10 4 L5 9 M10 4 L15 9" fill="none" ' +
+            'stroke="currentColor" stroke-width="2" stroke-linecap="round" ' +
+            'stroke-linejoin="round"/></svg>';
+        wrap.appendChild(ta);
+        wrap.appendChild(send);
+        form.appendChild(wrap);
+
+        card.appendChild(head);
+        card.appendChild(body);
+        card.appendChild(confirm);
+        card.appendChild(form);
+        conversation.appendChild(card);
+
+        s.card = card;
+        s.pane = body;
+        s.titleEl = title;
+        s.pillEl = pill;
+        s.confirmEl = confirm;
+        s.composerInput = ta;
+
+        // Clicking anywhere on the card focuses this session (jump aid +
+        // unread clear). The close button stops propagation below.
+        card.addEventListener('mousedown', () => {
+            if (activeSid !== sid) switchSession(sid);
+        });
+        cardClose.addEventListener('click', (ev) => {
+            ev.stopPropagation();
+            closeSession(sid);
+        });
+        form.addEventListener('submit', (ev) => {
+            ev.preventDefault();
+            submitText(sid, ta.value, ta);
+        });
+        ta.addEventListener('keydown', (ev) => {
+            if (ev.key === 'Enter' && ev.ctrlKey) {
+                ev.preventDefault();
+                form.requestSubmit();
+            }
+        });
+        ta.addEventListener('input', () => {
+            _FloatingComposer.onSourceInput(sid, ta,
+                () => (sessions.get(sid) || {}).name || sid.slice(0, 8),
+                (finalText) => submitText(sid, finalText, ta));
+        });
+
+        sessions.set(sid, s);
+        _updateLayout();
+        return s;
+    }
+
+    function _autoNameForNewSession() {
+        // Number tabs in creation order. Sessions are not removed from the
+        // numbering pool — keeps names stable as old tabs are closed.
+        return 'Session ' + (sessions.size + 1);
+    }
+
+    function _renameSession(sid, name) {
+        const s = sessions.get(sid);
+        if (!s || !name) return;
+        s.name = name;
+        if (s.titleEl) s.titleEl.textContent = name;
+    }
+
+    function _startRenameSession(sid) {
+        const s = sessions.get(sid);
+        if (!s || !s.titleEl) return;
+        const el_ = s.titleEl;
+        const oldName = el_.textContent;
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.className = 'session-card-title-input';
+        input.value = oldName;
+        el_.replaceWith(input);
+        input.focus();
+        input.select();
+        function commit() {
+            const newName = input.value.trim() || oldName;
+            const span = document.createElement('span');
+            span.className = 'session-card-title';
+            span.textContent = newName;
+            span.addEventListener('dblclick', () => _startRenameSession(sid));
+            input.replaceWith(span);
+            s.titleEl = span;
+            s.name = newName;
+        }
+        input.addEventListener('blur', commit);
+        input.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') { e.preventDefault(); input.blur(); }
+            if (e.key === 'Escape') { input.value = oldName; input.blur(); }
+        });
+    }
+
+    function createSession(opts) {
+        const sid = (opts && opts.sid) || _uuid();
+        const name = (opts && opts.name) || _autoNameForNewSession();
+        _mountSession(sid, name);
+        switchSession(sid);
+        return sid;
+    }
+
+    function switchSession(sid) {
+        if (!sessions.has(sid)) return;
+        // All cards are visible in the tiled layout; "switching" just moves
+        // the focus highlight + scrolls the card into view + clears unread.
+        if (activeSid && activeSid !== sid && sessions.has(activeSid)) {
+            const old = sessions.get(activeSid);
+            if (old.card) old.card.classList.remove('active');
+        }
+        activeSid = sid;
+        const s = sessions.get(sid);
+        if (s.card) {
+            s.card.classList.add('active');
+            try { s.card.scrollIntoView({ inline: 'nearest', block: 'nearest' }); }
+            catch (_) { /* ignore */ }
+        }
+        s.unread = false;
+        // Repaint UI affordances that reflect the active session's state.
+        _repaintActivityForActive();
+        try { if (s.composerInput) s.composerInput.focus(); } catch (_) { /* ignore */ }
+        window.__handqLog('INFO', 'switchSession', { sid });
+    }
+
+    function _repaintActivityForActive() {
+        // No-op — per-session activity is rendered inline in each pane.
+    }
+
+    async function closeSession(sid) {
+        if (!sessions.has(sid)) return;
+        closedSessions.add(sid);
+        window.__handqLog('INFO', 'closeSession', { sid });
+        // Kill the floating pop-out editor if it was pointed at this session
+        // — its backing textarea is about to be removed from the DOM.
+        try { _FloatingComposer.destroyFor(sid); } catch (_) { /* ignore */ }
+        // Send close_session to bridge so flow.destroy() releases resources.
+        try {
+            handq.sendRequest({ type: 'close_session', session_id: sid });
+        } catch (err) {
+            window.__handqLog('ERROR', 'close_session dispatch failed',
+                { err: err && err.message });
+        }
+        // All layout-affecting mutations happen inside one View Transition so
+        // the browser snapshots once, then animates the closing card out and
+        // the remaining cards into their new slots.
+        await _runVT(() => {
+            const s = sessions.get(sid);
+            if (s && s.card && s.card.parentNode) {
+                s.card.parentNode.removeChild(s.card);
+            }
+            sessions.delete(sid);
+            _updateLayout();
+            if (activeSid === sid) {
+                // Switch to neighbour tab, or auto-spawn a fresh one if this
+                // was the last session.
+                const next = sessions.keys().next();
+                if (next && !next.done) {
+                    switchSession(next.value);
+                } else {
+                    createSession();
+                }
+            }
+        });
+    }
+
+    function _updateLayout() {
+        const n = sessions.size;
+        conversation.classList.remove('layout-row', 'layout-grid', 'layout-scroll');
+        if (n <= 3) conversation.classList.add('layout-row');
+        else if (n <= 6) conversation.classList.add('layout-grid');
+        else conversation.classList.add('layout-scroll');
+        // Ask main to grow the window to fit the new tile count (grow-only;
+        // maximized at 6). Main is authoritative on display bounds + clamps.
+        if (window.windowControls && typeof window.windowControls.autoResize === 'function') {
+            try { window.windowControls.autoResize(n); }
+            catch (_) { /* ignore */ }
+        }
+    }
+
+    function currentSid() {
+        return activeSid;
+    }
+
+    // ----- Floating composer (long-text pop-out editor) ------------------
+    // One instance per session. Auto-opens when the session's inline textarea
+    // passes >3 rows OR >200 chars, and stays independent from other
+    // sessions' floaters — dragging/typing in one never disturbs the others.
+    // Two-way synced with the source textarea while open. Draggable header +
+    // bottom-right resize handle. Position clamped inside the viewport
+    // (respects titlebar so it never overlaps window controls).
+    const _FloatingComposer = (function () {
+        const MARGIN = 8;
+        const TITLEBAR_H = 42;
+        const MIN_W = 320;
+        const MIN_H = 180;
+        const THRESHOLD_CHARS = 200;
+        const THRESHOLD_ROWS = 3;
+        const CASCADE_STEP = 28;
+
+        const instances = new Map(); // sid -> instance state
+
+        function _bounds() {
+            return {
+                left: MARGIN,
+                top: TITLEBAR_H + MARGIN,
+                right: window.innerWidth - MARGIN,
+                bottom: window.innerHeight - MARGIN,
+            };
+        }
+
+        function _clampBox(box) {
+            const b = _bounds();
+            const maxW = b.right - b.left;
+            const maxH = b.bottom - b.top;
+            let w = Math.max(MIN_W, Math.min(box.w, maxW));
+            let h = Math.max(MIN_H, Math.min(box.h, maxH));
+            let x = Math.max(b.left, Math.min(box.x, b.right - w));
+            let y = Math.max(b.top,  Math.min(box.y, b.bottom - h));
+            return { x, y, w, h };
+        }
+
+        function _visibleCount() {
+            let n = 0;
+            for (const inst of instances.values()) if (_isVisible(inst)) n++;
+            return n;
+        }
+
+        function _defaultBox(cascadeIndex) {
+            const b = _bounds();
+            const w = Math.min(620, b.right - b.left);
+            const h = Math.min(340, b.bottom - b.top);
+            const cx = Math.round((window.innerWidth  - w) / 2);
+            const cy = Math.round((window.innerHeight - h) / 2);
+            const off = cascadeIndex * CASCADE_STEP;
+            return _clampBox({ x: cx + off, y: cy + off, w, h });
+        }
+
+        function _applyPos(el, p) {
+            el.style.left   = p.x + 'px';
+            el.style.top    = p.y + 'px';
+            el.style.width  = p.w + 'px';
+            el.style.height = p.h + 'px';
+        }
+
+        function _build(sid) {
+            const el = document.createElement('div');
+            el.className = 'floating-composer hidden';
+            el.dataset.sid = sid;
+
+            const headEl = document.createElement('div');
+            headEl.className = 'fc-head';
+
+            const titleEl = document.createElement('div');
+            titleEl.className = 'fc-title';
+            titleEl.textContent = 'Editor';
+
+            const hint = document.createElement('div');
+            hint.className = 'fc-hint';
+            hint.textContent = 'Ctrl+Enter · Esc';
+
+            const closeBtn = document.createElement('button');
+            closeBtn.type = 'button';
+            closeBtn.className = 'fc-close';
+            closeBtn.setAttribute('aria-label', 'Close');
+            closeBtn.textContent = '×';
+
+            headEl.appendChild(titleEl);
+            headEl.appendChild(hint);
+            headEl.appendChild(closeBtn);
+
+            const body = document.createElement('div');
+            body.className = 'fc-body';
+
+            const textareaEl = document.createElement('textarea');
+            textareaEl.className = 'fc-textarea';
+            textareaEl.placeholder = 'Type here… (Ctrl+Enter to send)';
+            body.appendChild(textareaEl);
+
+            const resizeEl = document.createElement('div');
+            resizeEl.className = 'fc-resize';
+            resizeEl.setAttribute('aria-label', 'Resize');
+            body.appendChild(resizeEl);
+
+            el.appendChild(headEl);
+            el.appendChild(body);
+            document.body.appendChild(el);
+
+            const inst = {
+                sid, el, headEl, titleEl, closeBtn, textareaEl, resizeEl,
+                pos: null,
+                mirroring: false,
+                currentInput: null,
+                currentSend: null,
+                userClosed: false,
+            };
+            instances.set(sid, inst);
+
+            // Bring this floater on top when clicked anywhere.
+            el.addEventListener('mousedown', () => _bringToFront(inst));
+
+            closeBtn.addEventListener('click', (ev) => {
+                ev.stopPropagation();
+                inst.userClosed = true;
+                _hide(inst);
+            });
+
+            textareaEl.addEventListener('input', () => {
+                if (inst.mirroring) return;
+                if (!inst.currentInput) return;
+                inst.mirroring = true;
+                try {
+                    inst.currentInput.value = textareaEl.value;
+                    inst.currentInput.dispatchEvent(new Event('input', { bubbles: true }));
+                } finally { inst.mirroring = false; }
+            });
+            textareaEl.addEventListener('keydown', (ev) => {
+                if (ev.key === 'Enter' && ev.ctrlKey) {
+                    ev.preventDefault();
+                    const t = textareaEl.value;
+                    if (inst.currentSend) inst.currentSend(t);
+                    _hide(inst);
+                } else if (ev.key === 'Escape') {
+                    ev.preventDefault();
+                    inst.userClosed = true;
+                    _hide(inst);
+                }
+            });
+
+            _wireDrag(inst);
+            _wireResize(inst);
+            return inst;
+        }
+
+        function _bringToFront(inst) {
+            // Small z-index bump so the most recently interacted floater is on top.
+            // Cap growth so it stays under overlays (which sit at z=100).
+            for (const other of instances.values()) {
+                if (other.el) other.el.style.zIndex = '50';
+            }
+            inst.el.style.zIndex = '55';
+        }
+
+        function _wireDrag(inst) {
+            let dragging = false;
+            let dx = 0, dy = 0;
+            inst.headEl.addEventListener('mousedown', (ev) => {
+                if (ev.target === inst.closeBtn || inst.closeBtn.contains(ev.target)) return;
+                dragging = true;
+                inst.headEl.classList.add('dragging');
+                dx = ev.clientX - inst.pos.x;
+                dy = ev.clientY - inst.pos.y;
+                ev.preventDefault();
+            });
+            window.addEventListener('mousemove', (ev) => {
+                if (!dragging) return;
+                inst.pos = _clampBox({
+                    x: ev.clientX - dx,
+                    y: ev.clientY - dy,
+                    w: inst.pos.w,
+                    h: inst.pos.h,
+                });
+                _applyPos(inst.el, inst.pos);
+            });
+            window.addEventListener('mouseup', () => {
+                if (!dragging) return;
+                dragging = false;
+                inst.headEl.classList.remove('dragging');
+            });
+        }
+
+        function _wireResize(inst) {
+            let resizing = false;
+            let startX = 0, startY = 0, startW = 0, startH = 0;
+            inst.resizeEl.addEventListener('mousedown', (ev) => {
+                resizing = true;
+                startX = ev.clientX;
+                startY = ev.clientY;
+                startW = inst.pos.w;
+                startH = inst.pos.h;
+                ev.preventDefault();
+                ev.stopPropagation();
+            });
+            window.addEventListener('mousemove', (ev) => {
+                if (!resizing) return;
+                inst.pos = _clampBox({
+                    x: inst.pos.x,
+                    y: inst.pos.y,
+                    w: startW + (ev.clientX - startX),
+                    h: startH + (ev.clientY - startY),
+                });
+                _applyPos(inst.el, inst.pos);
+            });
+            window.addEventListener('mouseup', () => {
+                if (!resizing) return;
+                resizing = false;
+            });
+        }
+
+        function _show(inst, inputEl, title, sendCb) {
+            inst.currentInput = inputEl;
+            inst.currentSend = sendCb;
+            inst.titleEl.textContent = title || 'Editor';
+            inst.mirroring = true;
+            try { inst.textareaEl.value = inputEl.value || ''; }
+            finally { inst.mirroring = false; }
+            // Make visible first so _visibleCount reflects post-show state.
+            inst.el.classList.remove('hidden');
+            if (!inst.pos) {
+                // Cascade based on peers already visible (this one now counted).
+                const idx = Math.max(0, _visibleCount() - 1);
+                inst.pos = _defaultBox(idx);
+            } else {
+                inst.pos = _clampBox(inst.pos);
+            }
+            _applyPos(inst.el, inst.pos);
+            _bringToFront(inst);
+            try {
+                inst.textareaEl.focus();
+                const n = inst.textareaEl.value.length;
+                inst.textareaEl.setSelectionRange(n, n);
+            } catch (_) { /* ignore */ }
+        }
+
+        function _hide(inst) {
+            if (!inst || !inst.el || inst.el.classList.contains('hidden')) return;
+            inst.el.classList.add('hidden');
+            inst.currentInput = null;
+            inst.currentSend = null;
+        }
+
+        function _isVisible(inst) {
+            return !!(inst && inst.el && !inst.el.classList.contains('hidden'));
+        }
+
+        function _isLong(inputEl) {
+            const text = (inputEl && inputEl.value) || '';
+            if (!text) return false;
+            if (text.length > THRESHOLD_CHARS) return true;
+            // Explicit newlines: count \n characters + 1.
+            let newlineRows = 1;
+            for (let i = 0; i < text.length; i++) {
+                if (text.charCodeAt(i) === 10) newlineRows++;
+            }
+            if (newlineRows > THRESHOLD_ROWS) return true;
+            // Visual rows: paragraph wrap without explicit newlines can still
+            // fill many visible lines. Compare scrollHeight against a single
+            // line's height to derive the true visible row count.
+            if (inputEl && typeof inputEl.scrollHeight === 'number') {
+                const cs = window.getComputedStyle(inputEl);
+                const lh = parseFloat(cs.lineHeight) || 20;
+                const padTop = parseFloat(cs.paddingTop) || 0;
+                const padBot = parseFloat(cs.paddingBottom) || 0;
+                const contentH = Math.max(0, inputEl.scrollHeight - padTop - padBot);
+                const visualRows = Math.round(contentH / lh);
+                if (visualRows > THRESHOLD_ROWS) return true;
+            }
+            return false;
+        }
+
+        function isOpenFor(sid) { return _isVisible(instances.get(sid)); }
+
+        function onSourceInput(sid, inputEl, titleGetter, sendCb) {
+            let inst = instances.get(sid);
+            if (inst && inst.mirroring) return;
+            // Keep mirror in sync while visible.
+            if (inst && _isVisible(inst)) {
+                inst.mirroring = true;
+                try { inst.textareaEl.value = inputEl.value || ''; }
+                finally { inst.mirroring = false; }
+            }
+            const long = _isLong(inputEl);
+            if (!long) {
+                if (inst) inst.userClosed = false;
+                return;
+            }
+            if (inst && _isVisible(inst)) return;
+            if (inst && inst.userClosed) return;
+            if (!inst) inst = _build(sid);
+            _show(inst, inputEl, titleGetter && titleGetter(), sendCb);
+        }
+
+        function closeFor(sid) { _hide(instances.get(sid)); }
+
+        function destroyFor(sid) {
+            const inst = instances.get(sid);
+            if (!inst) return;
+            try {
+                if (inst.el && inst.el.parentNode) inst.el.parentNode.removeChild(inst.el);
+            } catch (_) { /* ignore */ }
+            instances.delete(sid);
+        }
+
+        window.addEventListener('resize', () => {
+            for (const inst of instances.values()) {
+                if (_isVisible(inst) && inst.pos) {
+                    inst.pos = _clampBox(inst.pos);
+                    _applyPos(inst.el, inst.pos);
+                }
+            }
+        });
+
+        return { onSourceInput, closeFor, destroyFor, isOpenFor };
+    })();
+
+    // ----- end multi-session state ---------------------------------------
+
+    // Session straggler filter. gateGen() drops envelopes that arrive for
+    // a session we've already closed (its session bucket is gone) or that
+    // target a session_id we don't recognise. This protects a fresh tab
+    // from a wedged old subtask whose blocking syscall prevents Python
+    // from killing the OS thread on Windows.
 
     // Thinking bubble shown in chat while receptionist prepares a reply.
-    let thinkingBubble = null;
+    // Per-session — looked up via _S().thinkingBubble during dispatch.
+
+    // Module-level "current dispatch sid". Set at the top of each handq
+    // listener (onStatus/onFinal/onError) so the bubble-appending helpers
+    // can resolve to the right session's pane. Falls back to activeSid for
+    // outbound paths (e.g. composer submit).
+    let _dispatchSid = null;
+
+    function _resolveSid(evt) {
+        // Prefer envelope's session_id; bridge-meta envelopes (config, ltm,
+        // cron) typically don't carry one — fall back to active session.
+        if (evt && typeof evt.session_id === 'string' && evt.session_id) {
+            return evt.session_id;
+        }
+        return activeSid;
+    }
+
+    function _dispatchSession() {
+        // Returns the session bucket for the in-flight dispatch (or active).
+        const sid = _dispatchSid || activeSid;
+        return sessions.get(sid) || sessions.get(activeSid);
+    }
+
+    function _dispatchPane() {
+        const s = _dispatchSession();
+        return (s && s.pane) || conversation;
+    }
 
     function gateGen(evt) {
         // Returns true if the event should be DROPPED.
         if (!evt) return true;
-        const g = evt.gen;
-        // Legacy or bridge-meta envelopes without a gen tag pass through —
-        // the bridge tags everything in this build, but be permissive so
-        // a half-upgraded combo (renderer new, bridge old) still works.
-        if (typeof g !== 'number') return false;
-        if (g < currentGen) return true;
-        if (g > currentGen) currentGen = g;
+        if (evt.session_id && closedSessions.has(evt.session_id)) return true;
+        const sid = _resolveSid(evt);
+        if (sid && !sessions.has(sid)) return true;
         return false;
-    }
-
-    function setPill(text) {
-        // The "tooltip" always tracks the latest backend event so users can
-        // hover the strip mid-completion to see what's happening underneath.
-        if (activityStrip) activityStrip.title = text || '';
-        if (activityCurrent) activityCurrent.textContent = text || 'idle';
     }
 
     function truncate(s, n) {
@@ -430,17 +1097,20 @@
         return s.length > n ? s.slice(0, n - 1) + '…' : s;
     }
 
-    // Whether the planner/agent has a real task in flight. Used to gate
-    // receptionist-side pill updates so a chat reply mid-task can't reset
-    // the activity strip to "idle". `session.state` is set by state_changed
-    // events (V2 emits planning / thinking / executing / idle);
-    // `activeExecCount` covers the brief window where a tool is running
-    // before the next state_changed lands.
+    // Whether the planner/agent has a real task in flight, for the dispatch
+    // session. Used to gate receptionist-side pill updates so a chat reply
+    // mid-task can't reset that session's pill to "idle". `sessionState` is set
+    // by state_changed events (V2 emits planning / thinking / executing /
+    // idle); `activeExecCount` covers the brief window where a tool is running
+    // before the next state_changed lands. Callers run inside _onStatusBody, so
+    // _dispatchSession() resolves the session the in-flight event belongs to.
     function isTaskRunning() {
-        return session.state === 'planning'
-            || session.state === 'thinking'
-            || session.state === 'executing'
-            || activeExecCount > 0;
+        const s = _dispatchSession();
+        if (!s) return false;
+        return s.sessionState === 'planning'
+            || s.sessionState === 'thinking'
+            || s.sessionState === 'executing'
+            || s.activeExecCount > 0;
     }
 
     // ----- Markdown rendering ---------------------------------------------
@@ -654,51 +1324,217 @@
         return out.join('');
     }
 
-    // ----- Activity strip + popover ---------------------------------------
+    // ----- Per-session activity groups ------------------------------------
     //
-    // The strip (inline in the shortcuts bar) is always visible and shows the
-    // most recent agent event as a single muted line. Clicking the strip
-    // opens the popover above it with the full ring-buffer feed.
+    // The legacy global activity strip + popover have been removed (multi-
+    // session model — see plan #11/#12). Each session's pane now hosts its
+    // own activity content as collapsible `<details>` groups interleaved
+    // between chat bubbles. A group accumulates events (decision_made,
+    // tool_execution_started, tool result, planner step, network event...)
+    // since the last chat bubble; the next chat bubble seals the group and
+    // a fresh one opens on the next activity event. Sealed groups stay in
+    // the DOM as collapsed history.
+    //
+    // The session bucket holds the events as JS objects (`s.activityItems`)
+    // so a session's activity persists across tab switches.
 
-    const ACTIVITY_RING  = 30;
     const ACTIVITY_TRUNC = 2000;
-    const activityItems  = [];
-    let   activityLiveTimer = null;
-    let   popoverOpen = false;
 
-    function pulseActivityLive() {
-        if (!activityStrip) return;
-        activityStrip.classList.add('live');
-        if (activityLiveTimer) clearTimeout(activityLiveTimer);
-        activityLiveTimer = setTimeout(() => {
-            if (!activityStrip.classList.contains('working')) {
-                activityStrip.classList.remove('live');
-            }
-        }, 2500);
+    // Per-session status pill (UI1). The dispatch session is resolved from
+    // `_dispatchSid` (set while handling each inbound event) so each card
+    // reflects its own backend state; outbound paths fall back to active.
+    function setPill(text) {
+        const s = _dispatchSession();
+        if (!s) return;
+        s.pillText = text || 'idle';
+        if (s.pillEl) {
+            s.pillEl.textContent = text || 'idle';
+            s.pillEl.title = text || '';
+        }
     }
-
     function setWorking(text) {
-        if (!activityStrip) return;
-        if (activityLiveTimer) clearTimeout(activityLiveTimer);
-        activityStrip.classList.add('live', 'working');
-        if (activityCurrent) activityCurrent.textContent = text || '';
-        activityStrip.title = text || '';
+        const s = _dispatchSession();
+        if (!s) return;
+        s.pillText = text || 'working…';
+        if (s.pillEl) {
+            s.pillEl.textContent = text || 'working…';
+            s.pillEl.title = text || '';
+            s.pillEl.classList.add('working');
+        }
     }
-
     function clearWorking() {
-        if (!activityStrip) return;
-        activityStrip.classList.remove('working');
+        const s = _dispatchSession();
+        if (!s) return;
+        if (s.pillEl) s.pillEl.classList.remove('working');
     }
 
-    // Track last tool name for post-execution display (backend sends None for tool in post events)
-    var lastCalledTool = '';
-    // Latest agent reasoning (from decision_made). Used to label the activity
-    // strip with the actual thinking content instead of a generic "thinking…".
-    var lastThinking = '';
-    // Count of currently in-flight tool executions. When > 0, the strip stays
-    // in "working" state showing the active execution rather than flipping to
-    // a completed result.
-    var activeExecCount = 0;
+    // ── Activity group rendering inside per-session panes ───────────────
+
+    function _getOrCreateActivityGroup(pane) {
+        if (!pane) return null;
+        if (pane._activeActivityGroup) return pane._activeActivityGroup;
+        const group = document.createElement('details');
+        group.className = 'activity-group';
+        group.open = false;
+        const summary = document.createElement('summary');
+        summary.className = 'activity-group-summary';
+        const sCount = document.createElement('span');
+        sCount.className = 'ai-group-count';
+        sCount.textContent = 'Activity (0)';
+        summary.appendChild(sCount);
+        group.appendChild(summary);
+        const itemsContainer = document.createElement('div');
+        itemsContainer.className = 'activity-group-items';
+        group.appendChild(itemsContainer);
+        group._itemsContainer = itemsContainer;
+        group._count = 0;
+        group._countLabel = sCount;
+        pane.appendChild(group);
+        pane._activeActivityGroup = group;
+        return group;
+    }
+
+    function _sealActivityGroup(pane) {
+        if (pane) pane._activeActivityGroup = null;
+    }
+
+    function _renderActivityItem(entry) {
+        const item = el('div', 'activity-item');
+        const head = el('div', 'ai-head');
+        head.appendChild(el('span', 'ai-icon', entry.icon));
+        head.appendChild(el('span', 'ai-label', entry.label));
+        head.appendChild(el('span', 'ai-time', entry.time));
+        item.appendChild(head);
+        if (entry.content) {
+            const contentIsJson = isJsonString(entry.content);
+            const content = el('span', 'ai-content' + (contentIsJson ? ' ai-json' : ''));
+            if (contentIsJson) content.appendChild(renderJsonContent(entry.content));
+            else content.textContent = truncate(entry.content, ACTIVITY_TRUNC);
+            item.appendChild(content);
+            item.title = contentIsJson ? '' : entry.content;
+        }
+        if (entry.resultContent) {
+            _appendActivityResult(item, entry);
+        }
+        item.addEventListener('click', (ev) => {
+            // Don't toggle expansion when the click bubbled up from the
+            // outer <details> summary — let the summary handle its own toggle.
+            ev.stopPropagation();
+            item.classList.toggle('expanded');
+            const c = item.querySelector('.ai-content');
+            if (c && !c.classList.contains('ai-json')) {
+                c.textContent = item.classList.contains('expanded')
+                    ? entry.content
+                    : truncate(entry.content, ACTIVITY_TRUNC);
+            }
+            const r = item.querySelector('.ai-result');
+            if (r && !r.classList.contains('ai-json')) {
+                r.textContent = '↳ ' + (item.classList.contains('expanded')
+                    ? entry.resultContent
+                    : truncate(entry.resultContent, ACTIVITY_TRUNC));
+            }
+        });
+        return item;
+    }
+
+    function _appendActivityResult(item, entry) {
+        const resultIsJson = isJsonString(entry.resultContent);
+        const resultEl = el('div', 'ai-result' + (resultIsJson ? ' ai-json' : ''));
+        if (resultIsJson) {
+            resultEl.appendChild(document.createTextNode('↳ '));
+            resultEl.appendChild(renderJsonContent(entry.resultContent));
+        } else {
+            resultEl.textContent = '↳ ' + truncate(entry.resultContent, ACTIVITY_TRUNC);
+        }
+        item.appendChild(resultEl);
+    }
+
+    function pushActivity(icon, label, content, opts) {
+        // Append an activity entry to the current dispatch session's
+        // pane. The entry lands inside the session's "open" activity
+        // group; if no group is open, one is created at the current
+        // bottom of the pane (which is where it semantically belongs —
+        // events that happen between two chat bubbles get grouped
+        // together visually).
+        const pane = _dispatchPane();
+        const s = _dispatchSession();
+        if (!pane || !s) return null;
+        const time = new Date().toLocaleTimeString([], { hour12: false });
+        const entry = {
+            icon: icon || '·',
+            label: label || '',
+            content: content == null ? '' : String(content),
+            time: time,
+            iter: opts && opts.iter != null ? String(opts.iter) : null,
+            tool: opts && opts.tool ? String(opts.tool) : null,
+            pending: !!(opts && opts.pending),
+            resultIcon: null,
+            resultContent: null,
+            _el: null,
+        };
+        s.activityItems.push(entry);
+        const group = _getOrCreateActivityGroup(pane);
+        const itemEl = _renderActivityItem(entry);
+        entry._el = itemEl;
+        group._itemsContainer.appendChild(itemEl);
+        group._count += 1;
+        group._countLabel.textContent = 'Activity (' + group._count + ')';
+        scrollToBottom();
+        return entry;
+    }
+
+    function updateActivityResult(iter, tool, resultIcon, headLabel, resultContent) {
+        // Fold a tool's post-execution result into its matching pre-event
+        // entry instead of pushing a separate "done" line. We scan THIS
+        // session's items (newest first) for a pending entry with
+        // matching (iter, tool).
+        const s = _dispatchSession();
+        if (!s) return;
+        const iterStr = iter == null ? null : String(iter);
+        let match = null;
+        for (let i = s.activityItems.length - 1; i >= 0; i--) {
+            const e = s.activityItems[i];
+            if (!e.pending) continue;
+            if (iterStr != null && e.iter !== iterStr) continue;
+            if (tool && e.tool && e.tool !== tool) continue;
+            match = e;
+            break;
+        }
+        if (!match) {
+            pushActivity(resultIcon || '✓',
+                         (tool || 'tool') + ' done',
+                         resultContent || '');
+            return;
+        }
+        match.icon = resultIcon || '✓';
+        match.label = headLabel || match.tool || match.label;
+        match.resultIcon = resultIcon || '✓';
+        match.resultContent = resultContent == null ? '' : String(resultContent);
+        match.pending = false;
+        if (match._el) {
+            const head = match._el.querySelector('.ai-head');
+            if (head) {
+                const icon = head.querySelector('.ai-icon');
+                const label = head.querySelector('.ai-label');
+                if (icon)  icon.textContent  = match.icon;
+                if (label) label.textContent = match.label;
+            }
+            if (!match._el.querySelector('.ai-result')) {
+                _appendActivityResult(match._el, match);
+            }
+        }
+    }
+
+    function clearActivity() {
+        // Reset this session's activity history. Called from scNew (the
+        // "reset current tab" shortcut). The pane's bubbles have already
+        // been cleared by the caller via innerHTML = ''; here we just
+        // drop the in-memory ring + clear the active-group pointer.
+        const s = _dispatchSession() || active();
+        if (!s) return;
+        s.activityItems = [];
+        if (s.pane) s.pane._activeActivityGroup = null;
+    }
 
     function briefToolContext(tool, params) {
         if (!params) return '';
@@ -769,240 +1605,6 @@
         // activity entries (state_changed, progress, thinking).
         setPill(text);
     }
-
-    function pushActivity(icon, label, content, opts) {
-        if (!activityStrip) return null;
-        const time = new Date().toLocaleTimeString([], { hour12: false });
-        const entry = {
-            icon: icon || '·',
-            label: label || '',
-            content: content == null ? '' : String(content),
-            time: time,
-            // Optional pairing tags — set by the tool_execution_started pre
-            // branch so the matching post event can find this entry and
-            // attach a result instead of pushing a separate Done item.
-            iter: opts && opts.iter != null ? String(opts.iter) : null,
-            tool: opts && opts.tool ? String(opts.tool) : null,
-            pending: !!(opts && opts.pending),
-            resultIcon: null,
-            resultContent: null,
-        };
-        activityItems.push(entry);
-        if (activityItems.length > ACTIVITY_RING) activityItems.shift();
-        renderActivityFeed();
-        // Refresh the strip text with a one-line preview of the latest entry.
-        const preview = entry.icon + ' ' + entry.label +
-            (entry.content ? ' · ' + truncate(entry.content.replace(/\s+/g, ' '), 120) : '');
-        setPill(preview);
-        pulseActivityLive();
-        return entry;
-    }
-
-    // Find the oldest pending entry matching (iter, tool) and attach a
-    // result to it — folding the post-execution event into the same
-    // activity item that announced the pre-execution. Falls back to a
-    // fresh activity entry if no matching pending entry is found (e.g.
-    // it was evicted from the ring buffer).
-    function updateActivityResult(iter, tool, resultIcon, headLabel, resultContent) {
-        var iterStr = iter == null ? null : String(iter);
-        var match = null;
-        for (var i = 0; i < activityItems.length; i++) {
-            var e = activityItems[i];
-            if (!e.pending) continue;
-            if (iterStr != null && e.iter !== iterStr) continue;
-            if (tool && e.tool && e.tool !== tool) continue;
-            match = e;
-            break;
-        }
-        if (!match) {
-            // Pending entry already evicted (or never recorded). Degrade to
-            // the legacy behaviour so the result is still surfaced.
-            pushActivity(resultIcon || '✓', (tool || 'tool') + ' done', resultContent || '');
-            return;
-        }
-        match.icon = resultIcon || '✓';
-        match.label = headLabel || match.tool || match.label;
-        match.resultIcon = resultIcon || '✓';
-        match.resultContent = resultContent == null ? '' : String(resultContent);
-        match.pending = false;
-        renderActivityFeed();
-        // Refresh the strip text so the most recent completion is visible.
-        const preview = match.icon + ' ' + match.label +
-            (match.resultContent ? ' · ' + truncate(match.resultContent.replace(/\s+/g, ' '), 120) : '');
-        setPill(preview);
-        pulseActivityLive();
-    }
-
-    function renderActivityFeed() {
-        if (!activityFeed) return;
-        activityFeed.innerHTML = '';
-        // Newest at the top — common for notification-style feeds.
-        for (let i = activityItems.length - 1; i >= 0; i--) {
-            const entry = activityItems[i];
-            const li = el('li', 'activity-item');
-
-            const head = el('div', 'ai-head');
-            head.appendChild(el('span', 'ai-icon', entry.icon));
-            head.appendChild(el('span', 'ai-label', entry.label));
-            head.appendChild(el('span', 'ai-time', entry.time));
-            li.appendChild(head);
-
-            if (entry.content) {
-                const contentIsJson = isJsonString(entry.content);
-                const content = el('span', 'ai-content' + (contentIsJson ? ' ai-json' : ''));
-                if (contentIsJson) {
-                    content.appendChild(renderJsonContent(entry.content));
-                } else {
-                    content.textContent = truncate(entry.content, ACTIVITY_TRUNC);
-                }
-                li.appendChild(content);
-                li.title = contentIsJson ? '' : entry.content;
-            }
-
-            // Threaded result line: when a pending exec entry has been
-            // sealed by its post-event, render the result inside the same
-            // <li> with a leading "↳" so it's clearly tied to the command
-            // above. Collapsed by default; expands with the parent click.
-            if (entry.resultContent) {
-                const resultIsJson = isJsonString(entry.resultContent);
-                const resultEl = el('div', 'ai-result' + (resultIsJson ? ' ai-json' : ''));
-                if (resultIsJson) {
-                    resultEl.appendChild(document.createTextNode('↳ '));
-                    resultEl.appendChild(renderJsonContent(entry.resultContent));
-                } else {
-                    resultEl.textContent = '↳ ' + truncate(entry.resultContent, ACTIVITY_TRUNC);
-                }
-                li.appendChild(resultEl);
-            }
-
-            li.addEventListener('click', () => {
-                li.classList.toggle('expanded');
-                const c = li.querySelector('.ai-content');
-                if (c && !c.classList.contains('ai-json')) {
-                    c.textContent = li.classList.contains('expanded')
-                        ? entry.content
-                        : truncate(entry.content, ACTIVITY_TRUNC);
-                }
-                const r = li.querySelector('.ai-result');
-                if (r && !r.classList.contains('ai-json')) {
-                    r.textContent = '↳ ' + (li.classList.contains('expanded')
-                        ? entry.resultContent
-                        : truncate(entry.resultContent, ACTIVITY_TRUNC));
-                }
-            });
-
-            activityFeed.appendChild(li);
-        }
-    }
-
-    function clearActivity() {
-        activityItems.length = 0;
-        renderActivityFeed();
-        if (activityStrip) activityStrip.classList.remove('live');
-    }
-
-    function openPopover() {
-        if (!activityPopover) return;
-        activityPopover.classList.remove('hidden');
-        activityPopover.setAttribute('aria-hidden', 'false');
-        if (activityStrip) {
-            activityStrip.classList.add('open');
-            activityStrip.setAttribute('aria-expanded', 'true');
-        }
-        popoverOpen = true;
-    }
-
-    function closePopover() {
-        if (!activityPopover) return;
-        activityPopover.classList.add('hidden');
-        activityPopover.setAttribute('aria-hidden', 'true');
-        if (activityStrip) {
-            activityStrip.classList.remove('open');
-            activityStrip.setAttribute('aria-expanded', 'false');
-        }
-        popoverOpen = false;
-    }
-
-    function togglePopover() {
-        if (popoverOpen) closePopover();
-        else openPopover();
-    }
-
-    if (activityStrip) {
-        activityStrip.addEventListener('click', (e) => {
-            e.stopPropagation();
-            togglePopover();
-        });
-    }
-    if (activityClose) {
-        activityClose.addEventListener('click', (e) => {
-            e.stopPropagation();
-            closePopover();
-        });
-    }
-    // Click outside both strip and popover closes the popover.
-    document.addEventListener('click', (e) => {
-        if (!popoverOpen) return;
-        if (activityPopover && activityPopover.contains(e.target)) return;
-        if (activityStrip && activityStrip.contains(e.target)) return;
-        closePopover();
-    });
-
-    // ── Activity popover proportional resize (handle at bottom-left) ──────
-    (function initActivityResize() {
-        const handle = document.getElementById('activity-resize-handle');
-        if (!handle || !activityPopover) return;
-        let resizing = false, startX, startY, startW, startH, aspect;
-
-        handle.addEventListener('mousedown', (e) => {
-            e.preventDefault();
-            e.stopPropagation();
-            resizing = true;
-            startX = e.clientX;
-            startY = e.clientY;
-            startW = activityPopover.offsetWidth;
-            // Use max(offsetHeight, 200) to avoid an extreme aspect ratio when
-            // the feed has very few items and the natural height is tiny.
-            startH = Math.max(activityPopover.offsetHeight, 200);
-            aspect = startW / startH;
-            document.body.style.userSelect = 'none';
-        });
-
-        document.addEventListener('mousemove', (e) => {
-            if (!resizing) return;
-            // Dragging bottom-left handle: left decreases X → width grows,
-            // down increases Y → height grows. Use the larger delta to drive
-            // proportional scaling.
-            const dx = startX - e.clientX; // positive = dragged left = bigger
-            const dy = e.clientY - startY; // positive = dragged down = bigger
-            // dy converts to width-delta via aspect (width/height), not aspect^2.
-            const delta = Math.abs(dx) >= Math.abs(dy) ? dx : dy * aspect;
-            let newW = startW + delta;
-            let newH = newW / aspect;
-
-            // Clamp to minimum
-            if (newW < 320) { newW = 320; newH = newW / aspect; }
-            if (newH < 200) { newH = 200; newW = newH * aspect; }
-
-            // Clamp to app window size (can't exceed viewport)
-            const maxW = window.innerWidth - 28;
-            const maxH = window.innerHeight - 80;
-            if (newW > maxW) { newW = maxW; newH = newW / aspect; }
-            if (newH > maxH) { newH = maxH; newW = newH * aspect; }
-
-            activityPopover.style.width = Math.round(newW) + 'px';
-            // Use style.height (not maxHeight) so shrinking actually reduces
-            // the rendered height regardless of content amount.
-            activityPopover.style.height = Math.round(newH) + 'px';
-        });
-
-        document.addEventListener('mouseup', () => {
-            if (resizing) {
-                resizing = false;
-                document.body.style.userSelect = '';
-            }
-        });
-    })();
 
     function formatToolParams(params) {
         if (params === undefined || params === null) return '';
@@ -1077,13 +1679,18 @@
     }
 
     function scrollToBottom() {
-        conversation.scrollTop = conversation.scrollHeight;
+        // Scroll the dispatch session's own card body (each card scrolls
+        // independently in the tiled layout).
+        const p = _dispatchPane();
+        if (p) p.scrollTop = p.scrollHeight;
     }
 
     function addUserBubble(text) {
         const bubble = el('div', 'bubble user');
         bubble.appendChild(el('div', 'bubble-body', text));
-        conversation.appendChild(bubble);
+        const pane = _dispatchPane();
+        _sealActivityGroup(pane);
+        pane.appendChild(bubble);
         scrollToBottom();
     }
 
@@ -1112,29 +1719,39 @@
         catch (_) { span.textContent = text || ''; }
         body.appendChild(span);
         bubble.appendChild(body);
-        conversation.appendChild(bubble);
+        const pane = _dispatchPane();
+        _sealActivityGroup(pane);
+        pane.appendChild(bubble);
         scrollToBottom();
     }
 
     // Streaming receptionist reply — incremental markdown render per delta.
-    var activeReceptionistBubble = null;
+    // The "currently streaming" bubble is tracked PER SESSION via the
+    // session bucket's `activeReceptionistBubble` field; this allows two
+    // concurrent sessions to each have their own streaming bubble in-flight.
 
     function appendReceptionistDelta(text) {
         if (!text) return;
-        if (!activeReceptionistBubble) {
-            activeReceptionistBubble = el('div', 'bubble assistant streaming');
+        const s = _dispatchSession();
+        if (!s) return;
+        if (!s.activeReceptionistBubble) {
+            s.activeReceptionistBubble = el('div', 'bubble assistant streaming');
             const body = el('div', 'bubble-body');
-            activeReceptionistBubble.appendChild(body);
-            activeReceptionistBubble._body = body;
-            activeReceptionistBubble._currentTextSpan = null;
-            conversation.appendChild(activeReceptionistBubble);
+            s.activeReceptionistBubble.appendChild(body);
+            s.activeReceptionistBubble._body = body;
+            s.activeReceptionistBubble._currentTextSpan = null;
+            const pane = s.pane || conversation;
+            // New assistant turn — seal any open activity group so it
+            // settles above the upcoming streaming bubble.
+            _sealActivityGroup(pane);
+            pane.appendChild(s.activeReceptionistBubble);
         }
-        var span = activeReceptionistBubble._currentTextSpan;
+        var span = s.activeReceptionistBubble._currentTextSpan;
         if (!span) {
             span = el('div', 'text-stream md-rendered');
             span._rawText = '';
-            activeReceptionistBubble._body.appendChild(span);
-            activeReceptionistBubble._currentTextSpan = span;
+            s.activeReceptionistBubble._body.appendChild(span);
+            s.activeReceptionistBubble._currentTextSpan = span;
         }
         span._rawText += text;
         scheduleMarkdownRender(span);
@@ -1142,59 +1759,83 @@
     }
 
     function sealReceptionistBubble() {
-        if (!activeReceptionistBubble) return;
-        activeReceptionistBubble.classList.remove('streaming');
-        activeReceptionistBubble.classList.add('complete');
-        if (activeReceptionistBubble._currentTextSpan) {
-            var span = activeReceptionistBubble._currentTextSpan;
+        const s = _dispatchSession();
+        if (!s || !s.activeReceptionistBubble) return;
+        s.activeReceptionistBubble.classList.remove('streaming');
+        s.activeReceptionistBubble.classList.add('complete');
+        if (s.activeReceptionistBubble._currentTextSpan) {
+            var span = s.activeReceptionistBubble._currentTextSpan;
             try { span.innerHTML = renderMarkdown(span._rawText || ''); }
             catch (_) { span.textContent = span._rawText || ''; }
         }
-        activeReceptionistBubble = null;
+        s.activeReceptionistBubble = null;
     }
 
     function showThinkingBubble() {
-        if (thinkingBubble) return;
-        thinkingBubble = el('div', 'bubble assistant thinking-indicator');
+        const s = _dispatchSession();
+        if (!s || s.thinkingBubble) return;
+        s.thinkingBubble = el('div', 'bubble assistant thinking-indicator');
         var body = el('div', 'bubble-body');
         var dots = el('span', 'thinking-dots');
         dots.appendChild(el('span', 'dot'));
         dots.appendChild(el('span', 'dot'));
         dots.appendChild(el('span', 'dot'));
         body.appendChild(dots);
-        thinkingBubble.appendChild(body);
-        conversation.appendChild(thinkingBubble);
+        s.thinkingBubble.appendChild(body);
+        const pane = s.pane || conversation;
+        _sealActivityGroup(pane);
+        pane.appendChild(s.thinkingBubble);
         scrollToBottom();
     }
 
     function removeThinkingBubble() {
-        if (!thinkingBubble) return;
-        if (thinkingBubble.parentNode) thinkingBubble.parentNode.removeChild(thinkingBubble);
-        thinkingBubble = null;
+        const s = _dispatchSession();
+        if (!s || !s.thinkingBubble) return;
+        if (s.thinkingBubble.parentNode) {
+            s.thinkingBubble.parentNode.removeChild(s.thinkingBubble);
+        }
+        s.thinkingBubble = null;
     }
 
     function addSystemBubble(text) {
         const bubble = el('div', 'bubble system');
         bubble.appendChild(el('div', 'bubble-body', text || ''));
-        conversation.appendChild(bubble);
+        const pane = _dispatchPane();
+        _sealActivityGroup(pane);
+        pane.appendChild(bubble);
+        scrollToBottom();
+    }
+
+    function addGlobalSystemBubble(text) {
+        // Global events (network, llm_fallback) affect all sessions — render
+        // in every mounted session pane so the user sees it regardless of
+        // which tab is active. Without this, the bubble only appears in
+        // activeSid and background sessions have no visibility.
+        for (const [, s] of sessions) {
+            const bubble = el('div', 'bubble system global-notice');
+            bubble.appendChild(el('div', 'bubble-body', text || ''));
+            _sealActivityGroup(s.pane);
+            s.pane.appendChild(bubble);
+        }
         scrollToBottom();
     }
 
     function addStepBubble(icon, desc) {
-        const bubble = el('div', 'bubble step');
-        const body = el('div', 'bubble-body');
-        const time = new Date().toLocaleTimeString([], { hour12: false });
-        body.textContent = time + '  ' + (icon ? icon + ' ' : '') + (desc || '');
-        bubble.appendChild(body);
-        conversation.appendChild(bubble);
-        scrollToBottom();
+        // Step events (planner inline_event) are activity-class; route them
+        // into the current session's activity group instead of producing
+        // standalone bubbles. Keeps the conversation thread focused on
+        // user/assistant messages while letting the user expand activity to
+        // see step traces.
+        pushActivity(icon || '·', String(desc || ''), '');
     }
 
     function addErrorBubble(message, where) {
         const bubble = el('div', 'bubble error');
         const prefix = where ? '[' + where + '] ' : '';
         bubble.appendChild(el('div', 'bubble-body', prefix + (message || '(no message)')));
-        conversation.appendChild(bubble);
+        const pane = _dispatchPane();
+        _sealActivityGroup(pane);
+        pane.appendChild(bubble);
         scrollToBottom();
     }
 
@@ -1215,24 +1856,19 @@
     // engine then either treats it as user_message (tool path) or
     // injects it as risk_guidance (risk path).
 
-    // Track the prompt id of the currently shown modal so each Approve /
-    // Reject / Submit click sends back a single response. Reset to null
-    // after responding to avoid double-sends if the user rapid-clicks.
-    let activePromptId = null;
-    // Track whether the active prompt expects a yes/no answer (confirm)
-    // or a free-form string (secret_input).
-    let activePromptKind = null;
+    // UI3 — per-session confirmations. Each session renders its own prompt
+    // INLINE inside its card (above its composer), so a popup in session B
+    // never blocks or steals focus from session A. The pending prompt id is
+    // tracked per session (s.pendingConfirm) and the answer is always stamped
+    // with that session's own sid — never the globally-focused tab.
 
-    function renderDecisionSummary(decision) {
+    function _renderDecisionInto(elNode, decision) {
         // decision: { tool_calls: [{tool_name, params: {...}}], reasoning }
-        confirmDecisionEl.textContent = '';
-        if (!decision) {
-            confirmDecisionEl.classList.add('hidden');
-            return;
-        }
+        elNode.textContent = '';
+        if (!decision) { elNode.classList.add('hidden'); return; }
         const calls = Array.isArray(decision.tool_calls) ? decision.tool_calls : [];
         if (calls.length === 0 && !decision.reasoning) {
-            confirmDecisionEl.classList.add('hidden');
+            elNode.classList.add('hidden');
             return;
         }
         const lines = [];
@@ -1248,117 +1884,191 @@
             lines.push('');
             lines.push('reasoning: ' + decision.reasoning);
         }
-        confirmDecisionEl.textContent = lines.join('\n');
-        confirmDecisionEl.classList.remove('hidden');
+        elNode.textContent = lines.join('\n');
+        elNode.classList.remove('hidden');
+    }
+
+    // Build the inline confirmation controls inside a session's confirm host
+    // exactly once; wire the buttons to that session's sid. Returns the refs.
+    function _ensureConfirmUI(s) {
+        if (s.confirmUI) return s.confirmUI;
+        const host = s.confirmEl;
+        const card = el('div', 'session-confirm-card');
+        const titleEl = el('div', 'scc-title');
+        const descEl = el('div', 'scc-desc');
+        const decisionEl = el('pre', 'scc-decision hidden');
+        const secretWrap = el('label', 'scc-secret-wrap hidden');
+        const secretLabel = el('span', 'scc-secret-label', 'Value:');
+        const secretIn = document.createElement('input');
+        secretIn.type = 'password';
+        secretIn.className = 'scc-secret';
+        secretWrap.appendChild(secretLabel);
+        secretWrap.appendChild(secretIn);
+        const guidanceEl = document.createElement('textarea');
+        guidanceEl.className = 'scc-guidance hidden';
+        guidanceEl.rows = 2;
+        guidanceEl.placeholder = 'Optional guidance for the agent…';
+        const actions = el('div', 'scc-actions');
+        const rejectBtn = el('button', 'scc-reject', 'Reject');
+        rejectBtn.type = 'button';
+        const guidBtn = el('button', 'scc-guid', 'Cancel guidance');
+        guidBtn.type = 'button';
+        const submitBtn = el('button', 'scc-submit primary', 'Approve');
+        submitBtn.type = 'button';
+        actions.appendChild(rejectBtn);
+        actions.appendChild(guidBtn);
+        actions.appendChild(submitBtn);
+        card.appendChild(titleEl);
+        card.appendChild(descEl);
+        card.appendChild(decisionEl);
+        card.appendChild(secretWrap);
+        card.appendChild(guidanceEl);
+        card.appendChild(actions);
+        host.appendChild(card);
+
+        const sid = s.sid;
+        submitBtn.addEventListener('click', () => {
+            const kind = s.pendingConfirm && s.pendingConfirm.kind;
+            if (kind === 'secret_input' || kind === 'ask_human') {
+                sendConfirmationAnswer(sid, secretIn.value || '');
+            } else if (!guidanceEl.classList.contains('hidden')) {
+                const text = (guidanceEl.value || '').trim();
+                sendConfirmationAnswer(sid, text || 'yes');
+            } else {
+                sendConfirmationAnswer(sid, 'yes');
+            }
+        });
+        rejectBtn.addEventListener('click', () => sendConfirmationAnswer(sid, 'no'));
+        guidBtn.addEventListener('click', () => {
+            if (guidanceEl.classList.contains('hidden')) {
+                guidanceEl.classList.remove('hidden');
+                guidBtn.textContent = 'Cancel guidance';
+                try { guidanceEl.focus(); } catch (_) { /* ignore */ }
+            } else {
+                guidanceEl.classList.add('hidden');
+                guidanceEl.value = '';
+                guidBtn.textContent = 'Provide guidance';
+            }
+        });
+        secretIn.addEventListener('keydown', (e) => {
+            const kind = s.pendingConfirm && s.pendingConfirm.kind;
+            if (e.key === 'Enter' && (kind === 'secret_input' || kind === 'ask_human')) {
+                e.preventDefault();
+                sendConfirmationAnswer(sid, secretIn.value || '');
+            }
+        });
+
+        s.confirmUI = {
+            card, titleEl, descEl, decisionEl,
+            secretWrap, secretIn, guidanceEl,
+            rejectBtn, guidBtn, submitBtn,
+        };
+        return s.confirmUI;
     }
 
     function showConfirmationModal(evt) {
-        // Idempotency: if a previous prompt was never answered (shouldn't
-        // happen — the bridge serialises confirmations), the new one
-        // overwrites the active id. The earlier waiter on the Python side
-        // will time out only if we never send any response, but in
-        // practice the user clicks one of the new buttons and that reply
-        // unblocks whichever waiter is still pending in IM.
-        activePromptId = String(evt.id || '');
-        activePromptKind = String(evt.kind || '');
+        const sid = _resolveSid(evt);
+        const s = sessions.get(sid);
+        if (!s) {
+            window.__handqLog('ERROR', 'confirmation for unknown session',
+                { sid, id: evt && evt.id });
+            return;
+        }
+        const ui = _ensureConfirmUI(s);
+        s.pendingConfirm = { id: String(evt.id || ''), kind: String(evt.kind || '') };
 
-        // Reset any scope-specific styling from a previous modal.
-        const confirmCard = overlayConfirm.querySelector('.confirmation-card');
-        if (confirmCard) confirmCard.classList.remove('desktop-takeover');
+        ui.card.classList.remove('desktop-takeover');
 
         if (evt.kind === 'secret_input') {
-            confirmTitle.textContent = 'Input required';
-            confirmDescEl.textContent = String(evt.prompt || 'Enter value:');
-            renderDecisionSummary(null);
-            confirmSecretWrap.classList.remove('hidden');
-            confirmSecretIn.value = '';
-            try { confirmSecretIn.type = 'password'; } catch (_) { /* ignore */ }
-            confirmGuidanceEl.classList.add('hidden');
-            confirmGuidanceEl.value = '';
-            confirmRejectBtn.classList.add('hidden');
-            confirmGuidBtn.classList.add('hidden');
-            confirmSubmitBtn.textContent = 'Submit';
+            ui.titleEl.textContent = 'Input required';
+            ui.descEl.textContent = String(evt.prompt || 'Enter value:');
+            _renderDecisionInto(ui.decisionEl, null);
+            ui.secretWrap.classList.remove('hidden');
+            ui.secretIn.value = '';
+            try { ui.secretIn.type = 'password'; } catch (_) { /* ignore */ }
+            ui.guidanceEl.classList.add('hidden');
+            ui.guidanceEl.value = '';
+            ui.rejectBtn.classList.add('hidden');
+            ui.guidBtn.classList.add('hidden');
+            ui.submitBtn.textContent = 'Submit';
         } else if (evt.kind === 'ask_human') {
-            confirmTitle.textContent = 'Question from agent';
-            confirmDescEl.textContent = String(evt.prompt || 'The agent has a question:');
-            renderDecisionSummary(null);
-            confirmSecretWrap.classList.remove('hidden');
-            confirmSecretIn.value = '';
-            // Non-masked input — the user is typing a clarifying answer,
-            // not a secret. Reset to password before the next secret_input.
-            try { confirmSecretIn.type = 'text'; } catch (_) { /* ignore */ }
-            confirmGuidanceEl.classList.add('hidden');
-            confirmGuidanceEl.value = '';
-            confirmRejectBtn.classList.add('hidden');
-            confirmGuidBtn.classList.add('hidden');
-            confirmSubmitBtn.textContent = 'Send';
+            ui.titleEl.textContent = 'Question from agent';
+            ui.descEl.textContent = String(evt.prompt || 'The agent has a question:');
+            _renderDecisionInto(ui.decisionEl, null);
+            ui.secretWrap.classList.remove('hidden');
+            ui.secretIn.value = '';
+            try { ui.secretIn.type = 'text'; } catch (_) { /* ignore */ }
+            ui.guidanceEl.classList.add('hidden');
+            ui.guidanceEl.value = '';
+            ui.rejectBtn.classList.add('hidden');
+            ui.guidBtn.classList.add('hidden');
+            ui.submitBtn.textContent = 'Send';
         } else {
-            // risk_confirmation or tool_confirmation
             const isRisk = evt.kind === 'risk_confirmation';
             const isDesktopTakeover = evt.scope === 'task' && evt.tool === 'desktop';
-            confirmTitle.textContent = isRisk
+            // evt.title / evt.approve_label are optional per-envelope overrides
+            // populated by the bridge (see stdio_bridge.request_risk_confirmation).
+            // They let a caller reframe the generic Approve/Reject modal — e.g.
+            // browser.request_user_login shows "Login required" with an
+            // "I've logged in" button so users don't read the flow as
+            // "grant credentials to HandQ".
+            const customTitle = evt.title ? String(evt.title) : '';
+            const customApprove = evt.approve_label ? String(evt.approve_label) : '';
+            ui.titleEl.textContent = customTitle || (isRisk
                 ? 'High-risk operation'
                 : (isDesktopTakeover
                     ? 'Grant desktop control for this task?'
-                    : 'Confirm ' + (evt.tool || 'tool') + ' execution');
-            // Backend now ships an explicit description for desktop
-            // tool_confirmation (and could for any future task-scoped
-            // gate). Prefer it whenever present, falling back to the
-            // generic sentence for legacy / other tools.
+                    : 'Confirm ' + (evt.tool || 'tool') + ' execution'));
             const description = evt.description ? String(evt.description) : '';
-            if (isRisk) {
-                confirmDescEl.textContent = description;
-            } else if (description) {
-                confirmDescEl.textContent = description;
+            if (isRisk || description) {
+                ui.descEl.textContent = description;
             } else {
-                confirmDescEl.textContent =
+                ui.descEl.textContent =
                     'The agent wants to run "' + (evt.tool || 'tool') +
                     '" with the parameters below.';
             }
-            renderDecisionSummary(evt.decision);
-            confirmSecretWrap.classList.add('hidden');
-            confirmSecretIn.value = '';
-            // Guidance is open by default: the box is the primary affordance,
-            // so the user can type instructions for the agent without first
-            // clicking "Provide guidance". An empty box still submits as
-            // Approve (see confirmSubmitBtn handler).
-            confirmGuidanceEl.classList.remove('hidden');
-            confirmGuidanceEl.value = '';
-            confirmRejectBtn.classList.remove('hidden');
-            confirmGuidBtn.classList.remove('hidden');
-            confirmGuidBtn.textContent = 'Cancel guidance';
-            confirmSubmitBtn.textContent = isDesktopTakeover ? 'Approve task-wide' : 'Approve';
-            // Tag the card so styles.css can paint it more loudly for the
-            // task-scoped desktop approval.
-            if (confirmCard && isDesktopTakeover) {
-                confirmCard.classList.add('desktop-takeover');
-            }
+            _renderDecisionInto(ui.decisionEl, evt.decision);
+            ui.secretWrap.classList.add('hidden');
+            ui.secretIn.value = '';
+            ui.guidanceEl.classList.remove('hidden');
+            ui.guidanceEl.value = '';
+            ui.rejectBtn.classList.remove('hidden');
+            ui.guidBtn.classList.remove('hidden');
+            ui.guidBtn.textContent = 'Cancel guidance';
+            ui.submitBtn.textContent = customApprove
+                || (isDesktopTakeover ? 'Approve task-wide' : 'Approve');
+            if (isDesktopTakeover) ui.card.classList.add('desktop-takeover');
         }
 
-        openOverlay(overlayConfirm);
-        // Focus management: passwords / ask_human get the input; risk gates
-        // need an explicit click on Approve so we don't auto-focus the primary.
-        if (evt.kind === 'secret_input' || evt.kind === 'ask_human') {
-            try { confirmSecretIn.focus(); } catch (_) { /* ignore */ }
+        s.confirmEl.classList.remove('hidden');
+        // Mark unread if this isn't the focused card so the user notices.
+        if (sid !== activeSid) {
+            s.unread = true;
         }
+        if (evt.kind === 'secret_input' || evt.kind === 'ask_human') {
+            try { ui.secretIn.focus(); } catch (_) { /* ignore */ }
+        }
+        try { s.confirmEl.scrollIntoView({ block: 'nearest' }); } catch (_) { /* ignore */ }
     }
 
-    function sendConfirmationAnswer(answer) {
-        if (!activePromptId) return;
+    function sendConfirmationAnswer(sid, answer) {
+        const s = sessions.get(sid);
+        if (!s || !s.pendingConfirm) return;
+        const promptId = s.pendingConfirm.id;
         try {
             handq.sendRequest({
                 type: 'user_input',
                 kind: 'confirmation',
-                id: activePromptId,
+                session_id: sid,
+                id: promptId,
                 answer: String(answer || ''),
             });
         } catch (e) {
             window.__handqLog('ERROR', 'confirm send failed',
-                { id: activePromptId, error: String(e) });
+                { sid, id: promptId, error: String(e) });
         }
-        activePromptId = null;
-        activePromptKind = null;
-        closeOverlay(overlayConfirm);
+        s.pendingConfirm = null;
+        if (s.confirmEl) s.confirmEl.classList.add('hidden');
     }
 
     // ----- bridge events ---------------------------------------------------
@@ -1683,6 +2393,96 @@
         });
     }
 
+    // Live task panel collapse state — persists across re-renders within a
+    // session; reset to collapsed on New (see scNew handler). Default collapsed
+    // so the panel never blocks the top of the conversation; the header alone
+    // (progress + current item) stays visible, and clicking it floats the full
+    // list as an overlay (like the activity strip ↔ popover pair).
+    let checklistExpanded = false;
+
+    function renderChecklist(items) {
+        // Per-session live task panel pinned at the top of the session's
+        // conversation pane. Each session has its own panel — multiple
+        // concurrent sessions never overwrite each other's checklist.
+        // Stored as a class (not id) so multiple coexist in the DOM at the
+        // same time; the panel lives inside that session's pane.
+        const pane = _dispatchPane();
+        const s = _dispatchSession();
+        if (!pane || !s) return;
+        let panel = pane.querySelector(':scope > .checklist-panel');
+        if (!items || items.length === 0) {
+            if (panel) panel.remove();
+            return;
+        }
+        if (!panel) {
+            panel = document.createElement('div');
+            panel.className = 'checklist-panel';
+            pane.insertBefore(panel, pane.firstChild);
+        }
+        const expanded = !!s.checklistExpanded;
+        panel.classList.toggle('collapsed', !expanded);
+
+        const GLYPH = {
+            done: '✓', running: '▶', pending: '○', failed: '✗', interrupted: '⊗',
+        };
+        const doneCount = items.filter((it) => it && it.status === 'done').length;
+        const current = items.find((it) => it && it.status === 'running');
+
+        panel.innerHTML = '';
+
+        // Header — always visible; clicking it toggles the floating list.
+        const header = document.createElement('button');
+        header.type = 'button';
+        header.className = 'checklist-header';
+        header.setAttribute('aria-expanded', String(expanded));
+        const chevron = document.createElement('span');
+        chevron.className = 'cl-chevron';
+        chevron.textContent = expanded ? '▾' : '▸';
+        const label = document.createElement('span');
+        label.className = 'cl-summary';
+        let summary = 'Task plan · ' + doneCount + '/' + items.length;
+        if (!expanded && current) {
+            // Collapsed: surface what's running so the panel is useful unopened.
+            summary += ' · ▶ ' + String(current.instruction || '');
+        } else {
+            summary += ' done';
+        }
+        label.textContent = summary;
+        header.appendChild(chevron);
+        header.appendChild(label);
+        header.addEventListener('click', () => {
+            s.checklistExpanded = !s.checklistExpanded;
+            renderChecklist(items);
+        });
+        panel.appendChild(header);
+
+        // Items — built only when expanded; floats as an overlay (CSS absolute)
+        // so it covers the conversation instead of pushing it down.
+        if (expanded) {
+            const list = document.createElement('div');
+            list.className = 'checklist-items';
+            for (const it of items) {
+                const status = String((it && it.status) || 'pending');
+                const row = document.createElement('div');
+                row.className = 'checklist-item cl-' + status;
+                const glyph = document.createElement('span');
+                glyph.className = 'cl-glyph';
+                glyph.textContent = GLYPH[status] || '·';
+                const text = document.createElement('span');
+                text.className = 'cl-text';
+                text.textContent = String((it && it.instruction) || '');
+                row.appendChild(glyph);
+                row.appendChild(text);
+                list.appendChild(row);
+            }
+            panel.appendChild(list);
+        }
+        // Track items on the session bucket so a session switch could
+        // re-render in v2 (the pane's DOM already retains the rendered
+        // panel, so this is for state persistence not re-render).
+        s.checklistItems = items;
+    }
+
     function handleSessionEvent(eventName, data) {
         if (eventName === 'session_opened') {
             createSessionTerminal(data.session_id, data.command, data.description);
@@ -1711,6 +2511,37 @@
     handq.onStatus((evt) => {
         if (gateGen(evt)) return;
         if (!evt) return;
+        // Drop straggler events for sessions the user explicitly closed.
+        // These can arrive after bridge teardown starts and would otherwise
+        // render in the wrong pane.
+        if (evt.session_id && closedSessions.has(evt.session_id)) return;
+        // Stamp the dispatch context so bubble helpers route to this
+        // session's pane (per-session DOM in the multi-session model).
+        // If the event has no session_id, fall back to active.
+        _dispatchSid = _resolveSid(evt);
+        // If we received an event for a session we don't have a tab for,
+        // create one lazily (e.g. scheduler-dispatched task to default).
+        // But NEVER resurrect a tab the user explicitly closed — straggler
+        // events from the dying flow must be silently dropped.
+        if (evt.session_id && !sessions.has(evt.session_id) && !closedSessions.has(evt.session_id)) {
+            _mountSession(evt.session_id, _autoNameForNewSession());
+            if (!activeSid) switchSession(evt.session_id);
+        }
+        // Mark non-active tabs as having unread updates.
+        if (_dispatchSid && _dispatchSid !== activeSid) {
+            const ns = sessions.get(_dispatchSid);
+            if (ns) {
+                ns.unread = true;
+            }
+        }
+        try {
+            return _onStatusBody(evt);
+        } finally {
+            _dispatchSid = null;
+        }
+    });
+
+    function _onStatusBody(evt) {
         window.__handqLog('DEBUG', 'onStatus', {
             type: evt.type,
             id: evt.id,
@@ -1771,7 +2602,8 @@
         }
 
         if (evt.kind === 'state_changed' && evt.state) {
-            session.state = evt.state;
+            const s = _dispatchSession();
+            if (s) s.sessionState = evt.state;
             // V2 activity-strip vocabulary (see controller_v2):
             //   planning  — orchestrator is composing/revising the checklist
             //   thinking  — agent has the LLM stream open (reasoning + tools)
@@ -1786,8 +2618,8 @@
                 // Show the actual thinking content (latest reasoning) rather
                 // than a generic label; falls back to "thinking…" only before
                 // any reasoning has streamed for this task.
-                setWorking(lastThinking
-                    ? 'thinking: ' + truncate(lastThinking, 120)
+                setWorking(s && s.lastThinking
+                    ? 'thinking: ' + truncate(s.lastThinking, 120)
                     : 'thinking…');
             } else if (evt.state === 'executing') {
                 setWorking('working…');
@@ -1811,7 +2643,8 @@
         } else if (evt.kind === 'decision_made') {
             const iter = args[0] || '';
             const reasoning = args[1] || '';
-            lastThinking = reasoning;
+            const s = _dispatchSession();
+            if (s) s.lastThinking = reasoning;
             pushActivity('💭', 'thinking' + (iter ? ' · iter ' + iter : ''), reasoning);
             setWorking('thinking: ' + truncate(reasoning, 120));
         } else if (evt.kind === 'tool_execution_started') {
@@ -1819,6 +2652,7 @@
             var rawTool  = args[1] || '';
             const params = args[2];
             const output = args[3];
+            const s = _dispatchSession();
             // Backend now sends tool_name in BOTH pre and post events; the
             // pre/post discriminator is the output field (null for pre,
             // populated for post). The "None"/"null" guards stay in place
@@ -1826,11 +2660,11 @@
             var tool = (rawTool && rawTool !== 'None' && rawTool !== 'null') ? rawTool : '';
             var isPre = output === undefined || output === null
                         || output === 'None' || output === 'null';
-            if (isPre && tool) lastCalledTool = tool;
-            var effectiveTool = tool || lastCalledTool || 'action';
+            if (isPre && tool && s) s.lastCalledTool = tool;
+            var effectiveTool = tool || (s && s.lastCalledTool) || 'action';
             const paramText = formatToolParams(params);
             if (isPre) {
-                activeExecCount++;
+                if (s) s.activeExecCount++;
                 var ctx = briefToolContext(effectiveTool, params);
                 var preLabel = 'Executing ' + effectiveTool;
                 var preContent = ctx || paramText;
@@ -1839,20 +2673,21 @@
                 });
                 setWorking('⊙ ' + effectiveTool + (ctx ? ' · ' + ctx : ''));
             } else {
-                activeExecCount = Math.max(0, activeExecCount - 1);
+                if (s) s.activeExecCount = Math.max(0, s.activeExecCount - 1);
                 var readable = formatResultReadable(effectiveTool, output);
                 var resultText = readable || (output == null ? '' : String(output));
                 var resultIcon = (resultText && resultText.charAt(0) === '✗') ? '✗' : '✓';
                 updateActivityResult(iter, effectiveTool, resultIcon,
                                      effectiveTool, resultText);
-                if (activeExecCount === 0) {
+                if (!s || s.activeExecCount === 0) {
                     clearWorking();
                     setPill(resultIcon + ' ' + effectiveTool +
                             (readable ? ' · ' + readable : ''));
                 }
             }
         } else if (evt.kind === 'bridge_exit') {
-            session.state = 'bridge exited';
+            const s = _dispatchSession();
+            if (s) s.sessionState = 'bridge exited';
             setPill('bridge exited');
             pushActivity('⚠', 'Bridge exited', 'code=' + evt.code + ' signal=' + evt.signal);
         } else if (evt.kind === 'reply') {
@@ -1886,6 +2721,13 @@
             }
         } else if (evt.kind === 'session_event') {
             handleSessionEvent(evt.event, evt.data || {});
+        } else if (evt.kind === 'session_started') {
+            if (evt.session_name) _renameSession(_dispatchSid, evt.session_name);
+        } else if (evt.kind === 'scheduled_task_started') {
+            const name = evt.session_name || ('⏱ ' + (evt.name || 'Scheduled'));
+            _renameSession(_dispatchSid, name);
+        } else if (evt.kind === 'checklist') {
+            renderChecklist(Array.isArray(evt.items) ? evt.items : []);
         } else if (evt.kind === 'llm_server_error') {
             const retryIn = (typeof evt.retry_in === 'number' && evt.retry_in > 0)
                 ? ' — retrying in ' + evt.retry_in + 's'
@@ -1894,7 +2736,7 @@
                 ? ' (' + evt.attempts_left + ' attempt' + (evt.attempts_left !== 1 ? 's' : '') + ' remaining)'
                 : '';
             const errSummary = (evt.message || 'API server issue') + retryIn + attLeft;
-            addSystemBubble('⏳ ' + errSummary
+            addGlobalSystemBubble('⏳ ' + errSummary
                 + '\nThis is a temporary API server issue, not a HandQ problem.'
                 + ' Retrying automatically — please wait.');
             pushActivity('⏳', 'API retry', errSummary);
@@ -1903,10 +2745,10 @@
             const fromModel = String(evt.from_model || '?');
             const toModel   = String(evt.to_model   || '?');
             const reason    = evt.error ? ' — ' + evt.error : '';
-            addSystemBubble('↪ ' + fromModel + ' failed; trying ' + toModel + reason);
+            addGlobalSystemBubble('↪ ' + fromModel + ' failed; trying ' + toModel + reason);
             pushActivity('↪', 'Model fallback', fromModel + ' → ' + toModel);
         } else if (evt.kind === 'network_down') {
-            addSystemBubble('📡 ' + (evt.message || '网络中断，等待恢复…')
+            addGlobalSystemBubble('📡 ' + (evt.message || '网络中断，等待恢复…')
                 + '\nHandQ will resume automatically once the connection is restored.');
             pushActivity('📡', 'Network down', 'waiting for LLM endpoint');
             setPill('offline…');
@@ -1915,7 +2757,7 @@
                 ? evt.retry_in + 's' : '…';
             pushActivity('📡', 'Still offline', 'attempt ' + (evt.attempt || '?') + ', next probe in ' + retryIn);
         } else if (evt.kind === 'network_restored') {
-            addSystemBubble('✅ ' + (evt.message || '网络已恢复，继续执行'));
+            addGlobalSystemBubble('✅ ' + (evt.message || '网络已恢复，继续执行'));
             pushActivity('✅', 'Network restored', 'resuming');
             setPill('working…');
         } else if (evt.kind === 'skill_proposed') {
@@ -1933,10 +2775,20 @@
             addSystemBubble(msg);
             pushActivity('💡', 'Skill proposed', desc);
         }
-    });
+    }
 
     handq.onFinal((evt) => {
         if (gateGen(evt)) return;
+        if (evt && evt.session_id && closedSessions.has(evt.session_id)) return;
+        _dispatchSid = _resolveSid(evt);
+        try {
+            return _onFinalBody(evt);
+        } finally {
+            _dispatchSid = null;
+        }
+    });
+
+    function _onFinalBody(evt) {
         window.__handqLog('INFO', 'onFinal', {
             type: evt && evt.type,
             id: evt && evt.id,
@@ -1960,12 +2812,23 @@
             summary.appendChild(el('div', 'bubble-body',
                 (evt.result.success ? '✓ ' : '✗ ') +
                 (evt.result.message || '(no message)')));
-            conversation.appendChild(summary);
+            _dispatchPane().appendChild(summary);
             scrollToBottom();
+        }
+    }
+
+    handq.onError((evt) => {
+        if (gateGen(evt)) return;
+        if (evt && evt.session_id && closedSessions.has(evt.session_id)) return;
+        _dispatchSid = _resolveSid(evt);
+        try {
+            return _onErrorBody(evt);
+        } finally {
+            _dispatchSid = null;
         }
     });
 
-    handq.onError((evt) => {
+    function _onErrorBody(evt) {
         if (gateGen(evt)) return;
         if (!evt) return;
         window.__handqLog('ERROR', 'onError', {
@@ -1989,49 +2852,44 @@
         pushActivity('⚠', 'Error' + (evt.where ? ' · ' + evt.where : ''),
                      evt.message || '(no message)');
         if (evt.fatal) {
-            session.state = 'fatal';
+            const s = _dispatchSession();
+            if (s) s.sessionState = 'fatal';
             setPill('fatal');
         }
-    });
+    }
 
     // ----- composer --------------------------------------------------------
 
-    let firstSendDone = false;
+    // Note: firstSendDone is per-session — tracked on each session's state
+    // bucket as `firstSendDone`. The first message in a session goes out as
+    // `request` (and triggers _ensure_flow on the bridge); subsequent ones
+    // go out as `user_input` of kind 'message'.
 
-    composer.addEventListener('submit', (e) => {
-        e.preventDefault();
-        if (expandedOpen) {
-            composerInput.value = composerExpandedInput.value;
-            expandedOpen = false;
-            composerExpanded.classList.add('hidden');
-        }
-        const text = composerInput.value.trim();
+    // Shared send path for per-pane composers. Stamps the OWNING session's
+    // sid on the outbound envelope and appends the user bubble into that
+    // session's pane — so typing in pane B's box always talks to session B,
+    // never the focused tab. `inputEl` is the textarea to clear after sending.
+    function submitText(sid, rawText, inputEl) {
+        const text = (rawText || '').trim();
         if (!text) return;
 
-        // Hidden admin command. Typing /memory in the composer opens
-        // the LTM admin overlay instead of dispatching to the bridge.
-        // Variants accepted: /memory, /memory/, /MEMORY, "  /memory  ".
-        // We swallow the input (no bubble, no flow trigger) and just
-        // toggle the panel — that way the admin surface stays hidden
-        // from anyone who doesn't already know the magic word.
+        // Dismiss the floating pop-out editor if it's open for this session —
+        // the user has committed the draft, no reason to keep the panel.
+        try { _FloatingComposer.closeFor(sid); } catch (_) { /* ignore */ }
+
+        // Hidden admin command. Typing /memory toggles the LTM admin overlay
+        // instead of dispatching to the bridge (no bubble, no flow trigger).
         if (/^\/memory\/?$/i.test(text)) {
-            composerInput.value = '';
-            composerExpandedInput.value = '';
+            if (inputEl) inputEl.value = '';
             if (window.adminPanel) {
                 if (window.adminPanel.isOpen()) window.adminPanel.close();
                 else window.adminPanel.open();
             }
             return;
         }
-
-        // Sister command: /schedules opens the recurring-task manager.
-        // Functionally independent from /memory (the scheduler doesn't
-        // touch memory.db). Accepts both /schedules and /tasks as an
-        // alias since the feature is naturally called either thing
-        // depending on the user's mental model.
+        // Sister command: /schedules (alias /tasks) opens the scheduler.
         if (/^\/(schedules?|tasks?)\/?$/i.test(text)) {
-            composerInput.value = '';
-            composerExpandedInput.value = '';
+            if (inputEl) inputEl.value = '';
             if (window.schedulePanel) {
                 if (window.schedulePanel.isOpen()) window.schedulePanel.close();
                 else window.schedulePanel.open();
@@ -2039,142 +2897,28 @@
             return;
         }
 
-        addUserBubble(text);
-        composerInput.value = '';
-        composerExpandedInput.value = '';
+        if (inputEl) inputEl.value = '';
 
-        if (!firstSendDone) {
-            firstSendDone = true;
-            window.__handqLog('INFO', 'composer submit (first; type=request)',
-                { len: text.length, preview: window.__handqTrunc(text, 200) });
-            handq.sendRequest({ type: 'request', goal: text });
+        // Append the user bubble into the OWNING session's pane regardless of
+        // which tab is focused.
+        const prevDispatch = _dispatchSid;
+        _dispatchSid = sid;
+        try { addUserBubble(text); }
+        finally { _dispatchSid = prevDispatch; }
+
+        const s = sessions.get(sid);
+        if (s && !s.firstSendDone) {
+            s.firstSendDone = true;
+            window.__handqLog('INFO', 'submit (first; type=request)',
+                { sid, len: text.length, preview: window.__handqTrunc(text, 200) });
+            handq.sendRequest({ type: 'request', session_id: sid, goal: text });
         } else {
-            window.__handqLog('INFO', 'composer submit (type=user_input)',
-                { len: text.length, preview: window.__handqTrunc(text, 200) });
-            handq.sendRequest({ type: 'user_input', kind: 'message', text: text });
-        }
-    });
-
-    composerInput.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter' && e.ctrlKey) {
-            e.preventDefault();
-            composer.requestSubmit();
-        }
-    });
-
-    // ----- floating expanded editor ----------------------------------------
-
-    let expandedOpen = false;
-
-    function openExpanded() {
-        if (expandedOpen) return;
-        expandedOpen = true;
-        composerExpandedInput.value = composerInput.value;
-        composerExpanded.classList.remove('hidden');
-        composerExpandedInput.focus();
-        composerExpandedInput.selectionStart = composerExpandedInput.value.length;
-    }
-
-    function closeExpanded() {
-        if (!expandedOpen) return;
-        expandedOpen = false;
-        composerInput.value = composerExpandedInput.value;
-        composerExpanded.classList.add('hidden');
-        composerInput.focus();
-    }
-
-    function checkOverflow() {
-        if (expandedOpen) return;
-        if (composerInput.scrollHeight > composerInput.clientHeight + 4) {
-            openExpanded();
+            window.__handqLog('INFO', 'submit (type=user_input)',
+                { sid, len: text.length, preview: window.__handqTrunc(text, 200) });
+            handq.sendRequest({ type: 'user_input', kind: 'message',
+                                session_id: sid, text: text });
         }
     }
-
-    composerInput.addEventListener('input', checkOverflow);
-    composerExpandedClose.addEventListener('click', closeExpanded);
-
-    composerExpandedInput.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter' && e.ctrlKey) {
-            e.preventDefault();
-            composerInput.value = composerExpandedInput.value;
-            closeExpanded();
-            composer.requestSubmit();
-        }
-        if (e.key === 'Escape') {
-            closeExpanded();
-        }
-    });
-
-    document.getElementById('composer-expanded-send').addEventListener('click', () => {
-        composerInput.value = composerExpandedInput.value;
-        closeExpanded();
-        composer.requestSubmit();
-    });
-
-    // Drag-to-move: header acts as the drag handle.
-    // Constrained to the app window boundaries.
-    (function initExpandedDrag() {
-        const header = document.querySelector('.composer-expanded-header');
-        let dragging = false;
-        let startX = 0, startY = 0, origLeft = 0, origTop = 0;
-
-        function clampPosition(left, top) {
-            const rect = composerExpanded.getBoundingClientRect();
-            const w = rect.width;
-            const h = rect.height;
-            const maxLeft = window.innerWidth - w;
-            const maxTop = window.innerHeight - h;
-            return {
-                left: Math.max(0, Math.min(left, maxLeft)),
-                top: Math.max(0, Math.min(top, maxTop)),
-            };
-        }
-
-        header.addEventListener('mousedown', (e) => {
-            if (e.target.closest('.composer-expanded-close')) return;
-            dragging = true;
-            startX = e.clientX;
-            startY = e.clientY;
-            const rect = composerExpanded.getBoundingClientRect();
-            origLeft = rect.left;
-            origTop = rect.top;
-            e.preventDefault();
-        });
-
-        document.addEventListener('mousemove', (e) => {
-            if (!dragging) return;
-            const dx = e.clientX - startX;
-            const dy = e.clientY - startY;
-            const clamped = clampPosition(origLeft + dx, origTop + dy);
-            composerExpanded.style.left = clamped.left + 'px';
-            composerExpanded.style.top = clamped.top + 'px';
-            composerExpanded.style.right = 'auto';
-            composerExpanded.style.bottom = 'auto';
-        });
-
-        document.addEventListener('mouseup', () => { dragging = false; });
-
-        // Constrain resize: cap max-width/max-height based on current position.
-        const ro = new ResizeObserver(() => {
-            const rect = composerExpanded.getBoundingClientRect();
-            const maxW = window.innerWidth - rect.left;
-            const maxH = window.innerHeight - rect.top;
-            if (rect.width > maxW) composerExpanded.style.width = maxW + 'px';
-            if (rect.height > maxH) composerExpanded.style.height = maxH + 'px';
-        });
-        ro.observe(composerExpanded);
-
-        // Re-clamp on window resize so it never sits outside bounds.
-        window.addEventListener('resize', () => {
-            if (composerExpanded.classList.contains('hidden')) return;
-            const rect = composerExpanded.getBoundingClientRect();
-            const clamped = clampPosition(rect.left, rect.top);
-            composerExpanded.style.left = clamped.left + 'px';
-            composerExpanded.style.top = clamped.top + 'px';
-            composerExpanded.style.right = 'auto';
-            composerExpanded.style.bottom = 'auto';
-        });
-    })();
 
     // ----- titlebar window controls ----------------------------------------
 
@@ -2182,8 +2926,83 @@
         if (tbMin)   tbMin.addEventListener('click', () => winCtl.minimize());
         if (tbMax)   tbMax.addEventListener('click', () => winCtl.toggleMaximize());
         if (tbClose) tbClose.addEventListener('click', () => winCtl.hide());
+        // Swap the max-button icon (single square ↔ two overlapping squares)
+        // whenever the OS-level maximize state changes. Main pushes both the
+        // maximize/unmaximize events and one seed on did-finish-load.
+        if (typeof winCtl.onMaxState === 'function') {
+            winCtl.onMaxState((state) => {
+                if (!tbMax) return;
+                const maxed = !!(state && state.isMaximized);
+                tbMax.classList.toggle('is-maximized', maxed);
+                tbMax.setAttribute('aria-label', maxed ? 'Restore' : 'Maximize');
+                tbMax.setAttribute('title', maxed ? 'Restore' : 'Maximize');
+            });
+        }
     } else {
         window.__handqLog('WARN', 'windowControls preload bridge missing');
+    }
+
+    // ----- titlebar Dynamic Island (brand pill morph + menu) ---------------
+    //
+    // The pill collapses/expands via the .expanded class on #titlebar-island.
+    // Clicking a menu item inside the pill lets its existing sc-* handler
+    // (registered below in `----- shortcut buttons -----`) fire first, then
+    // collapses on the next tick via setTimeout so the two side effects don't
+    // race. Click-outside and ESC also collapse.
+
+    const island = document.getElementById('titlebar-island');
+    const islandTrigger = document.getElementById('island-trigger');
+    const islandMenu = document.getElementById('titlebar-island-menu');
+
+    function collapseIsland() {
+        if (!island || !island.classList.contains('expanded')) return;
+        island.classList.remove('expanded');
+        if (islandTrigger) islandTrigger.setAttribute('aria-expanded', 'false');
+        if (islandMenu) islandMenu.setAttribute('aria-hidden', 'true');
+    }
+
+    function expandIsland() {
+        if (!island || island.classList.contains('expanded')) return;
+        island.classList.add('expanded');
+        if (islandTrigger) islandTrigger.setAttribute('aria-expanded', 'true');
+        if (islandMenu) islandMenu.setAttribute('aria-hidden', 'false');
+    }
+
+    if (island && islandTrigger) {
+        islandTrigger.addEventListener('click', (e) => {
+            e.stopPropagation();
+            if (island.classList.contains('expanded')) {
+                collapseIsland();
+            } else {
+                expandIsland();
+            }
+        });
+
+        // Keep pointerdown inside the island from bubbling to the document
+        // click-outside listener below.
+        island.addEventListener('pointerdown', (e) => {
+            e.stopPropagation();
+        });
+
+        for (const item of island.querySelectorAll('.island-menu-item')) {
+            item.addEventListener('click', () => {
+                // Defer so the sc-* click handler runs first (opens overlay
+                // / creates session), then the island snaps shut.
+                setTimeout(collapseIsland, 0);
+            });
+        }
+
+        document.addEventListener('pointerdown', (e) => {
+            if (!island.classList.contains('expanded')) return;
+            if (island.contains(e.target)) return;
+            collapseIsland();
+        });
+
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape' && island.classList.contains('expanded')) {
+                collapseIsland();
+            }
+        });
     }
 
     // ----- overlay helpers -------------------------------------------------
@@ -2203,61 +3022,14 @@
     });
     settingsCancel.addEventListener('click', () => closeOverlay(overlaySettings));
 
-    // ----- confirmation modal button wiring --------------------------------
-    //
-    // The modal is intentionally NOT click-outside-dismissible: a high-risk
-    // confirmation requires an explicit Approve / Reject / Guidance choice,
-    // and Esc is also disabled while a prompt is active so the user cannot
-    // accidentally cancel an SSH credential prompt mid-typing.
-
-    confirmSubmitBtn.addEventListener('click', () => {
-        if (activePromptKind === 'secret_input' || activePromptKind === 'ask_human') {
-            sendConfirmationAnswer(confirmSecretIn.value || '');
-        } else if (!confirmGuidanceEl.classList.contains('hidden')) {
-            // Guidance mode active — submit the guidance text
-            const text = (confirmGuidanceEl.value || '').trim();
-            if (!text) {
-                // Empty guidance falls back to "yes" (Approve semantics).
-                sendConfirmationAnswer('yes');
-            } else {
-                sendConfirmationAnswer(text);
-            }
-        } else {
-            sendConfirmationAnswer('yes');
-        }
-    });
-
-    confirmRejectBtn.addEventListener('click', () => {
-        sendConfirmationAnswer('no');
-    });
-
-    confirmGuidBtn.addEventListener('click', () => {
-        // Toggle the guidance textarea. The submit button keeps its approve
-        // label (set in showConfirmationModal): an empty box submits as
-        // Approve, a filled box sends the guidance text instead.
-        if (confirmGuidanceEl.classList.contains('hidden')) {
-            confirmGuidanceEl.classList.remove('hidden');
-            confirmGuidBtn.textContent = 'Cancel guidance';
-            try { confirmGuidanceEl.focus(); } catch (_) { /* ignore */ }
-        } else {
-            confirmGuidanceEl.classList.add('hidden');
-            confirmGuidanceEl.value = '';
-            confirmGuidBtn.textContent = 'Provide guidance';
-        }
-    });
-
-    // Pressing Enter in the secret/ask_human input submits.
-    confirmSecretIn.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter' && (activePromptKind === 'secret_input' || activePromptKind === 'ask_human')) {
-            e.preventDefault();
-            sendConfirmationAnswer(confirmSecretIn.value || '');
-        }
-    });
+    // Confirmation button wiring is per-pane now (see _ensureConfirmUI): each
+    // session's inline confirmation card owns its own Reject / Guidance /
+    // Submit buttons bound to that session's sid (UI3). The legacy global
+    // #overlay-confirmation modal is no longer opened.
 
     window.addEventListener('keydown', (e) => {
         if (e.key === 'Escape') {
             if (!overlaySettings.classList.contains('hidden')) closeOverlay(overlaySettings);
-            if (popoverOpen) closePopover();
         }
     });
 
@@ -2299,52 +3071,26 @@
         }
     });
 
-    scNew.addEventListener('click', () => {
-        // Real "new session": ask the bridge to tear down the current
-        // FlowController + services and reset the InteractionManager
-        // singleton, then wipe the conversation pane. The next composer
-        // submit goes out as a fresh `request` against a brand-new flow
-        // (see stdio_bridge.py:_do_new_session).
-        //
-        // CRITICAL: bump currentGen BEFORE sending. The old flow may
-        // still emit notify_* calls during the bridge's bounded drain
-        // (and indefinitely if it's wedged on a Windows blocking I/O
-        // that we can't kill — ssh_tool's run_in_executor, etc.). Any
-        // such envelope carries the OLD generation; with our watermark
-        // already at new gen, gateGen() drops them silently. The bridge
-        // confirms the actual new gen in the new_session final result —
-        // we sync via the max-rule in gateGen.
-        currentGen += 1;
-        window.__handqLog('INFO', 'scNew clicked — sending new_session',
-            { optimistic_gen: currentGen });
-        try {
-            handq.sendRequest({ type: 'new_session' });
-        } catch (err) {
-            window.__handqLog('ERROR', 'new_session dispatch failed',
-                { err: err && err.message });
-        }
+    // (Legacy scNew "New" button handler removed — to start a fresh
+    // parallel session use the "+" in the session tab bar; to wipe the
+    // current session's chat, close its tab (X) and create a new one.)
 
-        conversation.innerHTML = '';
-        activeReceptionistBubble = null;
-        thinkingBubble = null;
-        lastCalledTool = '';
-        lastThinking = '';
-        activeExecCount = 0;
-        firstSendDone = false;
-        clearWorking();
-        session.state = 'idle';
-        setPill('idle');
-        clearActivity();
-        if (popoverOpen) closePopover();
-        composerInput.focus();
-        // Tear down any open session terminals — the generation bump above
-        // blocks future session_closed events from the old flow, so we must
-        // clean up the panel synchronously here.
-        for (const sid of [..._sessionTerminals.keys()]) {
-            removeSessionTerminal(sid);
-        }
-        hideTerminalPanel();
+
+    // ----- +New session button wiring --------------------------------------
+
+    document.getElementById('sc-new-session').addEventListener('click', async () => {
+        let sid;
+        await _runVT(() => {
+            sid = createSession();
+        });
+        window.__handqLog('INFO', 'sc-new-session clicked', { sid });
     });
+
+    // Bootstrap the initial default session so the first composer submit has
+    // a session_id to ride on. The bridge defaults a session_id-less request
+    // to "default" too — using a UUID here keeps both sides in sync and
+    // matches the multi-tab model from the start.
+    createSession({ name: 'Session 1' });
 
 
     // ----- settings form helpers (model pool + Agent/Helper tabs) -----

@@ -10,7 +10,9 @@ from .write_tool import WriteTool
 from .edit_tool import EditTool
 from .shell_tool import ShellTool
 from .ssh_tool import StatelessSSHTool
-from .remote_handq_tool import RemoteHandQTool
+# RemoteHandQTool is Windows-only — imported lazily inside `if _IS_WINDOWS:`
+# to avoid loading a module that has Python-version-dependent syntax and is
+# never used on Linux.
 from .glob_tool import GlobTool
 from .grep_tool import GrepTool
 from .notebook_edit_tool import NotebookEditTool
@@ -1020,6 +1022,7 @@ EXAMPLES
         # agent over SSH. Windows-only: the Windows GUI delegates complex work
         # to Linux agents; Linux HandQ doesn't delegate to itself.
         if _IS_WINDOWS:
+            from .remote_handq_tool import RemoteHandQTool
             _remote_handq_usage_guide = """\
 WHEN TO USE
   - The remote task requires REASONING or PLANNING — not just a known command.
@@ -1041,19 +1044,31 @@ KEY DISTINCTION: ssh vs remote_handq
                      "I need an agent to figure it out?" → remote_handq.
 
 PREREQUISITES
-  Remote Linux host must have HandQ pre-installed by the user.
-  User runs: bash handq_setup.sh --config <config> on the Linux machine.
-  submit_goal can start an idle HandQ (handq --new) but cannot install it.
+  Remote Linux host must have HandQ installed by the user: copy the built dist
+  package (handq_linux.dist/ + handq_config.yaml) and run handq_setup.sh to
+  install the `handq_linux` command, or drop a source checkout (handq_linux.py
+  next to src/) in ~/handq/. No service/systemd needed. submit_goal auto-wakes
+  the resident daemon (handq_linux --_daemon) if it is not already running, but
+  cannot deploy the files.
 
 WORKFLOW
-  1. submit_goal  — starts remote HandQ if idle, submits task
-  2. get_status   — poll until task_status="completed" (or use wait_timeout)
-  3. get_result   — read completion_reason + execution log tail
-  4. exit_handq   — clean shutdown (optional; remote HandQ idles on its own)
+  1. submit_goal(goal=...)  — wakes the daemon if needed, queues the goal,
+                              returns a message_id.
+  2. get_status(wait_timeout=N)
+                            — task_status is "running" while working, "idle"
+                              when settled; also returns latest_tool + checklist.
+  3. get_result(message_id=...)
+                            — fetch that goal's reply (the daemon writes one
+                              reply per message_id). wait_timeout polls for it.
+  4. exit_handq             — stop the daemon (optional; it is resident and
+                              survives network/power loss, resumable later).
 
-MID-TASK MESSAGING
-  Use send_message to inject instructions/corrections into a running task.
-  The remote HandQ's receptionist evaluates and may replan.
+CONTROL
+  - send_message(message=...) — inject a follow-up into the running task;
+                                returns its own message_id.
+  - new_session               — abandon the current session, start fresh.
+  - interrupt                 — abort the in-flight task and clear its pending
+                                checklist tail.
 """
             cls._tools[cls.REMOTE_HANDQ] = ToolMetadata(
                 name=cls.REMOTE_HANDQ,

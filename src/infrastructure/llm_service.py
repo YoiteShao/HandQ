@@ -74,6 +74,13 @@ class LLMChatResult:
         Individual fields are also accessible as properties for backward
         compatibility: ``input_tokens``, ``output_tokens``, ``total_tokens``,
         ``cache_creation_input_tokens``, ``cache_read_input_tokens``.
+    stop_reason:
+        Why the model stopped generating. Anthropic returns one of
+        ``end_turn`` / ``max_tokens`` / ``tool_use`` / ``stop_sequence``.
+        ``None`` when the backend did not report a stop reason (older
+        SDKs or non-Anthropic providers). ``max_tokens`` means the
+        response was truncated mid-generation — callers should treat
+        the JSON body as partial and expose that to downstream logs.
     """
     # Text content from message.content
     content: Optional[str] = None
@@ -86,6 +93,8 @@ class LLMChatResult:
     tool_calls: "list[ToolCallInfo]" = field(default_factory=list)
     # Token usage — all counts in one place
     token_usage: TokenUsage = field(default_factory=TokenUsage)
+    # Why the model stopped generating (Anthropic: end_turn/max_tokens/tool_use/stop_sequence)
+    stop_reason: Optional[str] = None
 
     # ── Backward-compat property accessors ───────────────────────────────────
     # These allow existing call sites to keep reading llm_result.input_tokens etc.

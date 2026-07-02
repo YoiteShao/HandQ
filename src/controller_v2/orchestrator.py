@@ -19,7 +19,7 @@ Architectural decisions (V2):
     factual_outcome (no LLM call required).
   - Stage 1 INTENT does NOT extract a goal — the original user message is
     forwarded verbatim to the planner.
-  - Stage 1 INTENT receives the same context (LTM, history, shell, checklist)
+  - Stage 1 INTENT receives the same context (LTM, history, checklist)
     as the planner so it can answer status questions accurately.
   - The planner emits a single op shape: replace_post_current(items). Plus
     optional interrupt_current to abort the in-flight item.
@@ -34,8 +34,7 @@ import json
 import time
 import uuid as _uuid
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set, cast
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Set, cast
 
 from ..infrastructure.json_key_streamer import JsonKeyStreamer
 from ..infrastructure.llm_pool import (
@@ -49,6 +48,7 @@ from ..infrastructure.anthropic_streaming_service import (
     StreamDoneEvent,
 )
 from ..infrastructure.logger import get_logger
+from ..infrastructure.long_term_memory._constants import RecallTier
 from ..infrastructure.utils import try_parse_json
 from .mention_preprocessing import preprocess_mentions
 from .planner_mixin import PlannerMixin
@@ -58,6 +58,7 @@ from .shared_checklist import (
     CheckListItem,
     ItemResult,
 )
+from .agent_utils import ProgressConcern, acceptance_info_delta
 from .planner_prompts import (
     INTENT_SYSTEM_PROMPT,
     INTENT_TEMPLATE,
@@ -87,12 +88,20 @@ class Orchestrator(PlannerMixin, ReceptionistMixin):
         on_response_done: Optional[Callable[[], Any]] = None,
         on_state_changed: Optional[Callable[[str], Any]] = None,
         on_recall_started: Optional[Callable[[], Any]] = None,
-        shell_history_path: Optional[str] = None,
+        on_task_complete: Optional[Callable[[], Awaitable[None]]] = None,
         session_dir: Optional[str] = None,
+        helper_services: Optional[List[LLMService]] = None,
     ):
         if not llm_services:
             raise ValueError("Orchestrator requires at least one LLMService")
         self._services: List[LLMService] = list(llm_services)
+        # Cheap-model pool for the acceptance-spinning auditor (Tier-1 sense at
+        # the acceptance-loop task boundary). Empty-degrades exactly like
+        # PersistentAgent's watcher pool: no helpers → auditor is skipped and
+        # the mechanical delta==0 signal alone decides termination.
+        self._helper_services: List[LLMService] = (
+            list(helper_services) if helper_services else []
+        )
         self._checklist = checklist
         self.logger = get_logger()
         self._on_reply_to_user = on_reply_to_user
@@ -108,18 +117,42 @@ class Orchestrator(PlannerMixin, ReceptionistMixin):
         # (rerank + dynamic_k, ~3s); this surfaces a transient "recalling…"
         # label on the activity strip while it runs.
         self._on_recall_started = on_recall_started
-        self.shell_history_path = shell_history_path
+        # Task-boundary cleanup hook. Fires when the acceptance gate reaches
+        # a terminal verdict (PASS / TRIVIAL / ACCEPT) — i.e. the whole task
+        # is really finished, not just an item boundary. FlowControllerV2 wires
+        # this to the browser-holder close so Chromium doesn't linger between
+        # tasks in the same session. EXTEND / VALIDATE do NOT fire it (more
+        # work is queued). Optional; ``None`` = no cleanup callback.
+        self._on_task_complete = on_task_complete
         self._session_dir = session_dir
 
         # Session-scoped conversation history (all user + assistant turns)
         self.conversation_history: List[Dict[str, str]] = []
 
-        # Planner-tier LTM recall cache: (query, expiry_monotonic, block).
-        # Single-slot — only one recall query is "active" at a time (frozen
-        # during a task, replaced on the next user message). Collapses the
-        # per-item-completion background re-plan recalls into one real call.
-        # See _build_long_term_block for the freshness argument.
-        self._ltm_block_cache: Optional[tuple] = None
+        # Planner-tier LTM recall cache: {(query, tier_value, bare): (expiry_monotonic, block)}.
+        # Two slots per query — one for fast-tier (INTENT / receptionist), one for
+        # quality-tier (Planner / stagnation). Same query can carry both; a chat
+        # turn does not evict the quality slot the Planner will later want.
+        # The ``bare`` dimension differentiates full blocks (with header +
+        # identity + known-entities) from bare blocks (memory/knowledge only)
+        # used by the dual-recall extra path — see _build_long_term_block.
+        self._ltm_block_cache: Dict[tuple[str, str, bool], tuple[float, str]] = {}
+
+        # Task-root recall query — the user message that STARTED the current
+        # task (INTENT classified it as "task"). Planner uses this instead of
+        # ``conversation_history[-1]`` so mid-task chats ("wait, first make me
+        # coffee") do NOT re-anchor recall on the chat text — the planner_loop
+        # keeps recalling against the original task goal for the whole task
+        # lifecycle. INTENT still uses conversation_history[-1] (each user
+        # turn deserves its own fresh classification recall).
+        # Set in _handle_user_message when intent=task; overwritten by every
+        # subsequent task classification. Not cleared on task completion — the
+        # next task's INTENT will overwrite, and while idle the field is
+        # harmless (planner_loop only fires on mark_done which requires an
+        # active checklist). None means "no active task; fall back to the last
+        # user message" (identical to pre-fix behaviour, covers cold-start and
+        # edge cases like planner tests).
+        self._task_root_query: Optional[str] = None
 
         # Receptionist mixin owns no state — skills live in checklist.
 
@@ -135,6 +168,13 @@ class Orchestrator(PlannerMixin, ReceptionistMixin):
         # wakes up and runs another planner call against the new state.
         self._planner_trigger = asyncio.Event()
         self._checklist.on_item_done(self._on_item_done_sync)
+        # Tier-1 progress watcher → planner. Symmetric to on_item_done: a
+        # divergence verdict on the in-flight item wakes the planner loop the
+        # same way an item completion does. The planner then reads the in-flight
+        # digests + concern from the checklist context (no new pipeline needed)
+        # and may replace_post_current / interrupt_agent. The watcher gets no
+        # direct handle on the orchestrator — only this trigger.
+        self._checklist.on_progress_concern(self._on_progress_concern_sync)
 
     # ── Channel 1: User Message (single entry point) ─────────────────────────
 
@@ -153,6 +193,11 @@ class Orchestrator(PlannerMixin, ReceptionistMixin):
         """
         message, prescan = preprocess_mentions(message)
         self.conversation_history.append({"role": "user", "content": message})
+        # Mirror the verbatim message into the checklist so PersistentAgent
+        # can render an `[User Original Request]` grounding block in its
+        # prompt — preserves user-side nuance (e.g. specific Chinese phrasing)
+        # that the planner's item-instruction translation may flatten.
+        self._checklist.set_latest_user_message(message)
         self._submit_user_turn_to_ltm_triage(message)
 
         # Apply prescan immediately so @-mentioned skills activate even on
@@ -210,8 +255,18 @@ class Orchestrator(PlannerMixin, ReceptionistMixin):
         on_chunk: Optional[Callable[[str], Any]],
     ) -> str:
         """Run Stage 1 (INTENT). Forward to Stage 2 (PLAN_MODIFY) when intent=task."""
-        sections = await self._gather_context_sections()
+        sections = await self._gather_context_sections(RecallTier.FAST)
         intent_context = self._format_for_intent(sections)
+
+        # Speculative QUALITY recall pre-warm: start the rerank-enabled recall
+        # concurrently with the INTENT LLM streaming. If intent=task,
+        # _run_planner's _gather_context_sections(QUALITY) will hit the
+        # _ltm_block_cache — eliminating 3-8s of rerank latency from the
+        # critical startup path. If intent=chat, the task is cancelled.
+        quality_prefetch = asyncio.create_task(
+            self._build_long_term_block(message, tier=RecallTier.QUALITY),
+            name="quality-recall-prefetch",
+        )
 
         intent_messages = [
             {"role": "system", "content": INTENT_SYSTEM_PROMPT},
@@ -255,17 +310,49 @@ class Orchestrator(PlannerMixin, ReceptionistMixin):
             # INTENT stream fell back to non-streaming (or no chunk hook was
             # set), `_last_response_streamed` is False and a non-empty reply
             # still needs to go out via the batch sink.
+            quality_prefetch.cancel()
             if reply and self._on_reply_to_user and not self._last_response_streamed:
                 self._on_reply_to_user(reply)
             return reply or "I'm here. Send me a task when you're ready."
 
-        # Task path: run the unified planner under the lock so we don't race
-        # with the background planner_loop's own call. Reuse the freshly
-        # gathered sections — LTM recall is the same query and is the most
-        # expensive section to rebuild.
+        # Task path: ensure the speculative QUALITY recall has finished and
+        # populated _ltm_block_cache before _run_planner reads it. The rerank
+        # started in parallel with INTENT streaming, so at most we wait
+        # (rerank_time - intent_time) — the same wait _run_planner would have
+        # incurred anyway, just shifted earlier in the timeline.
+        try:
+            await quality_prefetch
+        except (asyncio.CancelledError, Exception):
+            pass  # _run_planner does its own recall on cache miss
+
+        # Run the unified planner under the lock so we don't race with the
+        # background planner_loop's own call.
+        #
+        # Freeze the task-root recall query ONLY when the checklist has
+        # no in-flight work — either this is the first task of the session
+        # (total_items == 0) OR the previous task fully completed (every item
+        # marked done, so completed_count == total_items). Mid-task task-
+        # modifier messages that get forcibly reclassified as task via
+        # deferred_actions ("also handle concurrency", forced task because
+        # deferred is non-empty) MUST NOT overwrite the anchor — otherwise
+        # the modifier replaces "refactor foo.py" and subsequent item-
+        # completion re-plans lose the original task's recall anchor.
+        #
+        # WHY NOT ``total_items == 0`` alone: total_items is monotonic — it
+        # never shrinks after items are added, so once task 1 completes with
+        # 10 items, total_items stays at 10 forever. Using == 0 would mean
+        # only the very first task of the whole session gets a root query,
+        # and every subsequent task inherits task 1's stale anchor. The
+        # completed_count equality captures "checklist is idle" correctly
+        # regardless of session history.
+        _cl = self._checklist
+        _task_idle = _cl.total_items == _cl.completed_count
+        if self._task_root_query is None or _task_idle:
+            self._task_root_query = message
         async with self._planner_lock:
             plan_reply = await self._run_planner(
-                trigger="user_msg", precomputed_sections=sections,
+                trigger="user_msg",
+                fallback_actions=deferred,
             )
         if plan_reply:
             return plan_reply
@@ -277,6 +364,7 @@ class Orchestrator(PlannerMixin, ReceptionistMixin):
         self,
         trigger: str = "user_msg",
         precomputed_sections: Optional[Dict[str, str]] = None,
+        fallback_actions: Optional[List[str]] = None,
     ) -> str:
         """Single planner LLM call. Shared by Stage 2 and the background loop.
 
@@ -286,11 +374,20 @@ class Orchestrator(PlannerMixin, ReceptionistMixin):
         when the resulting state has nothing in flight.
 
         `trigger` is "user_msg" or "mark_done" — used only in logs.
-        `precomputed_sections` lets the user-message path forward the sections
-        gathered for INTENT so we don't recompute LTM recall.
+        `precomputed_sections` lets a caller forward pre-built sections when
+        (and only when) they were gathered under ``RecallTier.QUALITY`` (the
+        planner tier). Cross-tier reuse is unsafe — the sections would carry
+        an unreranked LTM block. In practice both callers now pass None and
+        this method re-gathers under QUALITY.
+        `fallback_actions` is the intent-stage `deferred` plan. Used ONLY on the
+        user_msg path as a safety net: if the planner produces no items (e.g. a
+        JSON parse failure yielded an empty dict), these are materialized into
+        checklist items so a triggered task never silently idles. The
+        background `mark_done` loop passes None.
 
-        Returns the planner's `response_to_user` (may be empty). The completion
-        reply (when emitted) goes out separately via _on_reply_to_user.
+        Returns "" — the planner has no user-facing channel. The completion
+        reply (when emitted) goes out separately via _on_reply_to_user, and
+        the synchronous user-message reply comes from the INTENT stage.
         """
         # Activity strip → "designing…": the planner is composing/revising the
         # checklist. Fires for both the user-message path and the post-item
@@ -298,12 +395,16 @@ class Orchestrator(PlannerMixin, ReceptionistMixin):
         # idle transition in _emit_completion_reply) supersede it next.
         self._notify_state("planning")
 
-        sections = precomputed_sections or await self._gather_context_sections()
+        sections = precomputed_sections or await self._gather_context_sections(
+            RecallTier.QUALITY,
+            query_override=self._task_root_query,
+        )
         full_context_block = self._format_for_planner(sections)
 
         # Quality controls: loop detection + epistemic inventory preamble.
         completed_results = self._checklist.get_completed_results()
         loop_warning = self._detect_loops(completed_results)
+        failure_tail_warning = self._build_failed_tail_warning(completed_results)
         last_user = self._last_user_message()
         epistemic_preamble = self._build_epistemic_inventory_warning(
             last_user, completed_results
@@ -323,6 +424,7 @@ class Orchestrator(PlannerMixin, ReceptionistMixin):
             full_context_block=full_context_block,
             epistemic_preamble=epistemic_preamble,
             loop_warning=loop_warning,
+            failure_tail_warning=failure_tail_warning,
             user_message=last_user,
         )
 
@@ -331,32 +433,25 @@ class Orchestrator(PlannerMixin, ReceptionistMixin):
             {"role": "user", "content": user_content},
         ]
 
-        # Streaming PLAN_MODIFY: response_to_user chunks → UI as JSON arrives.
-        # Other fields (post_current_items, skills_needed, etc.) are
-        # parsed from the accumulated full text after the stream completes.
+        # PLAN_MODIFY has no user-facing channel — the planner schema no longer
+        # carries a response_to_user field. We still use the streaming variant
+        # for its json_mode parse + network-wait behaviour, but pass
+        # on_response_chunk=None so nothing reaches the UI. Even if the model
+        # emits a stray response_to_user, it is parsed into the dict and then
+        # ignored (see _apply_planner_output) — never streamed, never surfaced.
+        # The sole planner-originated user message is the completion summary.
         parsed = await self._call_and_parse_streaming(
             messages,
             "plan_modify",
-            on_response_chunk=self._on_response_chunk,
+            on_response_chunk=None,
             extra_kwargs={"json_mode": True},
         ) or {}
-        # If the reply was actually streamed to the user (fragments pushed via
-        # `_on_response_chunk`), suppress the batch emit in
-        # `_apply_planner_output` below to avoid duplicating the same text. If
-        # the stream fell back to non-streaming, `_last_response_streamed` is
-        # False and a non-empty reply is still emitted there.
-        streamed_reply_to_user = self._last_response_streamed
-
-        # Structural guards (e.g. drop bad ops, validate item shape).
-        parsed = self._apply_structural_guards(parsed)
 
         # Apply: skills + tools commit, optional interrupt, post-current
-        # replacement, optional reply. Returns True iff the resulting state has
-        # nothing in flight (task-complete candidate — still subject to
-        # verification gate below).
-        task_complete = await self._apply_planner_output(
-            parsed, suppress_reply=streamed_reply_to_user,
-        )
+        # replacement. Returns True iff the resulting state has nothing in
+        # flight (task-complete candidate — still subject to verification
+        # gate below).
+        task_complete = await self._apply_planner_output(parsed)
 
         # Verification gate (B1): when the planner thinks the task is done,
         # decide whether to verify or skip, run goal-level acceptance synthesis
@@ -369,22 +464,61 @@ class Orchestrator(PlannerMixin, ReceptionistMixin):
             and not self._checklist.has_pending
         ):
             # Planner left nothing for the agent to run and this isn't a
-            # completion (e.g. it just replied to acknowledge a preference the
-            # LTM triage will persist). No item will ever flip the strip to
-            # "executing", and the completion path — the only other place that
-            # emits "idle" — didn't fire, so settle the strip here. Without
-            # this it stays stuck on "designing…" forever.
-            self._notify_state("idle")
+            # completion. On the background mark_done loop this is benign (the
+            # re-plan simply found nothing left to do). But a freshly triggered
+            # user task that yields no items is the silent-idle bug: e.g. a
+            # JSON parse failure collapsed `parsed` to {} and the user's
+            # request would vanish unexecuted. The planner has no
+            # response_to_user channel any more, so a user_msg trigger with no
+            # items ALWAYS needs recovery. Recover before settling the strip.
+            recovered = False
+            if trigger == "user_msg":
+                if fallback_actions:
+                    self.logger.warning(
+                        f"[Orchestrator] Planner yielded no items/reply for a "
+                        f"user task — materializing {len(fallback_actions)} "
+                        f"deferred fallback action(s)",
+                        component="Orchestrator",
+                    )
+                    await self._apply_planner_output(
+                        {"post_current_items": [
+                            {"instruction": a} for a in fallback_actions
+                        ]},
+                    )
+                    recovered = (
+                        self._checklist.get_current_item() is not None
+                        or self._checklist.has_pending
+                    )
+                if not recovered:
+                    self.logger.warning(
+                        "[Orchestrator] Planner yielded nothing actionable for "
+                        "a user task and no usable fallback was available — "
+                        "asking the user to rephrase",
+                        component="Orchestrator",
+                    )
+                    if self._on_reply_to_user:
+                        try:
+                            self._on_reply_to_user(
+                                "I wasn't able to turn that into a concrete "
+                                "plan. Could you rephrase or add a bit more "
+                                "detail?"
+                            )
+                        except Exception:
+                            pass
+            if not recovered:
+                # No item will flip the strip to "executing" and the completion
+                # path didn't fire, so settle it here — otherwise it stays
+                # stuck on "designing…" forever.
+                self._notify_state("idle")
 
-        reply = parsed.get("response_to_user", "") or ""
         self.logger.info(
             f"[Orchestrator] Planner({trigger}): "
             f"interrupt={parsed.get('interrupt_current')} "
             f"items={len(parsed.get('post_current_items') or [])} "
-            f"task_complete={task_complete} reply_len={len(reply)}",
+            f"task_complete={task_complete}",
             component="Orchestrator",
         )
-        return reply
+        return ""
 
     async def _call_and_parse_streaming(
         self,
@@ -444,13 +578,27 @@ class Orchestrator(PlannerMixin, ReceptionistMixin):
                     break
 
             full_text = "".join(accumulated)
-            # Record whether we actually streamed the reply: drives the
-            # caller's suppress_reply decision. A successful stream that
-            # produced fragments → True; a silent (empty response_to_user)
-            # run → False.
+            # Record whether we actually streamed the reply: drives the INTENT
+            # path's batch-emit decision (only emit the reply if it wasn't
+            # already streamed). A successful stream that produced fragments →
+            # True; a silent (empty response_to_user) run → False. The
+            # plan_modify path passes on_response_chunk=None, so this stays
+            # False there and the planner reply is never surfaced.
             self._last_response_streamed = streamed_any
             parsed = try_parse_json(full_text)
-            return parsed if isinstance(parsed, dict) else None
+            if isinstance(parsed, dict):
+                return parsed
+            # Parse failure (model emitted prose under json_mode, or truncated
+            # JSON). A silent None here propagates to `or {}` at the call site
+            # and — for a fresh task — silently idles the planner. Retry ONCE
+            # non-streaming before giving up; the retry usually returns clean
+            # JSON and keeps the task alive.
+            self.logger.warning(
+                f"Orchestrator {log_context} stream produced non-JSON "
+                f"({len(full_text)} chars) — one non-streaming retry",
+                component="Orchestrator",
+            )
+            return await self._call_and_parse(messages, log_context, extra_kwargs=extra_kwargs)
 
         except NetworkUnavailableError:
             raise
@@ -493,11 +641,11 @@ class Orchestrator(PlannerMixin, ReceptionistMixin):
 
     # ── Context building ─────────────────────────────────────────────────────
     #
-    # Two consumers (INTENT and PLAN_MODIFY) both need the same 4 sections
-    # (LTM, conversation, shell, CheckList) but want different ordering:
+    # Two consumers (INTENT and PLAN_MODIFY) both need the same 3 sections
+    # (LTM, conversation, CheckList) but want different ordering:
     #   - INTENT runs frequently (every user message). Within Anthropic's
     #     5-minute prefix-cache TTL, consecutive INTENT calls can hit cache,
-    #     so we want append-only sections (Conversation, Shell) at the FRONT
+    #     so we want the append-only section (Conversation) at the FRONT
     #     and query-dependent / volatile sections (LTM, CheckList) at the BACK.
     #     This maximises the byte-stable prefix between calls.
     #   - PLAN_MODIFY's mark_done trigger cycle is often >5 min (one Agent
@@ -511,26 +659,74 @@ class Orchestrator(PlannerMixin, ReceptionistMixin):
     # PLAN_MODIFY back-to-back and reuses the same gather (LTM recall is
     # the same query and is the most expensive section).
 
-    async def _gather_context_sections(self) -> Dict[str, str]:
+    async def _gather_context_sections(
+        self,
+        tier: RecallTier,
+        *,
+        query_override: Optional[str] = None,
+    ) -> Dict[str, str]:
         """Compute every context section ONCE.
+
+        ``tier`` selects the LTM recall lane:
+          * ``RecallTier.FAST``    — no rerank, chat / INTENT hot path.
+          * ``RecallTier.QUALITY`` — rerank on, Planner / dynamic-K path.
+        Cache is keyed by (query, tier.value) so both lanes can coexist for the
+        same query without evicting each other. Callers MUST NOT share sections
+        gathered under one tier with a stage that expects the other tier.
+
+        ``query_override`` overrides the default recall query
+        (``conversation_history[-1]``). Planner passes ``self._task_root_query``
+        so item-completion re-plans keep anchoring on the original task goal
+        instead of the latest utterance.
+
+        Dual-recall: if ``query_override`` is provided AND the latest user
+        message diverged from it (mid-task chat / task-modifier), we ALSO
+        recall against the latest message and concatenate the results. This
+        keeps the planner's LTM context anchored on the task goal (primary
+        recall) while surfacing memory relevant to whatever the user just
+        added (extra recall) — so "use the DNS-retry approach we discussed"
+        can still pull the DNS-retry memory even mid-task. Each recall is
+        cached at its own (query, tier) key; the second call is free on
+        repeat within the 60s TTL.
 
         Returns a dict with keys:
           ltm           — formatted LTM recall block (may be "")
           conversation  — formatted prior-conversation block, header included
                           (may be "")
-          shell         — formatted shell-history block (may be "")
           checklist     — `[Current CheckList]` block, always present;
                           contains `_EMPTY_CHECKLIST_MARKER` when idle.
         """
-        ltm_block = await self._build_long_term_block(
+        default_query = (
             self.conversation_history[-1]["content"]
             if self.conversation_history else ""
         )
+        primary_query = (
+            query_override if query_override is not None else default_query
+        )
+        ltm_block = await self._build_long_term_block(primary_query, tier=tier)
+
+        # Dual-recall condition: planner supplied a root query AND the current
+        # tail message is a DIFFERENT string (i.e. user chatted / added a
+        # modifier since task start). No extra recall on the first task turn
+        # (root == tail) or on pure INTENT calls (query_override is None).
+        if (
+            query_override is not None
+            and default_query
+            and default_query != primary_query
+        ):
+            extra_block = await self._build_long_term_block(
+                default_query, tier=tier, bare=True,
+            )
+            if extra_block and extra_block.strip():
+                divider = (
+                    "\n<!-- Additional recall for latest user message: "
+                    f"{default_query[:80]!r} -->\n"
+                )
+                ltm_block = (ltm_block or "") + divider + extra_block
         conv_raw = self._format_conversation_history()
         conversation_block = (
             f"[Recent Conversation History]\n{conv_raw}\n" if conv_raw else ""
         )
-        shell_block = self._read_shell_history()
         checklist_body = (
             self._checklist.get_checklist_context_for_planner()
             if self._checklist.total_items > 0
@@ -541,23 +737,21 @@ class Orchestrator(PlannerMixin, ReceptionistMixin):
         return {
             "ltm": ltm_block,
             "conversation": conversation_block,
-            "shell": shell_block,
             "checklist": checklist_block,
         }
 
     def _format_for_intent(self, sections: Dict[str, str]) -> str:
         """Cache-friendly ordering: append-only sections first, volatile last.
 
-        Conversation and shell histories grow by appending — their byte
-        prefix stays stable across consecutive user messages within the cache
-        TTL window. LTM is query-dependent so it can change between turns;
-        placing it AFTER the append-only blocks keeps those blocks cacheable
-        as a contiguous prefix. CheckList is the most volatile section
-        (mutates within a turn on every mark_done) and goes last.
+        Conversation history grows by appending — its byte prefix stays
+        stable across consecutive user messages within the cache TTL window.
+        LTM is query-dependent so it can change between turns; placing it
+        AFTER the append-only block keeps that block cacheable as a
+        contiguous prefix. CheckList is the most volatile section (mutates
+        within a turn on every mark_done) and goes last.
         """
         parts = [
             sections["conversation"],
-            sections["shell"],
             sections["ltm"],
             sections["checklist"],
         ]
@@ -569,13 +763,12 @@ class Orchestrator(PlannerMixin, ReceptionistMixin):
         The planner's attention should be most focused on the CheckList
         (what it is about to mutate) and the user's request (rendered by the
         prompt template AFTER this block). Push background context (LTM,
-        shell, prior conversation) to the front so it informs but does not
+        prior conversation) to the front so it informs but does not
         dominate. Cache rarely hits on this path, so order is purely an
         attention argument.
         """
         parts = [
             sections["ltm"],
-            sections["shell"],
             sections["conversation"],
             sections["checklist"],
         ]
@@ -600,31 +793,41 @@ class Orchestrator(PlannerMixin, ReceptionistMixin):
 
     # ── Long-term memory ─────────────────────────────────────────────────────
 
-    async def _build_long_term_block(self, query: str) -> str:
-        """Recall LTM context. Falls back to "" on any error.
+    async def _build_long_term_block(
+        self, query: str, *, tier: RecallTier, bare: bool = False,
+    ) -> str:
+        """Recall LTM context for *query* at the requested *tier*. Falls back to "" on any error.
 
-        Orchestrator drives INTENT + PLAN, which is the high-stakes planner
-        tier per ``_constants.py:62-64``. ``rerank=True`` activates the
-        LLM cross-encoder rerank stage; ``dynamic_k=True`` activates score-
-        gap trimming bounded by ``RECALL_PLANNER_MIN_K`` / ``MAX_K``.
+        Tier semantics (see ``_constants.py`` §2b):
+          * ``RecallTier.FAST``    — ``rerank=False, dynamic_k=False``. Sub-second
+            latency, RRF+recency ordering only. Used on the chat-turn hot path
+            (INTENT stage) where the user is actively waiting.
+          * ``RecallTier.QUALITY`` — ``rerank=True, dynamic_k=True``. LLM cross-
+            encoder rerank + score-gap trimming bounded by
+            ``RECALL_PLANNER_MIN_K`` / ``MAX_K``. Used for Planner and other
+            paths where the downstream decision has high stakes.
 
-        Result is cached for ``_LTM_BLOCK_CACHE_TTL_SEC`` keyed by ``query``.
-        The background planner_loop re-plans after every item completion, but
-        during autonomous execution no new user/assistant turn is appended to
-        ``conversation_history`` — so the recall query is frozen for the
-        duration of a task, and the LTM corpus is frozen too (triage is async
-        with a 60s floor). The N background re-plans of one task therefore
-        recompute the *identical* reranked block; the cache collapses those
-        into a single real recall. A new user message changes the query →
-        cache miss → fresh recall, so per-turn freshness is preserved.
+        ``bare=True`` skips the ``[Long-Term Context]`` header + description
+        + identity + known-entities blocks and returns ONLY the
+        ``<memory-context>`` / ``<knowledge-context>`` tags for *query*. Used
+        by the dual-recall path in ``_gather_context_sections`` where the
+        primary recall already carries the shared prelude — concatenating two
+        full blocks would produce duplicate headers and repeat identity
+        directives, wasting prompt tokens.
+
+        Cache is keyed by ``(query, tier.value, bare)`` so the bare / full
+        variants coexist without evicting each other. During a task, the
+        background planner_loop re-plans after every item completion — but the
+        recall query stays frozen (task_root_query) and the LTM corpus is
+        frozen too (triage has a 60s floor). The N background re-plans of one
+        task therefore all hit the QUALITY cache entry. A new user message
+        changes the query → cache miss → fresh recall, so per-turn freshness
+        is preserved.
         """
-        cached = self._ltm_block_cache
-        if (
-            cached is not None
-            and cached[0] == query
-            and time.monotonic() < cached[1]
-        ):
-            return cached[2]
+        cache_key = (query, tier.value, bare)
+        cached = self._ltm_block_cache.get(cache_key)
+        if cached is not None and time.monotonic() < cached[0]:
+            return cached[1]
         try:
             from ..infrastructure.long_term_memory import LongTermMemory
             ltm = LongTermMemory.get()
@@ -635,10 +838,29 @@ class Orchestrator(PlannerMixin, ReceptionistMixin):
         # ``/local/mnt/wine/...`` (Linux-SSH-observed) insights to the planner
         # and trigger the wine-bug class of UNC→SSH mistranslation.
         current_frame = {"os": "windows", "host": "local", "confidence": 0.95}
+        rerank = (tier == RecallTier.QUALITY)
+        dynamic_k = (tier == RecallTier.QUALITY)
+        # Fast tier bypasses rerank, and RECALL_RERANK_MIN_SCORE is the
+        # authoritative relevance cutoff — without rerank, top-K by RRF would
+        # surface activity-snapshot noise (cosine band 0.34-0.41) as "least
+        # bad" matches on chat turns even when the query has no real hit.
+        # Raise the dense-branch floor so noise-band rows are pre-filtered out.
+        # Quality tier keeps the standard floor because rerank still runs.
+        from ..infrastructure.long_term_memory._constants import (
+            RECALL_MIN_SCORE,
+            RECALL_MIN_SCORE_FAST,
+        )
+        min_score = RECALL_MIN_SCORE if rerank else RECALL_MIN_SCORE_FAST
         try:
             self._notify_recall_started()
             block = await ltm.format_context_block(
-                query=query, rerank=True, dynamic_k=True,
+                query=query,
+                rerank=rerank,
+                dynamic_k=dynamic_k,
+                min_score=min_score,
+                include_identity=not bare,
+                include_known_entities=not bare,
+                include_header=not bare,
                 current_frame=current_frame,
             )
         except Exception:
@@ -646,8 +868,8 @@ class Orchestrator(PlannerMixin, ReceptionistMixin):
                 "LTM format_context_block failed", component="Orchestrator"
             )
             return ""
-        self._ltm_block_cache = (
-            query, time.monotonic() + _LTM_BLOCK_CACHE_TTL_SEC, block,
+        self._ltm_block_cache[cache_key] = (
+            time.monotonic() + _LTM_BLOCK_CACHE_TTL_SEC, block,
         )
         return block
 
@@ -717,20 +939,6 @@ class Orchestrator(PlannerMixin, ReceptionistMixin):
         except Exception:
             pass
 
-    # ── Shell history ────────────────────────────────────────────────────────
-
-    def _read_shell_history(self) -> str:
-        """Read recent shell commands for context."""
-        if not self.shell_history_path:
-            return ""
-        try:
-            content = Path(self.shell_history_path).read_text(encoding="utf-8").strip()
-            if not content:
-                return ""
-            return f"[Shell History]\n{content}\n"
-        except Exception:
-            return ""
-
     # ── Helpers ──────────────────────────────────────────────────────────────
 
     def _on_item_done_sync(self, result: ItemResult) -> None:
@@ -740,6 +948,16 @@ class Orchestrator(PlannerMixin, ReceptionistMixin):
         the trigger event; the planner_loop wakes, acquires the planner lock,
         and runs `_run_planner` against the new state. No queue, no per-result
         eval object — the loop reads everything off the checklist.
+        """
+        self._planner_trigger.set()
+
+    def _on_progress_concern_sync(self, concern: ProgressConcern) -> None:
+        """Callback from CheckList — wake the planner_loop on a watcher verdict.
+
+        Identical mechanism to _on_item_done_sync: set the trigger and let the
+        planner_loop read the concern (and the in-flight digests) off the
+        checklist context. Runs synchronously in the agent coroutine via the
+        bus callback, so it does no real work beyond flipping the event.
         """
         self._planner_trigger.set()
 
@@ -792,7 +1010,7 @@ class Orchestrator(PlannerMixin, ReceptionistMixin):
                 return turn.get("content", "")
         return ""
 
-    async def _apply_planner_output(self, parsed: dict, suppress_reply: bool = False) -> bool:
+    async def _apply_planner_output(self, parsed: dict) -> bool:
         """Apply a planner LLM response to the checklist.
 
         Schema:
@@ -801,13 +1019,12 @@ class Orchestrator(PlannerMixin, ReceptionistMixin):
             "interrupt_reason": str (optional, empty when no interrupt),
             "post_current_items": [item_dict, ...],
             "skills_needed": [name, ...],
-            "tools_needed": [name, ...],
-            "response_to_user": "..."
+            "tools_needed": [name, ...]
           }
 
-        `suppress_reply=True` means the caller already streamed
-        `response_to_user` to the user via `_on_response_chunk` and we should
-        NOT batch-emit it here (would duplicate the same text in the UI).
+        The planner has no user-facing channel — there is no response_to_user
+        field. The only planner-originated user message is the completion
+        summary composed in `_emit_completion_reply`.
 
         Returns True iff the resulting checklist has nothing in flight (no
         current item AND no pending) — this is the trigger for emitting the
@@ -863,13 +1080,6 @@ class Orchestrator(PlannerMixin, ReceptionistMixin):
                     component="Orchestrator",
                 )
 
-        reply = parsed.get("response_to_user", "") or ""
-        if reply and self._on_reply_to_user and not suppress_reply:
-            try:
-                self._on_reply_to_user(reply)
-            except Exception:
-                pass
-
         # "Task done" = nothing in flight AND nothing pending AND we have
         # already executed something (completed_count > 0). Empty initial
         # state shouldn't trigger completion.
@@ -877,6 +1087,82 @@ class Orchestrator(PlannerMixin, ReceptionistMixin):
             self._checklist.completed_count > 0
             and not self._checklist.has_pending
             and self._checklist.get_current_item() is None
+        )
+
+    async def _audit_acceptance_spinning(
+        self,
+        latest: ItemResult,
+        prior: List[ItemResult],
+    ) -> ProgressConcern:
+        """Cheap-LLM semantic check: is the acceptance loop truly spinning?
+
+        Called ONLY after the mechanical delta is already 0 (see
+        `_handle_task_complete_candidate`). Judges whether the latest
+        acceptance round repeated an approach already tried — a reworded but
+        identical blocker is STILL spinning — or pursued a materially different
+        angle the set-difference could not detect.
+
+        Awaited (once per round at a task boundary, latency is fine), unlike
+        the fire-and-forget in-item progress watcher. Fail-toward-terminate:
+        an empty helper pool, an LLM error, or an unparseable reply all yield
+        `false_progress`, because the mechanical signal already says "no new
+        info" — when in doubt, stop rather than spin.
+        """
+        fallback = ProgressConcern(
+            item_id=latest.item_id,
+            verdict="false_progress",
+            rationale="auditor unavailable; mechanical delta==0 ⇒ terminate",
+        )
+        if not self._helper_services:
+            return fallback
+
+        from .agent_prompts import ACCEPTANCE_SPINNING_PROMPT
+
+        def _render(r: ItemResult) -> str:
+            parts: List[str] = []
+            if r.factual_outcome:
+                parts.append(f"outcome: {'; '.join(r.factual_outcome)}")
+            if r.key_findings:
+                parts.append(f"findings: {'; '.join(r.key_findings)}")
+            if r.artifacts:
+                parts.append(f"artifacts: {', '.join(r.artifacts)}")
+            if r.issues:
+                parts.append(f"issues: {'; '.join(r.issues)}")
+            body = " | ".join(parts) if parts else "(no structured output)"
+            return f"[{r.item_id}] {body}"
+
+        prompt = ACCEPTANCE_SPINNING_PROMPT.format(
+            prior_rounds="\n".join(_render(r) for r in prior) or "(none)",
+            latest_round=_render(latest),
+        )
+
+        try:
+            result = await call_with_fallback(
+                self._helper_services,
+                dict(
+                    messages=[{"role": "user", "content": prompt}],
+                    json_mode=True,
+                    max_tokens=400,
+                ),
+            )
+        except Exception as e:
+            self.logger.warning(
+                f"[Orchestrator] Acceptance auditor LLM call failed "
+                f"({type(e).__name__}: {e}) — defaulting to false_progress.",
+                component="Orchestrator",
+            )
+            return fallback
+
+        parsed = try_parse_json(result.content or "")
+        if not isinstance(parsed, dict):
+            return fallback
+        verdict = str(parsed.get("verdict", "false_progress")).strip().lower()
+        if verdict not in ("false_progress", "ok"):
+            verdict = "false_progress"
+        return ProgressConcern(
+            item_id=latest.item_id,
+            verdict=verdict,
+            rationale=str(parsed.get("rationale", ""))[:500],
         )
 
     async def _handle_task_complete_candidate(self) -> None:
@@ -887,9 +1173,24 @@ class Orchestrator(PlannerMixin, ReceptionistMixin):
 
         Mechanical 5-verdict dispatcher. The verifier itself decides whether
         to skip (TRIVIAL), pass (PASS), inject more work (EXTEND/VALIDATE),
-        or finalise with a noted gap (ACCEPT). The "stop looping" rule is
-        enforced inside the verifier prompt by inspecting the completed list
-        for items prefixed with `acceptance_` — no host-side round counter.
+        or finalise with a noted gap (ACCEPT). The verifier prompt is asked to
+        ACCEPT once `acceptance_*` items are visible in the completed list, but
+        that is advisory. The hard stop is **information-gain based**, not a
+        round count — it mirrors the in-item control loop (planner decides →
+        agent executes → Tier-0 mechanical sense → Tier-1 cheap-LLM observation
+        → planner intervenes):
+
+          - Tier-0 (mechanical, ungameable): `acceptance_info_delta` measures
+            what the latest acceptance round added over the union of all prior
+            completed results. `total_new > 0` ⇒ genuine exploration, EXTEND is
+            honored. `total_new == 0` ⇒ candidate produced nothing new.
+          - Tier-1 (cheap semantic auditor): fires ONLY when delta == 0, to
+            catch reworded-identical spinning the mechanical diff would miss.
+            `false_progress` ⇒ terminal ACCEPT (the persistent blocker becomes
+            the gap); `ok` ⇒ honor EXTEND (mechanical missed real novelty).
+          - Seatbelt (`_ACCEPTANCE_SEATBELT_ROUNDS`): defense-in-depth ceiling
+            for pathological novelty signals (e.g. timestamped artifact paths);
+            logged at WARNING and never the deciding mechanism in normal runs.
 
         Action map:
           PASS / TRIVIAL → emit completion reply, no further work.
@@ -928,9 +1229,131 @@ class Orchestrator(PlannerMixin, ReceptionistMixin):
             component="Orchestrator",
         )
 
+        # First-round-ACCEPT guard: a gap-bearing ACCEPT before any
+        # acceptance_* item has run is almost always the verifier giving up
+        # too early. Snap to EXTEND with a corrective acceptance_* item; the
+        # prompt's "don't loop after acceptance_* ran" rule still bounds
+        # termination on subsequent rounds. Skipped on fallback (synthesis
+        # crashed — no real verification signal to act on).
+        acceptance_results = [
+            r for r in completed
+            if r.item_id.startswith(self._ACCEPTANCE_PREFIX)
+        ]
+        acceptance_count = len(acceptance_results)
+        if (
+            verdict.verdict == "ACCEPT"
+            and verdict.gap_summary
+            and acceptance_count == 0
+            and not verdict.fallback
+        ):
+            self.logger.warning(
+                f"[Orchestrator] First-round ACCEPT with non-empty gap "
+                f"({verdict.gap_summary[:80]!r}) — snapping to EXTEND.",
+                component="Orchestrator",
+            )
+            corrective = CheckListItem(
+                item_id=f"acceptance_{str(_uuid.uuid4())[:6]}",
+                instruction=(
+                    f"Verification gap: {verdict.gap_summary} "
+                    "Re-attempt the missing observable evidence using whichever "
+                    "tool applies (SSH / browser / email / web_search). If a "
+                    "required tool is genuinely unavailable, document the named "
+                    "blocker explicitly rather than producing a prose summary."
+                ),
+                expected_outcomes=[
+                    "Observable evidence for the gap is collected, OR the "
+                    "blocker is explicitly documented with the missing "
+                    "tool/credential named.",
+                ],
+                planner_reasoning=(
+                    "Acceptance guard: first-round ACCEPT with non-empty gap "
+                    "rejected; force one EXTEND round before terminal ACCEPT."
+                ),
+            )
+            from .planner_mixin import AcceptanceVerdict
+            verdict = AcceptanceVerdict(
+                verdict="EXTEND",
+                gap_summary=verdict.gap_summary,
+                items_to_inject=[corrective],
+            )
+
+        # Information-gain termination (replaces the old fixed round cap).
+        # Fires once at least one acceptance_* round has completed and the
+        # verifier still wants more work. The first-round guard above can only
+        # fire at acceptance_count == 0, so it never collides with this block.
+        # Mirrors the in-item control loop: the Tier-0 mechanical delta gates
+        # whether the Tier-1 cheap auditor runs, and only their combination
+        # terminates — so genuine exploration is never killed and pure spinning
+        # is stopped on the first round that adds nothing.
+        if (
+            verdict.verdict in ("EXTEND", "VALIDATE")
+            and acceptance_count >= 1
+        ):
+            from .planner_mixin import AcceptanceVerdict
+
+            if acceptance_count >= self._ACCEPTANCE_SEATBELT_ROUNDS:
+                # Defense-in-depth only — must not be the normal exit. Logged
+                # loud so a spurious trip (e.g. timestamped artifact paths that
+                # always read as "new", defeating the set-difference) is
+                # diagnosable from a single WARNING line.
+                self.logger.warning(
+                    f"[Orchestrator] Acceptance seatbelt engaged "
+                    f"({acceptance_count} rounds) — forcing "
+                    f"{verdict.verdict}→ACCEPT. Novelty signal likely defeated; "
+                    f"investigate if this fires in normal operation.",
+                    component="Orchestrator",
+                )
+                verdict = AcceptanceVerdict(
+                    verdict="ACCEPT",
+                    gap_summary=verdict.gap_summary or (
+                        "Acceptance seatbelt reached with an unresolved gap; "
+                        "finalising."
+                    ),
+                )
+            else:
+                latest = acceptance_results[-1]
+                prior = [r for r in completed if r is not latest]
+                delta = acceptance_info_delta(latest, prior)
+                total_new = delta["total_new"]
+                if total_new == 0:
+                    # Tier-0 says the round added nothing new. Ask the cheap
+                    # auditor whether that is true semantic spinning or merely
+                    # reworded novelty the set-difference cannot see.
+                    concern = await self._audit_acceptance_spinning(latest, prior)
+                    if concern.verdict == "false_progress":
+                        self.logger.info(
+                            f"[Orchestrator] Acceptance spinning confirmed "
+                            f"(delta=0, auditor=false_progress: "
+                            f"{concern.rationale[:80]!r}) — terminal ACCEPT.",
+                            component="Orchestrator",
+                        )
+                        verdict = AcceptanceVerdict(
+                            verdict="ACCEPT",
+                            gap_summary=verdict.gap_summary or (
+                                "Acceptance loop made no new progress against a "
+                                "persistent blocker; finalising."
+                            ),
+                        )
+                    else:
+                        # Auditor sees genuine novelty the diff missed — honor
+                        # the EXTEND/VALIDATE and let the agent continue.
+                        self.logger.info(
+                            f"[Orchestrator] Acceptance delta=0 but auditor "
+                            f"judged novel ({concern.rationale[:80]!r}) — "
+                            f"honoring {verdict.verdict}.",
+                            component="Orchestrator",
+                        )
+                else:
+                    self.logger.info(
+                        f"[Orchestrator] Acceptance round produced new info "
+                        f"(total_new={total_new}) — honoring {verdict.verdict}.",
+                        component="Orchestrator",
+                    )
+
         if verdict.verdict in ("PASS", "TRIVIAL"):
             self._submit_session_to_ltm(success=True)
             self._emit_completion_reply()
+            await self._run_task_complete_cleanup()
             return
 
         if verdict.verdict == "ACCEPT":
@@ -944,6 +1367,7 @@ class Orchestrator(PlannerMixin, ReceptionistMixin):
                 if verdict.gap_summary else ""
             )
             self._emit_completion_reply(prefix=prefix)
+            await self._run_task_complete_cleanup()
             return
 
         if verdict.verdict in ("EXTEND", "VALIDATE"):
@@ -953,6 +1377,7 @@ class Orchestrator(PlannerMixin, ReceptionistMixin):
                 self._emit_completion_reply(
                     prefix=f"(verification {verdict.verdict.lower()} produced no item)\n"
                 )
+                await self._run_task_complete_cleanup()
                 return
             await self._checklist.replace_post_current(verdict.items_to_inject)
             # No completion reply emitted: agent will run injected items →
@@ -965,6 +1390,27 @@ class Orchestrator(PlannerMixin, ReceptionistMixin):
         self._emit_completion_reply(
             prefix=f"(unknown verdict {verdict.verdict!r} — finalising)\n"
         )
+        await self._run_task_complete_cleanup()
+
+    async def _run_task_complete_cleanup(self) -> None:
+        """Invoke the task-complete cleanup callback, swallowing any error.
+
+        Fires at every terminal verdict path (PASS / TRIVIAL / ACCEPT /
+        VALIDATE-with-empty-items / unknown), but NOT at EXTEND / VALIDATE
+        with more work queued — those flow back into the acceptance loop.
+        A misbehaving callback must never derail completion delivery; the
+        completion reply has already been emitted at the call site.
+        """
+        if self._on_task_complete is None:
+            return
+        try:
+            await self._on_task_complete()
+        except Exception as e:
+            self.logger.warning(
+                f"[Orchestrator] task-complete cleanup callback raised "
+                f"({type(e).__name__}: {e}); ignoring.",
+                component="Orchestrator",
+            )
 
     def _notify_state(self, state: str) -> None:
         """Push an activity-strip state through the optional UI hook.

@@ -295,6 +295,7 @@ class AnthropicStreamingService(LLMService):
         output_tokens: int = 0
         cache_creation_input_tokens: int = 0
         cache_read_input_tokens: int = 0
+        stop_reason: Optional[str] = None
 
         async for event in stream:
             etype = event.type
@@ -358,6 +359,13 @@ class AnthropicStreamingService(LLMService):
                 # streaming AND the cache_creation / cache_read fields. The
                 # message_start branch below is a fallback only; on Anthropic
                 # (and the QGenie gateway) cache tokens land here.
+                # ``delta.stop_reason`` also arrives here — critical for
+                # detecting truncated (max_tokens) completions downstream.
+                delta_obj = getattr(event, "delta", None)
+                if delta_obj is not None:
+                    sr = getattr(delta_obj, "stop_reason", None)
+                    if sr:
+                        stop_reason = sr
                 usage = getattr(event, "usage", None)
                 if usage is not None:
                     input_tokens = getattr(usage, "input_tokens", 0) or 0
@@ -407,11 +415,13 @@ class AnthropicStreamingService(LLMService):
                 cache_creation_tokens=cache_creation_input_tokens,
                 cache_read_tokens=cache_read_input_tokens,
             ),
+            stop_reason=stop_reason,
         )
         self.logger.debug(
             f"AnthropicStreaming response summary: "
             f"text_len={len(text_content) if text_content else 0}, "
             f"tool_calls={len(all_tool_calls)}, "
+            f"stop_reason={stop_reason}, "
             f"tokens=in:{input_tokens} out:{output_tokens} total:{input_tokens + output_tokens}"
             + (f" cache_create:{cache_creation_input_tokens}" if cache_creation_input_tokens else "")
             + (f" cache_read:{cache_read_input_tokens}" if cache_read_input_tokens else "")

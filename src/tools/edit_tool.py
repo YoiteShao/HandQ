@@ -8,15 +8,25 @@ import hashlib
 import tempfile
 import difflib
 from pathlib import Path
+from typing import Optional
 from .base_tool import BaseTool, ToolResult
 from .file_state import FileState
 
 
-def _walk_for_suggestions(target_name: str, search_root: str) -> list:
+def _walk_for_suggestions(
+    target_name: str, search_root: str, workspace_root: Optional[str] = None,
+) -> list:
     """Pure-sync helper used by edit_tool when the target file does not exist.
     Walks the filesystem to find files with similar names; bounded to
     _MAX_WALK_FILES = 500 to avoid wedging on huge trees. Pulled out to a
     module-level helper so it can be run inside loop.run_in_executor.
+
+    The optional broadening walk uses *workspace_root* (the per-session
+    working directory), never the process cwd: the bridge no longer
+    os.chdir's into the workspace, so a bare ``os.walk(".")`` here would
+    scan the install/launch dir and surface unrelated filenames as
+    suggestions. When no workspace is known (ctx=None test fixtures) the
+    broadening walk is skipped so suggestions never depend on process cwd.
     """
     suggestions = []
     try:
@@ -29,8 +39,12 @@ def _walk_for_suggestions(target_name: str, search_root: str) -> list:
                     break
             if len(all_files) >= _MAX_WALK_FILES:
                 break
-        if search_root != "." and len(all_files) < _MAX_WALK_FILES:
-            for dirpath, _dirnames, filenames in os.walk("."):
+        # Broaden the search to the workspace root when the target's own
+        # directory under-fills — but only if it's a different tree than the
+        # one we just walked, and only when a workspace is known.
+        if (workspace_root and len(all_files) < _MAX_WALK_FILES
+                and os.path.realpath(workspace_root) != os.path.realpath(search_root)):
+            for dirpath, _dirnames, filenames in os.walk(workspace_root):
                 for fname in filenames:
                     fpath = os.path.join(dirpath, fname)
                     if fpath not in all_files:
@@ -124,6 +138,11 @@ class EditTool(BaseTool):
                 {"path": path, "old_content": old_content, "new_content": new_content, "replace_all": replace_all}
             )
 
+            # Resolve relative paths against the per-session workspace, not the
+            # process cwd. Downstream Path(path), FileState staleness check, and
+            # the displayed .absolute() path all use this single resolved value.
+            path = self.resolve_in_workspace(path)
+
             path_obj = Path(path)
 
             # (5) Similar file suggestion: if target file doesn't exist, suggest alternatives.
@@ -131,8 +150,12 @@ class EditTool(BaseTool):
             if not path_obj.exists():
                 target_name = path_obj.name
                 search_root = str(path_obj.parent) if path_obj.parent != Path(".") else "."
+                workspace_root = (
+                    self.ctx.working_directory if (self.ctx and self.ctx.working_directory) else None
+                )
                 suggestions = await loop.run_in_executor(
-                    None, lambda: _walk_for_suggestions(target_name, search_root),
+                    None,
+                    lambda: _walk_for_suggestions(target_name, search_root, workspace_root),
                 )
 
                 error_msg = f"File not found: {path}"
@@ -253,6 +276,8 @@ class EditTool(BaseTool):
                 lineterm=""
             ))
             diff_preview = "".join(diff_lines) if diff_lines else "(no diff — content identical)"
+            if len(diff_preview) > 5_000:
+                diff_preview = diff_preview[:5_000] + "\n... (diff truncated at 5000 chars; full edit applied)"
 
             # Update FileState so subsequent edits in the same session don't trigger stale warning
             new_hash = hashlib.sha256(new_file_content.encode("utf-8")).hexdigest()

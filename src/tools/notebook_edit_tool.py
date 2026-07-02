@@ -84,6 +84,10 @@ class NotebookEditTool(BaseTool):
         try:
             self.validate_params(["notebook_path"], params)
 
+            # Resolve relative paths against the per-session workspace, not the
+            # process cwd, so file I/O and displayed .absolute() paths are correct.
+            notebook_path = self.resolve_in_workspace(notebook_path)
+
             if edit_mode not in ("replace", "insert", "delete"):
                 return ToolResult(
                     success=False,

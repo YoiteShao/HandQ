@@ -95,6 +95,24 @@ import keyring as _keyring
 _POOL_MAX_IDLE_SECS = 300                 # evict if idle longer than this
 _MIN_CONNECT_INTERVAL = 1.5   # seconds between NEW connections to the same host
 
+# ── Output truncation (parity with shell_tool) ───────────────────────────────
+_SSH_TRUNCATION_TOTAL_CHARS = 15_000
+_SSH_TRUNCATION_HEAD_CHARS = 5_000
+_SSH_TRUNCATION_TAIL_CHARS = 5_000
+
+
+def _truncate_ssh_output(text: str) -> tuple:
+    """Truncate SSH command output using head+tail strategy.
+
+    Returns (truncated_text, was_truncated).
+    """
+    if len(text) <= _SSH_TRUNCATION_TOTAL_CHARS:
+        return text, False
+    head = text[:_SSH_TRUNCATION_HEAD_CHARS]
+    tail = text[-_SSH_TRUNCATION_TAIL_CHARS:]
+    omitted = len(text) - _SSH_TRUNCATION_HEAD_CHARS - _SSH_TRUNCATION_TAIL_CHARS
+    return f"{head}\n\n... [{omitted} chars omitted] ...\n\n{tail}", True
+
 
 # ── Per-session pool class (used by SessionContext) ──────────────────────────
 #
@@ -1120,9 +1138,14 @@ class StatelessSSHTool(BaseTool):
                 execution_time=time.time() - start_time,
             )
 
-        # Load credentials (raises on bad file — caught below)
+        # Anchor a relative credentials_file path to the per-session workspace
+        # rather than the process cwd (no longer mutated via os.chdir — see
+        # concurrency work). _load_credentials only does os.path.expanduser, so
+        # a bare "creds.yaml" would otherwise be looked up under the install
+        # dir; with this resolve it lands in the agent's working directory.
+        resolved_creds_file = self.resolve_in_workspace(credentials_file)
         try:
-            creds = _load_credentials(credentials_file)
+            creds = _load_credentials(resolved_creds_file)
         except Exception as exc:
             return ToolResult(
                 success=False, output=None,
@@ -1215,6 +1238,8 @@ class StatelessSSHTool(BaseTool):
             )
 
         success = (exit_code == 0)
+        stdout, stdout_truncated = _truncate_ssh_output(stdout)
+        stderr, stderr_truncated = _truncate_ssh_output(stderr)
         out: Dict[str, Any] = {
             "command":    command,
             "stdout":     stdout,
@@ -1222,6 +1247,8 @@ class StatelessSSHTool(BaseTool):
             "exit_code":  exit_code,
             "login_shell": login_shell,
         }
+        if stdout_truncated or stderr_truncated:
+            out["truncated"] = True
         # Warn when the login shell is not bash so the agent knows to wrap its
         # own commands.  Built-in actions (exec_bg / job_status / safe_exit)
         # already use 'bash -c' internally and are unaffected.

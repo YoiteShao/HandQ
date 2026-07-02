@@ -30,6 +30,7 @@ from ..infrastructure.llm_service import LLMChatResult, LLMService
 from ..infrastructure.logger import get_logger
 from ..infrastructure.config_manager import ConfigManager
 from ..infrastructure.execution_recorder import ExecutionRecorder
+from ..infrastructure.utils import try_parse_json
 from ..models.token_usage import TokenUsage
 from ..tools.base_tool import BaseTool, ToolResult
 from ..tools.tool_registry import ToolRegistry
@@ -48,12 +49,20 @@ from .agent_utils import (
     ToolCall,
     TurnOutcome,
     ConversationTurn,
+    TurnDigest,
+    ProgressConcern,
     IterationAdvisor,
     format_tool_entry,
     resolve_obs_budget,
     SUPERSEDABLE_TOOL_ACTIONS,
 )
-from .agent_prompts import AGENT_SYSTEM_PROMPT, COMPACT_CONVERSATION_PROMPT, get_platform_context
+from .agent_prompts import (
+    AGENT_SYSTEM_PROMPT,
+    COMPACT_CONVERSATION_PROMPT,
+    PROGRESS_WATCHER_PROMPT,
+    get_platform_context,
+)
+from .coding_hint import HINT_ONLY_PROVIDER_NAMES
 
 # Desktop confirmation helpers — imported eagerly so packaging tools can
 # statically discover the dependency and any breakage surfaces at startup.
@@ -65,6 +74,18 @@ from ..tools.desktop_tool import (
 
 
 MAX_ITEM_ITERATIONS = 999
+
+# Observation rendering tiers: the LATEST turn keeps full results (LLM hasn't
+# digested it yet). The next FULL_OBS_RECENT_TURNS get compressed observations.
+# Older turns keep only the assistant reasoning (observations dropped).
+FULL_OBS_RECENT_TURNS = 3
+
+# Tier-1 watcher hysteresis gate. The Tier-0 no-progress streak counts turns
+# past its own small (~3-turn) threshold; requiring the streak to reach this
+# value before spending a (cheap, fire-and-forget) watcher LLM call enforces
+# the ">=2 re-checks past Tier-0" hysteresis from the design — so a brief stall
+# never escalates, only a sustained one does.
+WATCHER_STREAK_GATE = 2
 
 PreItemHintProvider = Callable[[CheckListItem], Union[str, Awaitable[str]]]
 
@@ -92,6 +113,7 @@ class PersistentAgent:
         pre_item_hint_provider: Optional[PreItemHintProvider] = None,
         ctx: Optional["SessionContext"] = None,
         expose_session_storage_in_prompt: bool = True,
+        helper_services: Optional[List[LLMService]] = None,
     ):
         if not llm_services:
             raise ValueError("llm_services must contain at least one LLMService")
@@ -115,6 +137,16 @@ class PersistentAgent:
         # LLM services
         self._services: List[LLMService] = list(llm_services)
         self._obs_budget_chars: int = resolve_obs_budget(self._services[0].context_window)
+
+        # Cheap auxiliary pool for the Tier-1 progress watcher. Kept SEPARATE
+        # from self._services so the watcher's LLM call shares no stream state
+        # with _think_streaming (independent service objects). Empty/None
+        # disables the watcher; Tier-0 mechanical sense still runs.
+        self._helper_services: List[LLMService] = list(helper_services or [])
+        # Fire-and-forget watcher handle + in-flight guard. Never awaited on the
+        # agent's critical path; cancelled + cleared at each item boundary.
+        self._watcher_task: Optional[asyncio.Task] = None
+        self._watcher_inflight: bool = False
 
         # Conversation state (replaces old _observations/_assistant_messages/_obs_group_sizes).
         # Out-of-band events (background-task completions, context-truncation
@@ -181,6 +213,7 @@ class PersistentAgent:
         #   - InteractionManager turn IDs visible to UI
         # Per-item iteration count lives in `_item_loop`'s local `iteration`.
         self.current_iteration: int = 0
+        self._current_item_turn_count: int = 0
         self.logger = get_logger()
 
         # Recorder / UI / Checklist
@@ -202,6 +235,11 @@ class PersistentAgent:
         # Skills / tools injection tracking
         self._injected_skills: Set[str] = set()
         self._loaded_tools: Set[str] = set()
+        # Tools the agent has explicitly released for visibility purposes.
+        # Loaded resources stay warm — see _apply_self_extension /
+        # _regenerate_api_tools. Re-claiming a hidden tool removes it from
+        # this set in the same turn (0 ms — no bootstrap).
+        self._hidden_tools: Set[str] = set()
 
         # Skill prelude — append-only ordered list, sits between system prompt
         # and the per-item instruction in _build_messages. Excluded from
@@ -273,7 +311,8 @@ class PersistentAgent:
 
     async def _execute_item(self, item: CheckListItem) -> None:
         """Execute a single CheckList item with full feature parity."""
-        self._advisor.reset_for_item()
+        self._advisor.reset_for_item(item.expected_outcomes)
+        self._current_item_turn_count = 0
 
         # Item-static context — persisted until the next item begins.
         # _build_messages reads these every turn so the agent never loses
@@ -300,6 +339,10 @@ class PersistentAgent:
             pass
 
         item_result = await self._item_loop(item)
+        # Item boundary: kill any in-flight watcher and drop its verdict so a
+        # stale judgment from THIS item cannot bleed into the next one.
+        self._cancel_progress_watcher()
+        self._checklist.clear_progress_concern()
         self._total_token_usage += item_result.token_usage or TokenUsage()
         self._total_items_processed += 1
         if item_result.success:
@@ -325,6 +368,10 @@ class PersistentAgent:
             f"(success={item_result.success}, iters={item_result.iterations})",
             component="PersistentAgent",
         )
+        # Item boundary: the completed item's raw turns are now dead weight
+        # (ItemResult carries everything cross-item), so fold them into the
+        # rolling summary instead of letting _turns grow until byte pressure.
+        await self._compact_item_boundary()
 
     async def _item_loop(self, item: CheckListItem) -> ItemResult:
         """Per-item OTA loop."""
@@ -392,6 +439,16 @@ class PersistentAgent:
             _token_usage += _iter_token_usage
 
             self._advisor.record_turn_tool_count(len(turn_result.tool_calls or []))
+
+            # Apply agent-driven self-extension (claim_tool / release_tool)
+            # BEFORE the per-turn branching. Claim makes the tool available
+            # for THIS iteration's tool calls when re-claiming an already-
+            # loaded hidden tool (instance is warm); release hides on the
+            # NEXT prompt build. Brand-new claims arrive on the next turn.
+            if turn_result.claim_tool or turn_result.release_tool:
+                self._apply_self_extension(
+                    turn_result.claim_tool, turn_result.release_tool,
+                )
 
             # ── 4. Error handling (PTL recovery) ─────────────────────────────
             if turn_result.is_error:
@@ -488,10 +545,91 @@ class PersistentAgent:
                         token_usage=_token_usage,
                     )
 
+                # Completion-format guard: the LLM ignored the JSON contract
+                # and returned pure prose (no dict with `reasoning`). Reject
+                # like the speculative-completion guard below: inject a
+                # corrective observation reminding the LLM of the schema and
+                # of the "long content → artifact file, not factual_outcome"
+                # rule, then loop. Empirically this happens after an
+                # interrupt reframes the item as "just summarise what you
+                # have" and the LLM dumps markdown; the corrective turn lets
+                # it re-emit a proper JSON completion.
+                if turn_result.format_violation:
+                    self.logger.warning(
+                        f"[{iteration}] Completion format violation rejected: "
+                        f"LLM returned non-JSON prose. Forcing retry.",
+                        component="PersistentAgent",
+                    )
+                    self._persist_event_observations(
+                        [ToolResult(
+                            success=False, output=None,
+                            tool_name="completion_guard", tool_parameters={},
+                            error=(
+                                "Completion output was not a JSON object with a "
+                                "`reasoning` key. Re-emit the completion in the "
+                                "documented envelope: "
+                                "{\"reasoning\": \"...\", "
+                                "\"factual_outcome\": [\"short structured fact\", ...], "
+                                "\"artifacts\": [\"path/to/file\"], "
+                                "\"key_findings\": [\"brief fact\"]}. "
+                                "`factual_outcome` bullets are <30 words each — "
+                                "for a long summary, write the prose to a file "
+                                "under the session dir and put that path in "
+                                "`artifacts`, NOT the summary text in "
+                                "`factual_outcome`."
+                            ),
+                        )],
+                        note=(
+                            "(My last completion was pure markdown, not JSON. "
+                            "I must re-emit as the JSON completion envelope; "
+                            "long content goes to a file in artifacts.)"
+                        ),
+                    )
+                    continue
+
+                # Speculative-completion guard: an item that claims success
+                # without ever dispatching a tool is almost always the LLM
+                # composing prose in lieu of action. Real "no work needed"
+                # items do not have expected_outcomes or ssh_target.
+                if not _tools_used and (item.expected_outcomes or item.ssh_target):
+                    self.logger.warning(
+                        f"[{iteration}] Speculative completion rejected: 0 tool calls "
+                        f"for item with expected_outcomes/ssh_target. Forcing retry.",
+                        component="PersistentAgent",
+                    )
+                    self._persist_event_observations(
+                        [ToolResult(
+                            success=False, output=None,
+                            tool_name="completion_guard", tool_parameters={},
+                            error=(
+                                "Item declared complete without any tool execution. "
+                                "Items with expected_outcomes or ssh_target require "
+                                "tool-grounded evidence. If a required tool is "
+                                "unavailable in your tool list, return an error JSON "
+                                "naming the missing tool — do not synthesise a "
+                                "free-form factual_outcome."
+                            ),
+                        )],
+                        note=(
+                            "(I declared the item complete with no tool calls. The "
+                            "completion-guard rejected this — call the appropriate "
+                            "tool or return error JSON.)"
+                        ),
+                    )
+                    continue
+
                 self.logger.info(
                     f"[{iteration}] Item complete: {turn_result.reasoning[:100]}",
                     component="PersistentAgent",
                 )
+                _issues: List[str] = []
+                if turn_result.truncation_note:
+                    self.logger.warning(
+                        f"[{iteration}] Completion truncation detected: "
+                        f"{turn_result.truncation_note}",
+                        component="PersistentAgent",
+                    )
+                    _issues.append(turn_result.truncation_note)
                 return ItemResult(
                     item_id=item.item_id,
                     success=True,
@@ -500,11 +638,13 @@ class PersistentAgent:
                         _produced_paths, turn_result.artifacts
                     ),
                     key_findings=list(turn_result.key_findings or []),
+                    issues=_issues,
                     iterations=iteration,
                     token_usage=_token_usage,
                 )
 
             # ── 6. Record tool results ───────────────────────────────────────
+            prev_artifacts = len(_produced_paths)
             for tr in tool_results:
                 if tr.tool_name:
                     params = tr.tool_parameters or {}
@@ -565,11 +705,34 @@ class PersistentAgent:
                         token_usage=_token_usage,
                     )
 
-            # ── 8. Update advisor ────────────────────────────────────────────
+            # ── 8. Update advisor + per-turn progress signal ─────────────────
+            goal_signal_hit = False
             for tr in tool_results:
                 self._advisor.record_tool_result(tr)
+                if not goal_signal_hit and tr.success and tr.output is not None:
+                    goal_signal_hit = self._advisor.matches_goal(str(tr.output)[:2000])
+            self._advisor.record_progress_signal(
+                produced_new_artifact=len(_produced_paths) > prev_artifacts,
+                goal_signal_hit=goal_signal_hit,
+            )
 
-        # Reached per-item iteration cap
+            # ── 9. Mechanical digest + Tier-1 watcher (fire-and-forget) ──────
+            # Write one bus digest per turn (cheap, synchronous) so the planner
+            # has an in-flight view of this running item. Then, only after the
+            # Tier-0 no-progress streak has persisted (hysteresis), launch the
+            # cheap LLM watcher — never awaited on this critical path.
+            self._checklist.append_turn_digest(TurnDigest(
+                item_id=item.item_id,
+                iteration=iteration,
+                tool_names=[tr.tool_name for tr in tool_results if tr.tool_name],
+                success_count=sum(1 for tr in tool_results if tr.success),
+                fail_count=sum(1 for tr in tool_results if not tr.success),
+                produced_new_artifact=len(_produced_paths) > prev_artifacts,
+                goal_signal_hit=goal_signal_hit,
+                no_progress_streak=self._advisor.noprogress_streak,
+            ))
+            self._maybe_launch_progress_watcher(item)
+
         advisor_summary = self._advisor.get_summary()
         self.logger.warning(
             f"Item '{item.item_id}' hit iteration cap ({self._max_item_iterations}). "
@@ -582,6 +745,132 @@ class PersistentAgent:
             issues=[f"Reached per-item iteration cap ({self._max_item_iterations})"],
             iterations=iteration,
             token_usage=_token_usage,
+        )
+
+    # ── Tier-1 progress watcher (fire-and-forget) ────────────────────────────
+
+    def _maybe_launch_progress_watcher(self, item: CheckListItem) -> None:
+        """Launch the cheap LLM watcher iff the hysteresis gate is satisfied.
+
+        Gate (all must hold):
+          - a helper pool is configured (else Tier-1 is disabled),
+          - no watcher is already in flight (one at a time),
+          - the Tier-0 no-progress streak has persisted >= WATCHER_STREAK_GATE
+            turns past the small Tier-0 threshold (the >=2-recheck hysteresis
+            from the design — only escalate when Tier-0 keeps re-firing).
+
+        Never awaits: spawns a task and returns immediately so the agent's
+        per-turn wall-clock is unaffected (latency is the only enemy).
+        """
+        if not self._helper_services:
+            return
+        if self._watcher_inflight:
+            return
+        if self._advisor.noprogress_streak < WATCHER_STREAK_GATE:
+            return
+        self._watcher_inflight = True
+        self._watcher_task = asyncio.create_task(
+            self._run_progress_watcher(item),
+            name=f"progress_watcher_{item.item_id}",
+        )
+        self._watcher_task.add_done_callback(self._on_watcher_done)
+
+    def _on_watcher_done(self, task: "asyncio.Task") -> None:
+        """Clear the in-flight guard when the watcher task settles."""
+        self._watcher_inflight = False
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            self.logger.warning(
+                f"[ProgressWatcher] task failed: {e}",
+                component="PersistentAgent",
+            )
+
+    def _cancel_progress_watcher(self) -> None:
+        """Cancel any in-flight watcher and reset state (item boundary)."""
+        task = self._watcher_task
+        if task is not None and not task.done():
+            task.cancel()
+        self._watcher_task = None
+        self._watcher_inflight = False
+
+    async def _run_progress_watcher(self, item: CheckListItem) -> None:
+        """Cheap, fire-and-forget divergence check on the in-flight item.
+
+        Snapshots the mechanical digests BEFORE the first await (so it never
+        iterates a deque that the agent coroutine mutates mid-call), builds a
+        small prompt from the item's expected_outcomes + digests, and asks the
+        helper pool for a verdict. Only "diverging"/"false_progress" verdicts
+        are written to the bus; "ok" leaves the slot untouched. A stale result
+        arriving after the item advanced is dropped (item_id guard).
+        """
+        digests = [
+            d for d in self._checklist.get_turn_digests()
+            if d.item_id == item.item_id
+        ]
+        if not digests:
+            return
+
+        expected = "\n".join(f"- {o}" for o in item.expected_outcomes) \
+            or "(no explicit expected outcomes provided)"
+        digest_lines = []
+        for d in digests[-12:]:
+            tools = ",".join(d.tool_names) if d.tool_names else "none"
+            digest_lines.append(
+                f"iter {d.iteration}: tools={tools} ok={d.success_count} "
+                f"fail={d.fail_count} new_artifact={d.produced_new_artifact} "
+                f"goal_hit={d.goal_signal_hit} "
+                f"no_progress_streak={d.no_progress_streak}"
+            )
+        prompt = PROGRESS_WATCHER_PROMPT.format(
+            expected_outcomes=expected,
+            digests="\n".join(digest_lines),
+        )
+
+        try:
+            result = await call_with_fallback(
+                self._helper_services,
+                dict(
+                    messages=[{"role": "user", "content": prompt}],
+                    json_mode=True,
+                    max_tokens=400,
+                ),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            self.logger.warning(
+                f"[ProgressWatcher] LLM call failed: {e}",
+                component="PersistentAgent",
+            )
+            return
+
+        parsed = try_parse_json(result.content or "")
+        if not isinstance(parsed, dict):
+            return
+        verdict = str(parsed.get("verdict", "ok")).strip().lower()
+        if verdict not in ("diverging", "false_progress"):
+            return
+
+        # Drop a verdict that arrived after the item already advanced.
+        current = self._checklist.get_current_item()
+        if current is None or current.item_id != item.item_id:
+            return
+
+        self._checklist.set_progress_concern(ProgressConcern(
+            item_id=item.item_id,
+            verdict=verdict,
+            rationale=str(parsed.get("rationale", ""))[:500],
+            suggest_replan=bool(parsed.get("suggest_replan", False)),
+            suggest_interrupt=bool(parsed.get("suggest_interrupt", False)),
+        ))
+        self.logger.info(
+            f"[ProgressWatcher] item={item.item_id} verdict={verdict} "
+            f"replan={bool(parsed.get('suggest_replan', False))} "
+            f"interrupt={bool(parsed.get('suggest_interrupt', False))}",
+            component="PersistentAgent",
         )
 
     # ── LLM interaction ──────────────────────────────────────────────────────
@@ -681,6 +970,26 @@ class PersistentAgent:
                         else:
                             _asst_msg = {"role": "assistant", "content": reasoning}
                             turn_outcome = TurnOutcome.from_completion_text(reasoning)
+                            # Truncation diagnostics: log stop_reason + output tokens on
+                            # every completion turn, and stamp a truncation_note when
+                            # stop_reason=max_tokens so ITEM_END surfaces the partial.
+                            _sr = getattr(llm_result, "stop_reason", None)
+                            self.logger.info(
+                                f"[{self.current_iteration}][ThinkStream] Completion "
+                                f"stop_reason={_sr} out_tokens={llm_result.output_tokens} "
+                                f"raw_len={len(reasoning)}",
+                                component="PersistentAgent",
+                            )
+                            if _sr == "max_tokens":
+                                _mt_note = (
+                                    f"LLM stopped at max_tokens after "
+                                    f"{llm_result.output_tokens} output tokens; "
+                                    f"completion is truncated."
+                                )
+                                turn_outcome.truncation_note = (
+                                    f"{turn_outcome.truncation_note}; {_mt_note}"
+                                    if turn_outcome.truncation_note else _mt_note
+                                )
 
                         if turn_outcome.reasoning:
                             try:
@@ -760,6 +1069,7 @@ class PersistentAgent:
         # and carries nothing not already captured in the ItemResult / summary.
         if _asst_msg is not None and (_asst_msg.get("tool_calls") or tool_results):
             self._turns.append(ConversationTurn(assistant_message=_asst_msg, observations=tool_results))
+            self._current_item_turn_count += 1
             self._log_observations(tool_results)
 
         _in_tok = llm_result.input_tokens if llm_result is not None else 0
@@ -818,6 +1128,16 @@ class PersistentAgent:
         # on item completion), so this stays stable across a single item's many
         # iterations and keeps the turn trace below it cache-resident.
         top_parts: List[str] = []
+        # User's verbatim message — only on first iteration of this item.
+        # After that, the agent's reasoning chain carries the user intent.
+        if self._current_item_turn_count == 0:
+            user_msg = self._checklist.get_latest_user_message()
+            if user_msg:
+                top_parts.append(
+                    "[User Original Request — for grounding only; the "
+                    "actionable contract is the [New Task] instruction below]\n"
+                    f'"{user_msg}"'
+                )
         if self._conversation_summary:
             top_parts.append(
                 f"---\n[Earlier session progress]\n{self._conversation_summary}\n---"
@@ -833,44 +1153,68 @@ class PersistentAgent:
         if top_parts:
             messages.append({"role": "user", "content": "\n\n".join(top_parts)})
 
-        # Conversation trace.
-        for turn in turns:
-            messages.append(turn.assistant_message)
-            if turn.has_tool_calls:
-                tc_list = turn.assistant_message.get("tool_calls", [])
-                for i, obs in enumerate(turn.observations):
-                    call_id = tc_list[i]["id"] if i < len(tc_list) else f"call_{i}"
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": call_id,
-                        "content": obs.to_tool_result_json(),
-                    })
-            elif turn.observations:
-                combined = "\n\n".join(
-                    obs.to_obs_json(i + 1) for i, obs in enumerate(turn.observations)
-                )
-                messages.append({"role": "user", "content": combined})
+        # Conversation trace — three-tier observation rendering.
+        last_idx = len(turns) - 1
+        compressed_start = max(0, last_idx - FULL_OBS_RECENT_TURNS)
 
-        # Bottom instruction message — fresh per item, rebuilt every turn so the
-        # agent never loses expected_outcomes / host credentials / LTM recall,
-        # with the per-turn reminder + action prompt appended. Placed last so it
-        # is the model's freshest context. The `[Current Task]` fallback only
-        # fires if _current_item_block is None (should not happen in normal
-        # flow; set in _execute_item). Adjacent same-role messages (e.g. the
-        # preceding tool-result user message) are coalesced by the converter.
-        bottom_parts: List[str] = [
-            self._current_item_block or f"[Current Task]\n{instruction}"
-        ]
-        if self._current_ltm_block:
-            bottom_parts.append(self._current_ltm_block)
-        if self._current_item_hint:
-            bottom_parts.append(f"[Host Context]\n{self._current_item_hint}")
-        next_action = (
-            "Pick one: "
-            "(a) tool calls — batch every independent call in this same turn; "
-            "(b) completion JSON (no tool calls) when the instruction is fully achieved; "
-            "(c) error JSON (no tool calls) only when the instruction is genuinely unachievable."
-        )
+        for idx, turn in enumerate(turns):
+            if idx < compressed_start:
+                # TIER 3 — old: reasoning only, strip tool_calls (no API contract issue)
+                messages.append({
+                    "role": "assistant",
+                    "content": turn.assistant_message.get("content", ""),
+                })
+            elif idx < last_idx:
+                # TIER 2 — recent: compressed observations
+                messages.append(turn.assistant_message)
+                if turn.has_tool_calls:
+                    tc_list = turn.assistant_message.get("tool_calls", [])
+                    for i, obs in enumerate(turn.observations):
+                        call_id = tc_list[i]["id"] if i < len(tc_list) else f"call_{i}"
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": call_id,
+                            "content": self._compress_obs_for_context(obs),
+                        })
+                elif turn.observations:
+                    combined = "\n\n".join(
+                        self._compress_obs_for_context(obs) for obs in turn.observations
+                    )
+                    messages.append({"role": "user", "content": combined})
+            else:
+                # TIER 1 — latest: full uncompressed (LLM hasn't digested yet)
+                messages.append(turn.assistant_message)
+                if turn.has_tool_calls:
+                    tc_list = turn.assistant_message.get("tool_calls", [])
+                    for i, obs in enumerate(turn.observations):
+                        call_id = tc_list[i]["id"] if i < len(tc_list) else f"call_{i}"
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": call_id,
+                            "content": obs.to_tool_result_json(),
+                        })
+                elif turn.observations:
+                    combined = "\n\n".join(
+                        obs.to_obs_json(i + 1) for i, obs in enumerate(turn.observations)
+                    )
+                    messages.append({"role": "user", "content": combined})
+
+        # Bottom instruction message — placed last so it is the model's freshest
+        # context. On the first turn of an item, include full task block + LTM +
+        # host context. On subsequent turns, abbreviate to avoid repeating static
+        # content the model has already reasoned about.
+        if self._current_item_turn_count == 0:
+            bottom_parts: List[str] = [
+                self._current_item_block or f"[Current Task]\n{instruction}"
+            ]
+            if self._current_ltm_block:
+                bottom_parts.append(self._current_ltm_block)
+            if self._current_item_hint:
+                bottom_parts.append(f"[Host Context]\n{self._current_item_hint}")
+        else:
+            bottom_parts: List[str] = [f"[Continuing: {instruction[:120]}]"]
+            if self._current_item_hint and "ssh" in (self._current_item_hint or "").lower():
+                bottom_parts.append(f"[Host Context]\n{self._current_item_hint}")
         # Reminder section. extra_ltm_block (when present) is the
         # stagnation-triggered fresh LTM recall — kept here as an independent
         # block so it sits next to the advisor reminder that motivated it,
@@ -884,8 +1228,8 @@ class PersistentAgent:
             )
         if reminder:
             reminder_section_parts.append(reminder)
-        reminder_section_parts.append(next_action)
-        bottom_parts.append("\n\n".join(reminder_section_parts))
+        if reminder_section_parts:
+            bottom_parts.append("\n\n".join(reminder_section_parts))
         messages.append({"role": "user", "content": "\n\n".join(bottom_parts)})
 
         return messages
@@ -963,6 +1307,219 @@ class PersistentAgent:
                     f"result elided to save tokens]"
                 )
 
+    def _compress_obs_for_context(self, obs: ToolResult) -> str:
+        """Compress a ToolResult for tier-2 (recent but digested) rendering."""
+        tool = obs.tool_name or ""
+        params = obs.tool_parameters or {}
+
+        if not obs.success:
+            err = obs.error or str(obs.output) or ""
+            return json.dumps({"ok": False, "err": err[:500]}, ensure_ascii=False)
+
+        if tool == "read":
+            path = params.get("path", "?")
+            out = obs.output
+            if isinstance(out, dict):
+                lines = out.get("lines_returned") or out.get("total_lines") or "?"
+                return json.dumps({"ok": True, "out": f"Read {path} ({lines} lines)"}, ensure_ascii=False)
+            return json.dumps({"ok": True, "out": f"Read {path}"}, ensure_ascii=False)
+
+        if tool in ("bash", "shell", "ssh"):
+            out = obs.output
+            exit_code = obs.exit_code
+            if isinstance(out, dict):
+                stdout = str(out.get("stdout", ""))
+                exit_code = out.get("exit_code", exit_code)
+            else:
+                stdout = str(out or "")
+            lines = stdout.split("\n")
+            if len(lines) <= 10:
+                compressed = stdout
+            else:
+                head = "\n".join(lines[:5])
+                tail = "\n".join(lines[-5:])
+                compressed = f"{head}\n... ({len(lines) - 10} lines omitted) ...\n{tail}"
+            return json.dumps({"ok": True, "exit_code": exit_code, "out": compressed}, ensure_ascii=False)
+
+        if tool == "write":
+            path = params.get("path", "?")
+            lw = obs.lines_written or "?"
+            return json.dumps({"ok": True, "out": f"Wrote {path} ({lw} lines)"}, ensure_ascii=False)
+
+        if tool == "edit":
+            path = params.get("path", "?")
+            diff = obs.diff_output or ""
+            if len(diff) > 1000:
+                diff = diff[:1000] + "\n... (diff truncated)"
+            return json.dumps({"ok": True, "out": f"Edited {path}", "diff": diff}, ensure_ascii=False)
+
+        if tool == "desktop":
+            return self._compress_desktop_obs(obs)
+
+        if tool == "browser":
+            return self._compress_browser_obs(obs)
+
+        return obs.to_tool_result_json()
+
+    def _compress_desktop_obs(self, obs: ToolResult) -> str:
+        """Compress desktop tool observation for tier-2 rendering."""
+        params = obs.tool_parameters or {}
+        out = obs.output if isinstance(obs.output, dict) else {}
+        action = params.get("action", "")
+
+        def _state_summary(sa: dict) -> str:
+            parts: list[str] = []
+            if sa.get("foreground_changed"):
+                parts.append(f"fg→'{sa.get('foreground_title', '?')[:60]}'")
+            elif sa.get("title_changed"):
+                parts.append(f"title→'{sa.get('foreground_title', '?')[:60]}'")
+            new_wins = sa.get("new_windows", [])
+            if new_wins:
+                names = [w.get("title", "?")[:40] for w in new_wins[:2]]
+                parts.append(f"new_win: {names}")
+            return "; ".join(parts) if parts else "no change"
+
+        state = out.get("state_after", {})
+        state_str = _state_summary(state) if state else ""
+
+        if action == "screenshot":
+            path = out.get("path", "?")
+            return json.dumps({"ok": True, "out": f"Screenshot: {path}"}, ensure_ascii=False)
+
+        if action == "snapshot":
+            title = out.get("window_title", "?")
+            count = out.get("element_count", "?")
+            source = out.get("source", "?")
+            return json.dumps({"ok": True, "out": f"Snapshot: '{title}' ({count} elements, source={source})"}, ensure_ascii=False)
+
+        if action == "list_windows":
+            count = out.get("count", len(out.get("windows", [])))
+            fg = next((w["title"] for w in out.get("windows", []) if w.get("foreground")), "?")
+            return json.dumps({"ok": True, "out": f"Windows: {count} visible, fg='{fg[:60]}'"}, ensure_ascii=False)
+
+        if action == "find_element":
+            x, y = out.get("x", "?"), out.get("y", "?")
+            conf = out.get("confidence", "?")
+            src = out.get("source", "?")
+            matched = out.get("matched_text", "?")
+            return json.dumps({"ok": True, "out": f"Found '{matched}' at ({x},{y}), conf={conf}, source={src}"}, ensure_ascii=False)
+
+        if action == "find_and_click":
+            x, y = out.get("x", "?"), out.get("y", "?")
+            matched = out.get("matched_text", "?")
+            return json.dumps({"ok": True, "out": f"Clicked '{matched}' at ({x},{y})", "state": state_str}, ensure_ascii=False)
+
+        if action == "hover_at":
+            x, y = out.get("x", "?"), out.get("y", "?")
+            nearby = out.get("nearby_text", [])
+            tip = nearby[0]["text"][:100] if nearby else ""
+            return json.dumps({"ok": True, "out": f"Hover at ({x},{y})", "tooltip": tip}, ensure_ascii=False)
+
+        if action in ("click_at", "type_text", "drag", "scroll", "hotkey", "key_press"):
+            if action == "click_at":
+                label = f"Clicked ({out.get('x', '?')},{out.get('y', '?')})"
+            elif action == "type_text":
+                label = f"Typed {out.get('chars', '?')} chars"
+            elif action == "drag":
+                label = f"Dragged {out.get('from', '?')}->{out.get('to', '?')}"
+            elif action == "scroll":
+                label = f"Scrolled dy={out.get('dy', '?')} at ({out.get('x', '?')},{out.get('y', '?')})"
+            elif action == "hotkey":
+                label = f"Hotkey {out.get('keys', '?')}"
+            else:
+                label = f"Key {out.get('key', '?')}"
+            return json.dumps({"ok": True, "out": label, "state": state_str}, ensure_ascii=False)
+
+        return obs.to_tool_result_json()
+
+    def _compress_browser_obs(self, obs: ToolResult) -> str:
+        """Compress browser tool observation for tier-2 rendering."""
+        params = obs.tool_parameters or {}
+        out = obs.output if isinstance(obs.output, dict) else {}
+        action = params.get("action", "")
+
+        if action == "navigate":
+            url = out.get("url", "?")
+            status = out.get("status", "?")
+            ps = out.get("page_state")
+            result: dict = {"ok": True, "out": f"Navigated to {url} (status={status})"}
+            if ps and (ps.get("dialogs") or ps.get("notifications")):
+                result["page_state"] = ps
+            return json.dumps(result, ensure_ascii=False)
+
+        if action == "extract":
+            mode = out.get("mode", "?")
+            content = out.get("content", "")
+            trunc = " [truncated]" if out.get("truncated") else ""
+            head = content[:800].replace("\n", " ") if content else ""
+            result = {"ok": True, "out": f"Extracted {mode}: {len(content)} chars{trunc}"}
+            if head:
+                result["head"] = head
+            return json.dumps(result, ensure_ascii=False)
+
+        if action == "snapshot":
+            title = out.get("title", "?")
+            count = out.get("element_count", "?")
+            trunc = " [truncated]" if out.get("truncated") else ""
+            result = {"ok": True, "out": f"Snapshot: '{title}' ({count} elements{trunc})"}
+            dialogs = out.get("dialogs")
+            if dialogs:
+                result["dialogs"] = dialogs
+            notifs = out.get("notifications")
+            if notifs:
+                result["notifications"] = notifs
+            return json.dumps(result, ensure_ascii=False)
+
+        if action in ("click", "type"):
+            selector = params.get("selector", "?")
+            nav = " → navigated" if out.get("navigated") else ""
+            url = out.get("url_after", "")
+            result = {"ok": True, "out": f"{'Clicked' if action == 'click' else 'Typed into'} {selector}{nav}"}
+            if nav and url:
+                result["url"] = url
+            ps = out.get("page_state")
+            if ps and (ps.get("dialogs") or ps.get("notifications")):
+                result["page_state"] = ps
+            return json.dumps(result, ensure_ascii=False)
+
+        if action == "wait_for":
+            selector = out.get("selector")
+            if selector:
+                state = out.get("state", "?")
+                return json.dumps({"ok": True, "out": f"Wait complete: {selector} {state}"}, ensure_ascii=False)
+            url = out.get("url", "")
+            return json.dumps({"ok": True, "out": f"URL matched: {url}"}, ensure_ascii=False)
+
+        if action == "screenshot":
+            path = out.get("path", "?")
+            return json.dumps({"ok": True, "out": f"Screenshot: {path}"}, ensure_ascii=False)
+
+        if action == "vision_query":
+            answer = out.get("answer", "")
+            if isinstance(answer, dict):
+                answer = json.dumps(answer, ensure_ascii=False)
+            if len(str(answer)) > 500:
+                answer = str(answer)[:500] + "..."
+            return json.dumps({"ok": True, "out": answer}, ensure_ascii=False)
+
+        if action == "video_context":
+            video = out.get("video", {})
+            dur = video.get("duration_s", "?")
+            captions = video.get("captions", [])
+            trunc = " [truncated]" if video.get("captions_truncated") else ""
+            return json.dumps({"ok": True, "out": f"Video: {dur}s, {len(captions)} captions{trunc}"}, ensure_ascii=False)
+
+        if action == "fetch_json":
+            status = out.get("status", "?")
+            body = out.get("body", "")
+            head = body[:800] if body else ""
+            result = {"ok": True, "out": f"HTTP {status}"}
+            if head:
+                result["body_head"] = head
+            return json.dumps(result, ensure_ascii=False)
+
+        return obs.to_tool_result_json()
+
     # ── Tool execution ───────────────────────────────────────────────────────
 
     async def _execute_one(self, tc: ToolCall) -> ToolResult:
@@ -1019,6 +1576,13 @@ class PersistentAgent:
             result.tool_name = tool_name
         if result.tool_parameters is None:
             result.tool_parameters = parameters
+
+        # Egress filter: redact known plaintext secrets (keyring passwords)
+        # from the tool output BEFORE it lands in the conversation history,
+        # the session log, or the UI notification below. This is the single
+        # boundary where every tool result passes through.
+        from ..infrastructure.secret_redactor import SecretRedactor
+        SecretRedactor.get().redact_tool_result(result)
 
         try:
             output = None
@@ -1226,8 +1790,46 @@ class PersistentAgent:
     # ── Conversation compaction ────────────────────────────────────────────
 
     KEEP_RECENT_TURNS = 5
+    # Hard ceiling on _conversation_summary length. It is fed by repeated
+    # appends (_hard_drop_turns) and re-compressions (_compact_*); without a cap
+    # it grows unbounded across a long multi-item session. Keep the most recent
+    # chars — older narrative is the least relevant.
+    MAX_SUMMARY_CHARS = 16_000
 
-    async def _compact_conversation(self, budget_ratio: float = 0.8) -> None:
+    async def _compact_item_boundary(self) -> None:
+        """Fold turns beyond KEEP_RECENT into the summary at each item boundary.
+
+        ``_turns`` is a single rolling buffer that never resets across items and
+        is only trimmed under byte pressure. Once an item completes its raw
+        turns are dead weight — the ``ItemResult`` is the cross-item carrier —
+        so unlike :meth:`_compact_conversation` (which only fires when the obs
+        budget is strained) this compresses unconditionally whenever there are
+        more than ``KEEP_RECENT_TURNS`` turns, regardless of budget.
+        """
+        compress_count = len(self._turns) - self.KEEP_RECENT_TURNS
+        if compress_count <= 0:
+            return
+
+        trace_text = self._build_trace_for_compaction(compress_count)
+        if self._conversation_summary:
+            trace_text = (
+                f"[Previous summary to re-compress]\n{self._conversation_summary}\n\n"
+                f"[New turns]\n{trace_text}"
+            )
+
+        new_summary = await self._llm_compress(trace_text, compress_count)
+
+        self._turns = self._turns[-self.KEEP_RECENT_TURNS:]
+        self._conversation_summary = new_summary[-self.MAX_SUMMARY_CHARS:]
+
+        self.logger.info(
+            f"[{self.current_iteration}][Compact] Item boundary: {compress_count} "
+            f"turns -> summary ({len(self._conversation_summary)} chars), "
+            f"{len(self._turns)} turns kept.",
+            component="PersistentAgent",
+        )
+
+    async def _compact_conversation(self, budget_ratio: float = 0.95) -> None:
         """Compress old conversation turns into a narrative summary."""
         if len(self._turns) <= self.KEEP_RECENT_TURNS + 2:
             return
@@ -1394,6 +1996,8 @@ class PersistentAgent:
             self._conversation_summary += "\n\n[Hard-drop summary]\n" + summary
         else:
             self._conversation_summary = "[Hard-drop summary]\n" + summary
+        # Cap: this append is the unbounded-growth point across a long session.
+        self._conversation_summary = self._conversation_summary[-self.MAX_SUMMARY_CHARS:]
 
         self._turns = self._turns[drop_count:]
 
@@ -1523,12 +2127,17 @@ class PersistentAgent:
         return {"os": "linux", "host": host or "unknown", "confidence": 0.85}
 
     async def _gather_ltm_block(self, item: CheckListItem) -> Optional[str]:
-        """Recall LTM context for this item's instruction.
+        """Recall LTM context for this item's deliverable intent.
 
         Uses the same LongTermMemory.get() singleton + format_context_block
-        API as Orchestrator, but queries with item.instruction (fine-grained)
-        rather than the raw user message (coarse-grained). Returns the
-        formatted block or None on empty/error so injection is a no-op.
+        API as Orchestrator. The recall query is built from the item's
+        ``expected_outcomes`` (the deliverable contract) rather than the full
+        ``instruction``: the instruction is laden with proper nouns (paths,
+        product/version names) that spuriously match passive-observation
+        activity snapshots about those same screens, inflating their recall
+        score. Anchoring on the deliverable keeps recall relevant to WHAT must
+        be produced. Falls back to ``instruction`` only when the item carries
+        no expected_outcomes.
         """
         try:
             from ..infrastructure.long_term_memory import LongTermMemory
@@ -1540,10 +2149,21 @@ class PersistentAgent:
         # insights surface and Windows-only insights are filtered out. See
         # _resolve_current_frame for the confidence rationale.
         current_frame = self._resolve_current_frame(item)
+        recall_query = " ".join(item.expected_outcomes).strip() or item.instruction
         try:
             self._interaction_manager.notify_recall_started()
+            from ..infrastructure.long_term_memory._constants import (
+                RECALL_MIN_SCORE_FAST,
+                RERANK_PERSISTENT_AGENT_ITEM,
+            )
+            # Per-item runs 5-20× per session at fast-tier (rerank off). Without
+            # rerank as the final relevance gate, the RECALL_MIN_SCORE_FAST
+            # dense-branch floor is what stops activity-snapshot noise from
+            # padding into the agent's per-item context. See _constants.py §4.
             block = await ltm.format_context_block(
-                query=item.instruction, rerank=True,
+                query=recall_query,
+                rerank=RERANK_PERSISTENT_AGENT_ITEM,
+                min_score=RECALL_MIN_SCORE_FAST,
                 current_frame=current_frame,
             )
             if not (block and block.strip()):
@@ -1640,13 +2260,16 @@ class PersistentAgent:
             query = item.instruction
         try:
             self._interaction_manager.notify_recall_started()
+            from ..infrastructure.long_term_memory._constants import (
+                RERANK_PERSISTENT_AGENT_STAGNATION,
+            )
             block = await ltm.format_context_block(
                 query=query,
                 memory_dimension=MemoryDimension.INSIGHT,
                 memory_k=3,
                 knowledge_k=3,
                 include_identity=False,
-                rerank=False,
+                rerank=RERANK_PERSISTENT_AGENT_STAGNATION,
                 current_frame=self._resolve_current_frame(item),
             )
         except Exception as exc:
@@ -1729,6 +2352,42 @@ class PersistentAgent:
         # genuine activation of that name. Mirrors the _injected_skills guard
         # in _handle_skills_added.
         loaded = [n for n in delta if n in new_tools]
+        # Names known to be hint-only providers (e.g. "coding") have no entry
+        # in ToolRegistry by design — their CapabilityProvider injects a hint
+        # via flow_controller._gather_pre_item_hints. Filtering them out here
+        # prevents a misleading "not registered" warning surfacing in the
+        # agent's conversation.
+        unresolved = [
+            n for n in delta
+            if n not in new_tools
+            and n not in HINT_ONLY_PROVIDER_NAMES
+        ]
+        if unresolved:
+            # Surface the unresolved names to the agent's conversation so the
+            # LLM can name them in error JSON when applicable. Without this,
+            # an item that needs a missing tool produces "0 tool calls →
+            # speculative completion" with no obvious cause from the agent's
+            # perspective. The synthetic ToolResult is a sentinel — it never
+            # gets executed; tool_name="tool_activation_notice" makes the
+            # source visible in logs and conversation traces.
+            self._persist_event_observations(
+                [ToolResult(
+                    success=False, output=None,
+                    tool_name="tool_activation_notice", tool_parameters={},
+                    error=(
+                        f"Planner requested tool(s) {unresolved} but they are "
+                        f"not registered in this build. They will NOT be "
+                        f"available. If the current item requires one of these, "
+                        f"return an error JSON naming the missing tool — do not "
+                        f"attempt to invoke it and do not fabricate a "
+                        f"factual_outcome."
+                    ),
+                )],
+                note=(
+                    f"(Tool activation: planner requested {sorted(delta)}; "
+                    f"loaded {sorted(loaded)}; unresolved {sorted(unresolved)}.)"
+                ),
+            )
         if not loaded:
             self.logger.warning(
                 f"[PersistentAgent] No tools resolved from activation request "
@@ -1737,9 +2396,56 @@ class PersistentAgent:
             )
             return
         self._loaded_tools.update(loaded)
-        all_loaded_extra = [name for name in self.tools.keys() if name not in ("read", "write", "edit", "shell", "glob", "grep")]
+        self._regenerate_api_tools()
+        self.logger.info(f"[PersistentAgent] Tools loaded: +{loaded}", component="PersistentAgent")
+
+    def _regenerate_api_tools(self) -> None:
+        """Rebuild self._api_tools from currently-loaded, non-hidden tools.
+
+        Called after planner activation (via _handle_tools_added) and after
+        agent self-extension (via _apply_self_extension). Hidden tools are
+        excluded from the LLM's visible tool list but their instances stay
+        loaded — re-claiming is 0 ms.
+        """
+        base = ("read", "write", "edit", "shell", "glob", "grep")
+        extra = [
+            n for n in self.tools.keys()
+            if n not in base and n not in self._hidden_tools
+        ]
         try:
-            self._api_tools = ToolRegistry.generate_tools_for_api(extra_tool_names=all_loaded_extra)
+            self._api_tools = ToolRegistry.generate_tools_for_api(extra_tool_names=extra)
         except Exception:
             pass
-        self.logger.info(f"[PersistentAgent] Tools loaded: +{loaded}", component="PersistentAgent")
+
+    def _apply_self_extension(self, claim: List[str], release: List[str]) -> None:
+        """Apply agent-driven claim_tool / release_tool fields from a turn.
+
+        - claim: append to checklist active tools (loads via the same callback
+          chain the planner uses) and remove from hidden if present.
+        - release: add to hidden set; resource stays loaded for fast re-claim.
+
+        Unknown names are silently dropped — operators see them at debug
+        level. Self-extension never errors back to the agent.
+        """
+        if not claim and not release:
+            return
+        if claim:
+            valid = [n for n in claim if n in ToolRegistry.get_tool_names()]
+            if valid:
+                # Re-claiming a hidden tool: clear it from _hidden_tools so
+                # _regenerate_api_tools puts it back in the visible list.
+                # activate_tools is idempotent; the on_tools_changed callback
+                # fires only for genuinely-new names.
+                self._hidden_tools.difference_update(valid)
+                self._checklist.activate_tools(valid)
+            dropped = [n for n in claim if n not in valid]
+            if dropped:
+                self.logger.debug(
+                    f"[PersistentAgent] claim_tool ignored unknown name(s): {dropped}",
+                    component="PersistentAgent",
+                )
+        if release:
+            self._hidden_tools.update(release)
+        # Always regenerate — cheap, and covers the "release-only" /
+        # "re-claim hidden tool" paths where the callback chain doesn't fire.
+        self._regenerate_api_tools()

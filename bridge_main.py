@@ -716,6 +716,20 @@ _boot_logger.info("import phase complete (took %dms total)", _imports_total_ms)
 _emit_boot_progress("imports_done", took_ms=_imports_total_ms)
 
 
+def _get_desktop_query():
+    """Lazy accessor for ``desktop_tool.is_any_session_holding_desktop``.
+
+    Imported here rather than at module top so the heavy desktop tool
+    imports (pywin32 / ctypes shims / RapidOCR initialisation paths)
+    don't run during the bridge's pre-loop bootstrap. By the time the
+    PersonalityMonitor constructor runs, ``src.tools.desktop_tool`` has
+    already been transitively imported through the ToolRegistry, so
+    this is effectively a cache lookup.
+    """
+    from src.tools.desktop_tool import is_any_session_holding_desktop
+    return is_any_session_holding_desktop
+
+
 async def _run_with_long_term_memory() -> None:
     """Initialise LongTermMemory + PersonalityMonitor + Scheduler before the
     bridge starts and tear them down on exit. All three live for the
@@ -791,6 +805,7 @@ async def _run_with_long_term_memory() -> None:
         ltm=ltm,
         screenshot_root=str(personality_root),
         config_path=config_path,
+        desktop_query=_get_desktop_query(),
     )
     _emit_boot_progress("personality_start_start")
     _t_pers = time.monotonic()

@@ -12,6 +12,7 @@ Outbound message types: token_stream, status, final, error
 from __future__ import annotations
 
 import asyncio
+import uuid
 import json
 import logging
 import os
@@ -89,6 +90,58 @@ from src.infrastructure.config_manager import ConfigManager
 from src.infrastructure.llm_service import LLMService
 
 
+# ---------------------------------------------------------------------------
+# Session-scoped LLM service wrapper.
+# Delegates streaming to a shared (bridge-global) service but keeps its own
+# _exhausted flag and on_server_error callback, so per-session exhaustion
+# tracking and error UI routing remain isolated.
+# ---------------------------------------------------------------------------
+
+
+class _SessionLLMService(LLMService):
+    """Thin per-session wrapper around a shared LLMService instance."""
+
+    def __init__(self, shared: LLMService) -> None:
+        super().__init__(
+            model=shared.model,
+            max_tokens=shared.max_tokens,
+            temperature=shared.temperature,
+            max_retries=shared.max_retries,
+            context_window=shared.context_window,
+        )
+        self._shared = shared
+
+    @property
+    def _base_url(self) -> str:  # type: ignore[override]
+        return getattr(self._shared, "_base_url", "")
+
+    async def chat_stream(  # type: ignore[override]
+        self,
+        messages,
+        model=None,
+        temperature=None,
+        max_tokens=None,
+        stop=None,
+        json_mode=True,
+        first_content=True,
+        **kwargs,
+    ):
+        async for event in self._shared.chat_stream(
+            messages,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            stop=stop,
+            json_mode=json_mode,
+            first_content=first_content,
+            **kwargs,
+        ):
+            yield event
+
+    async def close(self) -> None:
+        pass
+
+
 DEFAULT_CONFIG_PATH = "./handq_config.yaml"
 
 
@@ -118,12 +171,12 @@ async def dispatch_scheduled_task(task) -> bool:  # type: ignore[no-untyped-def]
     it calls in here. We:
 
     1. Refuse if the bridge isn't ready yet (boot still in progress).
-    2. Refuse if the bridge is currently running another flow session
-       — SCHEDULER_BUSY_POLICY = "skip" applies (see scheduler docs).
-    3. Otherwise emit a ``scheduled_task_started`` status envelope so
-       the UI can show "scheduled task X firing", then route a synthetic
-       ``request`` envelope through the same dispatcher path that
-       a manually-typed request takes.
+    2. Refuse if shutdown is in progress (``_shutdown_requested``).
+    3. Otherwise mint a fresh ``sched-{uuid}`` session, build a
+       FlowControllerV2 for it, run the goal through ``on_user_message``,
+       and block until the receptionist's reply returns. The session
+       remains mounted in the UI after completion so the user can see the
+       execution record.
 
     Returns True iff the bridge accepted the task. The scheduler
     interprets False as "bumped, try again later".
@@ -397,27 +450,28 @@ def _open_ipc_stdout():
 _ipc_out = _open_ipc_stdout()
 
 
-def _emit(obj: Dict[str, Any], gen: Optional[int] = None) -> None:
+def _emit(
+    obj: Dict[str, Any],
+    session_id: Optional[str] = None,
+) -> None:
     """Serialise *obj* as one JSON line on the IPC stdout and flush.
 
-    If *gen* is supplied (the caller's session generation — see
-    StdioBridge._generation and _StdioUI._generation), it is stamped onto
-    the envelope as ``gen``. The renderer uses this field to drop events
-    from flows that have been superseded by a `new_session`. Bridge-meta
-    events (config_get / config_set / shutdown final, etc.) call without
-    a *gen* — the renderer treats unstamped envelopes as "always accept",
-    so this remains backwards-compatible if either side gets out of sync.
+    If *session_id* is supplied (multi-session routing tag), it is stamped
+    onto the envelope. Bridge-global events (config, ltm, cron, personality)
+    omit it because they are not session-scoped. The renderer routes
+    session-stamped events to the matching tab; envelopes without a
+    session_id are treated as broadcast.
     """
-    if gen is not None:
-        obj["gen"] = gen
+    if session_id is not None:
+        obj["session_id"] = session_id
     line = json.dumps(obj, ensure_ascii=False, default=str)
     with _write_lock:
         _ipc_out.write(line + "\n")
         _ipc_out.flush()
     try:
         logger.debug(
-            "outbound envelope type=%s id=%s gen=%s",
-            obj.get("type"), obj.get("id"), obj.get("gen"),
+            "outbound envelope type=%s id=%s session_id=%s",
+            obj.get("type"), obj.get("id"), obj.get("session_id"),
         )
     except Exception:
         pass
@@ -431,24 +485,20 @@ def _emit(obj: Dict[str, Any], gen: Optional[int] = None) -> None:
 class _StdioUI:
     """V2 ``UIDelegate`` implementation for the Electron renderer.
 
-    Each method serialises a JSON envelope onto the IPC stdout. The async
+    Each method serialises a JSON envelope onto the IPC stdout.  The async
     ``request_*`` methods register an ``asyncio.Future`` keyed by prompt id;
     the stdin-reader thread resolves the matching future via
     :meth:`deliver_confirmation_response` when the user answers the modal.
-
-    Generation tag: each instance is born with a generation captured at
-    construction; every envelope carries it. ``_do_new_session`` bumps gen
-    and builds a fresh ``_StdioUI``, leaving the OLD instance bound to the
-    OLD flow's ``InteractionManager``. Stragglers from the old flow keep
-    emitting with the OLD generation; the renderer's gen-watermark drops
-    them, so the new conversation never sees old-flow content.
     """
 
-    def __init__(self, generation: int = 0) -> None:
-        self._generation = generation
+    def __init__(self, session_id: str = "default") -> None:
+        self._session_id = session_id
         # Bridge-owned confirmation registry. The IM is a clean async
         # forwarder with no internal state to hook, so the bridge keeps
-        # its own pending-future map.
+        # its own pending-future map. Per-session in the multi-session
+        # world — each session's _StdioUI has its own map keyed by
+        # prompt_id (prompt_id strings already carry timestamp+addr-hash
+        # entropy so cross-session collisions are vanishingly rare).
         self._pending: Dict[str, "asyncio.Future[str]"] = {}
         self._pending_lock = threading.Lock()
         # Loop captured by ``StdioBridge`` after construction so confirmation
@@ -483,12 +533,12 @@ class _StdioUI:
     def display_error(self, msg: str) -> None:
         _ui_logger.error("display_error: %s", _truncate(msg))
         _emit({"type": "error", "where": "engine", "message": str(msg),
-               "fatal": False}, gen=self._generation)
+               "fatal": False}, session_id=self._session_id)
 
     def show_state_changed(self, state: Any) -> None:
         _ui_logger.debug("show_state_changed: %s", _truncate(state))
         _emit({"type": "status", "kind": "state_changed", "state": str(state)},
-              gen=self._generation)
+              session_id=self._session_id)
 
     def show_inline_event(self, icon: str, desc: str) -> None:
         """Single-line status banner (icon + text). Renderer maps
@@ -497,7 +547,7 @@ class _StdioUI:
         _emit({"type": "status", "kind": "inline_event",
                "icon": str(icon or "·"),
                "desc": str(desc or "")},
-              gen=self._generation)
+              session_id=self._session_id)
 
     def show_recall_started(self) -> None:
         """LTM recall in flight. Renderer maps ``kind=recall_started`` to a
@@ -505,7 +555,7 @@ class _StdioUI:
         next state / decision / tool event.
         """
         _emit({"type": "status", "kind": "recall_started"},
-              gen=self._generation)
+              session_id=self._session_id)
 
     def notify_decision_made(
         self, iteration: int, reasoning: str, token_count: int = 0,
@@ -516,7 +566,7 @@ class _StdioUI:
         _emit({"type": "status", "kind": "decision_made",
                "args": [str(iteration), str(reasoning), str(token_count)],
                "kwargs": {}},
-              gen=self._generation)
+              session_id=self._session_id)
 
     def notify_tool_execution_started(
         self,
@@ -536,7 +586,7 @@ class _StdioUI:
                         params,
                         output],
                "kwargs": {}},
-              gen=self._generation)
+              session_id=self._session_id)
 
     # ── Non-Protocol forwarders (called by IM via ``_ui_call``) ──────────
     # The V2 ``UIDelegate`` Protocol is intentionally minimal. These methods
@@ -545,30 +595,29 @@ class _StdioUI:
     # streaming hook here; renderer-side handlers stay unchanged.
 
     def notify_desktop_takeover_started(self, reason: str = "input_action") -> None:
-        """Desktop tool entered an input-driving phase. Pause the activity
-        monitor (so its OCR samples don't capture agent-driven mouse / keyboard
-        events) and emit the ``desktop_takeover_started`` envelope so the
-        Electron overlay shows the fullscreen border + Ctrl+Shift+C revoke
-        hook.
+        """Desktop tool entered an input-driving phase. Emit the
+        ``desktop_takeover_started`` envelope so the Electron overlay shows
+        the fullscreen border + Ctrl+Shift+C revoke hook.
+
+        Pause coordination: the PersonalityMonitor pauses automatically by
+        querying ``desktop_tool.is_any_session_holding_desktop`` — no
+        explicit ``pause()`` call is needed here. That keeps the monitor's
+        state strictly derived from the authoritative global owner, with no
+        refcount and no drift even when ``_force_release_session_locks``
+        force-resets the owner after a destroy timeout.
         """
         _ui_logger.debug("notify_desktop_takeover_started: reason=%s", reason)
-        try:
-            if personality_monitor is not None:
-                personality_monitor.pause()
-        except Exception:
-            _ui_logger.exception("personality_monitor.pause failed")
         _emit({"type": "status", "kind": "desktop_takeover_started",
-               "reason": str(reason)}, gen=self._generation)
+               "reason": str(reason)}, session_id=self._session_id)
 
     def notify_desktop_takeover_ended(self, reason: str = "task_ended") -> None:
+        """Desktop tool finished its input-driving phase. Emits the
+        ``desktop_takeover_ended`` envelope; personality un-pause is
+        automatic via the desktop_query callable (see
+        ``notify_desktop_takeover_started`` for rationale)."""
         _ui_logger.debug("notify_desktop_takeover_ended: reason=%s", reason)
-        try:
-            if personality_monitor is not None:
-                personality_monitor.resume()
-        except Exception:
-            _ui_logger.exception("personality_monitor.resume failed")
         _emit({"type": "status", "kind": "desktop_takeover_ended",
-               "reason": str(reason)}, gen=self._generation)
+               "reason": str(reason)}, session_id=self._session_id)
 
     def notify_session_event(self, event_name: str, data: Any = None) -> None:
         """Live shell session lifecycle (open / exec_done / close). Renderer
@@ -579,23 +628,34 @@ class _StdioUI:
         _emit({"type": "status", "kind": "session_event",
                "event": str(event_name),
                "data": data if isinstance(data, dict) else {}},
-              gen=self._generation)
+              session_id=self._session_id)
+
+    def notify_checklist_changed(self, items: Any = None) -> None:
+        """Live checklist snapshot → renderer ``kind=checklist`` task panel.
+        ``items`` is the list of ``{item_id, instruction, status}`` dicts from
+        ``SharedCheckList.get_ui_snapshot``; an empty list tells the renderer to
+        drop the panel."""
+        _ui_logger.debug("notify_checklist_changed: %d item(s)",
+                         len(items) if isinstance(items, list) else 0)
+        _emit({"type": "status", "kind": "checklist",
+               "items": items if isinstance(items, list) else []},
+              session_id=self._session_id)
 
     def show_receptionist_thinking(self) -> None:
         _emit({"type": "status", "kind": "receptionist_thinking_on"},
-              gen=self._generation)
+              session_id=self._session_id)
 
     def clear_receptionist_thinking(self) -> None:
         _emit({"type": "status", "kind": "receptionist_thinking_off"},
-              gen=self._generation)
+              session_id=self._session_id)
 
     def stream_receptionist_reply_chunk(self, text: str) -> None:
         _emit({"type": "status", "kind": "reply_delta", "text": str(text)},
-              gen=self._generation)
+              session_id=self._session_id)
 
     def seal_receptionist_reply(self) -> None:
         _emit({"type": "status", "kind": "reply_done"},
-              gen=self._generation)
+              session_id=self._session_id)
 
     # ── V2 UIDelegate Protocol — async confirmations ──────────────────────
 
@@ -639,7 +699,7 @@ class _StdioUI:
             self._pending[prompt_id] = fut
         env: Dict[str, Any] = {"type": "status", "kind": kind, "id": prompt_id}
         env.update(payload)
-        _emit(env, gen=self._generation)
+        _emit(env, session_id=self._session_id)
         _ui_logger.debug("await_user_response: kind=%s id=%s", kind, prompt_id)
         try:
             return await fut
@@ -649,12 +709,28 @@ class _StdioUI:
             raise
 
     async def request_risk_confirmation(
-        self, description: str,
+        self,
+        description: str,
+        *,
+        title: Optional[str] = None,
+        approve_label: Optional[str] = None,
     ) -> UserConfirmation:
         """High-risk operation gate. Emits ``kind=risk_confirmation``;
-        awaits the renderer's yes/no/text answer."""
+        awaits the renderer's yes/no/text answer.
+
+        ``title`` and ``approve_label`` are optional renderer-side overrides
+        for the modal chrome. When provided they land in the envelope as
+        ``title`` / ``approve_label`` fields — the renderer honors them if
+        present and otherwise falls back to its baked-in defaults. Used by
+        ``browser.request_user_login`` to reframe the modal as a
+        "confirm-login-completed" gate rather than a generic "approve".
+        """
         prompt_id = f"risk-{int(time.time() * 1000)}-{id(description) & 0xffff:04x}"
-        payload = {"description": str(description)}
+        payload: Dict[str, Any] = {"description": str(description)}
+        if title:
+            payload["title"] = str(title)
+        if approve_label:
+            payload["approve_label"] = str(approve_label)
         answer = await self._await_user_response("risk_confirmation", payload, prompt_id)
         return self._resolve_confirmation(answer)
 
@@ -714,48 +790,193 @@ class _StdioUI:
 
 
 class StdioBridge:
-    """Single entry-point class for the stdio JSON bridge."""
+    """Single entry-point class for the stdio JSON bridge.
+
+    Multi-session model: a single bridge process can host many concurrent
+    ``FlowControllerV2`` instances keyed by ``session_id``. The renderer
+    mints a UUID per tab and stamps it on every outbound envelope
+    (request / user_input / close_session). Each session has
+    its own ``_StdioUI`` delegate, its own engine.log handler, and its own
+    LLM service pool.
+
+    Bridge-meta envelopes (config_*, ltm_*, cron_*, personality_*, shutdown,
+    scheduler housekeeping) are NOT session-scoped — they emit without a
+    session_id and the renderer treats them as broadcast.
+    """
 
     def __init__(self, config_path: str = DEFAULT_CONFIG_PATH) -> None:
         self.config_path: Path = Path(config_path)
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._inbox: Optional[asyncio.Queue] = None
 
-        # Lazy backend state — built on first 'request' message.
-        self._flow: Optional[FlowControllerV2] = None
-        self._services: List[LLMService] = []
+        # Per-session backend state. Each session_id has its own
+        # FlowControllerV2 + LLM service pool + engine.log handler +
+        # UI delegate. Built lazily on the first
+        # ``request`` for that session_id.
+        self._flows: Dict[str, FlowControllerV2] = {}
+        self._services_by_session: Dict[str, List[LLMService]] = {}
+        # Shared (bridge-global) LLM connection pools. Lazily constructed on
+        # first session and reused across all sessions. Each session gets
+        # lightweight _SessionLLMService wrappers with session-scoped
+        # _exhausted tracking. Cleared on config change (API key / model edit).
+        self._shared_services: Optional[List[LLMService]] = None
+        self._shared_helper_services: Optional[List[LLMService]] = None
+        # Session-scoped handq-engine.log handlers (one per session). Attached
+        # by _ensure_flow on session creation and detached by _do_close_session
+        # on teardown so each session gets an isolated engine log with no
+        # cross-session bleed and no lingering Windows file lock.
+        self._engine_log_handlers: Dict[str, Optional[logging.Handler]] = {}
+        # Per-session UI delegate (binds to that session's IM).
+        self._uis: Dict[str, _StdioUI] = {}
 
-        # Session-scoped handq-engine.log handler, attached to the ROOT logger
-        # by _ensure_flow and detached by _do_new_session so each session gets
-        # a fresh, isolated engine log (see logger.add_root_file_handler).
-        self._engine_log_handler: Optional[logging.Handler] = None
+        # Bridge-meta envelopes (config_*, ltm_*, cron_*, personality_*,
+        # boot, shutdown, scheduler housekeeping) emit through _emit()
+        # WITHOUT a session stamp. The renderer treats unstamped envelopes
+        # as "always accept" and routes to the active tab.
+        self._session_id: Optional[str] = None
 
-        # Session generation. Bumped by _do_new_session before the new
-        # singleton is constructed, so a fresh _StdioUI with the new
-        # generation drives the new flow while the OLD _StdioUI (still
-        # referenced by the old IM via the old FlowControllerV2) keeps
-        # emitting with its captured OLD generation. The renderer drops
-        # any envelope whose gen is older than its current generation,
-        # which is what isolates the new conversation from a wedged
-        # old subtask that may keep emitting until its blocking syscall
-        # finally returns (Windows: no portable thread kill).
-        self._generation: int = 0
+        # Sessions currently being torn down. Used to reject race-y `request`
+        # / `user_input` envelopes arriving for a sid whose flow.destroy is
+        # mid-flight; without this we could re-trigger _ensure_flow on a sid
+        # whose ctx.close hasn't returned, leaving two sets of resources
+        # racing for the same per-session file/socket state.
+        self._closing: set = set()
 
-        # The bridge no longer owns an InteractionManager — FlowControllerV2
-        # constructs and exposes one at ``flow.interaction_manager``. We
-        # build the _StdioUI here without an IM ref; ``_ensure_flow`` calls
-        # ``flow.interaction_manager.set_delegate(self._ui)`` to wire
-        # delegate-mode events.
-        self._ui = _StdioUI(self._generation)
+        # Per-session dispatch. The main loop runs each inbound message as its
+        # own asyncio task so a slow LLM round-trip for one session can't block
+        # another session's input. Same-session messages stay in arrival order
+        # via a per-sid lock; different sessions run concurrently.
+        self._session_dispatch_locks: Dict[str, asyncio.Lock] = {}
+        # Every live _dispatch task — drained on shutdown.
+        self._inflight_tasks: set = set()
+        # The request/user_input handler currently holding a session's lock, so
+        # close_session can preempt a slow round-trip (N3).
+        self._inflight_by_sid: Dict[str, asyncio.Task] = {}
+        # Guards self._uis against the stdin-reader thread iterating it while
+        # the loop thread mutates it (RuntimeError: dict changed size).
+        self._uis_lock = threading.Lock()
 
         self._shutdown_requested: bool = False
 
-        logger.info("StdioBridge initialised; config_path=%s gen=%d",
-                    self.config_path, self._generation)
+        logger.info("StdioBridge initialised; config_path=%s",
+                    self.config_path)
         # Publish self for module-level helpers (dispatch_scheduled_task).
         # See module docstring on the cross-module slots.
         global _active_bridge
         _active_bridge = self
+
+        # Register the llm_pool fallback + network notifiers ONCE at boot.
+        # These signals are session-agnostic — an API outage or model
+        # fallback affects every session identically — so the envelopes
+        # carry no session_id; the renderer treats them as bridge-meta
+        # broadcasts and renders them as system bubbles in the active tab.
+        self._register_llm_pool_notifiers()
+
+    @staticmethod
+    def _register_llm_pool_notifiers() -> None:
+        """One-shot registration of llm_pool's broadcast notifiers.
+
+        Idempotent: re-registering overwrites the same closure (no-op).
+        Kept as a separate method so unit tests can re-register after
+        mocking. Closures don't capture instance state — they're pure
+        broadcast wrappers around the module-level _emit.
+        """
+        from ..infrastructure.llm_pool import (
+            set_fallback_notifier,
+            set_network_event_notifier,
+        )
+
+        def _on_llm_fallback(from_model: str, to_model: str, exc: Exception) -> None:
+            _emit({
+                "type": "status",
+                "kind": "llm_fallback",
+                "from_model": from_model,
+                "to_model": to_model,
+                "error": str(exc)[:200],
+            })
+
+        def _on_network_event(state: str, attempt: int, sleep_secs: int) -> None:
+            if state == "down":
+                _emit({
+                    "type": "status",
+                    "kind": "network_down",
+                    "message": "网络已中断，LLM 服务暂不可达，等待恢复中…",
+                })
+            elif state == "waiting":
+                _emit({
+                    "type": "status",
+                    "kind": "network_waiting",
+                    "attempt": attempt,
+                    "retry_in": sleep_secs,
+                })
+            elif state == "restored":
+                _emit({
+                    "type": "status",
+                    "kind": "network_restored",
+                    "message": "网络已恢复，继续执行",
+                })
+
+        set_fallback_notifier(_on_llm_fallback)
+        set_network_event_notifier(_on_network_event)
+
+    # ------------------------------------------------------------------
+    # Session helpers
+    # ------------------------------------------------------------------
+
+    def _resolve_session_id(self, msg: Dict[str, Any]) -> Optional[str]:
+        """Pull session_id out of an inbound envelope. Returns None when
+        the renderer didn't supply one — callers MUST handle that (emit
+        error for session-scoped types, pass-through for bridge-meta).
+
+        Note: ``_resolve_session_id`` no longer falls back to a default
+        sid. The renderer mints a UUID on init and stamps every
+        session-scoped envelope; a missing sid here is a protocol bug or
+        a hand-crafted bridge-meta envelope (which shouldn't call this).
+        """
+        sid = msg.get("session_id")
+        if isinstance(sid, str):
+            sid = sid.strip()
+            if sid:
+                return sid
+        return None
+
+    def _get_or_create_ui(self, sid: str) -> "_StdioUI":
+        """Idempotent — returns the existing per-session UI delegate or
+        constructs a fresh one. The new UI captures the event loop ref so
+        confirmation futures can be resolved from the stdin reader thread."""
+        ui = self._uis.get(sid)
+        if ui is None:
+            ui = _StdioUI(session_id=sid)
+            if self._loop is not None:
+                ui._loop = self._loop
+            with self._uis_lock:
+                self._uis[sid] = ui
+        return ui
+
+    def _deliver_confirmation(
+        self, sid_hint: Any, prompt_id: str, answer: str,
+    ) -> None:
+        """Resolve a confirmation future on the owning session's ``_StdioUI``.
+
+        Prefer the renderer-supplied sid; if it is missing or unknown, scan
+        every UI (prompt_id strings carry timestamp+addr-hash entropy, so a
+        cross-session collision is vanishingly rare). Every ``_uis`` access is
+        held under ``_uis_lock`` and the scan iterates a snapshot, so a
+        concurrent loop-thread mutation cannot trip ``RuntimeError: dictionary
+        changed size during iteration`` when this runs on the stdin-reader
+        thread (F2). Shared by the reader fast-path and the inbox dispatcher.
+        """
+        ui = None
+        if isinstance(sid_hint, str) and sid_hint.strip():
+            with self._uis_lock:
+                ui = self._uis.get(sid_hint.strip())
+        if ui is not None:
+            ui.deliver_confirmation_response(prompt_id, answer)
+            return
+        with self._uis_lock:
+            uis = list(self._uis.values())
+        for other_ui in uis:
+            other_ui.deliver_confirmation_response(prompt_id, answer)
 
     # ------------------------------------------------------------------
     # Reader thread
@@ -793,7 +1014,7 @@ class StdioBridge:
                     logger.error("malformed JSON on stdin: %s; raw_len=%d", exc, len(raw))
                     _emit({"type": "error", "where": "bridge",
                            "message": f"Malformed JSON on stdin: {exc}",
-                           "fatal": False}, gen=self._generation)
+                           "fatal": False}, session_id=self._session_id)
                     continue
                 logger.debug(
                     "inbound message type=%s id=%s payload=%s",
@@ -808,13 +1029,20 @@ class StdioBridge:
                 # future. Resolving the future directly from this thread (via
                 # ``call_soon_threadsafe`` inside ``deliver_confirmation_response``)
                 # avoids that ordering hazard.
+                #
+                # Multi-session routing: prefer the session_id supplied by the
+                # renderer; if missing or unknown, fall through to a scan
+                # across all UIs (prompt_id strings already carry timestamp +
+                # addr-hash entropy so cross-session collisions are vanishingly
+                # rare).
                 if (isinstance(obj, dict)
                         and obj.get("type") == "user_input"
                         and obj.get("kind") == "confirmation"):
                     try:
                         prompt_id = str(obj.get("id") or "")
-                        self._ui.deliver_confirmation_response(
-                            prompt_id, str(obj.get("answer", "")),
+                        answer = str(obj.get("answer", ""))
+                        self._deliver_confirmation(
+                            obj.get("session_id"), prompt_id, answer,
                         )
                     except Exception:
                         logger.exception(
@@ -827,7 +1055,7 @@ class StdioBridge:
             logger.exception("stdin reader crashed")
             _emit({"type": "error", "where": "bridge",
                    "message": f"stdin reader crashed: {exc}", "fatal": True},
-                  gen=self._generation)
+                  session_id=self._session_id)
         finally:
             logger.info("stdin EOF; signalling dispatcher")
             # Sentinel to wake the dispatcher on EOF.
@@ -943,12 +1171,12 @@ class StdioBridge:
                         "config_path": str(self.config_path.resolve()),
                         "config": cfg,
                     },
-                }, gen=self._generation)
+                }, session_id=self._session_id)
             except Exception as exc:
                 logger.exception("config_get failed")
                 _emit({"type": "error", "id": msg_id, "where": "bridge",
                        "message": f"config_get failed: {exc}", "fatal": False},
-                      gen=self._generation)
+                      session_id=self._session_id)
             return
 
         if msg_type == "ltm_stats":
@@ -961,12 +1189,12 @@ class StdioBridge:
                 stats = await LongTermMemory.get().triage_stats()
                 _emit({
                     "type": "final", "id": msg_id, "result": stats,
-                }, gen=self._generation)
+                }, session_id=self._session_id)
             except Exception as exc:
                 logger.exception("ltm_stats failed")
                 _emit({"type": "error", "id": msg_id, "where": "bridge",
                        "message": f"ltm_stats failed: {exc}", "fatal": False},
-                      gen=self._generation)
+                      session_id=self._session_id)
             return
 
         # ── LTM review / archive (user trust surface) ───────────────────
@@ -1014,12 +1242,12 @@ class StdioBridge:
                     await ltm.archive(entry_id=eid, kind=kind, reason=reason)
                     result = {"ok": True}
                 _emit({"type": "final", "id": msg_id, "result": result},
-                      gen=self._generation)
+                      session_id=self._session_id)
             except Exception as exc:
                 logger.exception("%s failed", msg_type)
                 _emit({"type": "error", "id": msg_id, "where": "bridge",
                        "message": f"{msg_type} failed: {exc}",
-                       "fatal": False}, gen=self._generation)
+                       "fatal": False}, session_id=self._session_id)
             return
 
         # ── LTM 2.0 Skill proposal + Summary IPC ────────────────────────
@@ -1086,12 +1314,12 @@ class StdioBridge:
                             "generated_at": int(row[6] or 0),
                         }
                 _emit({"type": "final", "id": msg_id, "result": result},
-                      gen=self._generation)
+                      session_id=self._session_id)
             except Exception as exc:
                 logger.exception("%s failed", msg_type)
                 _emit({"type": "error", "id": msg_id, "where": "bridge",
                        "message": f"{msg_type} failed: {exc}",
-                       "fatal": False}, gen=self._generation)
+                       "fatal": False}, session_id=self._session_id)
             return
 
         # ── Activity Monitor IPC ───────────────────────────────────────
@@ -1100,17 +1328,17 @@ class StdioBridge:
                 if personality_monitor is None:
                     raise RuntimeError("activity monitor not initialised")
                 if msg_type == "personality_pause":
-                    personality_monitor.pause()
+                    personality_monitor.pause_by_user()
                 elif msg_type == "personality_resume":
-                    personality_monitor.resume()
+                    personality_monitor.resume_by_user()
                 snap = personality_monitor.snapshot_status()
                 _emit({"type": "final", "id": msg_id, "result": snap},
-                      gen=self._generation)
+                      session_id=self._session_id)
             except Exception as exc:
                 logger.exception("%s failed", msg_type)
                 _emit({"type": "error", "id": msg_id, "where": "bridge",
                        "message": f"{msg_type} failed: {exc}",
-                       "fatal": False}, gen=self._generation)
+                       "fatal": False}, session_id=self._session_id)
             return
 
         # ── Scheduler / Cron IPC ───────────────────────────────────────
@@ -1123,12 +1351,12 @@ class StdioBridge:
                     raise RuntimeError("scheduler not initialised")
                 result = await self._handle_cron(msg_type, msg)
                 _emit({"type": "final", "id": msg_id, "result": result},
-                      gen=self._generation)
+                      session_id=self._session_id)
             except Exception as exc:
                 logger.exception("%s failed", msg_type)
                 _emit({"type": "error", "id": msg_id, "where": "bridge",
                        "message": f"{msg_type} failed: {exc}",
-                       "fatal": False}, gen=self._generation)
+                       "fatal": False}, session_id=self._session_id)
             return
 
         # ── /remember (manual high-trust memory candidate) ──────────────
@@ -1147,12 +1375,12 @@ class StdioBridge:
                     cid = await submit_manual(ltm=ltm, text=text, ref=ref)
                     result = {"ok": bool(cid), "candidate_id": cid}
                 _emit({"type": "final", "id": msg_id, "result": result},
-                      gen=self._generation)
+                      session_id=self._session_id)
             except Exception as exc:
                 logger.exception("%s failed", msg_type)
                 _emit({"type": "error", "id": msg_id, "where": "bridge",
                        "message": f"{msg_type} failed: {exc}",
-                       "fatal": False}, gen=self._generation)
+                       "fatal": False}, session_id=self._session_id)
             return
 
         if msg_type == "config_set":
@@ -1175,11 +1403,18 @@ class StdioBridge:
                 old_repos = self._normalised_hook_repos(old_cfg)
 
                 self._save_config_dict(new_cfg)
-                if self._flow is not None:
+                self._invalidate_shared_pool()
+                # Reload config on every live flow so saved changes take
+                # effect across all running sessions (was a single self._flow
+                # check in the single-session world).
+                for sid, flow in list(self._flows.items()):
                     try:
-                        self._flow.config_manager.reload_config()
+                        flow.config_manager.reload_config()
                     except Exception:
-                        logger.exception("config_set: reload_config failed (continuing)")
+                        logger.exception(
+                            "config_set: reload_config failed for sid=%s (continuing)",
+                            sid,
+                        )
 
                 new_repos = self._normalised_hook_repos(new_cfg)
                 added = new_repos - old_repos
@@ -1203,21 +1438,33 @@ class StdioBridge:
                         "path": str(self.config_path.resolve()),
                         "git_hook_sync": hook_results,
                     },
-                }, gen=self._generation)
+                }, session_id=self._session_id)
             except Exception as exc:
                 logger.exception("config_set failed")
                 _emit({"type": "error", "id": msg_id, "where": "bridge",
                        "message": f"config_set failed: {exc}", "fatal": False},
-                      gen=self._generation)
+                      session_id=self._session_id)
             return
 
         if msg_type == "request":
+            sid = self._resolve_session_id(msg)
+            if sid is None:
+                _emit({"type": "error", "id": msg_id, "where": "bridge",
+                       "message": "request: missing session_id",
+                       "fatal": False})
+                return
+            if sid in self._closing:
+                _emit({"type": "error", "id": msg_id, "where": "bridge",
+                       "message": f"request: session {sid} is being torn down",
+                       "fatal": False})
+                return
             try:
                 goal = msg.get("goal", "")
-                # Early API-key guard — only on the first request (before the
-                # FlowController is built). An empty key causes cryptic errors
-                # deep in the LLM stack; surface a clear message here instead.
-                if self._flow is None:
+                # Early API-key guard — only on the first request for this
+                # session (before the FlowController is built). An empty key
+                # causes cryptic errors deep in the LLM stack; surface a
+                # clear message here instead.
+                if sid not in self._flows:
                     _cfg = self._load_config_dict()
                     if not (((_cfg.get("llm") or {}).get("API_KEY") or "")):
                         _emit(
@@ -1232,13 +1479,13 @@ class StdioBridge:
                                 ),
                                 "fatal": False,
                             },
-                            gen=self._generation,
+                            session_id=sid,
                         )
                         return
-                self._ensure_flow(goal=str(goal))
-                assert self._flow is not None
-                if not self._flow.started:
-                    await self._flow.start()
+                self._ensure_flow(sid, goal=str(goal))
+                flow = self._flows[sid]
+                if not flow.started:
+                    await flow.start()
                 # ``on_user_message`` returns the receptionist's
                 # reply string (sync conversational answer); background
                 # agent + planner work proceeds inside the flow's own
@@ -1246,41 +1493,55 @@ class StdioBridge:
                 # delegate as it happens. ``final`` correlates with this
                 # request id; subsequent activity arrives as status events.
                 try:
-                    reply = await self._flow.on_user_message(str(goal))
+                    reply = await flow.on_user_message(str(goal))
                     _emit({"type": "final", "id": msg_id,
                            "result": {"reply": reply, "ok": True}},
-                          gen=self._generation)
+                          session_id=sid)
                 except Exception as exc:
-                    logger.exception("on_user_message failed; id=%s", msg_id)
+                    logger.exception("on_user_message failed; sid=%s id=%s",
+                                     sid, msg_id)
                     _emit({"type": "error", "id": msg_id, "where": "engine",
                            "message": f"on_user_message failed: {exc}",
-                           "fatal": False}, gen=self._generation)
+                           "fatal": False}, session_id=sid)
             except Exception as exc:
-                logger.exception("request failed")
+                logger.exception("request failed; sid=%s", sid)
                 _emit({"type": "error", "id": msg_id, "where": "bridge",
                        "message": f"request failed: {exc}", "fatal": True},
-                      gen=self._generation)
+                      session_id=sid)
             return
 
         if msg_type == "user_input":
+            sid = self._resolve_session_id(msg)
+            if sid is None:
+                _emit({"type": "error", "id": msg_id, "where": "bridge",
+                       "message": "user_input: missing session_id",
+                       "fatal": False})
+                return
+            if sid in self._closing:
+                _emit({"type": "error", "id": msg_id, "where": "bridge",
+                       "message": f"user_input: session {sid} is being torn down",
+                       "fatal": False})
+                return
             try:
                 kind = msg.get("kind", "message")
                 if kind == "message":
                     text = str(msg.get("text", ""))
-                    if self._flow is not None and self._flow.started:
-                        await self._flow.on_user_message(text)
+                    flow = self._flows.get(sid)
+                    if flow is not None and flow.started:
+                        await flow.on_user_message(text)
                     else:
                         logger.warning(
-                            "user_input(message) before flow started; ignoring"
+                            "user_input(message) sid=%s before flow started; ignoring",
+                            sid,
                         )
                 elif kind == "confirmation":
                     # Normally consumed by the stdin reader fast-path; this
                     # branch covers the (rare) case where the envelope reaches
-                    # the dispatcher via the asyncio inbox instead.
+                    # the dispatcher via the asyncio inbox instead. Shares the
+                    # sid-first/scan-fallback delivery with the reader path.
                     prompt_id = str(msg.get("id") or "")
-                    self._ui.deliver_confirmation_response(
-                        prompt_id, str(msg.get("answer", "")),
-                    )
+                    answer = str(msg.get("answer", ""))
+                    self._deliver_confirmation(sid, prompt_id, answer)
                 elif kind == "desktop_takeover_revoked":
                     # Frontend overlay's revoke hotkey (Ctrl+C or
                     # equivalent) sends this. We flip the takeover flag
@@ -1290,9 +1551,10 @@ class StdioBridge:
                     # event with reason='user_revoked' is emitted by
                     # the DesktopState's revoke method itself.
                     try:
+                        flow = self._flows.get(sid)
                         ds = (
-                            self._flow._ctx.desktop_state
-                            if self._flow is not None and self._flow._ctx is not None
+                            flow._ctx.desktop_state
+                            if flow is not None and flow._ctx is not None
                             else None
                         )
                         if ds is not None:
@@ -1304,8 +1566,8 @@ class StdioBridge:
                             from ..tools.desktop_tool import revoke_takeover
                             changed = revoke_takeover()
                         logger.info(
-                            "user_input desktop_takeover_revoked: changed=%s",
-                            changed,
+                            "user_input desktop_takeover_revoked: sid=%s changed=%s",
+                            sid, changed,
                         )
                     except Exception as exc:
                         logger.warning(
@@ -1315,26 +1577,36 @@ class StdioBridge:
                     logger.warning("user_input: unknown kind=%r", kind)
                     _emit({"type": "error", "id": msg_id, "where": "bridge",
                            "message": f"Unknown user_input.kind: {kind!r}",
-                           "fatal": False}, gen=self._generation)
+                           "fatal": False}, session_id=sid)
             except Exception as exc:
-                logger.exception("user_input failed")
+                logger.exception("user_input failed; sid=%s", sid)
                 _emit({"type": "error", "id": msg_id, "where": "bridge",
                        "message": f"user_input failed: {exc}", "fatal": False},
-                      gen=self._generation)
+                      session_id=sid)
             return
 
         if msg_type == "shutdown":
             await self._do_shutdown(msg_id)
             return
 
-        if msg_type == "new_session":
-            await self._do_new_session(msg_id)
+        if msg_type == "close_session":
+            # Renderer's per-tab close button. Tears down the flow at the
+            # requested session_id, drains its LLM service pool, drops all
+            # per-session state from the bridge so the next message for a
+            # different sid is unaffected.
+            sid = self._resolve_session_id(msg)
+            if sid is None:
+                _emit({"type": "error", "id": msg_id, "where": "bridge",
+                       "message": "close_session: missing session_id",
+                       "fatal": False})
+                return
+            await self._do_close_session(sid, msg_id)
             return
 
         logger.warning("unknown inbound type=%r id=%s", msg_type, msg_id)
         _emit({"type": "error", "id": msg_id, "where": "bridge",
                "message": f"Unknown message type: {msg_type!r}",
-               "fatal": False}, gen=self._generation)
+               "fatal": False})
 
     # ------------------------------------------------------------------
     # Cron / scheduler IPC
@@ -1435,6 +1707,16 @@ class StdioBridge:
                 task.id[:8],
             )
             return False
+        # Scheduled fires get a freshly-minted session — renderer's onStatus
+        # lazily creates a tab when it sees an unknown session_id, so the
+        # user sees the cron task pop up as its own session (clean
+        # separation from interactive work). Each fire is an independent
+        # task; nothing about the cron schedule itself implies persistence
+        # across fires.
+        sid = f"sched-{uuid.uuid4().hex[:12]}"
+        from ..infrastructure.logger import set_session_context
+        set_session_context(sid)
+        # Renderer will see this sid for the first time and lazy-mount a tab.
         # Publish a notification first so the renderer can show a
         # "scheduled task firing" toast.
         try:
@@ -1443,7 +1725,8 @@ class StdioBridge:
                 "id": task.id, "name": task.name,
                 "schedule": task.schedule,
                 "prompt_preview": _truncate(task.prompt, 200),
-            }, gen=self._generation)
+                "session_name": f"⏱ {task.name}" if task.name else "⏱ Scheduled",
+            }, session_id=sid)
         except Exception:
             logger.exception("scheduler emit failed")
 
@@ -1454,10 +1737,10 @@ class StdioBridge:
         goal_text = task.dispatch_prompt or task.prompt
 
         try:
-            self._ensure_flow(goal=str(goal_text))
-            assert self._flow is not None
-            if not self._flow.started:
-                await self._flow.start()
+            self._ensure_flow(sid, goal=str(goal_text))
+            flow = self._flows[sid]
+            if not flow.started:
+                await flow.start()
         except Exception as exc:
             logger.exception("scheduler dispatch: flow setup failed")
             if scheduler is not None:
@@ -1471,18 +1754,42 @@ class StdioBridge:
 
         ok = True
         err = ""
-        try:
-            reply = await self._flow.on_user_message(str(goal_text))
-            _emit({"type": "final", "id": msg_id,
-                   "result": {"reply": reply, "ok": True, "scheduled": True}},
-                  gen=self._generation)
-        except Exception as exc:
-            ok = False
-            err = str(exc)[:500]
-            logger.exception("scheduled task dispatch failed")
-            _emit({"type": "error", "id": msg_id, "where": "engine",
-                   "message": err, "fatal": False},
-                  gen=self._generation)
+        # Acquire the per-sid dispatch lock so close_session can preempt via
+        # _cancel_inflight, and any user_input the user later sends into this
+        # sched tab properly serializes against the initial fire.
+        lock = self._session_dispatch_locks.setdefault(sid, asyncio.Lock())
+        async with lock:
+            # Wrap on_user_message in its own task so we can register it in
+            # _inflight_by_sid for preemption WITHOUT cancelling the scheduler's
+            # own long-running loop task.
+            run_task = asyncio.create_task(
+                flow.on_user_message(str(goal_text))
+            )
+            self._inflight_by_sid[sid] = run_task
+            self._inflight_tasks.add(run_task)
+            run_task.add_done_callback(self._inflight_tasks.discard)
+            try:
+                reply = await run_task
+                _emit({"type": "final", "id": msg_id,
+                       "result": {"reply": reply, "ok": True, "scheduled": True}},
+                      session_id=sid)
+            except asyncio.CancelledError:
+                ok = False
+                err = "cancelled by session close"
+                logger.info(
+                    "scheduled task %s cancelled (session closed)",
+                    task.id[:8],
+                )
+            except Exception as exc:
+                ok = False
+                err = str(exc)[:500]
+                logger.exception("scheduled task dispatch failed")
+                _emit({"type": "error", "id": msg_id, "where": "engine",
+                       "message": err, "fatal": False},
+                      session_id=sid)
+            finally:
+                if self._inflight_by_sid.get(sid) is run_task:
+                    self._inflight_by_sid.pop(sid, None)
 
         if scheduler is not None:
             try:
@@ -1498,11 +1805,69 @@ class StdioBridge:
         return True
 
 
+    def _get_or_create_shared_pool(
+        self,
+    ) -> tuple[List[LLMService], List[LLMService]]:
+        """Lazily build and cache the bridge-global LLM connection pools.
 
-    def _ensure_flow(self, goal: str) -> None:
-        if self._flow is not None:
-            return
+        Returns (main_services, helper_services). Each session wraps these
+        in _SessionLLMService for session-scoped exhaustion tracking.
+        """
+        if self._shared_services is not None:
+            return self._shared_services, self._shared_helper_services or []
+
         from ..infrastructure.role_resolver import resolve_models_and_helper
+
+        cm = ConfigManager(str(self.config_path))
+        cfg = cm.get_config()
+        llm_cfg = cfg.get("llm", {}) or {}
+
+        api_key = llm_cfg.get("API_KEY") or ""
+        _mt_raw = llm_cfg.get("max_tokens")
+        try:
+            _mt_int = int(_mt_raw) if _mt_raw is not None else 0
+        except (TypeError, ValueError):
+            _mt_int = 0
+        max_tokens: Optional[int] = _mt_int if _mt_int > 0 else None
+
+        models, _helper_models = resolve_models_and_helper(llm_cfg)
+        if not models:
+            models = ["anthropic::claude-4-5-haiku"]
+
+        _mt_kwargs: dict = {"max_tokens": max_tokens} if max_tokens is not None else {}
+        self._shared_services = [
+            AnthropicStreamingService(
+                api_key=api_key, model=m, max_retries=10, **_mt_kwargs,
+            )
+            for m in models
+        ]
+
+        _helper_model_names = _helper_models or models
+        self._shared_helper_services = [
+            AnthropicStreamingService(
+                api_key=api_key, model=m, max_retries=10, **_mt_kwargs,
+            )
+            for m in _helper_model_names
+        ]
+
+        logger.info(
+            "Shared LLM pool created: %d main services, %d helper services",
+            len(self._shared_services), len(self._shared_helper_services),
+        )
+        return self._shared_services, self._shared_helper_services
+
+    def _invalidate_shared_pool(self) -> None:
+        """Clear shared pool so next session rebuilds from fresh config."""
+        self._shared_services = None
+        self._shared_helper_services = None
+
+    def _ensure_flow(self, session_id: str, goal: str) -> None:
+        if session_id in self._flows:
+            return
+
+        # Make sure the UI delegate exists for this sid before we wire
+        # anything up. All status events for this session route through it.
+        ui = self._get_or_create_ui(session_id)
 
         cm = ConfigManager(str(self.config_path))
         cfg = cm.get_config()
@@ -1555,83 +1920,59 @@ class StdioBridge:
                 log_file=None,
                 log_dir=_engine_log_dir,
             )
-            # Detach any stale handler from a prior session before attaching the
-            # new one (defensive — _do_new_session normally removes it first).
-            remove_root_file_handler(self._engine_log_handler)
-            self._engine_log_handler = add_root_file_handler(
+            # Detach any stale handler for THIS session before attaching the
+            # new one (defensive — close_session normally removes it first).
+            stale_handler = self._engine_log_handlers.get(session_id)
+            remove_root_file_handler(stale_handler)
+            self._engine_log_handlers[session_id] = add_root_file_handler(
                 str(session_dir / "handq-engine.log"),
                 level=_level,
+                session_id=session_id,
             )
             logger.info(
-                "_ensure_flow: HandQ engine logger initialised; level=%s log_dir=%s",
-                _log_level_str.upper(), _engine_log_dir,
+                "_ensure_flow[sid=%s]: HandQ engine logger initialised; level=%s log_dir=%s",
+                session_id, _log_level_str.upper(), _engine_log_dir,
             )
         except Exception:
             logger.exception(
-                "_ensure_flow: initialize_logger failed (continuing with default)"
+                "_ensure_flow[sid=%s]: initialize_logger failed (continuing with default)",
+                session_id,
             )
 
         api_key = llm_cfg.get("API_KEY") or ""
-        # When `max_tokens` is missing or non-positive, leave it unset (None) so
-        # AnthropicStreamingService falls back to the per-model ceiling instead of
-        # capping every model at a default (e.g. 4096 truncates Sonnet/Haiku
-        # mid-tool-call, breaking write/edit with "missing required parameter").
-        _mt_raw = llm_cfg.get("max_tokens")
-        try:
-            _mt_int = int(_mt_raw) if _mt_raw is not None else 0
-        except (TypeError, ValueError):
-            _mt_int = 0
-        max_tokens: Optional[int] = _mt_int if _mt_int > 0 else None
 
-        # ── Resolve the main pool ───────────────────────────────────────
-        # Two pools come out of the resolver: ``models`` (main controller
-        # stack) and ``helper_models`` (auxiliary cheap pool consumed by
-        # scheduler.inferer + LTM triage / reranker / retriage). The bridge
-        # only cares about ``models`` here; helper_models is read directly by
-        # those auxiliary callers when they construct their own services.
-        models, _helper_models = resolve_models_and_helper(llm_cfg)
+        # ── Wrap the shared pool for this session ──────────────────────────
+        shared_main, shared_helper = self._get_or_create_shared_pool()
+        consolidated_services: List[LLMService] = [
+            _SessionLLMService(s) for s in shared_main
+        ]
+        helper_services: List[LLMService] = [
+            _SessionLLMService(s) for s in shared_helper
+        ]
 
-        # Fallback when no models are configured at all — keep the bridge
-        # bootable so the user can open Settings and configure models from the UI.
-        if not models:
-            models = ["anthropic::claude-4-5-haiku"]
+        models = [s.model for s in shared_main]
+        _helper_models = [s.model for s in shared_helper]
 
         logger.debug(
-            "FlowController lazy construction: top_level_keys=%s llm_keys=%s "
-            "session_keys=%s n_models=%d n_helper=%d max_tokens=%s "
+            "FlowController lazy construction[sid=%s]: n_models=%d n_helper=%d "
             "api_key_present=%s session_dir=%s",
-            sorted(cfg.keys()) if isinstance(cfg, dict) else None,
-            sorted(llm_cfg.keys()),
-            sorted(sess_cfg.keys()),
+            session_id,
             len(models), len(_helper_models),
-            max_tokens if max_tokens is not None else "auto(per-model ceiling)",
             bool(api_key),
             session_dir,
         )
         if not api_key:
             logger.warning("llm.API_KEY is empty in config; LLM calls will fail")
 
-        # ── Build the service list ──────────────────────────────────────
-        # One service per model. ``max_retries=10`` gives ~1-2 minutes of
-        # patience per model on transient rate limits before falling through
-        # to the next service in the chain. The fallback chain (built from
-        # the priority-ordered ``models`` list) is the primary resilience
-        # mechanism; max_retries handles short blips.
-        _mt_kwargs: dict = {"max_tokens": max_tokens} if max_tokens is not None else {}
-        consolidated_services: List[LLMService] = [
-            AnthropicStreamingService(
-                api_key=api_key, model=m, max_retries=10, **_mt_kwargs,
-            )
-            for m in models
-        ]
+        # Track every distinct service for shutdown — per-session list so we
+        # can drain only this session's pool on close_session.
+        self._services_by_session[session_id] = list(consolidated_services) + list(helper_services)
 
-        # Track every distinct service for shutdown.
-        self._services = list(consolidated_services)
-
-        # Wire server-error notifications to the UI.  The closure captures
-        # `self` so it always reads the current _generation at call time —
-        # important because the same services are reused across sessions.
-        _bridge = self
+        # Wire server-error notifications to the UI. Server-side issues are
+        # session-agnostic (an API outage hits every session identically),
+        # so the envelopes carry no session_id — renderer treats them as
+        # broadcast bridge-meta and shows them in the active tab as a
+        # system bubble.
         def _on_llm_server_error(msg: str, retry_in: int, attempts_left: int) -> None:
             _emit({
                 "type": "status",
@@ -1639,21 +1980,29 @@ class StdioBridge:
                 "message": msg,
                 "retry_in": retry_in,
                 "attempts_left": attempts_left,
-            }, gen=_bridge._generation)
-        for svc in self._services:
+            })
+        for svc in self._services_by_session[session_id]:
             svc.on_server_error = _on_llm_server_error
 
-        self._flow = FlowControllerV2(
+        # ``on_reply_to_user`` callback bound to this session so the receptionist
+        # reply lands on the correct chat tab.
+        def _on_reply(text: str) -> None:
+            self._on_receptionist_reply(session_id, text)
+
+        flow = FlowControllerV2(
             llm_services=consolidated_services,
             working_directory=str(agent_workspace),
             storage_directory=str(session_dir),
             config_path=str(self.config_path),
-            on_reply_to_user=self._on_receptionist_reply,
+            on_reply_to_user=_on_reply,
             expose_session_storage_in_prompt=False,
+            helper_llm_services=helper_services,
+            session_id=session_id,
         )
+        self._flows[session_id] = flow
         logger.info(
-            "FlowControllerV2 constructed; %d llm_service(s) in fallback chain",
-            len(consolidated_services),
+            "FlowControllerV2 constructed[sid=%s]; %d llm_service(s) in fallback chain",
+            session_id, len(consolidated_services),
         )
 
         # Tell the UI where this session's agent workspace lives. The renderer
@@ -1666,40 +2015,30 @@ class StdioBridge:
                 "kind": "session_started",
                 "session_dir": str(session_dir),
                 "workspace_dir": str(agent_workspace),
-            }, gen=self._generation)
+                "session_name": goal.strip()[:30] if goal else None,
+            }, session_id=session_id)
         except Exception:
             logger.exception("Failed to emit session_started status event")
 
-        # Make the agent's working directory real. The prompt advertises
-        # ``Working directory: <agent_workspace>`` and tells the agent to keep
-        # deliverables there, but the file/shell tools resolve relative paths
-        # against the PROCESS cwd (Path(p).absolute() / subprocess inherit) —
-        # and electron spawns the bridge with NO cwd set (electron/main.js:
-        # "No cwd is set on purpose"), so cwd was the electron launch dir. A
-        # bare-filename write therefore landed in C:\...\electron\ instead of
-        # the session workspace. chdir here closes that prompt↔runtime gap:
-        # relative writes/shell commands now land in the workspace, and the
-        # absolute path reported back (Path.absolute()) is the one the user
-        # can actually find. Bridge config/logs use absolute paths, so they
-        # are unaffected; on new_session this re-points cwd at the new
-        # session's workspace (single active session — no concurrency race).
-        try:
-            os.chdir(str(agent_workspace))
-            logger.info("session cwd set to agent workspace: %s", agent_workspace)
-        except Exception:
-            logger.exception(
-                "Failed to chdir into agent workspace %s; relative writes may "
-                "land in the process launch dir", agent_workspace,
-            )
+        # The agent's working directory is carried per-session on
+        # ``ctx.working_directory`` (== agent_workspace, passed to
+        # FlowControllerV2 above). File tools resolve relative paths against it
+        # via ``BaseTool.resolve_in_workspace``, and subprocess tools default
+        # their cwd to it — so a bare-filename write / shell command lands in
+        # the session workspace without touching the process cwd. We deliberately
+        # do NOT os.chdir here: process cwd is a shared global, and leaving it
+        # unmutated is what lets multiple sessions run concurrently without
+        # fighting over it. (electron spawns the bridge with no cwd set; that
+        # launch dir is now irrelevant because nothing resolves against it.)
 
-        # Bind the bridge's UI delegate to the IM that FlowControllerV2 owns.
+        # Bind this session's UI delegate to the IM that FlowControllerV2 owns.
         # All ``notify_*`` / ``request_*`` calls inside the V2 stack route
         # through here. The loop ref lets the stdin reader thread resolve
         # confirmation futures via call_soon_threadsafe.
-        if self._flow.interaction_manager is not None:
-            self._flow.interaction_manager.set_delegate(self._ui)
+        if flow.interaction_manager is not None:
+            flow.interaction_manager.set_delegate(ui)
         try:
-            self._ui._loop = asyncio.get_running_loop()
+            ui._loop = asyncio.get_running_loop()
         except RuntimeError:
             # _ensure_flow may run before the loop is captured into _stdin
             # context; the loop will be set on first await of a confirmation.
@@ -1711,70 +2050,26 @@ class StdioBridge:
         # tool — flow.start() built ctx with self.interaction_manager and
         # passed ctx to PersistentAgent → ToolRegistry → tool __init__.
 
-        # Wire module-level bridge hooks so llm_pool can emit status events
-        # without touching deep planner/agent/receptionist call paths.
-        from ..infrastructure.llm_pool import (
-            set_fallback_notifier as _set_fn,
-            set_network_event_notifier as _set_net_fn,
-        )
-        _bridge_ref = self
+        # NOTE on llm_pool notifiers: ``set_fallback_notifier`` and
+        # ``set_network_event_notifier`` are registered ONCE at bridge boot
+        # (see StdioBridge.__init__) — these signals (model fallback,
+        # network down/restored) are session-agnostic (any LLM service in
+        # any session can trigger them), so the envelopes are broadcast
+        # without session_id. The renderer shows them as system bubbles
+        # in the active tab.
 
-        def _on_llm_fallback(from_model: str, to_model: str, exc: Exception) -> None:
-            _emit(
-                {
-                    "type": "status",
-                    "kind": "llm_fallback",
-                    "from_model": from_model,
-                    "to_model": to_model,
-                    "error": str(exc)[:200],
-                },
-                gen=_bridge_ref._generation,
-            )
-
-        _set_fn(_on_llm_fallback)
-
-        def _on_network_event(state: str, attempt: int, sleep_secs: int) -> None:
-            if state == "down":
-                _emit(
-                    {
-                        "type": "status",
-                        "kind": "network_down",
-                        "message": "网络已中断，LLM 服务暂不可达，等待恢复中…",
-                    },
-                    gen=_bridge_ref._generation,
-                )
-            elif state == "waiting":
-                _emit(
-                    {
-                        "type": "status",
-                        "kind": "network_waiting",
-                        "attempt": attempt,
-                        "retry_in": sleep_secs,
-                    },
-                    gen=_bridge_ref._generation,
-                )
-            elif state == "restored":
-                _emit(
-                    {
-                        "type": "status",
-                        "kind": "network_restored",
-                        "message": "网络已恢复，继续执行",
-                    },
-                    gen=_bridge_ref._generation,
-                )
-
-        _set_net_fn(_on_network_event)
-
-    def _on_receptionist_reply(self, text: str) -> None:
+    def _on_receptionist_reply(self, session_id: str, text: str) -> None:
         """``FlowControllerV2.on_reply_to_user`` callback. Emits the
         receptionist's chat reply as a ``kind=reply`` status envelope so
         the renderer can render an assistant text bubble. Streaming
         (``reply_delta`` / ``reply_done``) is currently unwired — V2
-        baseline emits the full reply once."""
+        baseline emits the full reply once. session_id is closed-over when
+        the callback is bound in _ensure_flow so multi-session replies
+        land in the correct chat tab."""
         if not text:
             return
         _emit({"type": "status", "kind": "reply", "text": str(text)},
-              gen=self._generation)
+              session_id=session_id)
 
     # ------------------------------------------------------------------
     # New-session chain — equivalent to `handq new`. Designed for three
@@ -1796,7 +2091,7 @@ class StdioBridge:
     # Stragglers: if a child task ignores cancellation entirely, it survives
     # as a background coroutine. It can emit a short tail of status envelopes
     # before its underlying I/O finally times out. The renderer's
-    # generation-tag watermark drops them, so they don't pollute the new
+    # closedSessions set drops them, so they don't pollute the new
     # conversation — only correctness issue avoided is process leak, and the
     # asyncio cancel handles that on the next event-loop pass.
     # ------------------------------------------------------------------
@@ -1806,78 +2101,136 @@ class StdioBridge:
     _NEW_SESSION_GRACE_TIMEOUT = 2.5    # cooperative interrupt
     _NEW_SESSION_HARD_TIMEOUT  = 1.5    # after explicit cancel
     _NEW_SESSION_CLOSE_TIMEOUT = 2.0    # per-service httpx pool drain
+    _SHUTDOWN_DRAIN_TIMEOUT    = 3.0    # bounded wait for in-flight dispatch
+    _INFLIGHT_CANCEL_TIMEOUT   = 2.0    # bounded wait for a preempted request
 
-    async def _do_new_session(
-        self, msg_id: Optional[str], *, _suppress_final: bool = False,
+    # Inbound types whose handler is per-session ORDER-sensitive: a second
+    # request/user_input for the same sid must run after the first. These run
+    # under the per-sid dispatch lock (FIFO), so same-sid stays ordered while
+    # different sids run concurrently. The close_session lifecycle op
+    # deliberately skips the lock — it PREEMPTS the in-flight
+    # request by cancelling it (see _cancel_inflight), so a slow LLM round-trip
+    # can't wedge a tab-close.
+    _ORDERED_DISPATCH_TYPES = frozenset({"request", "user_input"})
+
+    @staticmethod
+    def _force_release_session_locks(ctx, session_id: str) -> None:  # type: ignore[no-untyped-def]
+        """Defensive release of the cross-session desktop ownership lock
+        held by this session, regardless of whether flow.destroy() completed
+        cleanly or timed out.
+
+        Without this, a session that wedges on Windows blocking I/O during
+        destroy would keep its desktop lock held forever, blocking other
+        sessions that try to drive input. The release helper on
+        DesktopState is idempotent (a no-op when this session didn't own
+        the lock to begin with), so calling it twice or out of order is
+        safe.
+
+        Browser is **not** force-released here: per the multi-session v2
+        model each session owns an independent Chromium user-data-dir, so
+        there is no cross-session browser lock to release. The browser's
+        own ``close()`` is called via ``flow.destroy() → ctx.close() →
+        browser_session.close()`` and any partial wedge just leaks one
+        Chromium process — harmless for other sessions.
+
+        Personality monitor is **not** explicitly resumed here either:
+        the monitor's ``_paused`` property is computed by querying
+        ``desktop_tool.is_any_session_holding_desktop`` directly, so once
+        ``_release_global_takeover_if_owned`` clears the global owner
+        above, the very next monitor tick will see ``_paused=False`` and
+        un-pause automatically. No refcount, no notifications, no
+        balancing call to track.
+        """
+        _ = session_id  # reserved for future per-session logging
+        if ctx is not None:
+            try:
+                ds = getattr(ctx, "desktop_state", None)
+                if ds is not None:
+                    ds._release_global_takeover_if_owned()
+            except Exception:
+                logger.warning("force release: desktop lock release raised", exc_info=True)
+
+    async def _do_close_session(
+        self, session_id: str, msg_id: Optional[str],
     ) -> None:
-        # Bump the generation BEFORE doing any cleanup, then construct a
-        # fresh _StdioUI bound to the new gen. The OLD _StdioUI is NOT
-        # mutated — it stays referenced by the OLD InteractionManager
-        # (which is still referenced by the old FlowControllerV2), so any
-        # straggler ``notify_*`` call from a wedged old subtask continues
-        # to emit through the OLD _StdioUI with the OLD generation. The
-        # renderer's gen-watermark drops those.
-        old_gen = self._generation
-        self._generation = old_gen + 1
-        new_gen = self._generation
-        new_ui = _StdioUI(new_gen)
-        try:
-            new_ui._loop = asyncio.get_running_loop()
-        except RuntimeError:
-            pass
-        logger.info("new_session sequence begin; id=%s old_gen=%d new_gen=%d suppress_final=%s",
-                    msg_id, old_gen, new_gen, _suppress_final)
+        """Renderer-initiated tear-down. Tears down the flow AND drops the
+        per-session UI delegate so the slot is truly empty — no auto-recreate
+        on the next stray emit. Renderer's "X" button on
+        each session tab fires this.
+
+        The flow.destroy() chain guarantees flow no residue (browser closed,
+        shells killed, SSH drained, screenshot store swept, asyncio tasks
+        cancelled, ctx resources dropped). After return, the session_id
+        slot is removed from every per-session dict on the bridge.
+        """
+        logger.info("close_session sequence begin; sid=%s id=%s", session_id, msg_id)
         t0 = time.monotonic()
 
-        # Snapshot + clear up-front. Any later in-flight `_emit` from
-        # an orphaned subtask can still write to stdout (the IPC stream
-        # is process-wide and unconditionally available), but it can no
-        # longer alias state on `self`. Crucially, a request that arrives
-        # next tick sees `_flow is None` and rebuilds from scratch.
-        flow = self._flow
-        services = self._services
-        self._flow = None
-        self._services = []
+        # Mark sid as closing so concurrent requests are rejected during
+        # the tear-down window (see _handle for the guard).
+        self._closing.add(session_id)
 
-        # Detach + close this session's engine.log handler from the root logger
-        # so the file is released and the next session's _ensure_flow opens a
-        # fresh handq-engine.log (no cross-session bleed, no lingering Windows
-        # file lock). The next _ensure_flow re-attaches a new one.
+        # Preempt this session's in-flight request (N3): cancel + bounded-await
+        # it so a slow LLM round-trip can't wedge the tab-close, and so it
+        # stops emitting/mutating per-session state before teardown.
+        await self._cancel_inflight(session_id)
+
+        flow = self._flows.pop(session_id, None)
+        services = self._services_by_session.pop(session_id, [])
+        with self._uis_lock:
+            self._uis.pop(session_id, None)
+        # Unknown-sid path (silent success by design — see §close_session in
+        # MULTI_SESSION_DESIGN.md). Four legitimate triggers:
+        #   1. User double-clicked the tab's X button (second IPC arrives
+        #      after the first already cleaned up the sid).
+        #   2. IPC reordering — close arrived before request actually built
+        #      the flow.
+        #   3. Renderer restart sent a stale close for a sid the new renderer
+        #      doesn't know about, but the bridge already cleared.
+        #   4. Test fixture / scripted client sent a typo'd sid.
+        # We still emit ``close_session: ok`` because the renderer's UI is
+        # authoritative: if the user closed the tab, bridge agreeing is
+        # correct regardless of internal residue. The warning makes
+        # production occurrences visible without disrupting flow.
+        if flow is None and not services:
+            logger.warning(
+                "close_session[sid=%s]: no active flow/services found "
+                "(double-close, IPC race, renderer restart, or unknown sid); "
+                "proceeding with idempotent cleanup",
+                session_id,
+            )
+        # Keep a ref to ctx for defensive lock release in finally — see
+        # _force_release_session_locks. Without this, a wedged flow.destroy
+        # leaves the global desktop/browser locks held forever and other
+        # sessions deadlock on them.
+        ctx_ref = getattr(flow, "_ctx", None) if flow is not None else None
+
+        # Detach + close this session's engine.log handler.
+        handler = self._engine_log_handlers.pop(session_id, None)
         try:
             from ..infrastructure.logger import remove_root_file_handler
-            remove_root_file_handler(self._engine_log_handler)
+            remove_root_file_handler(handler)
         except Exception:
-            logger.exception("new_session: failed to detach engine.log handler")
-        finally:
-            self._engine_log_handler = None
+            logger.exception(
+                "close_session[sid=%s]: failed to detach engine.log handler",
+                session_id,
+            )
 
         try:
-            # ``flow.destroy()`` trips the SharedCheckList interrupt event
-            # (waking shell/session tools parked on subprocess waits), cancels
-            # the agent + planner asyncio tasks, then awaits
-            # ``SessionContext.close()`` which closes the Playwright browser,
-            # kills interactive shell sessions, drains the SSH connection
-            # pool, sweeps the desktop / browser screenshot stores, and drops
-            # the per-session ``FileState`` + ``DesktopState`` instances.
-            #
-            # That single async call collapses what would otherwise be 6
-            # manual flush sites + 2 detach calls. New tools that need
-            # session-scoped cleanup register on the SessionContext; the
-            # bridge does not need to know about them.
             if flow is not None:
                 try:
-                    await asyncio.wait_for(flow.destroy(), timeout=2.0)
+                    await asyncio.wait_for(flow.destroy(), timeout=2.5)
                 except asyncio.TimeoutError:
-                    logger.warning("new_session: flow.destroy timed out (2.0s)")
+                    logger.warning(
+                        "close_session[sid=%s]: flow.destroy timed out (2.5s)",
+                        session_id,
+                    )
                 except Exception:
                     logger.warning(
-                        "new_session: flow.destroy failed", exc_info=True,
+                        "close_session[sid=%s]: flow.destroy failed",
+                        session_id, exc_info=True,
                     )
 
-            # AnthropicStreamingService instances live on the bridge (not on
-            # the flow) so flow.destroy doesn't touch them; the bridge owns
-            # their httpx pool drain. Cap each close to keep new_session
-            # bounded if a half-open TCP socket stalls.
             for i, svc in enumerate(services):
                 try:
                     await asyncio.wait_for(
@@ -1886,38 +2239,42 @@ class StdioBridge:
                     )
                 except asyncio.TimeoutError:
                     logger.warning(
-                        "new_session: svc[%d].close timed out after %.1fs",
-                        i, self._NEW_SESSION_CLOSE_TIMEOUT,
+                        "close_session[sid=%s]: svc[%d].close timed out after %.1fs",
+                        session_id, i, self._NEW_SESSION_CLOSE_TIMEOUT,
                     )
                 except Exception:
                     logger.warning(
-                        "new_session: svc[%d].close failed",
-                        i, exc_info=True,
+                        "close_session[sid=%s]: svc[%d].close failed",
+                        session_id, i, exc_info=True,
                     )
-
-            self._ui = new_ui
         except Exception:
-            logger.exception("new_session chain raised unexpectedly")
+            logger.exception(
+                "close_session[sid=%s] chain raised unexpectedly", session_id,
+            )
         finally:
+            # Defensive: release the cross-session desktop/browser locks
+            # even if flow.destroy timed out.
+            self._force_release_session_locks(ctx_ref, session_id)
+            self._closing.discard(session_id)
+            # Drop the per-sid dispatch lock + in-flight ref — the session is
+            # gone, so the next message for this sid (if any) starts clean.
+            self._session_dispatch_locks.pop(session_id, None)
+            self._inflight_by_sid.pop(session_id, None)
             elapsed = (time.monotonic() - t0) * 1000.0
-            logger.info("new_session sequence complete (%.2f ms; new_gen=%d)",
-                        elapsed, new_gen)
-            if not _suppress_final:
-                _emit({"type": "final", "id": msg_id,
-                       "result": {"new_session": "ok",
-                                  "generation": new_gen,
-                                  "elapsed_ms": round(elapsed, 1)}},
-                      gen=new_gen)
+            _emit({"type": "final", "id": msg_id,
+                   "result": {"close_session": "ok",
+                              "session_id": session_id,
+                              "elapsed_ms": round(elapsed, 1)}},
+                  session_id=session_id)
 
     # ------------------------------------------------------------------
     # Shutdown chain (per backend_surface.md §1)
     # ------------------------------------------------------------------
 
     async def _do_shutdown(self, msg_id: Optional[str]) -> None:
-        if self._shutdown_requested:
-            logger.debug("shutdown: already in progress; ignoring id=%s", msg_id)
-            return
-        self._shutdown_requested = True
+        # _shutdown_requested is already True (set by run() before drain).
+        # Double-shutdown cannot occur: the run-loop breaks immediately after
+        # this handler returns, and no other caller invokes _do_shutdown.
         logger.info("shutdown sequence begin; id=%s", msg_id)
         overall_t0 = time.monotonic()
 
@@ -1925,50 +2282,170 @@ class StdioBridge:
             return (time.monotonic() - t0) * 1000.0
 
         try:
-            if self._flow is not None:
-                t0 = time.monotonic()
-                try:
-                    # ``flow.destroy()`` is async: it trips the checklist
-                    # interrupt event, cancels both run-loops, and awaits
-                    # ``SessionContext.close()`` to tear down all per-session
-                    # resources (browser / shells / SSH pool / desktop state /
-                    # file state). The bridge no longer detaches IM refs or
-                    # calls flush_*_pool — destroy does all of it in one place.
-                    await asyncio.wait_for(
-                        self._flow.destroy(),
-                        timeout=2.5,
-                    )
-                    logger.info("shutdown: flow.destroy OK (%.2f ms)", _step_ms(t0))
-                except asyncio.TimeoutError:
-                    logger.warning(
-                        "shutdown: flow.destroy timed out (2.5s); leaving "
-                        "any stragglers as background — generation tag will "
-                        "filter their late emits",
-                    )
-                except Exception:
-                    logger.warning("shutdown: flow.destroy failed (%.2f ms)",
-                                   _step_ms(t0), exc_info=True)
-            else:
+            # Tear down every live session's flow + service pool. Each
+            # destroy/close is independent — one stuck flow doesn't block
+            # the others.
+            session_ids = list(self._flows.keys())
+            if not session_ids:
                 logger.info("shutdown: no FlowControllerV2 to destroy")
-
-            for i, svc in enumerate(self._services):
+            for sid in session_ids:
+                flow = self._flows.pop(sid, None)
+                services = self._services_by_session.pop(sid, [])
                 t0 = time.monotonic()
+                if flow is not None:
+                    try:
+                        # ``flow.destroy()`` is async: it trips the checklist
+                        # interrupt event, cancels both run-loops, and awaits
+                        # ``SessionContext.close()`` to tear down all per-session
+                        # resources (browser / shells / SSH pool / desktop state /
+                        # file state). The bridge no longer detaches IM refs or
+                        # calls flush_*_pool — destroy does all of it in one place.
+                        await asyncio.wait_for(flow.destroy(), timeout=2.5)
+                        logger.info(
+                            "shutdown[sid=%s]: flow.destroy OK (%.2f ms)",
+                            sid, _step_ms(t0),
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            "shutdown[sid=%s]: flow.destroy timed out (2.5s); "
+                            "leaving any stragglers as background — "
+                            "closedSessions will filter their late emits", sid,
+                        )
+                    except Exception:
+                        logger.warning(
+                            "shutdown[sid=%s]: flow.destroy failed (%.2f ms)",
+                            sid, _step_ms(t0), exc_info=True,
+                        )
+                for i, svc in enumerate(services):
+                    t0 = time.monotonic()
+                    try:
+                        await asyncio.wait_for(
+                            svc.close(),
+                            timeout=self._NEW_SESSION_CLOSE_TIMEOUT,
+                        )
+                        logger.info(
+                            "shutdown[sid=%s]: svc[%d].close OK (%.2f ms)",
+                            sid, i, _step_ms(t0),
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            "shutdown[sid=%s]: svc[%d].close timed out after "
+                            "%.1fs (%.2f ms)",
+                            sid, i, self._NEW_SESSION_CLOSE_TIMEOUT,
+                            _step_ms(t0),
+                        )
+                    except Exception:
+                        logger.warning(
+                            "shutdown[sid=%s]: svc[%d].close failed (%.2f ms)",
+                            sid, i, _step_ms(t0), exc_info=True,
+                        )
+
+            # Close the shared LLM connection pools (the actual httpx clients).
+            for svc in (self._shared_services or []) + (self._shared_helper_services or []):
                 try:
-                    await svc.close()
-                    logger.info("shutdown: svc[%d].close OK (%.2f ms)", i, _step_ms(t0))
+                    await asyncio.wait_for(svc.close(), timeout=2.0)
                 except Exception:
-                    logger.warning("shutdown: svc[%d].close failed (%.2f ms)",
-                                   i, _step_ms(t0), exc_info=True)
+                    pass
+            self._shared_services = None
+            self._shared_helper_services = None
         except Exception:
             logger.exception("shutdown chain raised unexpectedly")
         finally:
             logger.info("shutdown sequence complete (%.2f ms total)", _step_ms(overall_t0))
-            _emit({"type": "final", "id": msg_id, "result": {"shutdown": "ok"}},
-                  gen=self._generation)
+            _emit({"type": "final", "id": msg_id, "result": {"shutdown": "ok"}})
 
     # ------------------------------------------------------------------
     # Main loop
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Concurrent per-session dispatch
+    # ------------------------------------------------------------------
+
+    async def _dispatch(self, msg: Dict[str, Any]) -> None:
+        """Run ONE inbound envelope as its own task (F1).
+
+        ``request`` / ``user_input`` for a sid run under that sid's dispatch
+        lock so same-session messages stay in arrival order, while different
+        sessions run concurrently. The running request task is published in
+        ``_inflight_by_sid`` so a lifecycle op can preempt it (N3).
+
+        Everything else (lifecycle ops, bridge-meta) runs directly — lifecycle
+        handlers cancel the in-flight request themselves.
+        """
+        try:
+            mtype = msg.get("type") if isinstance(msg, dict) else None
+            if mtype in self._ORDERED_DISPATCH_TYPES:
+                sid = self._resolve_session_id(msg)
+                if sid is not None:
+                    from ..infrastructure.logger import set_session_context
+                    set_session_context(sid)
+                    lock = self._session_dispatch_locks.setdefault(
+                        sid, asyncio.Lock()
+                    )
+                    async with lock:
+                        task = asyncio.current_task()
+                        if task is not None:
+                            self._inflight_by_sid[sid] = task
+                        try:
+                            await self._handle(msg)
+                        finally:
+                            if self._inflight_by_sid.get(sid) is task:
+                                self._inflight_by_sid.pop(sid, None)
+                    return
+            await self._handle(msg)
+        except asyncio.CancelledError:
+            # Preempted by a lifecycle op (N3) or shutdown — let it unwind.
+            raise
+        except Exception as exc:
+            logger.exception(
+                "dispatch task crashed (type=%s)",
+                msg.get("type") if isinstance(msg, dict) else None,
+            )
+            try:
+                _emit({"type": "error", "where": "bridge",
+                       "message": f"dispatch crashed: {exc}", "fatal": False})
+            except Exception:
+                pass
+
+    async def _cancel_inflight(self, session_id: str) -> None:
+        """Cancel + bounded-await the in-flight request/user_input task for a
+        session so a lifecycle op (close/new) can preempt a slow LLM round-trip
+        (N3). No-op when the session has no task running."""
+        task = self._inflight_by_sid.pop(session_id, None)
+        if task is None or task.done() or task is asyncio.current_task():
+            return
+        logger.info("preempting in-flight request; sid=%s", session_id)
+        task.cancel()
+        try:
+            await asyncio.wait_for(task, timeout=self._INFLIGHT_CANCEL_TIMEOUT)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "in-flight request for sid=%s did not unwind in %.1fs; "
+                "proceeding with teardown", session_id,
+                self._INFLIGHT_CANCEL_TIMEOUT,
+            )
+        except asyncio.CancelledError:
+            pass  # expected: the task we just cancelled
+        except Exception:
+            logger.debug("in-flight task for sid=%s raised on unwind",
+                         session_id, exc_info=True)
+
+    async def _drain_inflight(self, timeout: float) -> None:
+        """Bounded wait for every live dispatch task before shutdown teardown.
+        Stragglers past the deadline are left for ``_do_shutdown`` to cancel
+        via each flow's ``destroy()``."""
+        tasks = [t for t in self._inflight_tasks if not t.done()]
+        if not tasks:
+            return
+        logger.info("shutdown: draining %d in-flight dispatch task(s)",
+                    len(tasks))
+        _, pending = await asyncio.wait(tasks, timeout=timeout)
+        if pending:
+            logger.warning(
+                "shutdown: %d dispatch task(s) still pending after %.1fs "
+                "drain; proceeding to teardown", len(pending), timeout,
+            )
 
     async def run(self) -> None:
         self._loop = asyncio.get_running_loop()
@@ -1998,13 +2475,35 @@ class StdioBridge:
                     msg.get("type") if isinstance(msg, dict) else type(msg).__name__,
                     msg.get("id") if isinstance(msg, dict) else None,
                 )
-            try:
-                await self._handle(msg)
-            except Exception as exc:
-                logger.exception("dispatcher caught exception")
-                _emit({"type": "error", "where": "bridge",
-                       "message": f"dispatch crashed: {exc}", "fatal": False},
-                      gen=self._generation)
+
+            mtype = msg.get("type") if isinstance(msg, dict) else None
+            if mtype == "shutdown":
+                # Quiesce the scheduler FIRST: setting the flag prevents new
+                # scheduled fires from being accepted (accept_scheduled_task
+                # checks it). Only then drain existing in-flight tasks (which
+                # now includes any live sched child tasks) before teardown.
+                self._shutdown_requested = True
+                # Shutdown is handled inline (not as a background task): drain
+                # the live per-session dispatch tasks (bounded), then run the
+                # teardown chain and exit the loop. Running it inline guarantees
+                # we don't start tearing down flows while their request tasks
+                # are still mutating per-session state.
+                await self._drain_inflight(self._SHUTDOWN_DRAIN_TIMEOUT)
+                try:
+                    await self._handle(msg)
+                except Exception as exc:
+                    logger.exception("shutdown handler raised")
+                    _emit({"type": "error", "where": "bridge",
+                           "message": f"shutdown crashed: {exc}",
+                           "fatal": False})
+                break
+
+            # Every other envelope runs as its own task so a slow LLM
+            # round-trip for one session never blocks another session's input.
+            task = asyncio.create_task(self._dispatch(msg))
+            self._inflight_tasks.add(task)
+            task.add_done_callback(self._inflight_tasks.discard)
+
             if self._shutdown_requested:
                 logger.info("shutdown_requested flag observed; exiting main loop")
                 break

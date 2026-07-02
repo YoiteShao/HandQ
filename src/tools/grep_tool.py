@@ -19,8 +19,8 @@ from .read_tool import _BINARY_EXTENSIONS
 
 
 _MAX_SEARCH_FILE_SIZE = 1_048_576  # 1 MB
-_MAX_OUTPUT_CHARS = 30_000         # 30 KB output cap
-_DEFAULT_HEAD_LIMIT = 250
+_MAX_OUTPUT_CHARS = 15_000         # 15 KB output cap
+_DEFAULT_HEAD_LIMIT = 100
 
 _SKIP_DIRS = frozenset({
     ".git", "__pycache__", "node_modules", ".venv", "venv",
@@ -353,7 +353,14 @@ class GrepTool(BaseTool):
             _ctx_before = context_before if context_before is not None else (context_lines or 0)
             _ctx_after = context_after if context_after is not None else (context_lines or 0)
 
-            search_dir = path or "."
+            # Default search base is the per-session workspace, not the process
+            # cwd (no longer mutated via os.chdir — see concurrency work). An
+            # explicit relative path is resolved against the workspace too, so
+            # search never depends on the process cwd.
+            if path:
+                search_dir = self.resolve_in_workspace(path)
+            else:
+                search_dir = self.ctx.working_directory if (self.ctx and self.ctx.working_directory) else "."
 
             loop = asyncio.get_event_loop()
             result = await loop.run_in_executor(

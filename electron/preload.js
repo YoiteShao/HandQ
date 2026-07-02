@@ -258,6 +258,21 @@ contextBridge.exposeInMainWorld('windowControls', {
         preloadLog('window:hide');
         ipcRenderer.send('window:hide');
     },
+    // Ask main to grow the window based on the current session count.
+    // Grow-only + capped at maximize when count reaches the threshold (6).
+    // Renderer calls this every time _updateLayout runs.
+    autoResize: (count) => {
+        preloadLog('window:auto-resize', { count });
+        ipcRenderer.send('window:auto-resize', count);
+    },
+    // Subscribe to maximize / unmaximize events so the custom titlebar
+    // can swap the max-button icon (single square ↔ two overlapping squares).
+    onMaxState: (cb) => {
+        if (typeof cb !== 'function') return;
+        ipcRenderer.on('window:maxState', (_evt, state) => {
+            try { cb(state); } catch (_) { /* swallow */ }
+        });
+    },
 });
 
 // Global hotkey settings — renderer reads/writes the toggle shortcut.
@@ -287,5 +302,19 @@ contextBridge.exposeInMainWorld('appInfo', {
     getVersion: () => {
         preloadLog('app:getVersion');
         return ipcRenderer.invoke('app:getVersion');
+    },
+});
+
+// Liquid Glass: desktopCapturer API for the renderer's WebGL refraction effect.
+contextBridge.exposeInMainWorld('glassCapture', {
+    getScreenSource: () => ipcRenderer.invoke('glass:getScreenSource'),
+    getWindowBounds: () => ipcRenderer.invoke('glass:getWindowBounds'),
+    // Subscribe to push updates from main.js on window move/resize. Avoids
+    // the per-frame IPC poll that made window drag feel laggy.
+    onBoundsChanged: (cb) => {
+        if (typeof cb !== 'function') return;
+        ipcRenderer.on('glass:boundsChanged', (_evt, bounds) => {
+            try { cb(bounds); } catch (_) { /* swallow */ }
+        });
     },
 });

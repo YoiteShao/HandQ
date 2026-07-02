@@ -10,17 +10,15 @@ Lifecycle::
 The ``dispatch`` argument is a callable provided by the bridge:
 
     async def dispatch(task: ScheduledTask) -> None:
-        # The bridge synthesises an inbound `request` envelope and
-        # routes it through its own dispatcher. Returns when the
-        # session has actually been kicked off (NOT when it finishes).
+        # The bridge mints a fresh sched-{uuid} session, builds a
+        # FlowControllerV2, runs on_user_message, and returns when
+        # the receptionist's reply is complete (NOT fire-and-forget).
         ...
 
-Why we don't await the actual flow completion: a long task could pin
-the scheduler loop for hours, blocking every other due fire. Instead,
-we mark the task as ``RUNNING`` before dispatch, and the bridge calls
-``Scheduler.notify_task_finished(task_id, ok, error)`` from its
-``_run_flow_session`` finally-block. That keeps the run-counter
-accurate without coupling the scheduler to FlowController internals.
+Note: dispatch blocks for the full reply duration. The scheduler's _fire
+awaits it, so concurrent cron fires for different schedules serialize behind
+the running one. If finer-grained concurrency is needed later, the bridge
+can wrap its dispatch in a background task and return immediately.
 """
 from __future__ import annotations
 
@@ -224,6 +222,16 @@ class Scheduler:
             await self._fire(t, manual=False)
 
     async def _fire(self, t: ScheduledTask, *, manual: bool) -> None:
+        # Scheduler firing is decoupled from "is any session idle?" — in the
+        # multi-session bridge model each fire generates a fresh
+        # ``sched-{uuid}`` session id and the bridge spawns a brand-new
+        # FlowControllerV2 to run it. Fires don't block on interactive
+        # sessions being busy; however _fire itself awaits dispatch completion
+        # (the full on_user_message round-trip), so overlapping schedules
+        # serialize behind one slow reply. The only refusal path is bridge
+        # shutdown (``_shutdown_requested=True``), in which case dispatch
+        # returns ``False`` below and we leave the task PENDING so the next
+        # live scheduler tick (or the next process boot) picks it up.
         _logger.info(
             "scheduler firing task=%s name=%r manual=%s",
             t.id[:8], t.name, manual,

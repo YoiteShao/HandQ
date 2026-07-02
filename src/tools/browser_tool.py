@@ -60,10 +60,12 @@ swallowed and logged.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import subprocess
 import sys
+import shutil
 import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -75,18 +77,37 @@ from urllib.parse import urlparse
 import yaml as _yaml  # type: ignore[import-not-found]
 
 from .base_tool import BaseTool, ToolResult
-from ..infrastructure.browser_paths import user_browser_profile_dir
+from ..infrastructure.browser_paths import (
+    SHARED_COOKIE_SUBPATHS,
+    user_browser_profile_dir,
+    user_browser_shared_cookies_dir,
+    user_browser_shared_storage_state_path,
+)
 from ..infrastructure.logger import get_logger
 
-# ── Playwright dependency (eager, hard requirement) ──────────────────────────
+# ── Playwright dependency ────────────────────────────────────────────────────
+# Eager hard requirement on Windows — a missing install fails the launch fast.
+# On non-Windows (the Linux HandQ runtime) the import is skipped and lightweight
+# fallbacks keep the module importable. The browser tool is never registered
+# off-Windows, so the real Playwright symbols are only reached on Windows; the
+# fallbacks merely keep module-level names defined and ``except`` clauses valid.
+if sys.platform == "win32":
+    from playwright.async_api import (  # type: ignore[import-not-found]
+        async_playwright,
+        Browser,
+        BrowserContext,
+        Page,
+        TimeoutError as _PlaywrightTimeoutError,
+    )
+    _PLAYWRIGHT_AVAILABLE = True
+else:
+    async_playwright = None  # type: ignore[assignment]
+    Browser = BrowserContext = Page = Any  # type: ignore[assignment,misc]
 
-from playwright.async_api import (  # type: ignore[import-not-found]
-    async_playwright,
-    Browser,
-    BrowserContext,
-    Page,
-    TimeoutError as _PlaywrightTimeoutError,
-)
+    class _PlaywrightTimeoutError(Exception):  # type: ignore[no-redef]
+        """Fallback so ``except _PlaywrightTimeoutError`` stays valid off-Windows."""
+
+    _PLAYWRIGHT_AVAILABLE = False
 
 
 # NOTE: browser_tool's two user-confirmation sites (attach_browser Chrome
@@ -198,7 +219,184 @@ def _validate_css_selector(selector: str) -> Optional[str]:
             "or [class~='5']. To target by visible text, use Playwright's "
             "text= engine: text='SA8797P.HGY.5.1.7.0'."
         )
+    # Detect Playwright chain syntax (`>>`) with stray quotes — the LLM
+    # tried to use `text=".t" >> nth=0` once and produced
+    # `.t" >> nth=0"` after broken JSON-style quoting. CSS does not have
+    # `>>`; redirecting the agent here saves the round-trip Playwright
+    # would spend producing a much-less-actionable parse error.
+    if ">>" in s and ('"' in s or "'" in s):
+        return (
+            f"selector {selector!r} appears to mix CSS with Playwright chain "
+            "syntax (`>>`) and contains stray quotes. The `selector` parameter "
+            "takes a plain CSS selector; do not use `>>`. To target the Nth "
+            "match, set `mode=list` with `limit=N`, or use a pure CSS "
+            "`:nth-child()` / `:nth-of-type()` instead."
+        )
     return None
+
+
+# ── Shared cookie/login-state carry-over between sessions ────────────────────
+# Per-session Chromium user-data-dirs are isolated (see browser_paths.py) so
+# concurrent sessions never contend on the user-data-dir lock. To keep the
+# user's SSO / login state across sessions despite that isolation, these
+# helpers copy a small subset (SHARED_COOKIE_SUBPATHS) between the session
+# profile and a shared carry-over directory:
+#
+#   * launch  → hydrate_session_profile_from_shared: copy shared → session
+#   * close   → persist_session_profile_to_shared:  copy session → shared
+#
+# Both are best-effort — a copy failure logs a warning but never blocks
+# browser launch or holder teardown. Attach-mode sessions (no owned profile
+# dir) skip both entirely; callers pass profile_dir="" in that case.
+
+def _copy_shared_subpath(src_root: str, dst_root: str, subpath: str, is_dir: bool) -> Optional[str]:
+    """Copy ONE entry from :data:`SHARED_COOKIE_SUBPATHS` between two dirs.
+
+    Returns the ``subpath`` on success or ``None`` when the source is
+    missing (silent skip). Any copy error is re-raised for the caller
+    aggregator to log and continue with the next entry.
+    """
+    src = os.path.join(src_root, subpath)
+    dst = os.path.join(dst_root, subpath)
+    if not os.path.exists(src):
+        return None
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    if is_dir:
+        shutil.copytree(src, dst, dirs_exist_ok=True)
+    else:
+        shutil.copy2(src, dst)
+    return subpath
+
+
+def _hydrate_session_profile_from_shared(profile_dir: str) -> List[str]:
+    """Copy carry-over cookies + DOM storage from shared/ into *profile_dir*.
+
+    Runs synchronously on the caller thread — invoke via
+    ``asyncio.to_thread`` from the async launch path. First-launch cases
+    where shared/ is empty return an empty list (no-op). Returns the list
+    of subpaths actually copied for logging.
+    """
+    shared = user_browser_shared_cookies_dir()
+    copied: List[str] = []
+    logger = get_logger()
+    for subpath, is_dir in SHARED_COOKIE_SUBPATHS:
+        try:
+            done = _copy_shared_subpath(shared, profile_dir, subpath, is_dir)
+            if done:
+                copied.append(done)
+        except Exception as exc:
+            logger.warning(
+                f"cookie hydrate: {subpath} failed ({type(exc).__name__}: {exc})",
+                component="BrowserTool",
+            )
+    return copied
+
+
+def _persist_session_profile_to_shared(profile_dir: str) -> List[str]:
+    """Copy live cookies + DOM storage from *profile_dir* back into shared/.
+
+    Runs synchronously — invoke via ``asyncio.to_thread`` from the async
+    close path. Called AFTER ``context.close()`` so Chromium is no longer
+    holding SQLite write locks. Returns the list of subpaths persisted.
+    """
+    shared = user_browser_shared_cookies_dir()
+    persisted: List[str] = []
+    logger = get_logger()
+    for subpath, is_dir in SHARED_COOKIE_SUBPATHS:
+        try:
+            done = _copy_shared_subpath(profile_dir, shared, subpath, is_dir)
+            if done:
+                persisted.append(done)
+        except Exception as exc:
+            logger.warning(
+                f"cookie persist: {subpath} failed ({type(exc).__name__}: {exc})",
+                component="BrowserTool",
+            )
+    return persisted
+
+
+# ── Playwright storage_state — the authoritative cookie carry-over path ──────
+# Empirically Chromium rewrites Local State on launch, so the DPAPI-encrypted
+# ``os_crypt`` key we copy into a fresh session profile is discarded and the
+# copied Cookies file can't be decrypted (silently — every cookie is treated
+# as invalid). Playwright's ``context.storage_state()`` bypasses that entirely
+# by serialising cookies in plaintext at the CDP layer; ``add_cookies`` on the
+# next context re-encrypts them under the new profile's key. This is the
+# officially supported cross-context auth-carry-over path.
+
+async def _inject_shared_storage_state(context: Any) -> int:
+    """Inject cookies from ``shared/storage_state.json`` into the live context.
+
+    Returns the number of cookies injected. Missing / empty file → 0 (silent
+    first-launch path). Malformed JSON logs a warning and returns 0 so the
+    launch continues; a corrupted carry-over file should not brick the
+    browser tool. Called immediately after ``launch_persistent_context``
+    succeeds, before any navigation.
+    """
+    path = user_browser_shared_storage_state_path()
+    if not os.path.exists(path):
+        return 0
+    logger = get_logger()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            state = json.load(f)
+    except Exception as exc:
+        logger.warning(
+            f"storage_state load failed ({type(exc).__name__}: {exc}); "
+            f"continuing without shared cookies",
+            component="BrowserTool",
+        )
+        return 0
+    cookies = state.get("cookies") or []
+    if not cookies:
+        return 0
+    try:
+        await context.add_cookies(cookies)
+    except Exception as exc:
+        logger.warning(
+            f"storage_state add_cookies failed ({type(exc).__name__}: {exc}); "
+            f"continuing without shared cookies",
+            component="BrowserTool",
+        )
+        return 0
+    return len(cookies)
+
+
+async def _persist_context_storage_state(context: Any) -> int:
+    """Dump the live context's cookies to ``shared/storage_state.json``.
+
+    Returns the number of cookies persisted. Called BEFORE ``context.close()``
+    so the CDP session is still up. Best-effort: a dump failure logs and
+    returns 0 rather than blocking teardown.
+
+    Origins/localStorage from the storage_state are also written to the same
+    file for future use — they aren't currently re-injected on the load path
+    (that would require navigating to each origin), but keeping them in the
+    JSON leaves the door open for that later without a file-format break.
+    """
+    logger = get_logger()
+    try:
+        state = await context.storage_state()
+    except Exception as exc:
+        logger.warning(
+            f"storage_state dump failed ({type(exc).__name__}: {exc}); "
+            f"shared/storage_state.json not updated",
+            component="BrowserTool",
+        )
+        return 0
+    path = user_browser_shared_storage_state_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+    except Exception as exc:
+        logger.warning(
+            f"storage_state write failed ({type(exc).__name__}: {exc}); "
+            f"shared/storage_state.json not updated",
+            component="BrowserTool",
+        )
+        return 0
+    return len(state.get("cookies") or [])
 
 
 # ── Module-level singleton state ─────────────────────────────────────────────
@@ -218,6 +416,7 @@ class BrowserSession:
     tabs: Dict[str, Any] = field(default_factory=dict)  # tab_id → Page
     last_used: float = 0.0
     _next_tab_seq: int = 1
+    last_navigated_url: Dict[str, str] = field(default_factory=dict)  # tab_id → url last set by _action_navigate
 
     def mint_tab_id(self) -> str:
         tid = f"t{self._next_tab_seq}"
@@ -251,22 +450,44 @@ class BrowserSession:
 # per-session live browser.
 
 
-class BrowserSessionHolder:
-    """Per-session container for the singleton-Chromium / Playwright graph.
+# In the multi-session v2 model each ``BrowserSessionHolder`` owns its own
+# Chromium user-data-dir under ``%USERPROFILE%\HandQ\browser_profile\sessions\<sid>\``
+# (see :func:`user_browser_profile_dir`). Two concurrent sessions therefore
+# launch into two independent directories — Chromium's OS-level user-data-dir
+# lock cannot fire because no two sessions share a directory. No process-wide
+# Python lock is needed; per-session isolation is the entire concurrency story.
+# Module-level "global owner" plumbing was removed when the per-session model
+# landed; the legacy ``flush_browser_pool`` shim still works via the sid=None
+# fallback holder (a single shared dir for ctx-less callers / test fixtures).
 
-    Chromium's user-data-dir locking forces "one browser per process" — that
-    constraint doesn't change with SessionContext. What changes is **lifecycle
-    ownership**: the live session is now bound to the FlowControllerV2 that
-    spawned it, and ``ctx.close()`` guarantees the next session boots with no
-    Playwright handles, no orphan Chromium, and no leftover pages.
+
+class BrowserSessionHolder:
+    """Per-session container for a Chromium / Playwright graph.
+
+    Each holder is bound to one FlowControllerV2 (one session) and owns:
+      * the live BrowserSession (Playwright + Context + tabs)
+      * a per-session Chromium user-data-dir (cookies / login state)
+      * a ScreenshotStore for browser-tab screenshots
+
+    No cross-session locks: ``ctx.close()`` shuts down this holder's
+    Chromium without affecting anything else. Two sessions can both
+    ``launch_browser`` concurrently and each end up with its own
+    Chromium process pointed at its own user-data-dir.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, session_id: Optional[str] = None) -> None:
+        # session_id picks the per-session user-data-dir; ``None`` falls
+        # back to the legacy single shared profile (used by ctx-less
+        # callers / test fixtures only).
+        self._session_id: Optional[str] = session_id
         self._session: Optional[BrowserSession] = None
         self._lock: asyncio.Lock = asyncio.Lock()
         self._store: Optional[Any] = None  # lazy ScreenshotStore
-
     # ── Live session accessors ───────────────────────────────────────────
+
+    @property
+    def session_id(self) -> Optional[str]:
+        return self._session_id
 
     @property
     def session(self) -> Optional[BrowserSession]:
@@ -277,12 +498,15 @@ class BrowserSessionHolder:
 
     @property
     def lock(self) -> asyncio.Lock:
-        """Global serialiser for every DOM operation across tools / agents."""
+        """Per-holder serialiser for DOM operations on THIS session's
+        BrowserContext. Other sessions have their own holders / locks
+        and run concurrently."""
         return self._lock
 
     @asynccontextmanager
     async def acquire(self) -> AsyncIterator["BrowserSession"]:
-        """Yield the live BrowserSession while holding the global lock.
+        """Yield the live BrowserSession while holding this holder's
+        per-session lock.
 
         Raises ``RuntimeError`` if no session is launched. Same shape as the
         module-level :func:`acquire_browser_lock` so callers can switch trivially.
@@ -294,6 +518,17 @@ class BrowserSessionHolder:
                     "browser.launch_browser before reusing the browser session."
                 )
             yield self._session
+
+    # ── Cross-session ownership — REMOVED in multi-session v2 ───────────
+    #
+    # Earlier revisions held a process-wide ``_GLOBAL_BROWSER_OWNERSHIP_LOCK``
+    # and per-holder ``_owns_global_lock`` / ``_owner_loop`` flags to serialise
+    # Chromium's user-data-dir against concurrent sessions. With per-session
+    # user-data-dirs (see :func:`user_browser_profile_dir`) the directories are
+    # disjoint by construction, so the Python-layer mutex was redundant. Two
+    # sessions can now ``launch_browser`` concurrently and each produce an
+    # independent Chromium process. The bridge's ``_force_release_session_locks``
+    # no longer touches the browser holder for the same reason.
 
     # ── Screenshot store (lazy) ──────────────────────────────────────────
 
@@ -349,6 +584,25 @@ class BrowserSessionHolder:
                     component="BrowserTool",
                 )
         else:
+            # Persist cookies via Playwright's storage_state BEFORE context.close
+            # so the CDP session is still up. This is the authoritative
+            # cross-session cookie carry-over — the file-copy below only
+            # handles DOM storage (localStorage / IndexedDB / SessionStorage).
+            try:
+                n = await _persist_context_storage_state(sess.context)
+                if n:
+                    logger.info(
+                        f"browser cookies persisted via storage_state: "
+                        f"{n} cookie(s)",
+                        component="BrowserTool",
+                    )
+            except Exception as exc:
+                logger.warning(
+                    f"storage_state persist: unexpected error "
+                    f"({type(exc).__name__}: {exc}); shared/storage_state.json "
+                    f"not updated",
+                    component="BrowserTool",
+                )
             try:
                 await sess.context.close()
             except Exception as exc:
@@ -356,6 +610,31 @@ class BrowserSessionHolder:
                     f"browser holder close (launch): context.close failed: {exc}",
                     component="BrowserTool",
                 )
+            # Persist this session's live cookies + DOM storage back to the
+            # shared carry-over dir so the next fresh session hydrates from
+            # it and skips re-login. Must run AFTER context.close() so the
+            # SQLite WAL is flushed and Chromium is no longer holding the
+            # file lock; runs BEFORE playwright.stop() only for logical
+            # grouping — the two are independent. Attach mode: skipped
+            # because we do not own the user-data-dir. Best-effort per
+            # subpath; last-writer-wins in the concurrent-session case.
+            if sess.profile_dir:
+                try:
+                    persisted = await asyncio.to_thread(
+                        _persist_session_profile_to_shared, sess.profile_dir
+                    )
+                    if persisted:
+                        logger.info(
+                            f"browser cookies persisted to shared/: "
+                            f"{', '.join(persisted)}",
+                            component="BrowserTool",
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        f"browser cookie persist: unexpected error "
+                        f"({type(exc).__name__}: {exc}); shared/ not updated",
+                        component="BrowserTool",
+                    )
         try:
             await sess.playwright.stop()
         except Exception as exc:
@@ -384,6 +663,9 @@ class BrowserSessionHolder:
                     f"screenshots flush failed: {exc}",
                     component="BrowserTool",
                 )
+        # Per-session v2: no cross-session browser lock to release. The
+        # Chromium subprocess + user-data-dir cleanup above is the entire
+        # teardown story for this holder.
         return 1
 
 
@@ -410,9 +692,10 @@ def _module_holder() -> "BrowserSessionHolder":
 # session model can evolve without breaking callers.
 
 def is_browser_available() -> bool:
-    """Always True now — playwright is an eager hard dep imported at module
-    load. Kept for callers that still query the flag; remove once they stop."""
-    return True
+    """True when Playwright was imported (Windows). False on platforms where
+    the browser tool is not registered (e.g. the Linux HandQ runtime), so
+    callers can short-circuit instead of touching unbound Playwright symbols."""
+    return _PLAYWRIGHT_AVAILABLE
 
 
 @asynccontextmanager
@@ -469,23 +752,17 @@ async def evaluate_fetch(
         )
     target_origin = f"{parsed.scheme}://{parsed.netloc}"
 
-    tab_id = session.first_tab_id()
-    if tab_id is None:
-        page = await session.context.new_page()
-        tab_id = session.mint_tab_id()
-        session.tabs[tab_id] = page
-    else:
-        page = session.tabs[tab_id]
-
-    if same_origin:
-        current_url = page.url or ""
-        cur_parsed = urlparse(current_url)
-        cur_origin = (
-            f"{cur_parsed.scheme}://{cur_parsed.netloc}"
-            if cur_parsed.scheme and cur_parsed.netloc
-            else ""
-        )
-        if cur_origin != target_origin:
+    # Always run the fetch on a dedicated, untracked page. The page is NOT
+    # registered in session.tabs so the agent's "tabs" view (and any
+    # extract/snapshot it does on its own tab) is unaffected by this call.
+    # Previously we reused session.first_tab_id() and goto(target_origin),
+    # which silently hijacked whatever page the agent had been working on
+    # (e.g. weather.com.cn) and pointed it at our target origin
+    # (qualcomm.sharepoint.com). web_search_tool's planned per-source-tab
+    # refactor lives here.
+    page = await session.context.new_page()
+    try:
+        if same_origin:
             try:
                 await page.goto(
                     target_origin,
@@ -499,38 +776,44 @@ async def evaluate_fetch(
                 # eventual fetch status.
                 pass
 
-    js = """
-        async ({url, method, headers, body, timeoutMs}) => {
-            const ctrl = new AbortController();
-            const timer = setTimeout(() => ctrl.abort(), timeoutMs);
-            try {
-                const init = {method, credentials: 'include', signal: ctrl.signal};
-                if (headers && Object.keys(headers).length) init.headers = headers;
-                if (body !== null && body !== undefined) init.body = body;
-                const r = await fetch(url, init);
-                const text = await r.text();
-                const hdrs = {};
-                r.headers.forEach((v, k) => { hdrs[k] = v; });
-                return {status: r.status, statusText: r.statusText,
-                        url: r.url, headers: hdrs, body: text};
-            } catch (err) {
-                return {error: (err && (err.message || String(err))) || 'fetch failed',
-                        name: (err && err.name) || 'Error'};
-            } finally {
-                clearTimeout(timer);
+        js = """
+            async ({url, method, headers, body, timeoutMs}) => {
+                const ctrl = new AbortController();
+                const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+                try {
+                    const init = {method, credentials: 'include', signal: ctrl.signal};
+                    if (headers && Object.keys(headers).length) init.headers = headers;
+                    if (body !== null && body !== undefined) init.body = body;
+                    const r = await fetch(url, init);
+                    const text = await r.text();
+                    const hdrs = {};
+                    r.headers.forEach((v, k) => { hdrs[k] = v; });
+                    return {status: r.status, statusText: r.statusText,
+                            url: r.url, headers: hdrs, body: text};
+                } catch (err) {
+                    return {error: (err && (err.message || String(err))) || 'fetch failed',
+                            name: (err && err.name) || 'Error'};
+                } finally {
+                    clearTimeout(timer);
+                }
             }
-        }
-    """
-    raw = await page.evaluate(
-        js,
-        {
-            "url": url,
-            "method": method.upper(),
-            "headers": dict(headers) if headers else {},
-            "body": body,
-            "timeoutMs": int(timeout_ms),
-        },
-    )
+        """
+        raw = await page.evaluate(
+            js,
+            {
+                "url": url,
+                "method": method.upper(),
+                "headers": dict(headers) if headers else {},
+                "body": body,
+                "timeoutMs": int(timeout_ms),
+            },
+        )
+    finally:
+        try:
+            await page.close()
+        except Exception:
+            pass
+
     if "error" in raw:
         return {
             "status": 0,
@@ -1119,6 +1402,10 @@ class BrowserTool(BaseTool):
         self, params: Dict[str, Any], start: float, **kwargs: Any,
     ) -> ToolResult:
         """Idempotent: returns the existing session if one is alive."""
+        # Per-session v2: this holder owns its own Chromium user-data-dir
+        # (see :func:`user_browser_profile_dir`). No cross-session gate to
+        # acquire — two concurrent sessions launch into disjoint dirs and
+        # run independent Chromium processes.
         existing = self.holder.session
         if existing is not None:
             # Verify the session is still healthy. context.pages will raise
@@ -1147,7 +1434,30 @@ class BrowserTool(BaseTool):
                 )
                 self.holder.set_session(None)
 
-        profile_dir = user_browser_profile_dir()
+        profile_dir = user_browser_profile_dir(self.holder.session_id)
+
+        # Hydrate the fresh per-session profile with shared cookies + DOM
+        # storage. First-launch case (shared/ empty) is a no-op. Wrapped in
+        # to_thread because shutil.copytree can walk hundreds of small files
+        # (Local Storage / IndexedDB) — enough I/O that blocking the event
+        # loop is noticeable on cold cache. Best-effort: hydrate failure is
+        # logged inside the helper and never blocks browser launch.
+        try:
+            copied = await asyncio.to_thread(
+                _hydrate_session_profile_from_shared, profile_dir
+            )
+            if copied:
+                self.logger.info(
+                    f"browser cookies hydrated from shared/: {', '.join(copied)}",
+                    component="BrowserTool",
+                )
+        except Exception as exc:
+            self.logger.warning(
+                f"browser cookie hydrate: unexpected error "
+                f"({type(exc).__name__}: {exc}); launching without shared cookies",
+                component="BrowserTool",
+            )
+
         pw = await async_playwright().start()
 
         # Channel priority: msedge → chrome → chromium. Each failure logs
@@ -1176,6 +1486,27 @@ class BrowserTool(BaseTool):
                     f"browser launched: channel={channel_label} profile={profile_dir}",
                     component="BrowserTool",
                 )
+                # Inject shared cookies via Playwright's CDP-layer API. This
+                # is the ONLY reliable way to carry cookies across sessions —
+                # the file-based hydrate above only handles DOM storage
+                # (localStorage / IndexedDB / SessionStorage) because
+                # Chromium rewrites Local State + Cookies with its own
+                # per-launch encryption key.
+                try:
+                    injected = await _inject_shared_storage_state(context)
+                    if injected:
+                        self.logger.info(
+                            f"browser cookies injected via storage_state: "
+                            f"{injected} cookie(s)",
+                            component="BrowserTool",
+                        )
+                except Exception as exc:
+                    self.logger.warning(
+                        f"storage_state inject: unexpected error "
+                        f"({type(exc).__name__}: {exc}); launching without "
+                        f"shared cookies",
+                        component="BrowserTool",
+                    )
                 break
             except Exception as exc:
                 last_error = exc
@@ -1263,6 +1594,11 @@ class BrowserTool(BaseTool):
         New tabs created via ``action='new_tab'`` are opened in the
         background by default so the user's focus is not stolen.
         """
+        # Per-session v2: no cross-session gate. Attach mode connects to
+        # the user's already-running Chrome via CDP, which is independent
+        # of the per-session user-data-dir model — but we still keep
+        # per-session BrowserSessionHolder lifecycle so close() detaches
+        # cleanly with that flow's destroy.
         # Read attach_enabled from config. Best-effort — when config can't
         # be read we conservatively REFUSE rather than silently allow.
         try:
@@ -1404,7 +1740,11 @@ class BrowserTool(BaseTool):
         # 1. credentials_file
         if creds_file:
             try:
-                path = os.path.expanduser(creds_file)
+                # Anchor a relative creds_file to the per-session workspace
+                # rather than the process cwd (no longer mutated via os.chdir
+                # — see concurrency work). Absolute paths and ``~`` references
+                # are honoured as-is.
+                path = os.path.expanduser(self.resolve_in_workspace(creds_file))
                 if not os.path.isfile(path):
                     return "", f"credentials_file (not found: {path})"
                 with open(path, "r", encoding="utf-8") as fh:
@@ -1702,10 +2042,16 @@ class BrowserTool(BaseTool):
 
         status = response.status if response is not None else None
         page_state = await self._capture_page_state(page)
+        tab_id_for_out = self._tab_id_of(sess, page)
+        # Stamp the last agent-initiated URL on this tab. _action_extract
+        # compares against this to flag silent drift caused by other actions
+        # (web_search internal fetches, auth redirects, JS pushState).
+        if tab_id_for_out:
+            sess.last_navigated_url[tab_id_for_out] = page.url
         out: Dict[str, Any] = {
             "url":         page.url,
             "status":      status,
-            "tab_id":      self._tab_id_of(sess, page),
+            "tab_id":      tab_id_for_out,
             "wait_until":  wait_until,
         }
         if page_state:
@@ -1730,6 +2076,24 @@ class BrowserTool(BaseTool):
         page = self._resolve_tab(sess, kwargs.get("tab_id"))
         if page is None:
             return self._error(params, start, f"Unknown tab_id: {kwargs.get('tab_id')!r}")
+
+        # Tab-drift check: if the agent last navigated this tab to URL X but
+        # something else has moved it (auth bounce, JS pushState, an internal
+        # tool that hijacked the tab) the extracted content is from a
+        # different page than the agent expects. Surface it loudly so the LLM
+        # cannot silently treat unrelated content as the intended target.
+        tab_id_for_drift = self._tab_id_of(sess, page)
+        drift_prefix = ""
+        if tab_id_for_drift:
+            expected = sess.last_navigated_url.get(tab_id_for_drift)
+            actual = page.url or ""
+            if expected and actual and expected != actual:
+                drift_prefix = (
+                    f"⚠ Tab {tab_id_for_drift} drifted: last navigate was "
+                    f"{expected}, but the page is now at {actual}. Another "
+                    f"action may have moved this tab. Verify the URL before "
+                    f"trusting the extracted content.\n\n"
+                )
 
         selector: Optional[str] = kwargs.get("selector")
         mode: str = (kwargs.get("mode") or "text").lower()
@@ -1773,6 +2137,8 @@ class BrowserTool(BaseTool):
 }"""
                     )
                 content = self._truncate(text or "")
+                if drift_prefix:
+                    content = drift_prefix + content
                 output: Dict[str, Any] = {
                     "mode":     "text",
                     "selector": selector,
@@ -1789,6 +2155,8 @@ class BrowserTool(BaseTool):
                 else:
                     html = await page.content()
                 content = self._truncate(html or "")
+                if drift_prefix:
+                    content = drift_prefix + content
                 output = {
                     "mode":     "html",
                     "selector": selector,
@@ -1863,6 +2231,8 @@ class BrowserTool(BaseTool):
                     "truncated": count > len(items),
                     "items":    items,
                 }
+                if drift_prefix:
+                    output["drift_warning"] = drift_prefix.strip()
 
             elif mode == "attr":
                 if not selector:
@@ -1894,6 +2264,8 @@ class BrowserTool(BaseTool):
                         "attributes": attrs,
                         "url":      page.url,
                     }
+                if drift_prefix:
+                    output["drift_warning"] = drift_prefix.strip()
             else:
                 return self._error(
                     params, start,
@@ -3128,16 +3500,20 @@ class BrowserTool(BaseTool):
             )
 
         # ── 2. Build modal payload + block on user answer ───────────────
+        # The Approve button is relabelled to "I've logged in — continue"
+        # at the call site below, so the description no longer needs to
+        # spell out what clicking Approve means. Keep the copy focused on
+        # WHY the modal is up and WHAT the user is expected to do in the
+        # browser window; the buttons speak for themselves.
         description = (
-            "Agent needs you to log in before continuing.\n\n"
-            f"Why: {reason}\n"
+            "HandQ has opened the login page on your screen.\n\n"
+            f"Reason: {reason}\n"
             f"Page: {url_before}\n\n"
-            "A browser window has been opened on your screen at the login page.\n"
-            "  1. Complete the login in that window (HandQ never sees your password).\n"
-            "  2. Return here and click Approve when finished.\n"
-            "  3. (Or click Reject to cancel this task.)\n\n"
-            "Cookies from your login will be stored locally so you do not need "
-            "to log in again for this site in future sessions."
+            "Sign in with your own account in that browser window "
+            "(HandQ never sees your password), then come back here.\n\n"
+            "Your login state is saved to "
+            "%USERPROFILE%\\HandQ\\browser_profile\\shared\\ and reused on the "
+            "next HandQ launch, so you usually won't have to log in again."
         )
 
         im = self.ctx.interaction_manager if self.ctx is not None else None
@@ -3152,7 +3528,15 @@ class BrowserTool(BaseTool):
             )
             confirmation = None
         else:
-            confirmation = await im.request_risk_confirmation(description)
+            # Reframe the generic risk_confirmation modal for the login flow:
+            # a custom title + Approve button label make it unambiguous that
+            # HandQ is NOT asking for permission to log in — it's waiting
+            # for the user to CONFIRM they've completed the login themselves.
+            confirmation = await im.request_risk_confirmation(
+                description,
+                title="Login required",
+                approve_label="I've logged in — continue",
+            )
 
         # ── 3. Move window off-screen regardless of outcome ─────────────
         try:
@@ -3200,9 +3584,10 @@ class BrowserTool(BaseTool):
             "url_changed":     url_before != url_after,
             "cookie_persisted": True,
             "note": (
-                "Cookies from this session are stored under "
-                "%USERPROFILE%\\HandQ\\browser_profile\\ and will be reused "
-                "next time HandQ starts."
+                "Cookies from this session will be persisted to "
+                "%USERPROFILE%\\HandQ\\browser_profile\\shared\\ on close and "
+                "hydrated back into the next HandQ session, so re-login "
+                "should not be needed on the next run."
             ),
         }
         if compiled_pattern is not None:

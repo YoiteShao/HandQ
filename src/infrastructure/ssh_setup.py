@@ -213,6 +213,11 @@ def _build_context_hint(creds_file: str, auth_method: str, login_shell: str = "u
     The full SSH workflow lives in the ssh tool's usage_guide (single source of
     truth). We only inject what changes per host: the creds_file path, how we
     authenticated, and a non-bash advisory when relevant.
+
+    When auth_method is keyring/password we ALSO drop a short paramiko+keyring
+    template so an agent that does NOT have the ssh tool activated (e.g.
+    planner picked single-shot ``ssh host 'cmd'`` via the shell tool) can
+    still reach the remote without rediscovering the credential layout.
     """
     auth_label = {
         "key":      "key",
@@ -223,8 +228,24 @@ def _build_context_hint(creds_file: str, auth_method: str, login_shell: str = "u
     shell_note = f"shell={login_shell}" if login_shell != "unknown" else "shell=?"
     hint = (
         f"[SSH ready] credentials_file={creds_file} | auth={auth_label} | {shell_note}\n"
-        f"Pass credentials_file in every ssh tool call."
+        f"Pass credentials_file in every ssh / remote_handq tool call."
     )
+
+    if auth_method in ("keyring", "password"):
+        # Pull hostname/username/service from the creds file so the agent
+        # does not have to read it. Best-effort: silent on parse failure.
+        host_user_svc = _read_creds_summary(creds_file)
+        if host_user_svc:
+            hostname, username, service = host_user_svc
+            hint += (
+                "\nNo ssh tool? Fallback (works from shell with `python -c` or "
+                "a written .py script):\n"
+                "  import keyring, paramiko\n"
+                f"  pw = keyring.get_password('{service}', '{username}')\n"
+                "  c = paramiko.SSHClient(); c.set_missing_host_key_policy(paramiko.AutoAddPolicy())\n"
+                f"  c.connect('{hostname}', username='{username}', password=pw, timeout=15)\n"
+                "  _, out, _ = c.exec_command('<your command>'); print(out.read().decode())"
+            )
 
     if login_shell not in ("bash", "unknown", "powershell"):
         hint += (
@@ -233,6 +254,27 @@ def _build_context_hint(creds_file: str, auth_method: str, login_shell: str = "u
         )
 
     return hint
+
+
+def _read_creds_summary(creds_file: str) -> Optional[tuple]:
+    """Return ``(hostname, username, keyring_service)`` from a creds YAML.
+
+    Best-effort: returns ``None`` on any failure. Used by ``_build_context_hint``
+    to populate the paramiko-fallback template without forcing the caller to
+    re-read the file.
+    """
+    try:
+        import yaml as _yaml
+        with open(creds_file, "r", encoding="utf-8") as f:
+            data = _yaml.safe_load(f) or {}
+        hostname = (data.get("hostname") or "").strip()
+        username = (data.get("username") or "").strip()
+        service = (data.get("keyring_service") or "").strip()
+        if hostname and username and service:
+            return hostname, username, service
+    except Exception:
+        pass
+    return None
 
 
 def _build_context_hint_brief(creds_file: str) -> str:

@@ -78,8 +78,11 @@ one thing you must never do.
 
 **Response style**:
   • For chat: write the full, direct reply.
-  • For task: write a SHORT transitional acknowledgement (one sentence). \
-The planner will produce the substantive reply describing the actual plan.
+  • For task: write a SHORT acknowledgement (one sentence) that stands on its \
+own — confirm what you're about to do. Do NOT promise a follow-up "plan" \
+message: the planner works silently and the system posts a single completion \
+summary when the work is done. Your ack is the only conversational reply the \
+user sees until then.
 
 **Critical rule — deferred_actions = work for the execution agent, NOT promises in your reply**:
 deferred_actions lists operations the EXECUTION AGENT must perform in the world — touching \
@@ -176,7 +179,23 @@ The question is never "does this work need isolation?" — it is always:
 **When to keep as one item:**
 - Independent parallel-capable work (the agent batches tool calls)
 - Work sharing the same reasoning context that doesn't need intermediate eval
-- Sequential operations with trivially predictable outcomes
+- Sequential operations with trivially predictable outcomes **within the
+  SAME tool family** (e.g. read 5 files, write 5 files, several shell probes)
+
+**Sub-action shape threshold**: an item bundling >4 sub-actions of
+DIFFERENT shapes (e.g. browser launch + multi-tab navigation + 3
+web_search backends + result aggregation) is too dense for a single
+drift checkpoint — split by shape group. Same-shape sub-actions stay
+merged because the agent batches them in one tool-call turn; mixed-shape
+bundles serialise inside the item and turn drift detection into an
+all-or-nothing post-mortem.
+
+  GOOD (split): "Test browser core actions (launch, navigate, extract,
+        tab management)" + "Test web_search across jira / confluence /
+        sharepoint".
+  BAD  (merged): "Test browser AND web_search end-to-end" — 9 sub-actions
+        of mixed shape, hundreds of log lines for one item, drift only
+        detectable after the whole bundle finishes.
 
 **Calibration**: if you cannot write a precise, verifiable expected_outcome
 in one sentence → the item is too broad, split it. If your items have trivially
@@ -268,11 +287,28 @@ Every item must have a risk_assessment string. For safe items, "Low risk —
 read-only" suffices. For risky items, name what could go wrong and the
 fallback.
 
-## Tool Selection
+## Tool Selection (Liberal Advisory)
 
-Declare which on-demand tools the remaining items need via the top-level
-`tools_needed` field. This is session-level: once activated, a tool stays
-available for every subsequent item until session end.
+Declare in `tools_needed` every on-demand tool that ANY remaining item
+plausibly benefits from. This is an **opening hand**, not a contract: the
+agent can claim additional tools mid-item and release tools it no longer
+needs without a planner round-trip. Err toward declaring MORE — over-
+declaration is cheap (the agent ignores tools it does not use), under-
+declaration costs the agent a self-extension turn.
+
+Activation is append-only at the planner level (see shared_checklist).
+The agent's per-turn claim/release adjusts only what the LLM sees;
+underlying resources stay loaded until session end.
+
+**Setting `ssh_target` on an item is independent of tool choice.** It tells
+the agent the work targets a remote host (so the agent can use `shell` with
+`ssh host 'cmd'`); it does NOT by itself require activating any on-demand
+tool. The Remote-work decision below tells you when an on-demand remote
+tool is actually needed. Liberal advisory does NOT mean "activate every
+tool". The tier choice (`shell` vs `ssh` vs `remote_handq`) still follows
+the routing rules — wrong tier picks the wrong intelligence locus, which
+is a real planner bug; redundant declarations of the right-tier tool are
+not.
 
 **Always-available core tools** (every item has these — DO NOT list):
 """
@@ -291,10 +327,18 @@ _PLAN_MODIFY_TOOLS_WINDOWS = """\
 {on_demand_tools_table}\
 | `coding` | Item **writes or modifies source code files** | Primary deliverable is source code |
 
+**Remote-work decision** (read this BEFORE the routing rules — picking wrong here is the most common planner bug):
+
+  - **Single remote command** (one `echo $SHELL`, one `cat /etc/os-release`) → use `shell` with `ssh host 'cmd'`. Do NOT activate any on-demand tool. Still set the item's `ssh_target` so the agent knows the host.
+  - **Remote long batch — known command sequence** (you can write the commands now: deploy script, log collection, build) → activate `ssh`.
+  - **Remote work that needs autonomous planning** (the *remote* side has to discover state, branch, retry — you cannot pre-write the commands) → activate `remote_handq`. The remote HandQ agent runs the loop on its end.
+
+`ssh` and `remote_handq` are NOT interchangeable. Pick `ssh` when the local agent drives; pick `remote_handq` when you want the remote agent to drive.
+
 **Routing rules** (first match wins, top to bottom):
 - Local one-shot work → no on-demand tool needed
 - Remote one-shot → no on-demand tool needed (shell with `ssh host 'cmd'`)
-- Remote long batch → add `"ssh"` to `tools_needed` + set item's `ssh_target`
+- Remote long batch with known commands → add `"ssh"` to `tools_needed` + set item's `ssh_target`
 - Local interactive matching scenario (1-4) → add `"session"` to `tools_needed`
 - Remote interactive → add `"session"` to `tools_needed` + set item's `ssh_target`
 {on_demand_routing_rules}\
@@ -305,6 +349,7 @@ _PLAN_MODIFY_TOOLS_WINDOWS = """\
   ❌ `["session"]` without naming scenario in planner_reasoning
   ❌ `["coding"]` for .md/.json/.yaml config files
   ❌ `["coding"]` for read-only review/grep with no file writes
+  ❌ ssh_target set but no remote tool in `tools_needed` AND the work is more than one command — the agent will have nothing to drive the multi-step remote work with
 {on_demand_antipatterns}\
 """
 
@@ -321,11 +366,19 @@ _PLAN_MODIFY_TOOLS_LINUX = """\
 {on_demand_tools_table}\
 | `coding` | Item **writes or modifies source code files** | Primary deliverable is source code |
 
+**Remote-work decision** (read this BEFORE the routing rules — picking wrong here is the most common planner bug):
+
+  - **Single remote command** (one `echo $SHELL`, one `cat /etc/os-release`) → use `shell` with `ssh host 'cmd'`. Do NOT activate any on-demand tool. Still set the item's `ssh_target` so the agent knows the host.
+  - **Remote long batch — known command sequence** (you can write the commands now: deploy script, log collection, build) → activate `ssh`.
+  - **Remote work that needs autonomous planning** (the *remote* side has to discover state, branch, retry — you cannot pre-write the commands) → activate `remote_handq`. The remote HandQ agent runs the loop on its end.
+
+`ssh` and `remote_handq` are NOT interchangeable. Pick `ssh` when the local agent drives; pick `remote_handq` when you want the remote agent to drive.
+
 **Routing rules** (first match wins, top to bottom):
 - Local one-shot work → no on-demand tool needed
 - Local interactive (REPL, monitoring) → no on-demand tool needed (decompose to shell idioms)
 - Remote one-shot → no on-demand tool needed (shell with `ssh host 'cmd'`)
-- Remote long batch → add `"ssh"` to `tools_needed` + set item's `ssh_target`
+- Remote long batch with known commands → add `"ssh"` to `tools_needed` + set item's `ssh_target`
 {on_demand_routing_rules}\
 - Item writes/modifies source code → ADD `"coding"` to `tools_needed`
 
@@ -333,6 +386,7 @@ _PLAN_MODIFY_TOOLS_LINUX = """\
   ❌ `["ssh"]` for single command — use shell
   ❌ `["coding"]` for .md/.json/.yaml config files
   ❌ `["coding"]` for read-only review with no file writes
+  ❌ ssh_target set but no remote tool in `tools_needed` AND the work is more than one command — the agent will have nothing to drive the multi-step remote work with
 {on_demand_antipatterns}\
 """
 
@@ -407,15 +461,18 @@ will be picked up after current finishes naturally.
 
 ## Output Schema
 
-Emit decision fields FIRST, response_to_user LAST. response_to_user is
-OPTIONAL — leave it `""` when the items speak for themselves. The system
-generates the final task-completion reply automatically; you do NOT need
-to write a "task complete" message.
+You do NOT write directly to the user — your only outputs shape the
+checklist (items, skills, tools, interrupt). The system generates the
+final task-completion reply automatically from the completed items'
+results; you never write a "task complete" message or any other
+user-facing text.
 
-`skills_needed` and `tools_needed` declare what ALL remaining items need.
-The system diffs against already-active state and activates only the delta.
-Re-listing already-active names is safe and expected — just declare what
-the work needs; the system handles first-time activation vs no-op.
+`skills_needed` and `tools_needed` are **liberal advisory** declarations of
+what remaining items plausibly benefit from. The system diffs against
+already-active state and activates only the delta. Re-listing already-active
+names is safe and expected. The agent can claim additional tools mid-item
+and release tools it no longer needs — your declaration is the opening hand,
+not a contract.
 Tool names must come from the on-demand tools table above.
 
 ```json
@@ -426,8 +483,7 @@ Tool names must come from the on-demand tools table above.
     {{"item_id": "...", "instruction": "...", "expected_outcomes": [...], "supplement": "", "planner_reasoning": "", "risk_assessment": "", "ssh_target": ""}}
   ],
   "skills_needed": [],
-  "tools_needed": [],
-  "response_to_user": ""
+  "tools_needed": []
 }}
 ```
 """
@@ -466,7 +522,7 @@ def build_plan_modify_system_prompt(
 
 PLAN_MODIFY_TEMPLATE = """\
 {full_context_block}\
-{epistemic_preamble}{loop_warning}\
+{epistemic_preamble}{loop_warning}{failure_tail_warning}\
 [User Original Message]
 "{user_message}"
 
@@ -507,12 +563,24 @@ Inputs you receive:
 the current focus; earlier turns provide constraints, prior commitments, \
 and what the user has already accepted.
   - Completed Items — for each item: instruction, expected_outcomes, \
-factual_outcome, artifacts, key_findings, success/issues. Each per-item \
-verdict is settled by the agent that ran it; your job is the REQUEST-LEVEL \
-assessment, not re-judging individual items.
+factual_outcome, artifacts, key_findings, success/issues, **iters** (how many \
+LLM turns the agent used inside this item). Each per-item verdict is settled \
+by the agent that ran it; your job is the REQUEST-LEVEL assessment, not \
+re-judging individual items.
   - Acceptance History — items whose item_id begins with "acceptance_" \
 were injected by a prior verification round. Their presence is your \
 signal that this gap has already been addressed once.
+
+## Trust but verify
+
+The agent's `factual_outcome` describes what it INTENDED to report. Tool \
+output is the only ground truth. When a bullet cannot be traced to a \
+specific tool call's evidence — an iteration with a successful tool \
+result whose content matches the claim — treat it as unsubstantiated and \
+prefer EXTEND or VALIDATE over ACCEPT. **Red flag pattern**: `iters=1` \
+with a multi-bullet `factual_outcome` describing rich data the agent \
+could not have observed in a single turn — that is speculation, not \
+work, and demands EXTEND.
 
 ## Pick ONE verdict
 
@@ -533,10 +601,13 @@ close the gap. Provide them in items_to_inject.
 (e.g. code edits without a syntax check; file written but never opened; \
 remote action without status read-back). Provide ONE narrow check item.
 
-  ACCEPT    Either the gap is genuinely unverifiable from local tools, \
-OR the completed list already contains items prefixed with "acceptance_" \
-and the same gap is still open. Surface gap_summary; the system finalises \
-the task with the gap noted to the user.
+  ACCEPT    Either the gap is genuinely unverifiable from ANY available \
+tool (no SSH / browser / email / web_search / desktop / etc. could possibly \
+close it), OR the completed list already contains items prefixed with \
+"acceptance_" and the same gap is still open. **On the first round (no \
+acceptance_* items yet), prefer EXTEND or VALIDATE — do not ACCEPT just \
+because the agent skipped the work.** Surface gap_summary; the system \
+finalises the task with the gap noted to the user.
 
 ## Rules of restraint
 

@@ -19,6 +19,7 @@ import signal
 import sys
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .base_tool import BaseTool, ToolResult
@@ -33,12 +34,12 @@ _DEFAULT_TIMEOUT_SECONDS: int = 120
 _MAX_TIMEOUT_SECONDS: int = 600
 
 # ── Output truncation ─────────────────────────────────────────────────────────
-_TRUNCATION_TOTAL_CHARS: int = 30_000
-_TRUNCATION_HEAD_CHARS: int = 10_000
+_TRUNCATION_TOTAL_CHARS: int = 15_000
+_TRUNCATION_HEAD_CHARS: int = 5_000
 _TRUNCATION_TAIL_CHARS: int = 5_000
 
 # ── Background task output buffer cap ─────────────────────────────────────────
-_BG_BUFFER_MAX_BYTES: int = 30_000
+_BG_BUFFER_MAX_BYTES: int = 15_000
 
 # ── Shell metacharacter injection detection ───────────────────────────────────
 _INJECTION_PATTERN = re.compile(
@@ -341,6 +342,32 @@ class BackgroundTaskRegistry:
 
 # ── ShellTool ─────────────────────────────────────────────────────────────────
 
+def _augment_ssh_command(command: str) -> str:
+    """Auto-add safety flags to bare ``ssh`` commands.
+
+    OpenSSH without ``BatchMode=yes`` will silently wait on stdin for a password
+    when key auth is unavailable; the wrapping shell tool only sees a hung
+    process and ends up paying the full timeout for nothing actionable.
+    Inject ``-o BatchMode=yes -o ConnectTimeout=15`` after the literal ``ssh``
+    token so failures surface as ``Permission denied`` immediately, giving the
+    LLM a real signal to switch credential strategies.
+
+    Only triggers when:
+      - the command's first token (post leading whitespace) is exactly ``ssh``
+        (rejects ``sshfs``, ``ssh-add``, ``ssh-keygen``, etc.)
+      - neither ``BatchMode=`` nor ``ConnectTimeout=`` already appear in the
+        command — explicit user intent always wins
+    """
+    stripped = command.lstrip()
+    if not stripped.startswith("ssh "):
+        return command
+    if "BatchMode=" in stripped or "ConnectTimeout=" in stripped:
+        return command
+    indent_len = len(command) - len(stripped)
+    head = command[:indent_len]
+    return f"{head}ssh -o BatchMode=yes -o ConnectTimeout=15 {stripped[4:]}"
+
+
 class ShellTool(BaseTool):
     """Execute shell commands (cross-platform) with background support.
 
@@ -421,6 +448,8 @@ class ShellTool(BaseTool):
                 tool_name=self.name,
                 tool_parameters={"command": command, "task_id": task_id},
             )
+
+        command = _augment_ssh_command(command)
 
         if run_in_background:
             return await self._execute_background(
@@ -522,7 +551,14 @@ class ShellTool(BaseTool):
 
         _check_injection(command)
 
-        effective_cwd = cwd if (cwd and os.path.isdir(cwd)) else None
+        # No explicit cwd → run in the per-session workspace, not the process
+        # cwd (no longer mutated via os.chdir — see concurrency work). A
+        # relative cwd is resolved against the workspace too, so neither the
+        # isdir check nor the subprocess base depends on the process cwd.
+        resolved_cwd = self.resolve_in_workspace(cwd) if cwd else None
+        effective_cwd = resolved_cwd if (resolved_cwd and os.path.isdir(resolved_cwd)) else (
+            self.ctx.working_directory if (self.ctx and self.ctx.working_directory) else None
+        )
 
         shell_argv = _resolve_shell(shell)
         full_argv = [shell_argv[0], *shell_argv[1:], command]
@@ -620,8 +656,13 @@ class ShellTool(BaseTool):
         try:
             self.validate_params(["command"], {"command": command})
 
-            # Working directory: use explicit cwd or inherit from parent process
-            effective_cwd = cwd
+            # Working directory: explicit cwd, else the per-session workspace
+            # (not the process cwd — no longer mutated via os.chdir). A relative
+            # cwd is resolved against the workspace, so neither the isdir check
+            # nor the subprocess base depends on the process cwd.
+            effective_cwd = (self.resolve_in_workspace(cwd) if cwd else None) or (
+                self.ctx.working_directory if (self.ctx and self.ctx.working_directory) else None
+            )
             if effective_cwd is not None and not os.path.isdir(effective_cwd):
                 return ToolResult(
                     success=False,
@@ -663,7 +704,16 @@ class ShellTool(BaseTool):
 
             _check_injection(command)
 
-            _scope_cwd = effective_cwd if effective_cwd is not None else os.getcwd()
+            # In production every ShellTool sees ``effective_cwd`` set via the
+            # injected SessionContext (``ctx.working_directory``). The fallback
+            # below only fires for ctx-less callers (test fixtures invoking
+            # ShellTool directly without a SessionContext). We pick the user
+            # home rather than ``os.getcwd()`` because the process cwd is
+            # global state shared across every running session — picking it
+            # up here would silently leak whatever directory the bridge was
+            # launched from (or any other module's last ``os.chdir``) into
+            # what should be a session-scoped wide-search heuristic.
+            _scope_cwd = effective_cwd if effective_cwd is not None else str(Path.home())
             _scope_warning = _check_wide_search(command, _scope_cwd)
 
             shell_argv = _resolve_shell(shell)

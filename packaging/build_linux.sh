@@ -155,6 +155,10 @@ NOFOLLOW_COMMON=(
     "--nofollow-import-to=notebook"
     "--nofollow-import-to=nbformat"
     "--nofollow-import-to=nbconvert"
+
+    # Windows-only: import gated by `if _IS_WINDOWS:` in tool_registry.py,
+    # so this module is never reachable at runtime on Linux; skip compilation.
+    "--nofollow-import-to=src.tools.remote_handq_tool"
 )
 
 # ── Common Nuitka include flags ───────────────────────────────────────────────
@@ -162,6 +166,9 @@ NOFOLLOW_COMMON=(
 INCLUDE_COMMON=(
     "--include-package=src"
     "--include-package=yaml"
+    # rich is kept although handq_linux.py has no TUI: --include-package=src
+    # still compiles src/ui/status_tui.py (the only rich consumer), so dropping
+    # rich would break the build for no meaningful size win.
     "--include-package=rich"
     "--include-package=json_repair"
     # QGenie SDK temporarily disabled — uncomment when re-enabling qgenie support
@@ -175,6 +182,11 @@ INCLUDE_COMMON=(
     "--include-package=keyrings"        # keyrings.alt: file-based backend for headless Linux envs
     "--include-package=cffi"            # required by cryptography (paramiko dep); must be explicit
     "--include-package=cryptography"    # required by paramiko for SSH crypto
+    "--include-package=pdfplumber"      # ReadTool: top-level import — must bundle or daemon start fails
+    "--include-package=pdfminer"        # pdfplumber core dep (pdfminer.six → pdfminer package)
+    "--include-package=PIL"             # pdfplumber dep (Pillow)
+    "--include-package=pypdfium2"       # pdfplumber dep (required >= 0.10.0); remove if not installed
+    "--include-package=chardet"         # pdfminer.six encoding dep
     # Note: ./handq_config.yaml is NOT embedded — it lives at the dist root
     # so users can edit it directly before running handq_setup.sh.
 )
@@ -285,7 +297,7 @@ build_linux() {
         \
         --lto=auto \
         \
-        handq.py
+        handq_linux.py
 
     BUILD_RESULT=$?
     BUILD_END=$(date +%s)
@@ -299,9 +311,9 @@ build_linux() {
         return 1
     fi
 
-    # Standalone mode: Nuitka produces handq.dist/ directory
-    STANDALONE_SRC="${BUILD_CACHE_DIR}/handq.dist"
-    BIN_PATH="${DIST_DIR}/handq.dist/handq.bin"
+    # Standalone mode: Nuitka produces handq_linux.dist/ directory
+    STANDALONE_SRC="${BUILD_CACHE_DIR}/handq_linux.dist"
+    BIN_PATH="${DIST_DIR}/handq_linux.dist/handq_linux.bin"
 
     if [ ! -d "$STANDALONE_SRC" ]; then
         print_error "Expected standalone dist dir not found: $STANDALONE_SRC"
@@ -310,13 +322,15 @@ build_linux() {
     fi
 
     # Copy the entire standalone dist directory into the clean dist dir
-    cp -r "$STANDALONE_SRC" "${DIST_DIR}/handq.dist"
+    cp -r "$STANDALONE_SRC" "${DIST_DIR}/handq_linux.dist"
 
     # ── Assemble the distributable package ───────────────────────────────────
     # dist/$OUTPUT_DIR/ structure (user-visible):
-    #   handq_config.yaml  ← users edit this first
-    #   handq_setup.sh     ← users run this to install
-    #   handq.dist/        ← binary + all C extensions/deps (don't edit)
+    #   handq_config.yaml    ← users edit this first (the bare binary auto-loads
+    #                          it from here; handq_setup.sh also passes it as
+    #                          --config to the installed handq_linux command)
+    #   handq_setup.sh       ← users run this to install the handq_linux command
+    #   handq_linux.dist/    ← binary + all C extensions/deps (don't edit)
     print_info "Assembling distributable package in ${DIST_DIR}/..."
     cp "${PROJECT_ROOT}/handq_setup.sh" "${DIST_DIR}/handq_setup.sh"
     chmod +x "${DIST_DIR}/handq_setup.sh"
@@ -325,13 +339,13 @@ build_linux() {
 
     print_info "Package contents:"
     ls -lh "${DIST_DIR}/handq_config.yaml" "${DIST_DIR}/handq_setup.sh"
-    echo "  handq.dist/  ($(du -sh "${DIST_DIR}/handq.dist" | cut -f1) standalone binary + deps)"
+    echo "  handq_linux.dist/  ($(du -sh "${DIST_DIR}/handq_linux.dist" | cut -f1) standalone binary + deps)"
 
     print_success "Linux build completed successfully!"
     print_info "============================================================================"
     print_info "Dist package : ${DIST_DIR}/"
-    print_info "  handq.dist/      — standalone binary + all dependencies"
-    print_info "  handq_setup.sh   — setup/install script"
+    print_info "  handq_linux.dist/  — standalone binary + all dependencies"
+    print_info "  handq_setup.sh     — setup/install script"
     print_info "  handq_config.yaml"
     print_info ""
     print_info "Build cache  : ${BUILD_CACHE_DIR}/  (intermediate files, not for distribution)"

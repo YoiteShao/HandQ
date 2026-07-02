@@ -4,6 +4,7 @@ Base Tool - Abstract base class for all tools.
 import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, Optional
 from datetime import datetime
 
@@ -283,3 +284,19 @@ class BaseTool(ABC):
     def get_description(self) -> str:
         """Return the tool description string."""
         return self.__doc__ or f"{self.name} tool"
+
+    def resolve_in_workspace(self, path: str) -> str:
+        """Resolve a possibly-relative *path* against the per-session workspace.
+
+        Absolute paths are returned unchanged. Relative paths are joined to
+        ``ctx.working_directory`` so resolution is independent of the process
+        cwd — required for session concurrency (process cwd is a shared global
+        and is no longer mutated via os.chdir). Falls back to legacy
+        cwd-relative behavior only when there is no ctx / no working_directory
+        (test fixtures).
+        """
+        p = Path(path)
+        if p.is_absolute():
+            return str(p)
+        base = self.ctx.working_directory if (self.ctx and self.ctx.working_directory) else None
+        return str(Path(base) / p) if base else str(p)

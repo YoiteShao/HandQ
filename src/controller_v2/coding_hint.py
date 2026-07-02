@@ -6,6 +6,15 @@ Mechanical contracts (edit exact-match, read-before-write, dangerous-command
 refusal) live in the relevant tool descriptions and are NOT duplicated here.
 """
 
+# Names the planner may declare in tools_needed that are HINT-ONLY providers,
+# i.e. they have no matching registered tool in ToolRegistry — they only
+# inject text into the per-item host-context block. PersistentAgent imports
+# this set to suppress the "unresolved tool" warning for these names; the
+# capability really IS active via the provider, just not as a callable tool.
+# Lives in this dependency-free module to avoid circular imports
+# (infrastructure/coding_setup.py imports this module).
+HINT_ONLY_PROVIDER_NAMES = frozenset({"coding"})
+
 CODING_HINT = """\
 [Coding Mode]
 This step modifies, creates, or reasons about source code.  The standard

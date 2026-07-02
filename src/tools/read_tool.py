@@ -17,7 +17,7 @@ from .file_state import FileState
 
 
 # Hard file-size limit for the 100000-char large-file truncation path
-_MAX_FILE_CHARS = 100_000
+_MAX_FILE_CHARS = 50_000
 _TRUNCATE_LINES = 200
 _MAX_PDF_PAGES_PER_REQUEST = 20
 
@@ -31,7 +31,7 @@ _DEFAULT_LIMIT = 2000
 # is included in full; every subsequent path is returned as a `file_skipped`
 # stub (path + size only, no I/O). The agent can re-read interesting paths
 # individually for full content.
-_MAX_MULTI_TOTAL_CHARS = 60_000
+_MAX_MULTI_TOTAL_CHARS = 40_000
 
 # Known binary file extensions — checked before reading
 _BINARY_EXTENSIONS = frozenset([
@@ -82,6 +82,12 @@ def _read_bytes_sample(path_obj: Path, n: int = 512) -> bytes:
 
 def _make_skipped_stub(path_str: str) -> dict:
     """Return a `file_skipped` stub for the multi-path aggregate-cap path.
+
+    *path_str* must already be workspace-resolved (absolute): this helper has
+    no ``ctx`` of its own, so ``.exists()``/``.stat()``/``.absolute()`` below
+    would otherwise resolve against the process cwd — wrong now that the bridge
+    no longer os.chdir's into the workspace. The caller passes
+    ``resolve_in_workspace(p)``.
 
     No content is read — just stat() for size if reachable. Used to keep the
     aggregate response bounded while still telling the agent which paths were
@@ -218,6 +224,10 @@ class ReadTool(BaseTool):
           2. Legacy start_line/end_line aliases   — kept for backward-compat
           3. Default                              — offset=1, limit=_DEFAULT_LIMIT
         """
+        # Resolve relative paths against the per-session workspace (not process
+        # cwd) so the FileState read record is keyed identically to the absolute
+        # path a later write/edit will check against.
+        path = self.resolve_in_workspace(path)
         path_obj = Path(path)
 
         if not path_obj.exists():
@@ -533,7 +543,7 @@ class ReadTool(BaseTool):
                     results.append({
                         "path": p,
                         "success": True,
-                        "data": _make_skipped_stub(p),
+                        "data": _make_skipped_stub(self.resolve_in_workspace(p)),
                     })
                     continue
 

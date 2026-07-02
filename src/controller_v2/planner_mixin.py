@@ -4,7 +4,9 @@ PlannerMixin — Planning intelligence, quality controls, and acceptance synthes
 This mixin provides planning capabilities to the Orchestrator class:
   - Loop detection: repeated failed goals → warning injection
   - Epistemic inventory: ASSUMED claims → observation obligation warning
-  - Structural guards: prevent silent completion on the back of a failed item
+  - Failed-tail check: about to end on a failed item → advisory warning
+    injected into the planner prompt (supervisor, not enforcer — the planner
+    keeps authority; the bounded acceptance gate is the real backstop)
   - Acceptance synthesis: goal-level 5-verdict tiered judgment after a
     task-complete candidate state. Verifier self-bounds via the ACCEPT
     verdict; no host-side round counter.
@@ -17,7 +19,6 @@ Usage:
           ...
 """
 import re
-import uuid as _uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, cast
 
@@ -42,10 +43,15 @@ _ALLOWED_VERDICTS = ("PASS", "TRIVIAL", "EXTEND", "VALIDATE", "ACCEPT")
 class AcceptanceVerdict:
     """Structured result of PlannerMixin.synthesize_acceptance().
 
-    Goal-level tiered verdict. The verifier self-bounds via ACCEPT — there
-    is no host-side round counter; the prompt instructs the verifier to
-    return ACCEPT once `acceptance_*` items are visible in the completed
-    list and the gap remains.
+    Goal-level tiered verdict. The verifier is *asked* to self-bound via
+    ACCEPT once `acceptance_*` items are visible in the completed list, but
+    that is advisory only. The enforced termination axis is **information
+    gain per round**, not a round count: `_handle_task_complete_candidate`
+    converts EXTEND/VALIDATE into a terminal ACCEPT only when a round adds no
+    new information (mechanical delta == 0) AND the cheap auditor confirms the
+    candidate is semantically spinning. `_ACCEPTANCE_SEATBELT_ROUNDS` is a
+    high defense-in-depth ceiling, never the deciding mechanism in normal
+    operation.
 
     Fields:
       verdict          — one of PASS | TRIVIAL | EXTEND | VALIDATE | ACCEPT.
@@ -262,75 +268,49 @@ class PlannerMixin:
         )
         return "\n".join(lines) + "\n"
 
-    # ── Structural guards ────────────────────────────────────────────────────
+    # ── Structural supervisor (advisory only) ─────────────────────────────────
 
-    def _apply_structural_guards(self, parsed: dict) -> dict:
-        """Apply structural guards to the unified planner output.
+    def _build_failed_tail_warning(self, results: List[ItemResult]) -> str:
+        """Advisory warning when the task is about to end on a failed item.
 
-        New-schema guards (operate on `post_current_items`):
+        Supervisor, not enforcer: this returns a prompt-injection string (like
+        `_detect_loops`) that flags "your most recent item failed — decide
+        deliberately before ending" and hands the decision back to the planner.
+        It does NOT rewrite the planner's `post_current_items`; the planner (and,
+        when it chooses to end, the bounded acceptance gate in
+        `_handle_task_complete_candidate`) hold final authority.
 
-        Guard 1: When the planner emits an empty `post_current_items` (i.e.
-        task is ending) but the most recent completed item failed, the planner
-        is prematurely declaring victory on a broken state. Replace the empty
-        list with a corrective verification item.
-
-        Mutates and returns the same dict.
+        Returns "" when there is nothing to flag:
+          - no completed results,
+          - the last completed item succeeded cleanly, or
+          - the last failure was interrupt-driven (the planner already
+            acknowledged a user/planner stop — don't nag about it).
         """
-        items = parsed.get("post_current_items")
-        if not isinstance(items, list):
-            items = []
+        if not results:
+            return ""
 
-        # Guard 1 applies only when planner is winding down (empty list).
-        if items:
-            return parsed
-
-        try:
-            completed = self._checklist.get_completed_results()
-        except Exception:
-            return parsed
-
-        if not completed:
-            return parsed
-
-        last = completed[-1]
-        # If last item succeeded cleanly, ending is legitimate.
+        last = results[-1]
         if last.success and not last.issues:
-            return parsed
-        # Don't second-guess interrupt-driven exits — agent itself recorded
-        # the interrupt and the planner is acknowledging it.
+            return ""
+        # Don't second-guess interrupt-driven exits — the agent recorded the
+        # interrupt and the planner is acknowledging it.
         if any(INTERRUPTED_BY_PLANNER in (i or "") for i in (last.issues or [])):
-            return parsed
+            return ""
 
-        logger = getattr(self, 'logger', None)
-        if logger:
-            logger.warning(
-                f"Structural guard: empty post_current_items but last item "
-                f"{last.item_id!r} failed (issues={last.issues}). Injecting "
-                f"corrective verification item.",
-                component="Orchestrator",
-            )
-
-        corrective = {
-            "item_id": str(_uuid.uuid4())[:8],
-            "instruction": (
-                "The previous item failed but the planner attempted to end "
-                "the task. VERIFICATION OBLIGATION: re-examine the failure, "
-                "re-attempt the work or document the genuine blocker, and "
-                "report whether the original goal can still be satisfied."
-            ),
-            "expected_outcomes": [
-                "Failure root cause identified",
-                "Either the work is redone successfully, or the blocker is "
-                "explicitly documented",
-            ],
-            "planner_reasoning": (
-                f"Structural guard: previous item ({last.item_id}) failed; "
-                "ending the task on a failure would silently drop the user's "
-                "request."
-            ),
-        }
-        parsed["post_current_items"] = [corrective]
-        return parsed
+        issues = "; ".join(i for i in (last.issues or []) if i) or "(no detail)"
+        return (
+            "⚠️ FAILED-TAIL CHECK — your most recently completed item "
+            f"({last.item_id!r}) failed:\n"
+            f"  • {issues[:300]}\n"
+            "  → Before ending the task, decide DELIBERATELY:\n"
+            "    - If this is a genuine terminal blocker (missing credential, "
+            "user declined, tool unavailable, user asked to stop), you MAY end "
+            "now — record the blocker explicitly in the completion summary.\n"
+            "    - Otherwise, add corrective work using a DIFFERENT approach "
+            "(different tool, method, or decomposition).\n"
+            "  Do NOT silently drop the user's request, but do NOT loop on an "
+            "unrecoverable blocker either.\n"
+        )
 
     # ── Summary builders ─────────────────────────────────────────────────────
     #
@@ -345,6 +325,15 @@ class PlannerMixin:
     # ── Acceptance synthesis ──────────────────────────────────────────────────
 
     _ACCEPTANCE_PREFIX = "acceptance_"
+    # Seatbelt (defense-in-depth only). Termination is normally decided by
+    # information gain per round — see _handle_task_complete_candidate: a round
+    # that adds nothing new (mechanical delta == 0) and is confirmed spinning by
+    # the cheap auditor terminates immediately, while rounds that keep surfacing
+    # genuinely new info are allowed to continue. This ceiling exists ONLY to
+    # bound pathological cases where the novelty signal is defeated (e.g.
+    # timestamped artifact paths that always read as "new"). Hitting it is
+    # logged at WARNING; it must never be the deciding mechanism in normal runs.
+    _ACCEPTANCE_SEATBELT_ROUNDS = 6
 
     async def synthesize_acceptance(
         self,
@@ -355,8 +344,11 @@ class PlannerMixin:
         """Goal-level 5-verdict tiered judgment.
 
         Single LLM call. Verifier sees the FULL conversation (not just the
-        latest user message) and the completed items, and self-bounds via
-        the ACCEPT verdict — no host-side round counter.
+        latest user message) and the completed items, and is asked to
+        self-bound via the ACCEPT verdict. That self-bounding is advisory; the
+        hard stop is information-gain based — `_handle_task_complete_candidate`
+        terminates a round that adds no new info and is confirmed spinning,
+        backed by the `_ACCEPTANCE_SEATBELT_ROUNDS` defense-in-depth ceiling.
 
         Failure path: returns ACCEPT with `fallback=True` so the dispatcher
         finalises the task with a "synthesis failed" gap rather than looping.
@@ -489,7 +481,7 @@ class PlannerMixin:
             issues = '; '.join(r.issues) if r.issues else ''
 
             block = [
-                f"{i}. [{tag}] item_id={r.item_id}{extra}",
+                f"{i}. [{tag}] item_id={r.item_id}{extra} (iters={r.iterations})",
                 f"   Instruction: {instruction}",
                 f"   Expected:    {expected}",
                 f"   Outcome:     {outcome}",
