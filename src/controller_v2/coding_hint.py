@@ -122,4 +122,21 @@ discipline.
    • If you couldn't verify (no test exists, dev server unreachable,
      compiler unavailable), say so explicitly.  Silence implies
      success, and silence is a lie when nothing was checked.
+
+7. Source code parsing (when writing code that READS/PARSES other code)
+   Python (and most languages) routinely break single logical statements
+   across multiple lines — imports, function calls, argument lists,
+   decorators, dict literals.  A per-line regex covers < 50% of real
+   code patterns.
+
+   • **Default to `ast` module** for Python source analysis.  Walking the
+     AST handles multi-line syntax, nested expressions, and f-strings
+     correctly with zero regex.
+   • If regex is unavoidable (e.g. non-Python, or need line numbers):
+     read the file as a single string, NOT line-by-line.  Match across
+     newlines (re.DOTALL) or read ahead to the closing bracket.
+   • **Self-check**: after extraction, compare your result count against
+     a simple `grep -c` on a distinctive substring of the pattern you're
+     looking for.  A significant mismatch (>20%) means your parser is
+     missing a common case.
 """

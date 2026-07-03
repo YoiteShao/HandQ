@@ -27,9 +27,61 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, List, Optional, Tuple, Union
 
+import numpy as np
 from rapidocr_onnxruntime import RapidOCR  # type: ignore[import-not-found]
+
+# ── Dark-background preprocessing ────────────────────────────────────────────
+# PP-OCR's text detection model was trained primarily on natural scenes and
+# documents with dark-on-light text. White/green-on-black (terminals, CMD,
+# PowerShell) hits a known blind spot. We detect such images and invert them
+# before recognition so the detector sees the expected polarity.
+
+_DARK_BG_MEAN_THRESHOLD = 90  # per-channel mean below this → dark background
+_DARK_BG_SAMPLE_BORDER = 20   # pixels from each edge to sample for bg check
+
+
+def _is_dark_background(img: np.ndarray) -> bool:
+    """Heuristic: sample border strips and check if the image is predominantly dark."""
+    h, w = img.shape[:2]
+    if h < _DARK_BG_SAMPLE_BORDER * 3 or w < _DARK_BG_SAMPLE_BORDER * 3:
+        return float(img.mean()) < _DARK_BG_MEAN_THRESHOLD
+    b = _DARK_BG_SAMPLE_BORDER
+    top = img[:b, :, ...]
+    bottom = img[-b:, :, ...]
+    left = img[:, :b, ...]
+    right = img[:, -b:, ...]
+    border_mean = np.mean([top.mean(), bottom.mean(), left.mean(), right.mean()])
+    return float(border_mean) < _DARK_BG_MEAN_THRESHOLD
+
+
+def _preprocess_for_ocr(img: np.ndarray) -> np.ndarray:
+    """Invert dark-background images to improve PP-OCR detection."""
+    if _is_dark_background(img):
+        return 255 - img
+    return img
+
+
+def _load_image_as_ndarray(image: Any) -> Optional[np.ndarray]:
+    """Convert supported image inputs to numpy ndarray (BGR/RGB uint8).
+
+    Returns None if the input is not a type we can preprocess (falls through
+    to RapidOCR's own loader).
+    """
+    if isinstance(image, np.ndarray):
+        return image
+    if isinstance(image, bytes):
+        arr = np.frombuffer(image, dtype=np.uint8)
+        import cv2
+        decoded = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        return decoded
+    if isinstance(image, (str, Path)):
+        import cv2
+        decoded = cv2.imread(str(image), cv2.IMREAD_COLOR)
+        return decoded
+    return None
 
 from ..logger import get_logger
 
@@ -129,16 +181,24 @@ class LocalOCR:
           * ``numpy.ndarray`` — pre-decoded RGB array (H, W, 3 uint8).
             Used by desktop_tool / activity_monitor when the frame is
             already in memory as a numpy array.
+
+        Preprocessing: dark-background images (terminals, CMD) are
+        automatically inverted before detection to compensate for PP-OCR's
+        dark-on-light training bias.
         """
         err = self._ensure_engine()
         if err is not None:
             return OCRResult("", error=err)
         t0 = time.time()
         try:
+            ocr_input = image
+            arr = _load_image_as_ndarray(image)
+            if arr is not None:
+                ocr_input = _preprocess_for_ocr(arr)
             # RapidOCR returns (results, elapse_seconds) where each
             # result is [polygon_points, text, score]. Older versions
             # used a different ordering; we defensively unpack.
-            result, _elapse = self._engine(image)
+            result, _elapse = self._engine(ocr_input)
         except Exception as exc:
             return OCRResult("", error=f"recognize failed: {exc}",
                              elapsed_ms=int((time.time() - t0) * 1000))

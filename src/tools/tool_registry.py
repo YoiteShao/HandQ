@@ -22,6 +22,7 @@ from .web_search_tool import WebSearchTool
 from .email_tool import EmailTool
 from .teams_tool import TeamsTool
 from .ask_human_tool import AskHumanTool
+from .wait_interval_tool import WaitIntervalTool
 
 if TYPE_CHECKING:
     from ..controller_v2.session_context import SessionContext
@@ -92,6 +93,7 @@ class ToolRegistry:
     EMAIL = "email"
     TEAMS = "teams"
     ASK_HUMAN = "ask_human"
+    WAIT_INTERVAL = "wait_interval"
 
     _tools: Dict[str, ToolMetadata] = {}
     _initialized = False
@@ -1128,8 +1130,9 @@ ACTIONS (parameter details in schema):
   exec    send command, wait for completion (delimiter auto-injected for
           shells; prompt_pattern matched for REPLs)
   write   send raw stdin without waiting (use for y/n prompts, ^C, password)
-  read    drain buffered output (timeout=N waits up to N seconds for new data)
-  list    list active sessions
+  read    drain buffered output (timeout=N waits up to N seconds for new data);
+          returns idle_seconds = time since last output (use for hang detection)
+  list    list active sessions (includes idle_seconds per session)
   close   kill the subprocess tree
 
 NOTES
@@ -1138,12 +1141,18 @@ NOTES
     Credentials must be pre-established by ssh_setup (key auth or keyring) —
     no password injection happens here.
   - For streaming processes (logcat, tail -f), use write + read instead of exec.
+  - HANG DETECTION: read and list return idle_seconds (time since last output).
+    For monitoring: open the test command → loop (wait_interval + read) →
+    if idle_seconds > threshold and status=alive → suspected hang.
+    This is the PRIMARY liveness signal — faster and more reliable than screenshots.
 
 EXAMPLES
   GOOD scenario (1): open('adb shell') → exec('cd /data') → exec('ls') → close
   GOOD scenario (2): open('adb logcat') → read(timeout=5) → write('q\\n')
   GOOD scenario (3): open('picocom -b 115200 /dev/ttyUSB0', prompt_pattern='> $')
   GOOD scenario (4): user said "watch it live" → open('ssh -tt user@host')
+  GOOD monitoring:   open('adb shell run_test.sh') → wait_interval(60) → read →
+        check idle_seconds → repeat until status=dead or idle_seconds > 300
   BAD:  open('adb shell') → exec('ls /data') → close
         ↑ single command, no state reuse → shell with: adb shell ls /data
   BAD:  open('ssh host') → exec('long_script.sh') → block waiting
@@ -1929,6 +1938,60 @@ EXAMPLES
                 tool_class=AskHumanTool,
                 on_demand=True,
             )
+
+        # Register WAIT_INTERVAL tool — cross-platform, always available.
+        # Lightweight async sleep for monitoring loops. The agent uses this
+        # between observation cycles so the IterationAdvisor knows the pause
+        # is intentional (not spinning).
+        cls._tools[cls.WAIT_INTERVAL] = ToolMetadata(
+            name=cls.WAIT_INTERVAL,
+            description=(
+                "Sleep for a specified duration between observation cycles in a "
+                "monitoring task. Zero resource consumption; interruptible by user "
+                "messages. Use this in any loop where you periodically check status "
+                "and need to wait before the next check."
+            ),
+            usage_guide="""\
+When to Use:
+  - Monitoring a long-running process (SSH job, ADB install, browser download)
+    and you need to wait between status checks
+  - Any task where you observe → judge → wait → repeat
+  - When you've confirmed the current state is acceptable and want to check
+    again after a delay
+
+When NOT to Use:
+  - When you are actively working toward a goal (writing code, debugging, etc.)
+  - As a substitute for SSH wait_done (use wait_done for "block until process
+    exits" — it's more efficient for that specific case)
+  - When the wait would exceed the task's natural completion time (if you expect
+    the process to finish in 30s, don't wait 300s)
+
+Monitoring Pattern:
+  1. Observe: call your observation tools (ssh.job_status, desktop.screenshot, etc.)
+  2. Judge: evaluate whether the state is normal, complete, or anomalous
+  3. If anomalous: take action immediately (email, remediate)
+  4. If complete: finish the item
+  5. If normal: call wait_interval(seconds=N), then go to step 1
+
+Choosing the interval:
+  - Fast-changing state (download, install): 30-60s
+  - Slow process (build, train, deploy): 300-600s
+  - Very long job (hours): 600-1800s""",
+            parameter_schema={
+                "type": "object",
+                "properties": {
+                    "seconds": {
+                        "type": "integer",
+                        "description": (
+                            "Duration to wait in seconds (1-7200, default 300). "
+                            "Interruptible by user messages."
+                        ),
+                    },
+                },
+                "required": [],
+            },
+            tool_class=WaitIntervalTool,
+        )
 
         cls._initialized = True
 

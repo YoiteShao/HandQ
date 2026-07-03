@@ -324,6 +324,7 @@ class IterationAdvisor:
         # a goal-keyword hit. _noprogress_streak counts consecutive turns past
         # the small threshold (consumed by the Tier 1 watcher's hysteresis gate).
         self._goal_keywords: Set[str] = set()
+        self._expected_outcomes: List[str] = []
         self._turns_since_artifact: int = 0
         self._turns_since_goal_signal: int = 0
         self._noprogress_cooldown: int = 0
@@ -337,6 +338,7 @@ class IterationAdvisor:
         self._iteration_tool_counts.clear()
         self._parallelism_cooldown = 0
         self._ltm_refresh_cooldown = 0
+        self._expected_outcomes = list(expected_outcomes) if expected_outcomes else []
         self._goal_keywords = self._extract_keywords(expected_outcomes or [])
         self._turns_since_artifact = 0
         self._turns_since_goal_signal = 0
@@ -344,7 +346,16 @@ class IterationAdvisor:
         self._noprogress_streak = 0
 
     def record_tool_result(self, tr: ToolResult) -> None:
-        """Record outcome of a tool execution."""
+        """Record outcome of a tool execution.
+
+        wait_interval is infrastructure (intentional yield between observation
+        cycles) — it is excluded from success_history so it does not break
+        consecutive-failure tracking, and from failed_approaches so repeated
+        waits are never flagged as retried failures.
+        """
+        if tr.tool_name == "wait_interval":
+            return
+
         self._success_history.append(tr.success)
 
         if not tr.success:
@@ -369,7 +380,8 @@ class IterationAdvisor:
             self._ltm_refresh_cooldown -= 1
 
     def record_progress_signal(
-        self, *, produced_new_artifact: bool, goal_signal_hit: bool
+        self, *, produced_new_artifact: bool, goal_signal_hit: bool,
+        has_wait_interval: bool = False,
     ) -> None:
         """Record per-turn progress signals (call once per turn).
 
@@ -379,9 +391,21 @@ class IterationAdvisor:
         succeeds but produces no new artifact and surfaces no goal keyword.
         _noprogress_streak counts consecutive turns past the small threshold;
         it is read by the Tier 1 watcher's hysteresis gate.
+
+        When has_wait_interval=True, the turn contained an intentional yield
+        (wait_interval tool). This is the agent's explicit "I confirmed the
+        state is normal and will check again later" signal — it resets the
+        no-progress counters because the agent IS progressing through its
+        monitoring duty, just not producing artifacts.
         """
         if self._noprogress_cooldown > 0:
             self._noprogress_cooldown -= 1
+
+        if has_wait_interval:
+            self._turns_since_artifact = 0
+            self._turns_since_goal_signal = 0
+            self._noprogress_streak = 0
+            return
 
         self._turns_since_artifact = (
             0 if produced_new_artifact else self._turns_since_artifact + 1
@@ -461,6 +485,15 @@ class IterationAdvisor:
                 and self._turns_since_artifact >= _NOPROGRESS_ARTIFACT_THRESHOLD
                 and self._turns_since_goal_signal >= _NOPROGRESS_GOAL_THRESHOLD
                 and self._get_success_rate() >= _NOPROGRESS_MIN_SUCCESS_RATE):
+            goal_anchor = ""
+            if self._expected_outcomes:
+                goals = "; ".join(self._expected_outcomes[:3])
+                goal_anchor = (
+                    f"\n\nGOAL RE-ANCHOR — your expected outcomes are: [{goals}]. "
+                    f"Is your current line of work the most DIRECT path to these "
+                    f"outcomes? If not, change approach now rather than continuing "
+                    f"a tangent."
+                )
             parts.append(
                 f"PROGRESS CHECK — the last {self._turns_since_artifact} turns "
                 f"completed without producing a new artifact, and the last "
@@ -470,7 +503,7 @@ class IterationAdvisor:
                 f"outcomes and ask: is the current line of work actually moving "
                 f"toward them, or should the approach change? If the outcomes are "
                 f"already met, complete the item; if truly blocked, use the "
-                f"\"error\" field."
+                f"\"error\" field.{goal_anchor}"
             )
             self._noprogress_cooldown = _NOPROGRESS_COOLDOWN
 
@@ -570,6 +603,16 @@ class IterationAdvisor:
             return None
 
         rate = self._get_success_rate()
+        goal_anchor = ""
+        if self._expected_outcomes:
+            goals = "; ".join(self._expected_outcomes[:3])
+            goal_anchor = (
+                f"\n\nGOAL RE-ANCHOR — your expected outcomes are: [{goals}]. "
+                f"Evaluate whether your current approach is the most direct path "
+                f"to these outcomes, or if you have drifted into solving a "
+                f"different problem."
+            )
+
         if consecutive >= _SEVERE_STAGNATION:
             return (
                 f"Significant Challenge Detected: {consecutive} consecutive "
@@ -582,6 +625,7 @@ class IterationAdvisor:
                 f"Options:\n"
                 f"  - Continue with a radically different strategy\n"
                 f"  - Use the \"error\" field if the instruction is truly unachievable"
+                f"{goal_anchor}"
             )
         return (
             f"Progress Note: Recent operations show {consecutive} consecutive "
@@ -593,6 +637,7 @@ class IterationAdvisor:
             f"  - Think creatively about solving the problem differently\n\n"
             f"The \"error\" field is available if you determine the instruction is "
             f"fundamentally unachievable."
+            f"{goal_anchor}"
         )
 
 

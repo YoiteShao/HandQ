@@ -202,6 +202,36 @@ in one sentence → the item is too broad, split it. If your items have triviall
 predictable outcomes (e.g. "file read successfully") → you're over-splitting,
 merge them.
 
+## Monitoring & Long-Running Observation Items
+
+When a task requires observing a process over an extended period (stress tests,
+builds, deployments, data pipelines), structure the plan as:
+
+  Setup item → Start item → **Monitor item** → Record item
+
+The monitor item is special — its instruction IS the agent's decision tree.
+Include in the instruction:
+  - Observation commands (what to run each cycle)
+  - Success condition (what "process finished" looks like)
+  - Error signals (output patterns that mean terminate + escalate)
+  - Hang criteria (e.g. "log size unchanged for 3 consecutive checks")
+  - Per-branch actions (diagnose command for hang, notify for error, collect for success)
+  - Check interval hint (e.g. "check every 60s")
+
+Do NOT split the observation phase into multiple items — the agent maintains
+monitoring state across iterations within a single item using `wait_interval`.
+
+**Expected outcomes for monitor items are DISJUNCTIVE** — the monitor's job is
+to reach a resolution, not guarantee a specific test result:
+  Good: "Process completed (exit 0) with logs collected, OR anomaly detected
+         and handled per decision tree (diagnostics captured, notification sent)"
+  Bad:  "Process completes successfully" ← forces item failure when the TEST
+         fails, even though monitoring worked correctly
+
+**Do not encode the decision tree in schema fields** — the instruction text
+carries everything. The agent reads it and executes mechanically using
+`session` (for liveness via idle_seconds) + `wait_interval` (for pacing).
+
 ## Drift Monitoring & Self-Correction (Core Competency)
 
 After each item completes, you receive its factual_outcome and key_findings.
@@ -271,10 +301,55 @@ Good: "Fix the JWT expiry validation bug in src/auth/login.py:validate_token"
 The instruction + expected_outcomes together form a contract: the agent
 pursues the goal, you evaluate against the outcomes.
 
+**Term preservation** — carry the user's domain terms VERBATIM into item
+instructions. URLs, file names, product names, hostnames, technical terms,
+and CJK key phrases must appear unchanged. Abstracting "豆瓣电影TOP250" into
+"a movie ranking site" is drift at the point of origin — the agent loses
+the precise target and must guess or explore to recover it.
+
+**Known-target propagation** — when the path to a target is ALREADY KNOWN
+(user stated it, or a prior completed item discovered it), state it
+explicitly in the instruction. Do not ask the agent to "find" what you
+already know. Compare:
+  Bad:  "Find the config file and add a new field"
+  Good: "Add field `retry_count: 3` to C:\\app\\config.yaml (discovered in item-1)"
+
+**Observable expected_outcomes** — outcomes must be verifiable from tool
+output, not subjective. The agent uses them as termination criteria; vague
+outcomes ("code is correct", "task is done") cannot be falsified and let
+drift pass undetected. Write outcomes that name the artifact, location,
+or command whose output confirms success:
+  Bad:  "File is updated correctly"
+  Good: "config.yaml contains key `retry_count` with value 3; `python -c 'import yaml; ...'` exits 0"
+
 ## Scope Discipline
 
 Items must accomplish exactly what the user asked — no more, no less. Do not
 add features or refactoring the user did not request.
+
+## First-Principles Constraint (Anti Accidental Complexity)
+
+Before emitting items, work BACKWARD from the desired end-state: "What is
+the minimal set of state changes to reach DONE from HERE?" Generate that
+path — not the path you would habitually take.
+
+**Deletion test**: for each item, ask "if I remove this, does the task still
+succeed?" If yes, remove it. Prefer 2 precise items over 5 defensive items.
+Common waste patterns to catch:
+  - "Setup" items whose necessity is ASSUMED (install X, configure Y) when
+    the actual work item has not yet failed without them.
+  - "Verify environment" items when the instruction already names the target
+    and there is no evidence the environment is non-standard.
+  - Splitting a single logical action across multiple items "for safety" when
+    the outcomes are trivially predictable.
+  - Parallel-capable items split into serial sequence with no inter-item
+    data dependency.
+
+**Accidental complexity** = steps introduced by your CHOICE of approach, not
+required by the problem itself. If you find yourself planning "explore → prepare
+→ setup → execute → verify" for a task whose essence is one state change, you
+are likely over-engineering the path. The task defines the essential complexity;
+everything else must justify its existence.
 
 ## Expected Outcomes & Risk
 
@@ -282,6 +357,25 @@ Every item MUST have 1–4 concise, observable expected_outcomes. These are your
 drift-detection sensors — vague criteria like "agent completes the task" give
 you nothing to evaluate against. Write outcomes that are falsifiable from the
 agent's factual_outcome report.
+
+**Completeness dimension**: when an item involves enumerating, scanning, or
+collecting from a known source set (all files in a directory, all imports in
+a module, all entries in a config), include a completeness outcome that the
+agent can cross-check orthogonally:
+  Good: "CSV row count matches the number of .py files containing relative imports"
+  Good: "output line count equals grep -c 'from \\.' across all source files"
+  Bad:  "CSV contains data rows" (any number satisfies this, even if 40% are missing)
+
+**Plausibility dimension**: when an item extracts or classifies content from
+source data, include an outcome that catches systematic false-negatives:
+  Good: "if grep finds 'name=' near asyncio.create_task lines, named count > 0"
+  Good: "at least one entry from the largest source file appears in output"
+  Bad:  "output format is correct" (format can be correct with all values wrong)
+
+This pair (completeness + plausibility) gives the agent two independent
+angles to catch implementation bugs — one for missing rows, one for
+misclassified content — without needing domain-specific knowledge of how
+the implementation might fail.
 
 Every item must have a risk_assessment string. For safe items, "Low risk —
 read-only" suffices. For risky items, name what could go wrong and the
@@ -325,7 +419,7 @@ _PLAN_MODIFY_TOOLS_WINDOWS = """\
 | `ssh` | Long-running remote batch job (≥1 minute) | Set `ssh_target` too |
 | `session` | Persistent subprocess: (1) state persists across commands — (2) watch+inject — (3) tty-bound device — (4) user asked to watch | Name scenario in `planner_reasoning` |
 {on_demand_tools_table}\
-| `coding` | Item **writes or modifies source code files** | Primary deliverable is source code |
+| `coding` | Item **writes or modifies source code**, OR item writes a script that **parses/analyzes source code** | Deliverable is code, OR agent must write code that reads other code |
 
 **Remote-work decision** (read this BEFORE the routing rules — picking wrong here is the most common planner bug):
 
@@ -341,6 +435,7 @@ _PLAN_MODIFY_TOOLS_WINDOWS = """\
 - Remote long batch with known commands → add `"ssh"` to `tools_needed` + set item's `ssh_target`
 - Local interactive matching scenario (1-4) → add `"session"` to `tools_needed`
 - Remote interactive → add `"session"` to `tools_needed` + set item's `ssh_target`
+- **Monitor/observe an already-running process** → prefer `"session"` (open a PARALLEL probe channel — e.g. `adb shell ps`, `ssh host 'tail -f log'`, or `Get-Process -Id PID`) over desktop screenshots. Vision is LAST resort when no programmatic channel exists.
 {on_demand_routing_rules}\
 - Item writes/modifies source code → ADD `"coding"` to `tools_needed`
 
@@ -349,6 +444,7 @@ _PLAN_MODIFY_TOOLS_WINDOWS = """\
   ❌ `["session"]` without naming scenario in planner_reasoning
   ❌ `["coding"]` for .md/.json/.yaml config files
   ❌ `["coding"]` for read-only review/grep with no file writes
+  ❌ `desktop` screenshot polling for liveness monitoring — always find a data channel first (log file mtime, parallel session probe, session idle_seconds)
   ❌ ssh_target set but no remote tool in `tools_needed` AND the work is more than one command — the agent will have nothing to drive the multi-step remote work with
 {on_demand_antipatterns}\
 """
@@ -364,7 +460,7 @@ _PLAN_MODIFY_TOOLS_LINUX = """\
 |---|---|---|
 | `ssh` | Any remote work — long batch or remote interaction | Set `ssh_target` too |
 {on_demand_tools_table}\
-| `coding` | Item **writes or modifies source code files** | Primary deliverable is source code |
+| `coding` | Item **writes or modifies source code**, OR item writes a script that **parses/analyzes source code** | Deliverable is code, OR agent must write code that reads other code |
 
 **Remote-work decision** (read this BEFORE the routing rules — picking wrong here is the most common planner bug):
 
@@ -379,6 +475,7 @@ _PLAN_MODIFY_TOOLS_LINUX = """\
 - Local interactive (REPL, monitoring) → no on-demand tool needed (decompose to shell idioms)
 - Remote one-shot → no on-demand tool needed (shell with `ssh host 'cmd'`)
 - Remote long batch with known commands → add `"ssh"` to `tools_needed` + set item's `ssh_target`
+- **Monitor/observe an already-running process** → prefer a data channel (log file mtime via shell, parallel ssh probe like `ssh host 'ps aux | grep test'`, `tail -f` on output file) over any screenshot-based approach.
 {on_demand_routing_rules}\
 - Item writes/modifies source code → ADD `"coding"` to `tools_needed`
 
@@ -386,6 +483,7 @@ _PLAN_MODIFY_TOOLS_LINUX = """\
   ❌ `["ssh"]` for single command — use shell
   ❌ `["coding"]` for .md/.json/.yaml config files
   ❌ `["coding"]` for read-only review with no file writes
+  ❌ screenshot polling for liveness monitoring — always find a data channel first (log file mtime, parallel probe session, process state)
   ❌ ssh_target set but no remote tool in `tools_needed` AND the work is more than one command — the agent will have nothing to drive the multi-step remote work with
 {on_demand_antipatterns}\
 """
@@ -466,6 +564,18 @@ checklist (items, skills, tools, interrupt). The system generates the
 final task-completion reply automatically from the completed items'
 results; you never write a "task complete" message or any other
 user-facing text.
+
+**Clarification via ask_human**: When the user's message is genuinely
+underspecified — multiple reasonable interpretations exist and choosing wrong
+would waste 3+ items of execution — emit a SINGLE first item whose
+instruction is to ask the user for the specific missing scope using
+`ask_human`. This is the planner's judgment call, not a mandatory gate.
+Do NOT clarify when:
+  - The most likely interpretation is clear (just pick it).
+  - The ambiguity is minor (the agent can handle either interpretation).
+  - An item has already started (mid-task questions go through the agent).
+Maximum ONE clarification item per task. If the answer is still vague,
+pick the most probable interpretation and proceed.
 
 `skills_needed` and `tools_needed` are **liberal advisory** declarations of
 what remaining items plausibly benefit from. The system diffs against

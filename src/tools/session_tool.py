@@ -102,6 +102,11 @@ class InteractiveSession:
     _prompt_output: str = field(default="", repr=False)
     _prompt_seen: Optional[asyncio.Event] = field(default=None, repr=False)
 
+    # Output activity tracking — updated by _append_to_buffer on every
+    # chunk received from the subprocess stdout. Consumers (list/read actions)
+    # expose this as idle_seconds for hang detection.
+    last_output_ts: float = field(default_factory=time.time)
+
     # Real-time UI streaming throttle
     _data_emit_buf: str = field(default="", repr=False)
     _data_emit_last_ts: float = field(default=0.0, repr=False)
@@ -118,6 +123,7 @@ def _append_to_buffer(session: InteractiveSession, text: str) -> None:
     session._stdout_buffer.append(text)
     byte_len = len(text.encode("utf-8", errors="replace"))
     session._buffer_bytes += byte_len
+    session.last_output_ts = time.time()
 
     # Real-time UI streaming: throttle to avoid flooding IPC
     session._data_emit_buf += text
@@ -253,8 +259,10 @@ class SessionRegistry:
 
     def list_sessions(self) -> List[Dict[str, Any]]:
         result = []
+        now = time.time()
         for s in self._sessions.values():
-            elapsed = time.time() - s.start_time
+            elapsed = now - s.start_time
+            idle = now - s.last_output_ts
             result.append({
                 "session_id": s.session_id,
                 "alias": s.alias,
@@ -263,6 +271,7 @@ class SessionRegistry:
                 "status": s.status,
                 "pid": s.pid,
                 "elapsed_seconds": round(elapsed, 1),
+                "idle_seconds": round(idle, 1),
                 "bytes_buffered": s._buffer_bytes,
             })
         return result
@@ -883,6 +892,7 @@ class InteractiveSessionTool(BaseTool):
 
         text = _drain_buffer(session)
         text, truncated = _truncate_output(text)
+        idle = time.time() - session.last_output_ts
 
         return ToolResult(
             success=True,
@@ -892,6 +902,7 @@ class InteractiveSessionTool(BaseTool):
                 "truncated": truncated,
                 "status": session.status,
                 "alive": session.status == "alive",
+                "idle_seconds": round(idle, 1),
             },
             tool_name=self.name, tool_parameters=kwargs,
             execution_time=time.time() - start_time,

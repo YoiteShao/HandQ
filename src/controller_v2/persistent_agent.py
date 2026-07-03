@@ -707,13 +707,17 @@ class PersistentAgent:
 
             # ── 8. Update advisor + per-turn progress signal ─────────────────
             goal_signal_hit = False
+            has_wait_interval = False
             for tr in tool_results:
                 self._advisor.record_tool_result(tr)
+                if tr.tool_name == "wait_interval" and tr.success:
+                    has_wait_interval = True
                 if not goal_signal_hit and tr.success and tr.output is not None:
                     goal_signal_hit = self._advisor.matches_goal(str(tr.output)[:2000])
             self._advisor.record_progress_signal(
                 produced_new_artifact=len(_produced_paths) > prev_artifacts,
                 goal_signal_hit=goal_signal_hit,
+                has_wait_interval=has_wait_interval,
             )
 
             # ── 9. Mechanical digest + Tier-1 watcher (fire-and-forget) ──────
