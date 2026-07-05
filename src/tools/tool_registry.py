@@ -23,6 +23,7 @@ from .email_tool import EmailTool
 from .teams_tool import TeamsTool
 from .ask_human_tool import AskHumanTool
 from .wait_interval_tool import WaitIntervalTool
+from .skill_tool import ReadSkillTool
 
 if TYPE_CHECKING:
     from ..controller_v2.session_context import SessionContext
@@ -94,6 +95,7 @@ class ToolRegistry:
     TEAMS = "teams"
     ASK_HUMAN = "ask_human"
     WAIT_INTERVAL = "wait_interval"
+    READ_SKILL = "read_skill"
 
     _tools: Dict[str, ToolMetadata] = {}
     _initialized = False
@@ -745,6 +747,54 @@ Examples:
                 "additionalProperties": False
             },
             tool_class=GlobTool
+        )
+
+        # Register READ_SKILL tool — the agent-facing half of progressive
+        # disclosure. Always available (on_demand=False, like read/glob) so it
+        # is present in every agent turn without a context provider. The
+        # [Available Skills] menu lists names+descriptions; this loads the full
+        # body of one on demand.
+        cls._tools[cls.READ_SKILL] = ToolMetadata(
+            name=cls.READ_SKILL,
+            description=(
+                "Load the full instructions of an available skill by name. "
+                "The [Available Skills] menu lists what exists (name + one-line "
+                "description); call this when the current task matches one of "
+                "them to pull its complete methodology into context."
+            ),
+            usage_guide="""\
+When to Use:
+  - The current task matches a skill listed in the [Available Skills] menu and
+    you want its full instructions before proceeding.
+  - The user @-mentioned a skill by name — read it, then apply it.
+
+When NOT to Use:
+  - Speculatively reading every skill "just in case" — read only the one(s)
+    relevant to the task at hand (menu descriptions tell you which).
+
+Strategy:
+  - Match the task to a menu entry by its description, then read that name.
+  - The body is returned once and lives in your turn history like any tool
+    result; you don't need to re-read it within the same task.
+
+Examples:
+  GOOD: {"name": "security-review"}   — task is "review this code for vulns"
+  BAD:  {"name": "nonexistent"}       — not in the menu; returns an error""",
+            parameter_schema={
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "description": (
+                            "Skill identifier exactly as shown in the "
+                            "[Available Skills] menu."
+                        )
+                    }
+                },
+                "required": ["name"],
+                "additionalProperties": False
+            },
+            tool_class=ReadSkillTool
         )
 
         # Register GREP tool

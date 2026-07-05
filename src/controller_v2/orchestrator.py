@@ -23,9 +23,11 @@ Architectural decisions (V2):
     as the planner so it can answer status questions accurately.
   - The planner emits a single op shape: replace_post_current(items). Plus
     optional interrupt_current to abort the in-flight item.
-  - Skills and tools are session-level append-only state on SharedCheckList.
-    Planner declares activations at the top level of its output; agent picks
-    up the diff via on_skills_changed / on_tools_changed callbacks.
+  - Tools are session-level append-only state on SharedCheckList. Planner
+    declares activations at the top level of its output; agent picks up the
+    diff via on_tools_changed callbacks. Skills are NOT activated: all roles
+    see the enabled menu + standing bodies (rendered live from SkillRegistry)
+    and the agent pulls non-standing bodies on demand via read_skill.
   - Conversation history is per-session, append-only, and re-rendered into the
     user prompt every turn.
 """
@@ -191,7 +193,11 @@ class Orchestrator(PlannerMixin, ReceptionistMixin):
             via a separate callback — INTENT/TASK is routing internal to
             Orchestrator and not user-facing.
         """
-        message, prescan = preprocess_mentions(message)
+        # Normalize @-mentions (quote/UNC handling); skill @-mentions are left
+        # inline. Under progressive disclosure a @skill is no longer
+        # force-activated — the normalized text rides along to the agent, which
+        # sees the [Available Skills] menu and decides whether to read_skill it.
+        message = preprocess_mentions(message)
         self.conversation_history.append({"role": "user", "content": message})
         # Mirror the verbatim message into the checklist so PersistentAgent
         # can render an `[User Original Request]` grounding block in its
@@ -199,11 +205,6 @@ class Orchestrator(PlannerMixin, ReceptionistMixin):
         # that the planner's item-instruction translation may flatten.
         self._checklist.set_latest_user_message(message)
         self._submit_user_turn_to_ltm_triage(message)
-
-        # Apply prescan immediately so @-mentioned skills activate even on
-        # chat-only paths where Stage 2 never runs.
-        if prescan:
-            self._activate_skills_in_checklist({"skills_needed": []}, prescan)
 
         chunk_cb = on_response_chunk or self._on_response_chunk
 
@@ -268,8 +269,20 @@ class Orchestrator(PlannerMixin, ReceptionistMixin):
             name="quality-recall-prefetch",
         )
 
+        # Skill awareness for the receptionist (single-turn, cannot read_skill
+        # mid-turn): the enabled menu (reference only) + standing bodies (drive
+        # response_to_user style). Rendered live so panel toggles take effect
+        # immediately. Each non-empty block is appended after the base prompt.
+        menu_block = self._build_skills_menu_block()
+        standing_block = self._build_standing_block()
+        intent_system = INTENT_SYSTEM_PROMPT
+        if standing_block:
+            intent_system += "\n\n" + standing_block
+        if menu_block:
+            intent_system += "\n\n" + menu_block
+
         intent_messages = [
-            {"role": "system", "content": INTENT_SYSTEM_PROMPT},
+            {"role": "system", "content": intent_system},
             {"role": "user", "content": INTENT_TEMPLATE.format(
                 full_context_block=intent_context,
                 message=message,
@@ -410,8 +423,16 @@ class Orchestrator(PlannerMixin, ReceptionistMixin):
             last_user, completed_results
         )
 
-        # Skills section reflects current active state (read from checklist).
-        skills_section = self._build_skills_section()
+        # Skill awareness block for the planner (single-turn, no read_skill):
+        # enabled menu + standing bodies, rendered live. The planner reasons
+        # ABOUT available skills but no longer activates them — the agent pulls
+        # bodies on demand via read_skill.
+        skills_section = self._build_standing_block()
+        menu_block = self._build_skills_menu_block()
+        if menu_block:
+            skills_section = (
+                skills_section + "\n\n" + menu_block if skills_section else menu_block
+            )
 
         system_prompt = build_plan_modify_system_prompt(
             on_demand_tools_table=self._on_demand_tools_table,
@@ -535,7 +556,7 @@ class Orchestrator(PlannerMixin, ReceptionistMixin):
         `response_to_user` is streamed chunk-by-chunk via `on_response_chunk`
         as the JSON arrives. The full response is parsed at the end and
         returned as a dict. Other fields (intent, post_current_items,
-        skills_needed, etc.) are ONLY available after the stream completes
+        tools_needed, etc.) are ONLY available after the stream completes
         — the stream is not used to dispatch any logic early, since the
         decisions that consume those fields all run after the stream is done.
 
@@ -1018,7 +1039,6 @@ class Orchestrator(PlannerMixin, ReceptionistMixin):
             "interrupt_current": bool,
             "interrupt_reason": str (optional, empty when no interrupt),
             "post_current_items": [item_dict, ...],
-            "skills_needed": [name, ...],
             "tools_needed": [name, ...]
           }
 
@@ -1030,15 +1050,10 @@ class Orchestrator(PlannerMixin, ReceptionistMixin):
         current item AND no pending) — this is the trigger for emitting the
         task-completion summary.
         """
-        # Skills + tools first — independent from items, can fail without
-        # affecting the rest of the operation.
-        try:
-            self._activate_skills_in_checklist(parsed)
-        except Exception as e:
-            self.logger.warning(
-                f"[Orchestrator] _activate_skills_in_checklist failed: {e}",
-                component="Orchestrator",
-            )
+        # Tools first — independent from items, can fail without affecting the
+        # rest of the operation. Skills are no longer activated here: the agent
+        # pulls bodies on demand via read_skill (progressive disclosure), so a
+        # legacy `skills_needed` key in `parsed` is simply ignored.
         try:
             self._activate_tools_in_checklist(parsed)
         except Exception as e:

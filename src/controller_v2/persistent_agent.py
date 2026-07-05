@@ -233,7 +233,6 @@ class PersistentAgent:
         self._pre_item_hint_provider: Optional[PreItemHintProvider] = pre_item_hint_provider
 
         # Skills / tools injection tracking
-        self._injected_skills: Set[str] = set()
         self._loaded_tools: Set[str] = set()
         # Tools the agent has explicitly released for visibility purposes.
         # Loaded resources stay warm — see _apply_self_extension /
@@ -241,18 +240,15 @@ class PersistentAgent:
         # this set in the same turn (0 ms — no bootstrap).
         self._hidden_tools: Set[str] = set()
 
-        # Skill prelude — append-only ordered list, sits between system prompt
-        # and the per-item instruction in _build_messages. Excluded from
-        # compaction (parallel to _turns) and anchored as a cache breakpoint.
-        # Each entry preserves the contributing skill names so PTL recovery
-        # can log meaningfully on eviction:
-        #   {"names": (skill_name_1, ...),
-        #    "messages": [{"role": "user", "content": ...},
-        #                 {"role": "assistant", "content": "Acknowledged."}]}
-        self._skill_entries: List[Dict[str, Any]] = []
+        # Skills follow the progressive-disclosure model (mirrors Claude Code):
+        # there is no per-session skill injection state here. Every turn,
+        # _build_messages renders the [Available Skills] menu + [Standing
+        # Skills] bodies LIVE from the SkillRegistry singleton (see
+        # _render_skill_prelude), so panel toggles take effect immediately and
+        # the agent pulls non-standing skill bodies on demand via read_skill.
 
-        # Subscribe to checklist state changes
-        self._checklist.on_skills_changed(self._handle_skills_added)
+        # Subscribe to checklist state changes (tools only — skills are no
+        # longer pushed; see _render_skill_prelude).
         self._checklist.on_tools_changed(self._handle_tools_added)
 
         # Build system prompt with environment info (static for session lifetime)
@@ -330,7 +326,7 @@ class PersistentAgent:
                 expected_outcomes=item.expected_outcomes,
                 active_tools=sorted(self._loaded_tools),
                 ssh_target=item.ssh_target,
-                skills_required=sorted(self._injected_skills),
+                skills_required=self._standing_skill_names(),
             )
 
         try:
@@ -491,11 +487,6 @@ class PersistentAgent:
                         if self._drop_current_ltm_block() > 0:
                             continue
 
-                        # Evict oldest skill prelude entry (loses skill body
-                        # for the rest of the session; tradeoff vs PTL-stuck)
-                        if self._evict_oldest_skill_entry() > 0:
-                            continue
-
                         # Last resort: truncate oldest turn's observations
                         if self._turns and len(self._turns[0].observations) > 1:
                             self._turns[0].observations = self._turns[0].observations[-1:]
@@ -524,6 +515,7 @@ class PersistentAgent:
                     item_id=item.item_id,
                     success=False,
                     issues=[f"Error: {err_text[:300]}"],
+                    plan_feedback=turn_result.plan_feedback or "",
                     iterations=iteration,
                     token_usage=_token_usage,
                 )
@@ -639,6 +631,7 @@ class PersistentAgent:
                     ),
                     key_findings=list(turn_result.key_findings or []),
                     issues=_issues,
+                    plan_feedback=turn_result.plan_feedback or "",
                     iterations=iteration,
                     token_usage=_token_usage,
                 )
@@ -1110,14 +1103,17 @@ class PersistentAgent:
             {"role": "system", "content": self._system_prompt},
         ]
 
-        # Skill prelude — append-only, sits after system. The last message gets
-        # tagged with `_cache_anchor`, which `_convert_messages_to_anthropic`
-        # turns into a cache_control breakpoint so the full prelude is served
-        # from prefix cache on subsequent turns.
-        if self._skill_entries:
-            flat = self._flat_skill_messages()
-            messages.extend(flat[:-1])
-            anchored = {**flat[-1], "_cache_anchor": True}
+        # Skill prelude — rendered LIVE from the SkillRegistry every turn
+        # (progressive disclosure): standing skill bodies + the [Available
+        # Skills] menu. The last message gets tagged with `_cache_anchor`,
+        # which `_convert_messages_to_anthropic` turns into a cache_control
+        # breakpoint so the prelude is served from prefix cache on subsequent
+        # turns. Content is byte-stable across turns unless the user toggles a
+        # skill in the panel, so the cache keeps hitting.
+        prelude = self._render_skill_prelude()
+        if prelude:
+            messages.extend(prelude[:-1])
+            anchored = {**prelude[-1], "_cache_anchor": True}
             messages.append(anchored)
 
         # Budget-enforced turns (drop oldest if over budget) + supersede stale
@@ -1250,11 +1246,7 @@ class PersistentAgent:
         always has some room for fresh observations.
         """
         overhead = (
-            sum(
-                len(m.get("content", ""))
-                for e in self._skill_entries
-                for m in e["messages"]
-            )
+            sum(len(m.get("content", "")) for m in self._render_skill_prelude())
             + len(self._conversation_summary or "")
             + len(self._current_item_block or "")
             + len(self._current_item_hint or "")
@@ -2019,38 +2011,60 @@ class PersistentAgent:
         )
         return drop_count
 
-    def _flat_skill_messages(self) -> List[Dict[str, Any]]:
-        """Flatten _skill_entries into a single message list."""
-        return [m for e in self._skill_entries for m in e["messages"]]
+    def _render_skill_prelude(self) -> List[Dict[str, Any]]:
+        """Render the live skill prelude: standing bodies + available menu.
 
-    def _evict_oldest_skill_entry(self) -> int:
-        """Drop the oldest skill prelude entry. Returns chars freed.
+        Progressive disclosure (mirrors Claude Code's Skills). Pulled fresh
+        from the SkillRegistry singleton every turn so panel toggles (enable /
+        standing / CRUD) take effect immediately without an event pipeline:
 
-        Used as a PTL-recovery primitive: when turn-level shrinking can't free
-        enough room, the next-cheapest source of bytes is the skill prelude.
-        Eviction is permanent for the session — there is no re-injection path
-        — so this should only fire after turn-level recovery is exhausted.
-        Tracks contributing skill names in the log so debugging a session that
-        lost a skill body has a breadcrumb.
+          - Standing skill bodies are injected as transparent prompt text —
+            the agent sees them as plain instructions, not as "skills".
+          - [Available Skills]: name + description of every enabled non-standing
+            skill for the agent to pull on demand via ``read_skill``.
+
+        Returns a two-message [user, assistant "Acknowledged."] pair, or ``[]``
+        when no enabled skills exist (keeps the prelude slot empty and the
+        prefix stable). Content is byte-stable across turns unless the user
+        toggles a skill, so the prefix cache keeps hitting.
         """
-        if not self._skill_entries:
-            return 0
-        oldest = self._skill_entries.pop(0)
-        freed = sum(len(m.get("content", "")) for m in oldest["messages"])
-        names = oldest.get("names", ())
-        # _injected_skills intentionally NOT updated: re-activating the same
-        # skill via the planner would re-trigger _handle_skills_added, which
-        # would skip it (already injected). Removing from _injected_skills
-        # here would let it be re-injected on next planner activation, which
-        # is desirable in some cases but introduces unbounded re-injection
-        # risk under thrashing. Leaving the bridge for future work.
-        self.logger.warning(
-            f"[{self.current_iteration}][PTL] Evicted oldest skill prelude entry "
-            f"(skills={list(names)}, freed={freed:,} chars, "
-            f"remaining_entries={len(self._skill_entries)})",
-            component="PersistentAgent",
-        )
-        return freed
+        try:
+            from ..infrastructure.skills import SkillRegistry
+            registry = SkillRegistry.get()
+        except Exception:
+            return []
+        standing = registry.render_standing_block()
+        menu = registry.render_menu_block(exclude=registry.standing_names())
+        if not standing and not menu:
+            return []
+        parts: List[str] = []
+        if standing:
+            parts.append(standing)
+        if menu:
+            parts.append(
+                menu
+                + "\n\nWhen the current task matches one of the skills above, "
+                "call read_skill(name) to load its full instructions before you "
+                "act — like reading a file you need."
+            )
+        content = "\n\n".join(parts)
+        return [
+            {"role": "user", "content": content},
+            {"role": "assistant", "content": "Acknowledged."},
+        ]
+
+    def _standing_skill_names(self) -> List[str]:
+        """Names of enabled+standing skills (always-in-effect for this agent).
+
+        Recorded as ``skills_required`` in the execution trace — the standing
+        set is the only body-injected skill state in the progressive-disclosure
+        model; on-demand ``read_skill`` calls show up in the turn trace instead.
+        """
+        try:
+            from ..infrastructure.skills import SkillRegistry
+            return SkillRegistry.get().standing_names()
+        except Exception:
+            return []
 
     def _drop_current_ltm_block(self) -> int:
         """Drop _current_ltm_block as a PTL-recovery primitive. Returns chars freed.
@@ -2237,9 +2251,8 @@ class PersistentAgent:
           - query: ``failure_signatures``-only — the instruction is
             already in ``_current_item_block`` and re-including it dilutes
             BM25 / dense focus on the actual blocker.
-          - memory dimension = INSIGHT — AGENTIC preferences live in the
-            item-start block already; INSIGHT is where past-failure /
-            environment facts cluster.
+          - memory dimension = AGENTIC — user patterns and environment
+            facts relevant to unblocking.
           - include_identity=False — IDENTITY is in ``_current_ltm_block``;
             re-rendering it on every stagnation refresh wastes tokens.
           - k=3/3 — focused reminder, not full re-discovery.
@@ -2269,7 +2282,7 @@ class PersistentAgent:
             )
             block = await ltm.format_context_block(
                 query=query,
-                memory_dimension=MemoryDimension.INSIGHT,
+                memory_dimension=MemoryDimension.AGENTIC,
                 memory_k=3,
                 knowledge_k=3,
                 include_identity=False,
@@ -2293,47 +2306,6 @@ class PersistentAgent:
 
     # ── Checklist callbacks ──────────────────────────────────────────────────
 
-    def _handle_skills_added(self, names: List[str]) -> None:
-        """Callback: planner activated new skills — inject their bodies.
-
-        Appends a stable user/assistant pair to ``_skill_entries``. The pair
-        lives outside the compaction pool (``_turns``), so the skill body
-        remains visible to the LLM for the rest of the session. Append-only, so
-        the prefix-cache anchor on the most recent ack keeps hitting as new
-        skills accrue. ``_injected_skills`` is updated only when a body actually
-        rendered, so a skill whose body was momentarily unavailable is not
-        permanently marked injected. Each entry tracks the contributing skill
-        names so PTL recovery can identify what is being evicted.
-        """
-        delta = [n for n in names if n and n not in self._injected_skills]
-        if not delta:
-            return
-        try:
-            from ..infrastructure.skills import SkillRegistry
-            registry = SkillRegistry.get()
-        except Exception:
-            return
-        block = registry.render_active_block(delta)
-        if not block.strip():
-            return
-        self._skill_entries.append({
-            "names": tuple(delta),
-            "messages": [
-                {"role": "user", "content": block},
-                {"role": "assistant", "content": "Acknowledged."},
-            ],
-        })
-        self._injected_skills.update(delta)
-        prelude_msgs = sum(len(e["messages"]) for e in self._skill_entries)
-        prelude_chars = sum(
-            len(m["content"]) for e in self._skill_entries for m in e["messages"]
-        )
-        self.logger.info(
-            f"[PersistentAgent] Injected skill bodies: {sorted(delta)} "
-            f"(prelude: {prelude_msgs} msgs, {prelude_chars:,} chars)",
-            component="PersistentAgent",
-        )
-
     def _handle_tools_added(self, names: List[str]) -> None:
         """Callback: planner activated new tools — load implementations."""
         delta = [n for n in names if n and n not in self._loaded_tools]
@@ -2353,8 +2325,7 @@ class PersistentAgent:
         # name (planner typo / not-yet-registered) is silently absent from
         # new_tools — create_all_tool_instances does not raise — so updating
         # _loaded_tools with the raw delta would permanently swallow a later
-        # genuine activation of that name. Mirrors the _injected_skills guard
-        # in _handle_skills_added.
+        # genuine activation of that name.
         loaded = [n for n in delta if n in new_tools]
         # Names known to be hint-only providers (e.g. "coding") have no entry
         # in ToolRegistry by design — their CapabilityProvider injects a hint

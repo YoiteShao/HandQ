@@ -1,10 +1,10 @@
 """
 SharedCheckList — thread-safe shared state between Agent and Planner.
 
-Agent:   reads current_item, marks done, reports result; reads active_skills
-         and injects newly added skill bodies into its observation history.
+Agent:   reads current_item, marks done, reports result; reads active_tools
+         and loads newly added tool implementations into its registry.
 Planner: writes items, modifies future items, reads results, signals completion;
-         writes to active_skills (append-only; never deactivates).
+         writes to active_tools (append-only; never deactivates).
 """
 import asyncio
 import collections
@@ -92,6 +92,11 @@ class ItemResult:
     key_findings: List[str] = field(default_factory=list)
     artifacts: List[str] = field(default_factory=list)
     issues: List[str] = field(default_factory=list)
+    # Optional agent→planner advisory (see TurnOutcome.plan_feedback). Non-empty
+    # when the agent — having read a skill body or discovered a fact this item —
+    # judges the planner's REMAINING items should change. Surfaced to the
+    # planner via get_checklist_context_for_planner on both success and failure.
+    plan_feedback: str = ""
     iterations: int = 0
     token_usage: Optional[TokenUsage] = None
     completed_at: Optional[datetime] = None
@@ -129,16 +134,15 @@ class SharedCheckList:
         # fan-out with per-callback exception isolation, same as on_item_done.
         self._on_checklist_changed_callbacks: List[Callable[[List[Dict[str, Any]]], Any]] = []
 
-        # Skills are append-only session state. Planner (Stage 2) adds names
-        # via activate_skills(); agent reads active_skills to detect deltas
-        # and injects bodies as observations. There is no deactivate path.
-        self._active_skills: Set[str] = set()
-        self._on_skills_changed_callbacks: List[Callable[[List[str]], Any]] = []
-
-        # Tools follow the same append-only pattern as skills. Planner declares
-        # activations; agent reacts via on_tools_changed (loads tool registry +
-        # runs session-level provider prep). Per-host prep (e.g. SSH for a
-        # specific ssh_target) is item-driven separately.
+        # Tools are append-only session state. Planner declares activations;
+        # agent reacts via on_tools_changed (loads tool registry + runs
+        # session-level provider prep). Per-host prep (e.g. SSH for a specific
+        # ssh_target) is item-driven separately.
+        #
+        # Skills are NOT tracked here: the progressive-disclosure model injects
+        # the enabled menu + standing bodies live from the SkillRegistry every
+        # turn, and the agent pulls non-standing bodies on demand via read_skill.
+        # There is no activate_skills path.
         self._active_tools: Set[str] = set()
         self._on_tools_changed_callbacks: List[Callable[[List[str]], Any]] = []
 
@@ -185,46 +189,18 @@ class SharedCheckList:
         return list(self._items)
 
     @property
-    def active_skills(self) -> AbstractSet[str]:
-        """Read-only snapshot of currently activated skill names."""
-        return frozenset(self._active_skills)
-
-    @property
     def active_tools(self) -> AbstractSet[str]:
         """Read-only snapshot of currently activated tool names."""
         return frozenset(self._active_tools)
-
-    # ── Skills (planner writes, agent reads diff) ────────────────────────────
-
-    def activate_skills(self, names: Iterable[str]) -> List[str]:
-        """Append-only skill activation. Returns names that were newly added.
-
-        Skills are session-level state. Once activated they stay until session
-        teardown — this matches the agent's append-only history semantics
-        (skill bodies injected as observations cannot be unwritten).
-
-        Caller is responsible for filtering against SkillRegistry; this method
-        does not validate names.
-        """
-        new = [n for n in names if n and n not in self._active_skills]
-        if not new:
-            return []
-        self._active_skills.update(new)
-        for cb in self._on_skills_changed_callbacks:
-            try:
-                cb(new)
-            except Exception:
-                pass
-        return new
 
     # ── Tools (planner writes, agent reads diff) ─────────────────────────────
 
     def activate_tools(self, names: Iterable[str]) -> List[str]:
         """Append-only tool activation. Returns names that were newly added.
 
-        Mirror of activate_skills: tools accumulate over the session, never
-        deactivate. Agent reacts to the diff by loading new tools into its
-        registry and running session-level provider prep (one prep per tool).
+        Tools accumulate over the session, never deactivate. Agent reacts to
+        the diff by loading new tools into its registry and running session-
+        level provider prep (one prep per tool).
 
         Caller is responsible for filtering against the tool registry; this
         method does not validate names.
@@ -440,6 +416,10 @@ class SharedCheckList:
                 lines.append(f"  Findings: {'; '.join(result.key_findings)}")
             if not result.success and result.issues:
                 lines.append(f"  Issues: {'; '.join(result.issues)}")
+            if result.plan_feedback:
+                lines.append(
+                    f"  → AGENT FLAGS FOR PLANNER: {result.plan_feedback}"
+                )
 
         # Current item
         current = self.get_current_item()
@@ -581,15 +561,6 @@ class SharedCheckList:
         any direct handle on the orchestrator.
         """
         self._on_progress_concern_callbacks.append(callback)
-
-    def on_skills_changed(self, callback: Callable[[List[str]], Any]) -> None:
-        """Register callback fired when new skills are activated.
-
-        Callback receives the delta (newly added names). Used by PersistentAgent
-        to inject skill bodies as observations when planner activates a new
-        skill mid-session.
-        """
-        self._on_skills_changed_callbacks.append(callback)
 
     def on_tools_changed(self, callback: Callable[[List[str]], Any]) -> None:
         """Register callback fired when new tools are activated.

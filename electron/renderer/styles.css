@@ -595,7 +595,7 @@ html, body {
 
 .titlebar-island.expanded {
     width: 260px;
-    height: 106px;
+    height: 140px;
     border-radius: 18px;
     background: rgba(255, 255, 255, 0.65);
     box-shadow:
@@ -3009,6 +3009,163 @@ button.danger:hover:not(:disabled) {
     color: #b85050;
 }
 .settings-toast.hidden { display: none; }
+
+/* ===== Skills panel — installed-skill cards ===== */
+/* Same glass language as the Scheduler overlay. */
+.skills-card {
+    width: min(760px, 94vw);
+    max-height: 86vh;
+    display: flex;
+    flex-direction: column;
+}
+.skills-body {
+    display: flex;
+    flex-direction: column;
+    flex: 1 1 auto;
+    min-height: 0;
+    padding: 18px 22px 22px 22px;
+    gap: 12px;
+    overflow-y: auto;
+}
+.skills-list-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.skills-list-header button {
+    padding: 6px 14px;
+    font-size: 12px;
+    border: 1px solid var(--hairline);
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.55);
+    color: var(--fg);
+    cursor: pointer;
+    font-family: var(--sans);
+    transition: background 120ms ease, transform 80ms ease;
+}
+.skills-list-header button:hover { background: rgba(255, 255, 255, 0.78); }
+.skills-list-header button:active { transform: translateY(1px); }
+.skills-list-header button.primary {
+    background: rgba(184, 175, 196, 0.20);
+    color: var(--tint-strong);
+    border-color: rgba(184, 175, 196, 0.45);
+    font-weight: 600;
+}
+.skills-list-header button.primary:hover { background: rgba(184, 175, 196, 0.30); }
+.skills-list-header .admin-count { font-size: 11px; color: var(--fg-mute); }
+
+.skills-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+    gap: 12px;
+}
+.skills-empty {
+    grid-column: 1 / -1;
+    padding: 24px 12px;
+    text-align: center;
+}
+.skill-card {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 12px 14px;
+    border: 1px solid var(--hairline);
+    border-radius: 10px;
+    background: rgba(255, 255, 255, 0.42);
+    transition: opacity 120ms ease;
+}
+.skill-card.disabled { opacity: 0.55; }
+.skill-card.standing {
+    border-color: rgba(90, 130, 245, 0.55);
+    background: rgba(90, 130, 245, 0.10);
+}
+.skill-card-badge {
+    flex: 0 0 auto;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    padding: 2px 7px;
+    border-radius: 999px;
+    color: #3a5bd0;
+    background: rgba(90, 130, 245, 0.18);
+    border: 1px solid rgba(90, 130, 245, 0.42);
+}
+.skill-card-badge.auto {
+    color: #a86412;
+    background: rgba(230, 160, 40, 0.16);
+    border-color: rgba(230, 160, 40, 0.46);
+}
+.skill-card-head {
+    display: flex;
+    align-items: center;
+    justify-content: flex-start;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+.skill-card-name {
+    font-family: var(--mono);
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--fg);
+    word-break: break-all;
+    flex: 1 1 auto;
+}
+.skill-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 11px;
+    color: var(--fg-mute);
+    cursor: pointer;
+    flex: 0 0 auto;
+}
+.skill-card-desc {
+    font-size: 12px;
+    line-height: 1.4;
+    color: var(--fg);
+}
+.skill-card-problem {
+    font-size: 11px;
+    color: #b85050;
+}
+.skill-card-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 2px;
+}
+.skill-card-actions button {
+    padding: 4px 12px;
+    font-size: 11px;
+    border: 1px solid var(--hairline);
+    border-radius: 8px;
+    background: rgba(255, 255, 255, 0.55);
+    color: var(--fg);
+    cursor: pointer;
+    font-family: var(--sans);
+    transition: background 120ms ease, transform 80ms ease;
+}
+.skill-card-actions button:hover { background: rgba(255, 255, 255, 0.78); }
+.skill-card-actions button:active { transform: translateY(1px); }
+
+.skill-form-modal { width: min(560px, 94vw); max-height: 86vh; }
+.skill-form-modal .settings-form {
+    padding: 18px 22px 22px 22px;
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    overflow-y: auto;
+    min-height: 0;
+}
+.skill-form-modal .settings-actions {
+    position: sticky;
+    bottom: 0;
+    padding-top: 10px;
+    background: inherit;
+}
+#overlay-skill-form { z-index: 1500; }
+
 
 /* ============================================================ */
 /* Liquid Glass — session card tilt (no specular highlight)     */

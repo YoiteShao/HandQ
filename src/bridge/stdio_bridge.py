@@ -1250,69 +1250,72 @@ class StdioBridge:
                        "fatal": False}, session_id=self._session_id)
             return
 
-        # ── LTM 2.0 Skill proposal + Summary IPC ────────────────────────
-        # ``ltm_list_skill_proposals``: surface staged skill_proposal rows
-        #   so the UI can render an approval queue.
-        # ``ltm_approve_skill_proposal``: move the staging SKILL.md to live,
-        #   reload SkillRegistry, flip status='approved'.
-        # ``ltm_reject_skill_proposal``: archive the row and remove staging.
-        # ``ltm_query_summary``: read one obs_summaries row (date+type) for UI.
+        # ── Skill control-panel IPC ─────────────────────────────────────
+        # The panel is the single hub for the skill lifecycle. ``skill_list``
+        # returns the full SkillRegistry inventory (incl. disabled skills).
+        # enable/disable + CRUD + import go through SkillRegistry; the write
+        # methods do blocking file I/O so they run in a worker thread. There is
+        # no approval queue — auto-generated skills are direct-written disabled
+        # by triage and surface here for review.
         if msg_type in (
-            "ltm_list_skill_proposals", "ltm_approve_skill_proposal",
-            "ltm_reject_skill_proposal", "ltm_query_summary",
+            "skill_list", "skill_set_enabled", "skill_set_standing",
+            "skill_create", "skill_update", "skill_delete", "skill_import",
         ):
             try:
-                from src.infrastructure.long_term_memory import LongTermMemory
-                ltm = LongTermMemory.get()
-                if msg_type == "ltm_list_skill_proposals":
-                    status = str(msg.get("status") or "proposed")
-                    limit = int(msg.get("limit") or 50)
-                    proposals = await ltm.list_skill_proposals(
-                        status=status, limit=limit,
+                from src.infrastructure.skills import SkillRegistry
+                reg = SkillRegistry.get()
+                if msg_type == "skill_list":
+                    skills = await asyncio.to_thread(reg.list_all)
+                    result = {"skills": skills}
+                elif msg_type == "skill_set_enabled":
+                    name = str(msg.get("name") or "")
+                    if not name:
+                        raise ValueError("skill_set_enabled: name required")
+                    result = await asyncio.to_thread(
+                        reg.set_enabled, name, bool(msg.get("enabled")),
                     )
-                    result = {"proposals": proposals}
-                elif msg_type == "ltm_approve_skill_proposal":
-                    # The entity id rides under ``skill_id``: the envelope's
-                    # ``id`` is the RPC correlation key and is overwritten by
-                    # the renderer's rpc() layer, so it cannot carry the row id.
-                    skill_id = str(msg.get("skill_id") or "")
-                    if not skill_id:
-                        raise ValueError("ltm_approve_skill_proposal: skill_id required")
-                    result = await ltm.approve_skill_proposal(skill_id)
-                elif msg_type == "ltm_reject_skill_proposal":
-                    skill_id = str(msg.get("skill_id") or "")
-                    if not skill_id:
-                        raise ValueError("ltm_reject_skill_proposal: skill_id required")
-                    reason = str(msg.get("reason") or "")
-                    result = await ltm.reject_skill_proposal(skill_id, reason=reason)
-                else:  # ltm_query_summary
-                    date_iso = str(msg.get("date") or "")
-                    # NB: the envelope's ``type`` field is the routing key
-                    # (== "ltm_query_summary" here), so the period must travel
-                    # under a distinct key or it would be clobbered.
-                    type_ = str(msg.get("summary_type") or "daily")
-                    lang = str(msg.get("language") or "en")
-                    if not date_iso:
-                        raise ValueError("ltm_query_summary: date required")
-                    row = await ltm._store.get_obs_summary(
-                        date=date_iso, type_=type_, language=lang,
+                elif msg_type == "skill_set_standing":
+                    name = str(msg.get("name") or "")
+                    if not name:
+                        raise ValueError("skill_set_standing: name required")
+                    result = await asyncio.to_thread(
+                        reg.set_standing, name, bool(msg.get("standing")),
                     )
-                    if row is None:
-                        result = {"found": False}
-                    else:
-                        import json as _json
-                        try:
-                            moments = _json.loads(row[3]) if row[3] else []
-                        except (TypeError, _json.JSONDecodeError):
-                            moments = []
-                        result = {
-                            "found": True,
-                            "date": row[0], "type": row[1], "language": row[2],
-                            "moments": moments,
-                            "summary_text": row[4] or "",
-                            "generated_model": row[5] or "",
-                            "generated_at": int(row[6] or 0),
-                        }
+                elif msg_type == "skill_create":
+                    result = await asyncio.to_thread(
+                        reg.create_skill,
+                        str(msg.get("name") or ""),
+                        str(msg.get("description") or ""),
+                        str(msg.get("body") or ""),
+                        standing=bool(msg.get("standing")),
+                    )
+                elif msg_type == "skill_update":
+                    name = str(msg.get("name") or "")
+                    if not name:
+                        raise ValueError("skill_update: name required")
+                    # Absent keys stay None → update_skill keeps that field.
+                    # A panel edit claims ownership: stamp origin=user so the
+                    # auto-miner will never overwrite what the user has touched
+                    # (even if this skill was originally triage-minted).
+                    from src.infrastructure.skills import SKILL_ORIGIN_USER
+                    result = await asyncio.to_thread(
+                        reg.update_skill, name,
+                        new_name=msg.get("new_name"),
+                        description=msg.get("description"),
+                        body=msg.get("body"),
+                        standing=msg.get("standing"),
+                        origin=SKILL_ORIGIN_USER,
+                    )
+                elif msg_type == "skill_delete":
+                    name = str(msg.get("name") or "")
+                    if not name:
+                        raise ValueError("skill_delete: name required")
+                    result = await asyncio.to_thread(reg.delete_skill, name)
+                else:  # skill_import
+                    src_path = str(msg.get("path") or "")
+                    if not src_path:
+                        raise ValueError("skill_import: path required")
+                    result = await asyncio.to_thread(reg.import_skill, src_path)
                 _emit({"type": "final", "id": msg_id, "result": result},
                       session_id=self._session_id)
             except Exception as exc:

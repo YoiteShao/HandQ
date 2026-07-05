@@ -1,6 +1,6 @@
 {
   "name": "handq-electron",
-  "version": "1.3.2",
+  "version": "1.3.3",
   "description": "Your AI-driven integration engineer",
   "main": "main.js",
   "private": true,

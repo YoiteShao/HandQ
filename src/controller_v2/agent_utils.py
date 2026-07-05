@@ -661,6 +661,14 @@ class TurnOutcome:
     key_findings: Optional[List[str]] = None
     claim_tool: List[str] = field(default_factory=list)
     release_tool: List[str] = field(default_factory=list)
+    # Optional agent→planner advisory. Set by the agent (on a completion OR an
+    # error turn) when something it learned this item — most often a skill body
+    # read via read_skill, or a discovered fact — means the planner's REMAINING
+    # items should change. Carried onto ItemResult and rendered into the
+    # planner's checklist context at the item boundary; the planner may then
+    # replace_post_current the pending tail. Distinct from key_findings (facts)
+    # and from the watcher's ProgressConcern (watcher→planner only).
+    plan_feedback: Optional[str] = None
     # Non-fatal note attached when a completion turn has evidence of
     # truncation (stop_reason=max_tokens, or JSON that only parsed after
     # json_repair salvage). Populated by _think_streaming after inspecting
@@ -711,6 +719,7 @@ class TurnOutcome:
                 f"mid-stream); raw_len={len(raw_content)}"
                 if repaired else None
             )
+            _pf = parsed.get("plan_feedback")
             return cls(
                 reasoning=parsed.get("reasoning", ""),
                 error=parsed.get("error"),
@@ -720,6 +729,7 @@ class TurnOutcome:
                 claim_tool=claim,
                 release_tool=release,
                 truncation_note=note,
+                plan_feedback=(str(_pf).strip() or None) if _pf is not None else None,
             )
 
         # Fallback: the LLM returned something that isn't a JSON object with

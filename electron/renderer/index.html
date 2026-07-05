@@ -59,6 +59,13 @@
                                 <span class="im-label">Scheduler</span>
                             </button>
                         </li>
+                        <li role="none">
+                            <button class="island-menu-item" id="sc-skills" role="menuitem"
+                                    type="button">
+                                <span class="im-icon" aria-hidden="true">🧠</span>
+                                <span class="im-label">Skills</span>
+                            </button>
+                        </li>
                     </ul>
                 </div>
                 <button class="titlebar-new-btn" id="sc-new-session" type="button"
@@ -478,10 +485,6 @@
                     <button type="button" class="admin-tab"
                             data-admin-tab="knowledge" role="tab">Knowledge</button>
                     <button type="button" class="admin-tab"
-                            data-admin-tab="skills" role="tab">Skills</button>
-                    <button type="button" class="admin-tab"
-                            data-admin-tab="summary" role="tab">Summary</button>
-                    <button type="button" class="admin-tab"
                             data-admin-tab="stats" role="tab">Stats</button>
                     <button type="button" class="admin-tab"
                             data-admin-tab="activity" role="tab">Activity</button>
@@ -522,45 +525,6 @@
                             <span class="admin-count" id="admin-kn-count"></span>
                         </header>
                         <ul class="admin-list" id="admin-kn-list"></ul>
-                    </section>
-
-                    <!-- ── Skills tab (proposal approval queue) ────── -->
-                    <section class="admin-pane hidden" data-admin-pane="skills">
-                        <header class="admin-pane-header">
-                            <select id="admin-skill-status">
-                                <option value="proposed">Proposed</option>
-                                <option value="approved">Approved</option>
-                                <option value="rejected">Rejected</option>
-                            </select>
-                            <button type="button" id="admin-skill-refresh">Refresh</button>
-                            <span class="admin-count" id="admin-skill-count"></span>
-                            <small class="help-text">
-                                Skill proposals the dream worker staged from
-                                recurring workflows. Approve to install into the
-                                live Skill registry; reject to discard staging.
-                            </small>
-                        </header>
-                        <ul class="admin-list" id="admin-skill-list"></ul>
-                    </section>
-
-                    <!-- ── Summary tab (activity digest reader) ────── -->
-                    <section class="admin-pane hidden" data-admin-pane="summary">
-                        <header class="admin-pane-header">
-                            <input type="date" id="admin-sum-date">
-                            <select id="admin-sum-type">
-                                <option value="daily">Daily</option>
-                                <option value="weekly">Weekly</option>
-                                <option value="monthly">Monthly</option>
-                            </select>
-                            <button type="button" id="admin-sum-load">Load</button>
-                            <small class="help-text">
-                                Human-readable activity digest from the summary
-                                worker. Pick a date and period, then Load.
-                            </small>
-                        </header>
-                        <pre class="admin-stats-output" id="admin-sum-narrative">
-(pick a date and click Load)</pre>
-                        <ul class="admin-list" id="admin-sum-moments"></ul>
                     </section>
 
                     <!-- ── Stats tab ───────────────────────────────── -->
@@ -706,6 +670,94 @@
         <!-- Confirmations render inline inside each session card (UI3,        -->
         <!-- renderer.js _ensureConfirmUI). The legacy global confirmation     -->
         <!-- modal was removed so a popup in one session can't block another.  -->
+
+        <!-- ============================================================ -->
+        <!-- Skills overlay (opened from the titlebar island menu).        -->
+        <!-- The single hub for the skill lifecycle: installed skills      -->
+    <!-- (enable/disable, edit, delete) as cards, including auto-       -->
+    <!-- generated ones triage direct-writes disabled. "Import" pulls   -->
+    <!-- in an external SKILL.md. No approval queue.                    -->
+    <!-- ============================================================ -->
+    <div class="overlay hidden" id="overlay-skills" aria-hidden="true">
+        <div class="overlay-card settings-card skills-card" role="dialog" aria-modal="true">
+            <header class="overlay-header">
+                <h2>Skills</h2>
+                <button type="button" class="overlay-close" id="skills-close"
+                        aria-label="Close">×</button>
+            </header>
+            <div class="settings-toast hidden" id="skills-toast" role="status"></div>
+            <div class="skills-body">
+                <div class="skills-list-header">
+                    <button type="button" id="skills-create-btn" class="primary">+ New skill</button>
+                    <button type="button" id="skills-import-btn">Import SKILL.md</button>
+                    <button type="button" id="skills-refresh-btn">Refresh</button>
+                    <span class="admin-count" id="skills-count"></span>
+                </div>
+                <div class="skills-grid" id="skills-grid"></div>
+            </div>
+        </div>
+    </div>
+
+    <!-- ============================================================ -->
+    <!-- Skill create / edit modal — pops over #overlay-skills.        -->
+    <!-- Three fields: name (identifier), description (L0 menu line),  -->
+    <!-- body (the methodology injected on activation).                -->
+    <!-- ============================================================ -->
+    <div class="overlay hidden" id="overlay-skill-form" aria-hidden="true">
+        <div class="overlay-card settings-card skill-form-modal" role="dialog" aria-modal="true">
+            <header class="overlay-header">
+                <h3 id="skill-form-title">New skill</h3>
+                <button type="button" class="overlay-close" id="skill-form-close"
+                        aria-label="Close">×</button>
+            </header>
+            <form class="settings-form" id="skill-form-inner">
+                <label>
+                    <span>Name</span>
+                    <input type="text" id="skill-form-name"
+                           placeholder="deploy-checklist" autocomplete="off"
+                           spellcheck="false" />
+                    <small class="help-text">
+                        Identifier used to <code>@</code>-mention the skill.
+                        Letters, digits, CJK, <code>_</code> and <code>-</code> only.
+                    </small>
+                </label>
+                <label>
+                    <span>Description</span>
+                    <input type="text" id="skill-form-desc"
+                           placeholder="Pre-deploy checklist for prod releases"
+                           autocomplete="off" />
+                    <small class="help-text">
+                        One line shown in the skill menu — the agent uses it to
+                        decide when to read the skill's full instructions.
+                    </small>
+                </label>
+                <label>
+                    <span>Body</span>
+                    <textarea id="skill-form-body" rows="10" spellcheck="false"
+                              placeholder="# Steps&#10;1. ...&#10;2. ..."></textarea>
+                    <small class="help-text">
+                        Full methodology (markdown). The agent loads it on demand
+                        via <code>read_skill</code>; standing skills are injected
+                        into every role automatically.
+                    </small>
+                </label>
+                <label class="checkbox-row">
+                    <input type="checkbox" id="skill-form-standing" />
+                    <span>Standing (always in effect)</span>
+                    <small class="help-text">
+                        When on, the skill body is injected into every role
+                        (receptionist, planner, agent) on every turn — use for
+                        persona / tone / general methodology. A standing skill is
+                        always enabled.
+                    </small>
+                </label>
+                <div class="settings-actions">
+                    <button type="button" id="skill-form-cancel">Cancel</button>
+                    <button type="submit" id="skill-form-save">Save</button>
+                </div>
+            </form>
+        </div>
+    </div>
     </div>
 
     <script src="vendor/xterm.bundle.js"></script>

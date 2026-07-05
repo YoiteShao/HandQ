@@ -120,8 +120,10 @@ class LongTermMemory:
         self._config = config
         # Outbound notification channel into the chat feed. Injected by the
         # bridge at init time (stdio_bridge._emit); None in tests / headless
-        # runs. Background workers (DreamWorker) use it to surface events
-        # like a freshly-staged skill proposal that the user can act on.
+        # runs. A generic seam for background workers to push a hint to the
+        # user. No live producer today — its only past user, the retired
+        # skill-proposal staging hint, is gone now that skills are minted
+        # directly as disabled files.
         self._emit = emit
         self._dream_task: Optional[asyncio.Task] = None
         self._retriage_task: Optional[asyncio.Task] = None
@@ -197,6 +199,20 @@ class LongTermMemory:
             cls._init_event.set()
             return inst  # type: ignore[return-value]
 
+        # One-shot cleanup: archive entries whose dimension has been removed
+        # from the enum (see _constants.LEGACY_DIMENSIONS). Deterministic +
+        # idempotent; runs before DreamWorker spawns so no race with L2/L3.
+        try:
+            from . import _constants as _C
+            n_archived = await store.archive_legacy_dimensions(_C.LEGACY_DIMENSIONS)
+            if n_archived:
+                _logger.info(
+                    "Archived %d entries with legacy dimensions %s",
+                    n_archived, _C.LEGACY_DIMENSIONS,
+                )
+        except Exception:
+            _logger.warning("Legacy dimension archive failed", exc_info=True)
+
         embedder = _embedder_from_config(cfg)
         reranker = _reranker_from_config(cfg)
         pii = PIIFilter()
@@ -226,8 +242,9 @@ class LongTermMemory:
 
         # LTM 2.0 observation pipeline workers — spawned alongside the dream
         # worker. SessionAggregator groups raw obs_snapshots into sessions;
-        # SemanticExtractor LLM-abstracts each closed session into a
-        # semantic event that DreamWorker then promotes to mem_entries.
+        # ArcAggregator groups sessions into activity arcs (cut on 20min idle);
+        # SemanticExtractor LLM-abstracts each closed arc into a semantic event
+        # that DreamWorker then promotes to mem_entries.
         try:
             from .session_aggregator import SessionAggregator
             session_agg = SessionAggregator(store=store)
@@ -243,6 +260,20 @@ class LongTermMemory:
             ltm._session_agg_task = None
 
         try:
+            from .arc_aggregator import ArcAggregator
+            arc_agg = ArcAggregator(store=store)
+            ltm._arc_agg = arc_agg
+            ltm._arc_agg_task = asyncio.create_task(
+                arc_agg.run(), name="ltm-arc-aggregator",
+            )
+        except Exception:
+            _logger.exception(
+                "ArcAggregator failed to start; sessions will not be grouped into arcs",
+            )
+            ltm._arc_agg = None
+            ltm._arc_agg_task = None
+
+        try:
             from .semantic_extractor import SemanticExtractor
             sem_extractor = SemanticExtractor(
                 store=store,
@@ -255,27 +286,10 @@ class LongTermMemory:
             )
         except Exception:
             _logger.exception(
-                "SemanticExtractor failed to start; closed sessions will not be abstracted",
+                "SemanticExtractor failed to start; closed arcs will not be abstracted",
             )
             ltm._semantic_extractor = None
             ltm._semantic_extractor_task = None
-
-        try:
-            from .summary_worker import SummaryWorker
-            summary_w = SummaryWorker(
-                store=store,
-                llm_services=retriage_helper_services or None,
-            )
-            ltm._summary_worker = summary_w
-            ltm._summary_worker_task = asyncio.create_task(
-                summary_w.run(), name="ltm-summary-worker",
-            )
-        except Exception:
-            _logger.exception(
-                "SummaryWorker failed to start; daily summaries will be skipped",
-            )
-            ltm._summary_worker = None
-            ltm._summary_worker_task = None
 
         cls._instance = ltm
         cls._init_event.set()
@@ -387,8 +401,8 @@ class LongTermMemory:
         # LTM 2.0 observation pipeline workers — same cancel + bounded wait.
         for task_attr, label in (
             ("_session_agg_task", "session_aggregator"),
+            ("_arc_agg_task", "arc_aggregator"),
             ("_semantic_extractor_task", "semantic_extractor"),
-            ("_summary_worker_task", "summary_worker"),
         ):
             task = getattr(self, task_attr, None)
             if task and not task.done():
@@ -723,111 +737,6 @@ class LongTermMemory:
 
     async def list_pending_candidates(self, limit: int = 20) -> List[Candidate]:
         return await self._store.list_candidates(status="pending", limit=limit)
-
-    # ── LTM 2.0 Skill proposal IPC ──────────────────────────────────────────
-
-    async def list_skill_proposals(
-        self, *, status: str = "proposed", limit: int = 50,
-    ) -> List[dict]:
-        """Return active skill proposals for the IPC layer.
-
-        ``status`` ∈ {'proposed', 'approved', 'rejected'}. The data is
-        formatted as plain dicts (not the SkillProposal dataclass) so the
-        IPC bridge can serialize without an adapter.
-        """
-        rows = await self._store._fetchall(
-            "SELECT id, skill_status, skill_fingerprint, recurrence_count, "
-            "       summary, created_at, updated_at "
-            "FROM mem_entries "
-            "WHERE kind='skill_proposal' AND archived=0 AND skill_status=? "
-            "ORDER BY updated_at DESC LIMIT ?",
-            (status, limit),
-        )
-        out = []
-        for r in rows:
-            out.append({
-                "id": r[0], "status": r[1], "fingerprint": r[2],
-                "recurrence_count": int(r[3]),
-                "summary": r[4],
-                "staging_path": str(self._skill_staging_path(r[0])),
-                "created_at": int(r[5]),
-                "updated_at": int(r[6]),
-            })
-        return out
-
-    async def approve_skill_proposal(self, skill_id: str) -> dict:
-        """Move staging file to live Skill dir, reload SkillRegistry, mark approved."""
-        import shutil
-        staging = self._skill_staging_path(skill_id)
-        if not staging.exists():
-            return {"ok": False, "reason": "staging_not_found", "path": str(staging)}
-        # Live skill dir = HandQ/Skill/<canonical>/SKILL.md.
-        # staging = HandQ/Skill/.proposed/<id8>; staging.parent.parent
-        # is HandQ/Skill, where canonical sibling dirs live.
-        skill_root = staging.parent.parent  # HandQ/Skill
-        canonical = f"proposed-{skill_id[:8]}"
-        live_dir = skill_root / canonical  # HandQ/Skill/<canonical>
-        # SkillRegistry keys skills by DIRECTORY name (frontmatter `name:` is
-        # advisory — see skills.py:_load_skill_file). So reusing a directory
-        # that already holds a SKILL.md would silently overwrite an unrelated
-        # approved skill (possible via an 8-char id-prefix clash, a stray
-        # user-created dir, or a re-approval after the row was re-issued).
-        # Disambiguate with a numeric suffix instead of clobbering.
-        if (live_dir / "SKILL.md").exists():
-            n = 2
-            while (skill_root / f"{canonical}-{n}" / "SKILL.md").exists():
-                n += 1
-            canonical = f"{canonical}-{n}"
-            live_dir = skill_root / canonical
-        try:
-            live_dir.mkdir(parents=True, exist_ok=True)
-            await asyncio.to_thread(
-                shutil.copyfile,
-                staging / "SKILL.md", live_dir / "SKILL.md",
-            )
-            # Remove staging directory after successful copy
-            await asyncio.to_thread(shutil.rmtree, staging, True)
-        except Exception as exc:
-            _logger.exception("approve_skill copy failed sid=%s", skill_id[:8])
-            return {"ok": False, "reason": "copy_failed", "error": str(exc)}
-        # Update DB
-        await self._store._execute(
-            "UPDATE mem_entries SET skill_status='approved', updated_at=? WHERE id=?",
-            (int(time.time()), skill_id),
-        )
-        # Trigger SkillRegistry reload
-        try:
-            from ..skills import SkillRegistry
-            reg = SkillRegistry.get()
-            if hasattr(reg, "reload"):
-                await asyncio.to_thread(reg.reload)
-            elif hasattr(reg, "refresh"):
-                await asyncio.to_thread(reg.refresh)
-        except Exception:
-            _logger.exception("SkillRegistry reload after approve failed")
-        return {"ok": True, "live_path": str(live_dir / "SKILL.md")}
-
-    async def reject_skill_proposal(self, skill_id: str, reason: str = "") -> dict:
-        """Delete staging directory + mark proposal as rejected/archived."""
-        import shutil
-        staging = self._skill_staging_path(skill_id)
-        if staging.exists():
-            try:
-                await asyncio.to_thread(shutil.rmtree, staging, True)
-            except Exception:
-                _logger.exception("reject_skill staging rm failed sid=%s", skill_id[:8])
-        await self._store._execute(
-            "UPDATE mem_entries SET skill_status='rejected', archived=1, "
-            "archived_reason=?, updated_at=? WHERE id=?",
-            (f"user_rejected:{reason[:120]}" if reason else "user_rejected",
-             int(time.time()), skill_id),
-        )
-        return {"ok": True}
-
-    @staticmethod
-    def _skill_staging_path(skill_id: str):
-        from pathlib import Path
-        return Path.home() / "HandQ" / "Skill" / ".proposed" / skill_id[:8]
 
     async def triage_stats(self) -> dict:
         """Return per-source acceptance / rejection counts for observability.

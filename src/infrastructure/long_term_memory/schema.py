@@ -4,8 +4,8 @@ LTM 2.0 baseline schema. Three logical namespaces:
 
     obs_*  — observation layer (snapshots, OCR frames, events, sessions,
              semantic events, pipeline runs, daily/weekly summaries)
-    mem_*  — unified memory layer (mem_entries with kind=memory|knowledge
-             |skill_proposal; supporting chunks/FTS/versions/candidates/
+    mem_*  — unified memory layer (mem_entries with kind=memory|knowledge;
+             supporting chunks/FTS/versions/candidates/
              embedding_cache/recall_log/correction_proposals/dream_runs)
     ent_*  — entity graph (principals: people/machines/projects; aliases;
              sightings ledger)
@@ -216,27 +216,12 @@ _BASELINE_STATEMENTS: List[str] = [
     )""",
     "CREATE INDEX IF NOT EXISTS idx_obs_pipeline_started ON obs_pipeline_runs(started_at DESC)",
 
-    # ── obs_summaries — daily/weekly/monthly rollups ──────────────────────
-    """CREATE TABLE IF NOT EXISTS obs_summaries (
-        date            TEXT NOT NULL,
-        type            TEXT NOT NULL,
-        language        TEXT NOT NULL DEFAULT 'en',
-        moments_json    TEXT,
-        summary_text    TEXT,
-        generated_model TEXT,
-        generated_at    INTEGER,
-        PRIMARY KEY (date, type, language)
-    )""",
-
-    # ── mem_entries — unified memory / knowledge / skill_proposal ─────────
+    # ── mem_entries — unified memory / knowledge ──────────────────────────
     """CREATE TABLE IF NOT EXISTS mem_entries (
         id                TEXT PRIMARY KEY,
         kind              TEXT NOT NULL,
         dimension         TEXT,
         category          TEXT,
-        skill_status      TEXT,
-        skill_signature   TEXT,
-        skill_fingerprint TEXT,
         recurrence_count  INTEGER NOT NULL DEFAULT 1,
         summary           TEXT NOT NULL,
         frame_json        TEXT,
@@ -258,9 +243,6 @@ _BASELINE_STATEMENTS: List[str] = [
     "CREATE INDEX IF NOT EXISTS idx_mem_entries_lookup ON mem_entries(kind, archived, dimension, category)",
     "CREATE INDEX IF NOT EXISTS idx_mem_entries_frame  ON mem_entries(kind, archived, frame_os)",
     "CREATE INDEX IF NOT EXISTS idx_mem_entries_recent ON mem_entries(updated_at DESC)",
-    """CREATE UNIQUE INDEX IF NOT EXISTS idx_mem_skill_dedup
-        ON mem_entries(skill_fingerprint)
-        WHERE kind='skill_proposal' AND archived=0""",
 
     # ── mem_chunks — chunked content + embedding source ───────────────────
     """CREATE TABLE IF NOT EXISTS mem_chunks (
@@ -521,16 +503,38 @@ async def _migration_unique_session_extraction(conn) -> None:
     )
 
 
-async def _migration_skill_recurrence(conn) -> None:
-    """v4: add the ``skill_recurrence`` counter table.
+async def _migration_v4(conn) -> None:
+    """v4: retired placeholder — intentionally a no-op.
 
-    Skill proposals now come from successful HandQ task sessions, but only
-    once a task *pattern* recurs (see ``triage._apply_session_skill`` +
+    Slot 4 was originally occupied by a migration that some user DBs recorded
+    in ``migration_log`` as ``_migration_v4``. That slot was later replaced
+    *in place* by ``_migration_skill_recurrence`` — a violation of the
+    append-only rule below. Because ``store._apply_migrations`` gates purely on
+    the positional ``schema_version`` (``cur_version >= len(MIGRATIONS)``), any
+    DB that had already advanced to v4 saw "4 of 4 applied" and never ran the
+    replacement, so the ``skill_recurrence`` table was never created and every
+    skill-extraction attempt failed silently (no such table).
+
+    The fix keeps this slot as a no-op to preserve the historical v4 identity
+    and moves the table creation to a fresh v5 slot
+    (``_migration_skill_recurrence``), which every DB — old or new — now runs.
+    Do NOT repurpose this slot; append new migrations at the end instead.
+    """
+    return
+
+
+async def _migration_skill_recurrence(conn) -> None:
+    """v5: add the ``skill_recurrence`` counter table.
+
+    Skills are minted from successful HandQ task sessions, but only once a
+    task *pattern* recurs (see ``triage._apply_session_skill`` +
     ``SKILL_RECURRENCE_THRESHOLD``). This table is the recurrence counter:
     one row per LLM-normalized ``skill_fingerprint``, incremented on every
-    skill-worthy ``SESSION_COMPLETE``. Sub-threshold patterns live here only
-    (they never touch ``mem_entries``); the proposal row is written to
-    ``mem_entries`` once the count reaches the threshold.
+    skill-worthy ``SESSION_COMPLETE``. Sub-threshold patterns live here only;
+    once the count reaches the threshold the skill is written directly into
+    the unified Skill root (``%USERPROFILE%\\HandQ\\Skill\\<slug>\\SKILL.md`` on
+    Windows) with ``enabled: false`` via ``SkillRegistry`` — there is no
+    proposal row and ``mem_entries`` is never touched.
 
     Kept deliberately separate from ``mem_entries`` so one-off / building
     task patterns don't pollute the live memory table or its dedup index.
@@ -548,11 +552,76 @@ async def _migration_skill_recurrence(conn) -> None:
     )
 
 
+async def _migration_skill_recurrence_centroid(conn) -> None:
+    """v6: give ``skill_recurrence`` a semantic centroid.
+
+    The recurrence counter originally clustered occurrences by an exact-match
+    string fingerprint (normalized token set / ``verb:object``). Synonymous
+    phrasings of the same task ("restart the nginx" / "bounce the web server")
+    hash differently, so the counter fragmented and never reached
+    ``SKILL_RECURRENCE_THRESHOLD`` — the dominant reason no skill ever minted.
+
+    ``triage._apply_session_skill`` now clusters by embedding similarity instead
+    (``store.bump_skill_recurrence_semantic``): a skill-worthy session joins the
+    nearest existing cluster when cosine >= ``SKILL_RECURRENCE_TAU``. These three
+    columns persist that cluster state:
+
+      * ``centroid`` — running-mean vector of the cluster's members (float32
+        bytes via ``embedding.vec_to_bytes``); NULL on rows created by the
+        lexical fallback, which the semantic matcher simply skips.
+      * ``provider`` / ``model`` — the embedding space the centroid lives in.
+        Vectors are only ever compared within the same (provider, model) so a
+        model swap can't corrupt distances (mirrors ``mem_embedding_cache``).
+
+    Additive ``ADD COLUMN`` — safe on existing DBs; old rows keep NULLs and age
+    out via the recurrence window. Appended as a fresh slot per the append-only
+    rule (see ``_migration_v4``); never edit a shipped slot in place.
+    """
+    await conn.execute("ALTER TABLE skill_recurrence ADD COLUMN centroid BLOB")
+    await conn.execute("ALTER TABLE skill_recurrence ADD COLUMN provider TEXT")
+    await conn.execute("ALTER TABLE skill_recurrence ADD COLUMN model TEXT")
+
+
+async def _migration_activity_arcs(conn) -> None:
+    """v7: add obs_arcs table + obs_sessions.arc_id column.
+
+    Activity arcs aggregate multiple obs_sessions into a single continuous
+    work period (cut only by >= 20 min idle). They give SemanticExtractor
+    enough cross-app context to distill genuine workflow patterns rather
+    than operating on single-app fragments with <5% hit rate.
+    """
+    await conn.execute(
+        """CREATE TABLE IF NOT EXISTS obs_arcs (
+            id              TEXT PRIMARY KEY,
+            started_at      INTEGER NOT NULL,
+            ended_at        INTEGER,
+            session_count   INTEGER NOT NULL DEFAULT 0,
+            frame_os        TEXT,
+            frame_host      TEXT,
+            semantic_status TEXT NOT NULL DEFAULT 'pending'
+        )"""
+    )
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_obs_arcs_status "
+        "ON obs_arcs(semantic_status, ended_at)"
+    )
+    await conn.execute(
+        "ALTER TABLE obs_sessions ADD COLUMN arc_id TEXT"
+    )
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_obs_sessions_arc "
+        "ON obs_sessions(arc_id)"
+    )
+
+
 # Ordered list — index N -> migration applied as version (N+1). New migrations
 # append; never edit the baseline in place once shipped.
 MIGRATIONS: List[Callable[[object], Awaitable[None]]] = [
-    _migration_baseline,
-    _migration_drop_session_triage_status,
-    _migration_unique_session_extraction,
-    _migration_skill_recurrence,
+    _migration_baseline,                    # v1
+    _migration_drop_session_triage_status,  # v2
+    _migration_unique_session_extraction,   # v3
+    _migration_v4,                          # v4 — retired no-op (see docstring)
+    _migration_skill_recurrence,            # v5 — creates skill_recurrence
+    _migration_skill_recurrence_centroid,   # v6 — adds semantic centroid columns
+    _migration_activity_arcs,              # v7 — obs_arcs + obs_sessions.arc_id
 ]

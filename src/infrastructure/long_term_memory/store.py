@@ -5,7 +5,7 @@ hosting three logical namespaces:
 
     obs_*  observation layer (snapshots / OCR frames / events / sessions /
            semantic events / pipeline runs / summaries)
-    mem_*  memory layer (mem_entries with kind ∈ memory|knowledge|skill_proposal
+    mem_*  memory layer (mem_entries with kind ∈ memory|knowledge
            plus chunks / FTS / versions / candidates / embedding_cache /
            recall_log / correction_proposals / dream_runs)
     ent_*  entity graph (principals / aliases / sightings)
@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 
 from . import _constants as C
+from .embedding import cosine, vec_from_bytes, vec_to_bytes
 from .models import (
     Candidate,
     CandidateStatus,
@@ -49,9 +50,6 @@ from .models import (
     SemanticEvent,
     SemanticStatus,
     Session,
-    SkillProposal,
-    SkillProposalStatus,
-    Summary,
     TriggerKind,
 )
 from .schema import DDL_BOOTSTRAP, MIGRATIONS
@@ -189,7 +187,8 @@ class SQLiteStore:
                 return list(cur.fetchall())
             finally:
                 cur.close()
-        return await asyncio.to_thread(_q)
+        async with self._write_lock:
+            return await asyncio.to_thread(_q)
 
     async def _fetchone(self, sql: str, params: tuple = ()) -> Optional[tuple]:
         def _q() -> Optional[tuple]:
@@ -198,7 +197,8 @@ class SQLiteStore:
                 return cur.fetchone()
             finally:
                 cur.close()
-        return await asyncio.to_thread(_q)
+        async with self._write_lock:
+            return await asyncio.to_thread(_q)
 
     # ── Meta ───────────────────────────────────────────────────────────────
 
@@ -372,7 +372,7 @@ class SQLiteStore:
             await asyncio.to_thread(self._raw.commit)
             return cur.rowcount
 
-    # ── mem_entries unified CRUD (memory + knowledge + skill_proposal) ─────
+    # ── mem_entries unified CRUD (memory + knowledge) ─────────────────────
 
     async def insert_entry(
         self,
@@ -388,9 +388,6 @@ class SQLiteStore:
         source_event_id: Optional[str] = None,
         frame: Optional[dict] = None,
         principal_ids: Optional[List[str]] = None,
-        skill_status: Optional[SkillProposalStatus] = None,
-        skill_signature: Optional[dict] = None,
-        skill_fingerprint: Optional[str] = None,
         recurrence_count: int = 1,
         synthesis_level: int = 0,
         source_entry_ids: Optional[List[str]] = None,
@@ -399,9 +396,9 @@ class SQLiteStore:
         """Insert a new mem_entries row + chunked content into mem_chunks.
 
         ``kind`` selects the discriminator row. ``dimension`` is required for
-        kind=memory; ``category`` for kind=knowledge; skill fields for
-        kind=skill_proposal. Caller-supplied ``entry_id`` reserves the id
-        BEFORE insert (for /remember mirror files etc.).
+        kind=memory; ``category`` for kind=knowledge. Caller-supplied
+        ``entry_id`` reserves the id BEFORE insert (for /remember mirror files
+        etc.).
         """
         from .chunking import chunk_markdown
         eid = entry_id or str(uuid.uuid4())
@@ -410,23 +407,20 @@ class SQLiteStore:
         frame_json = json.dumps(frame, ensure_ascii=False) if frame else None
         principal_json = json.dumps(principal_ids or [], ensure_ascii=False) if principal_ids else None
         source_entry_json = json.dumps(source_entry_ids or [], ensure_ascii=False) if source_entry_ids else None
-        sig_json = json.dumps(skill_signature, ensure_ascii=False) if skill_signature else None
-        skill_status_val = skill_status.value if skill_status else None
 
         def _txn() -> None:
             try:
                 self._raw.execute("BEGIN IMMEDIATE")
                 self._raw.execute(
                     """INSERT INTO mem_entries
-                       (id, kind, dimension, category, skill_status, skill_signature,
-                        skill_fingerprint, recurrence_count, summary, frame_json,
-                        source_event_id, source, source_ref, archived, synthesis_level,
-                        source_entry_ids, version, principal_ids, created_at, updated_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, 1, ?, ?, ?)""",
+                       (id, kind, dimension, category, recurrence_count, summary,
+                        frame_json, source_event_id, source, source_ref, archived,
+                        synthesis_level, source_entry_ids, version, principal_ids,
+                        created_at, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, 1, ?, ?, ?)""",
                     (eid, kind.value,
                      dimension.value if dimension else None,
                      category.value if category else None,
-                     skill_status_val, sig_json, skill_fingerprint,
                      recurrence_count, summary[:120], frame_json,
                      source_event_id, source, source_ref, synthesis_level,
                      source_entry_json, principal_json, now, now),
@@ -736,14 +730,6 @@ class SQLiteStore:
         if facet_value:
             sql += f" AND e.{facet_col}=?"
             params.append(facet_value)
-        if C.RECALL_EXCLUDE_OBSERVATION_INSIGHTS:
-            # Drop W-tier passive-observation activity-snapshot insights — they
-            # surface as domain-similar-but-useless recall noise. Predicate is
-            # safe for knowledge rows (e.dimension is NULL there → no match).
-            sql += (
-                " AND NOT (e.kind='memory' AND e.dimension='insight' "
-                "AND e.source='semantic_event')"
-            )
         sql += " ORDER BY rank LIMIT ?"
         params.append(limit)
         try:
@@ -805,13 +791,6 @@ class SQLiteStore:
             f"  AND ec.chunk_kind=? AND ec.provider=? AND ec.model=? "
             f"WHERE e.archived=0 AND e.kind=?"
         )
-        if C.RECALL_EXCLUDE_OBSERVATION_INSIGHTS:
-            # Mirror the _fts_search exclusion on the dense branch so W-tier
-            # passive-observation insights are dropped from both recall paths.
-            sql += (
-                " AND NOT (e.kind='memory' AND e.dimension='insight' "
-                "AND e.source='semantic_event')"
-            )
         return await self._fetchall(sql, (kind, provider, model, kind))
 
     async def list_chunks_missing_embedding(
@@ -1121,33 +1100,98 @@ class SQLiteStore:
              session_id),
         )
 
-    async def set_obs_session_status(
-        self,
-        session_id: str,
-        *,
-        semantic_status: Optional[str] = None,
-    ) -> None:
-        sets, params = [], []
-        if semantic_status:
-            sets.append("semantic_status=?")
-            params.append(semantic_status)
-        if not sets:
-            return
-        params.append(session_id)
-        await self._execute(
-            f"UPDATE obs_sessions SET {', '.join(sets)} WHERE id=?",
-            tuple(params),
-        )
-
-    async def list_sessions_pending_extraction(self, limit: int = 8) -> List[tuple]:
+    async def list_sessions_unassigned_to_arc(self, limit: int = 200) -> List[tuple]:
         return await self._fetchall(
-            "SELECT id, trigger_kind, started_at, ended_at, frame_os, frame_host, "
-            "primary_process, primary_window_title, snapshot_count, apps_seen "
+            "SELECT id, started_at, ended_at, frame_os, frame_host "
             "FROM obs_sessions "
-            "WHERE semantic_status='pending' AND ended_at IS NOT NULL "
+            "WHERE ended_at IS NOT NULL AND arc_id IS NULL "
             "ORDER BY started_at ASC LIMIT ?",
             (limit,),
         )
+
+    async def assign_sessions_to_arc(
+        self, session_ids: List[str], arc_id: str
+    ) -> None:
+        if not session_ids:
+            return
+        placeholders = ",".join("?" for _ in session_ids)
+        await self._execute(
+            f"UPDATE obs_sessions SET arc_id=? WHERE id IN ({placeholders})",
+            (arc_id, *session_ids),
+        )
+
+    # ── obs_arcs ──────────────────────────────────────────────────────────
+
+    async def insert_obs_arc(
+        self,
+        *,
+        arc_id: str,
+        started_at: int,
+        ended_at: Optional[int] = None,
+        session_count: int = 0,
+        frame_os: Optional[str] = None,
+        frame_host: Optional[str] = None,
+        semantic_status: str = "pending",
+    ) -> str:
+        await self._execute(
+            """INSERT INTO obs_arcs
+               (id, started_at, ended_at, session_count, frame_os, frame_host, semantic_status)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (arc_id, started_at, ended_at, session_count, frame_os, frame_host, semantic_status),
+        )
+        return arc_id
+
+    async def close_obs_arc(
+        self, arc_id: str, *, ended_at: int, session_count: int
+    ) -> None:
+        await self._execute(
+            "UPDATE obs_arcs SET ended_at=?, session_count=? WHERE id=?",
+            (ended_at, session_count, arc_id),
+        )
+
+    async def set_obs_arc_status(self, arc_id: str, status: str) -> None:
+        await self._execute(
+            "UPDATE obs_arcs SET semantic_status=? WHERE id=?",
+            (status, arc_id),
+        )
+
+    async def list_arcs_pending_extraction(self, limit: int = 8) -> List[tuple]:
+        return await self._fetchall(
+            "SELECT id, started_at, ended_at, session_count, frame_os, frame_host "
+            "FROM obs_arcs "
+            "WHERE semantic_status='pending' AND ended_at IS NOT NULL "
+            f"AND session_count >= ? "
+            "ORDER BY started_at ASC LIMIT ?",
+            (C.ARC_MIN_SESSIONS, limit),
+        )
+
+    async def get_arc_session_ids(self, arc_id: str) -> List[str]:
+        rows = await self._fetchall(
+            "SELECT id FROM obs_sessions WHERE arc_id=? ORDER BY started_at ASC",
+            (arc_id,),
+        )
+        return [r[0] for r in rows]
+
+    async def archive_legacy_dimensions(self, dimensions: List[str]) -> int:
+        """Archive all non-archived memory entries whose dimension matches a
+        legacy value. Deterministic + idempotent; entries carry
+        archived_reason='legacy_dimension_removed' so a future restore can
+        target them. Zero-length input is a no-op.
+        """
+        if not dimensions:
+            return 0
+        placeholders = ",".join("?" * len(dimensions))
+        def _do() -> int:
+            cur = self._raw.execute(
+                f"UPDATE mem_entries SET archived=1, "
+                f"archived_reason='legacy_dimension_removed', updated_at=? "
+                f"WHERE dimension IN ({placeholders}) AND archived=0",
+                (_now(), *dimensions),
+            )
+            self._raw.commit()
+            return cur.rowcount
+        async with self._write_lock:
+            return await asyncio.to_thread(_do)
 
     # ── obs_semantic_events ────────────────────────────────────────────────
 
@@ -1293,55 +1337,28 @@ class SQLiteStore:
             await asyncio.to_thread(self._raw.commit)
             return cur.rowcount
 
-    async def archive_stale_skill_proposals(self, older_than_ts: int) -> List[str]:
-        """Archive un-acted skill proposals created before cutoff.
-
-        Returns the archived entry ids so the caller can clean up their on-disk
-        staging dirs. Targets only ``kind='skill_proposal'`` rows that are
-        still archived=0 AND ``skill_status='proposed'`` (un-acted) — approved
-        / rejected proposals have already left the active set. Marks
-        ``archived=1, archived_reason='auto_expired'`` rather than deleting:
-        the audit row survives, the partial-UNIQUE dedup slot frees (so a later
-        recurrence can re-propose), and the IPC list (archived=0 filter) drops
-        it. ``created_at`` is unix SECONDS.
-        """
-        def _txn() -> List[str]:
-            rows = self._raw.execute(
-                "SELECT id FROM mem_entries "
-                "WHERE kind='skill_proposal' AND archived=0 "
-                "AND skill_status='proposed' AND created_at < ?",
-                (older_than_ts,),
-            ).fetchall()
-            ids = [r[0] for r in rows]
-            if ids:
-                self._raw.execute(
-                    "UPDATE mem_entries "
-                    "SET archived=1, archived_reason='auto_expired', updated_at=? "
-                    "WHERE kind='skill_proposal' AND archived=0 "
-                    "AND skill_status='proposed' AND created_at < ?",
-                    (_now(), older_than_ts),
-                )
-            return ids
-
-        async with self._write_lock:
-            ids = await asyncio.to_thread(_txn)
-            await asyncio.to_thread(self._raw.commit)
-            return ids
-
     async def bump_skill_recurrence(
-        self, fingerprint: str, *, category: Optional[str], title: str,
+        self, fingerprint: str, *, category: Optional[str] = None, title: str,
+        window_days: int = C.SKILL_RECURRENCE_WINDOW_DAYS,
     ) -> int:
         """Find-or-create a skill_recurrence row by fingerprint; increment its
         occurrence_count. Returns the NEW count (1 on first sight).
 
         Mirrors ``upsert_principal``'s find-or-create-increment, but uses an
         UPSERT … RETURNING so the new count comes back in one round trip. The
-        count gates skill-proposal promotion: a task pattern must recur
+        count gates skill generation: a task pattern must recur
         ``SKILL_RECURRENCE_THRESHOLD`` times before ``_apply_session_skill``
-        writes a proposal — one-off tasks stay at count 1/2 forever and never
-        surface a skill.
+        writes a live (disabled) skill — one-off tasks stay at count 1/2 forever
+        and never surface a skill.
+
+        Recency window: the count is a *rolling streak*, not a lifetime tally.
+        When this occurrence lands more than ``window_days`` after the previous
+        one, the counter RESETS to 1 (and ``first_seen`` moves to now). This
+        keeps "recurring" meaning "a currently-repeated habit" — a task done a
+        few times months apart never crosses the threshold on stale history.
         """
         now = _now()
+        window_sec = int(window_days) * 86_400
 
         def _txn() -> int:
             try:
@@ -1351,12 +1368,22 @@ class SQLiteStore:
                             first_seen, last_seen)
                        VALUES (?, 1, ?, ?, ?, ?)
                        ON CONFLICT(fingerprint) DO UPDATE SET
-                           occurrence_count = occurrence_count + 1,
+                           occurrence_count = CASE
+                               WHEN excluded.last_seen - last_seen > ?
+                                   THEN 1
+                               ELSE occurrence_count + 1
+                           END,
+                           first_seen = CASE
+                               WHEN excluded.last_seen - last_seen > ?
+                                   THEN excluded.last_seen
+                               ELSE first_seen
+                           END,
                            category   = excluded.category,
                            last_title = excluded.last_title,
                            last_seen  = excluded.last_seen
                        RETURNING occurrence_count""",
-                    (fingerprint, category, title[:120], now, now),
+                    (fingerprint, category, title[:120], now, now,
+                     window_sec, window_sec),
                 )
                 row = cur.fetchone()
                 cur.close()
@@ -1370,41 +1397,107 @@ class SQLiteStore:
             return await asyncio.to_thread(_txn)
 
 
-    # ── obs_summaries ──────────────────────────────────────────────────────
+    async def bump_skill_recurrence_semantic(
+        self, vec: List[float], *, title: str, category: Optional[str] = None,
+        provider: str, model: str,
+        tau: float = C.SKILL_RECURRENCE_TAU,
+        window_days: int = C.SKILL_RECURRENCE_WINDOW_DAYS,
+    ) -> int:
+        """Semantic sibling of :meth:`bump_skill_recurrence` — cluster by
+        embedding similarity instead of exact-string fingerprint.
 
-    async def upsert_obs_summary(
-        self,
-        *,
-        date: str,
-        type_: str,
-        language: str = "en",
-        moments: Optional[List[dict]] = None,
-        summary_text: str = "",
-        generated_model: str = "",
-    ) -> None:
-        await self._execute(
-            """INSERT INTO obs_summaries (date, type, language, moments_json,
-                  summary_text, generated_model, generated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)
-               ON CONFLICT(date, type, language) DO UPDATE SET
-                  moments_json=excluded.moments_json,
-                  summary_text=excluded.summary_text,
-                  generated_model=excluded.generated_model,
-                  generated_at=excluded.generated_at""",
-            (date, type_, language,
-             json.dumps(moments or [], ensure_ascii=False),
-             summary_text, generated_model, _now()),
-        )
+        ``vec`` is the skill's task-identity embedding (name + description).
+        Caller guarantees it is non-empty. The occurrence joins the nearest
+        existing centroid *within the same (provider, model) space* when their
+        cosine is >= ``tau``; otherwise it opens a new cluster. Returns the NEW
+        occurrence count for whichever cluster it landed in (1 on a fresh
+        cluster or a window reset).
 
-    async def get_obs_summary(
-        self, *, date: str, type_: str, language: str = "en",
-    ) -> Optional[tuple]:
-        return await self._fetchone(
-            "SELECT date, type, language, moments_json, summary_text, "
-            "       generated_model, generated_at FROM obs_summaries "
-            "WHERE date=? AND type=? AND language=?",
-            (date, type_, language),
-        )
+        Centroid maintenance mirrors the lexical method's rolling window: on a
+        match inside the window the count increments and the centroid becomes
+        the running mean of its members; a match landing more than
+        ``window_days`` after the cluster was last seen RESETS the streak to 1
+        and reseeds the centroid to ``vec`` (a stale cluster is a new habit, not
+        a continuation). New clusters get a synthetic ``sem:<uuid>`` primary key
+        so they never collide with lexical fingerprint rows, and rows with a
+        NULL centroid (written by the lexical fallback) are skipped by the
+        matcher — the two cluster kinds coexist harmlessly.
+        """
+        now = _now()
+        window_sec = int(window_days) * 86_400
+
+        def _txn() -> int:
+            try:
+                best_fp: Optional[str] = None
+                best_sim = -1.0
+                best_count = 0
+                best_centroid: List[float] = []
+                best_first_seen = 0
+                best_last_seen = 0
+                cur = self._raw.execute(
+                    """SELECT fingerprint, occurrence_count, centroid,
+                              first_seen, last_seen
+                       FROM skill_recurrence
+                       WHERE centroid IS NOT NULL
+                         AND provider = ? AND model = ?""",
+                    (provider, model),
+                )
+                for fp, count, cbytes, first_seen, last_seen in cur.fetchall():
+                    sim = cosine(vec, vec_from_bytes(cbytes))
+                    if sim > best_sim:
+                        best_sim, best_fp = sim, fp
+                        best_count = int(count)
+                        best_centroid = vec_from_bytes(cbytes)
+                        best_first_seen, best_last_seen = int(first_seen), int(last_seen)
+                cur.close()
+
+                if best_fp is not None and best_sim >= tau:
+                    if (now - best_last_seen) > window_sec:      # stale → reset
+                        new_count, new_first, new_centroid = 1, now, vec
+                    else:
+                        new_count = best_count + 1
+                        new_first = best_first_seen
+                        new_centroid = [
+                            (c * best_count + v) / (best_count + 1)
+                            for c, v in zip(best_centroid, vec)
+                        ]
+                    self._raw.execute(
+                        """UPDATE skill_recurrence
+                           SET occurrence_count = ?, first_seen = ?, last_seen = ?,
+                               category = ?, last_title = ?, centroid = ?
+                           WHERE fingerprint = ?""",
+                        (new_count, new_first, now, category, title[:120],
+                         vec_to_bytes(new_centroid), best_fp),
+                    )
+                    self._raw.commit()
+                    _logger.info(
+                        "skill recurrence (semantic) matched fp=%s sim=%.3f count=%d",
+                        best_fp[:12], best_sim, new_count,
+                    )
+                    return new_count
+
+                new_fp = f"sem:{uuid.uuid4().hex}"
+                self._raw.execute(
+                    """INSERT INTO skill_recurrence
+                           (fingerprint, occurrence_count, category, last_title,
+                            first_seen, last_seen, centroid, provider, model)
+                       VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?)""",
+                    (new_fp, category, title[:120], now, now,
+                     vec_to_bytes(vec), provider, model),
+                )
+                self._raw.commit()
+                _logger.info(
+                    "skill recurrence (semantic) new cluster fp=%s best_sim=%.3f",
+                    new_fp[:12], best_sim,
+                )
+                return 1
+            except Exception:
+                self._raw.rollback()
+                raise
+
+        async with self._write_lock:
+            return await asyncio.to_thread(_txn)
+
 
     # ── ent_principals / ent_aliases / ent_sightings ───────────────────────
 
@@ -1609,68 +1702,6 @@ class SQLiteStore:
             first_seen=int(row[9]), last_seen=int(row[10]),
             sighting_count=int(row[11] or 0),
             archived=bool(row[12]),
-        )
-
-    async def get_skill_proposal(self, proposal_id: str) -> Optional[SkillProposal]:
-        row = await self._fetchone(
-            "SELECT id, skill_status, skill_signature, skill_fingerprint, "
-            "recurrence_count, summary, source_event_id, created_at, updated_at "
-            "FROM mem_entries "
-            "WHERE id=? AND kind='skill_proposal'",
-            (proposal_id,),
-        )
-        if not row:
-            return None
-        try:
-            sps = SkillProposalStatus(row[1]) if row[1] else SkillProposalStatus.PROPOSED
-        except ValueError:
-            sps = SkillProposalStatus.PROPOSED
-        signature: dict = {}
-        if row[2]:
-            try:
-                v = json.loads(row[2])
-                signature = v if isinstance(v, dict) else {}
-            except (json.JSONDecodeError, TypeError, ValueError):
-                signature = {}
-        # Pull the body content from mem_chunks
-        chunk_rows = await self._fetchall(
-            "SELECT text FROM mem_chunks WHERE entry_id=? ORDER BY chunk_index",
-            (proposal_id,),
-        )
-        body_md = "\n\n".join(r[0] for r in chunk_rows)
-        from pathlib import Path as _Path
-        staging = _Path.home() / "HandQ" / "Skill" / ".proposed" / proposal_id[:8]
-        return SkillProposal(
-            id=row[0], skill_status=sps,
-            skill_signature=signature,
-            skill_fingerprint=row[3] or "",
-            summary=row[5] or "",
-            body_md=body_md,
-            recurrence_count=int(row[4] or 1),
-            staging_path=str(staging) if staging.exists() else None,
-            source_event_id=row[6],
-            created_at=int(row[7]), updated_at=int(row[8]),
-        )
-
-    async def get_obs_summary_dataclass(
-        self, *, date: str, type_: str, language: str = "en",
-    ) -> Optional[Summary]:
-        row = await self.get_obs_summary(date=date, type_=type_, language=language)
-        if not row:
-            return None
-        moments: list = []
-        if row[3]:
-            try:
-                v = json.loads(row[3])
-                moments = v if isinstance(v, list) else []
-            except (json.JSONDecodeError, TypeError, ValueError):
-                moments = []
-        return Summary(
-            date=row[0], type=row[1], language=row[2],
-            moments=moments,
-            summary_text=row[4] or "",
-            generated_model=row[5] or "",
-            generated_at=int(row[6] or 0),
         )
 
     # ── L2/L3 dream synthesis: real impls (LTM 2.0) ────────────────────────

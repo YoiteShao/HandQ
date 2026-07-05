@@ -151,11 +151,14 @@ async def recall_memory_impl(
         if not rows:
             return []
         rows = _recency_reorder(rows)
-    # else (rerank=True but reranker.available=False) — graceful fallback:
-    # preserve the pre-refactor behaviour (no gate, no recency reorder) so a
-    # rerank outage doesn't silently switch the QUALITY caller to aggressive
-    # FAST-tier semantics. Chat / per-item callers ask for rerank=False
-    # explicitly; only they should get the post-fusion floor.
+    else:
+        # rerank=True but reranker unavailable — apply a permissive cosine
+        # floor (same as rerank gate) and recency reorder so quality doesn't
+        # silently degrade to unfiltered RRF output.
+        rows = [r for r in rows if r[7] is None or r[7] >= C.RECALL_RERANK_MIN_SCORE]
+        if not rows:
+            return []
+        rows = _recency_reorder(rows)
     entries = [_row_to_memory_entry(r) for r in rows[:effective_k]]
     if dynamic_k:
         entries = _score_gap_trim(
@@ -208,7 +211,12 @@ async def recall_knowledge_impl(
         if not rows:
             return []
         rows = _recency_reorder(rows)
-    # else: graceful fallback for rerank=True + unavailable reranker.
+    else:
+        # rerank=True but reranker unavailable — same soft fallback as memory.
+        rows = [r for r in rows if r[7] is None or r[7] >= C.RECALL_RERANK_MIN_SCORE]
+        if not rows:
+            return []
+        rows = _recency_reorder(rows)
     entries = [_row_to_knowledge_entry(r) for r in rows[:effective_k]]
     if dynamic_k:
         entries = _score_gap_trim(

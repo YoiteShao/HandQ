@@ -1499,6 +1499,22 @@ ipcMain.handle('dialog:pickHistoryLog', async () => {
     return { canceled: false, path: result.filePaths[0] };
 });
 
+ipcMain.handle('dialog:pickSkillFile', async () => {
+    const owner = BrowserWindow.getFocusedWindow() || mainWindow || null;
+    const result = await dialog.showOpenDialog(owner, {
+        title: 'Import SKILL.md',
+        properties: ['openFile'],
+        filters: [
+            { name: 'Skill files', extensions: ['md'] },
+            { name: 'All files',   extensions: ['*'] },
+        ],
+    });
+    if (result.canceled || !result.filePaths || !result.filePaths.length) {
+        return { canceled: true, path: null };
+    }
+    return { canceled: false, path: result.filePaths[0] };
+});
+
 // --- graceful shutdown -----------------------------------------------------
 
 app.on('before-quit', (event) => {

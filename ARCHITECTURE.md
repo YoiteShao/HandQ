@@ -57,6 +57,9 @@ INSTALL_DIR =
     spillover\                         PersonalityMonitor 的 ring 溢出兜底
       m<idx>_<ts>_<seq>.jpg            JPEG 字节（quality=85，~300KB/帧）
       m<idx>_<ts>_<seq>.meta.json      元数据（title/app/tier/recent_texts 快照）
+  Skill\                             ← 技能库（agent 按需 read_skill；用户通过控制面板增删改/enable/disable/standing）
+    <name>\                            每个 skill 一个目录
+      SKILL.md                           YAML frontmatter (name/description/enabled/standing) + body
   browser_profile\                   browser_tool 状态根（多 session 模型 §1.7）
     sessions\                          per-flow Chromium user-data-dir
       <sid>\                           每个 FlowControllerV2 一个独立 profile
@@ -106,6 +109,7 @@ INSTALL_DIR =
 | Per-session 浏览器 profile | `%USERPROFILE%\HandQ\browser_profile\sessions\<sid>\` | 否 | 是 | 每个 flow 独立的 Chromium user-data-dir；详见 §1.7 多 session 模型 |
 | LTM SQLite | `%USERPROFILE%\HandQ\personality\memory.db` | 否 | 是 | 跨升级；详见 LTM 设计文档 |
 | 长 /remember 镜像 | `%USERPROFILE%\HandQ\personality\memory_notes\<id>.md` | 否 | 是 | 跨升级；用户可编辑器打开 |
+| 技能库 | `%USERPROFILE%\HandQ\Skill\<name>\SKILL.md` | 否 | 是 | 跨升级；用户可面板/编辑器管理；自动生成的默认 disabled |
 | Ring 溢出 buffer | `%USERPROFILE%\HandQ\personality\spillover\` | 否 | 是 | RAM ring 满 / 监视器断开时落盘；OCR 完立删；启动时清理 >24h 残留 |
 | 定时任务 | `%USERPROFILE%\HandQ\scheduled_tasks.json` | 否 | 是 | 跨升级；JSON 可手编 |
 | 框架日志 | `%USERPROFILE%\HandQ\logs\<launch>\` | 否 | 是 | 自动 prune（保留最近 30 个 launch） |

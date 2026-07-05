@@ -99,8 +99,6 @@
         // First-load on each tab.
         if (name === 'memory') refreshMemory();
         if (name === 'knowledge') refreshKnowledge();
-        if (name === 'skills') refreshSkills();
-        if (name === 'summary') refreshSummary();
         if (name === 'stats') refreshStats();
         if (name === 'activity') refreshActivity();
     }
@@ -222,189 +220,6 @@
             if (kind === 'memory') refreshMemory(); else refreshKnowledge();
         } catch (err) {
             showToast('archive failed: ' + err.message, 'error');
-        }
-    }
-
-    // ── Skills tab (proposal approval queue) ────────────────────
-    const skillStatus = document.getElementById('admin-skill-status');
-    const skillRefresh = document.getElementById('admin-skill-refresh');
-    const skillList = document.getElementById('admin-skill-list');
-    const skillCount = document.getElementById('admin-skill-count');
-
-    async function refreshSkills() {
-        const status = skillStatus.value || 'proposed';
-        try {
-            const r = await rpc('ltm_list_skill_proposals', { status, limit: 50 });
-            renderSkillList(r.proposals || []);
-            skillCount.textContent = `${(r.proposals || []).length} proposals`;
-        } catch (err) {
-            showToast('list skills failed: ' + err.message, 'error');
-        }
-    }
-    skillRefresh.addEventListener('click', refreshSkills);
-    skillStatus.addEventListener('change', refreshSkills);
-
-    function renderSkillList(proposals) {
-        skillList.innerHTML = '';
-        if (!proposals.length) {
-            const li = document.createElement('li');
-            li.textContent = '(no proposals)';
-            li.style.opacity = '0.5';
-            skillList.appendChild(li);
-            return;
-        }
-        for (const p of proposals) {
-            const li = document.createElement('li');
-
-            const main = document.createElement('div');
-            const summary = document.createElement('div');
-            summary.className = 'admin-entry-summary';
-            summary.textContent = p.summary || '(no summary)';
-            main.appendChild(summary);
-
-            const meta = document.createElement('div');
-            meta.className = 'admin-entry-meta';
-            const ts = p.updated_at
-                ? new Date(p.updated_at * 1000).toISOString().slice(0, 19).replace('T', ' ')
-                : '';
-            meta.textContent =
-                `seen ${p.recurrence_count}× · fp=${(p.fingerprint || '').slice(0, 12)} · ${ts}`;
-            main.appendChild(meta);
-
-            if (p.staging_path) {
-                const path = document.createElement('pre');
-                path.className = 'admin-entry-content';
-                path.textContent = p.staging_path;
-                main.appendChild(path);
-            }
-            li.appendChild(main);
-
-            const actions = document.createElement('div');
-            actions.className = 'admin-entry-actions';
-            // Only proposed rows are actionable; approved/rejected are terminal.
-            if (p.status === 'proposed') {
-                const approveBtn = document.createElement('button');
-                approveBtn.type = 'button';
-                approveBtn.textContent = 'Approve';
-                approveBtn.addEventListener('click', () => approveSkill(p.id));
-                const rejectBtn = document.createElement('button');
-                rejectBtn.type = 'button';
-                rejectBtn.textContent = 'Reject';
-                rejectBtn.addEventListener('click', () => rejectSkill(p.id));
-                actions.appendChild(approveBtn);
-                actions.appendChild(rejectBtn);
-            } else {
-                const badge = document.createElement('span');
-                badge.className = 'admin-entry-meta';
-                badge.textContent = p.status;
-                actions.appendChild(badge);
-            }
-            li.appendChild(actions);
-            skillList.appendChild(li);
-        }
-    }
-
-    async function approveSkill(id) {
-        if (!confirm('Approve this skill?\nIts SKILL.md will be installed into the live registry.')) {
-            return;
-        }
-        try {
-            const r = await rpc('ltm_approve_skill_proposal', { skill_id: id });
-            if (r && r.ok) {
-                showToast('Approved — skill installed.');
-            } else {
-                showToast('approve failed: ' + ((r && (r.reason || r.error)) || 'unknown'), 'error');
-            }
-            refreshSkills();
-        } catch (err) {
-            showToast('approve failed: ' + err.message, 'error');
-        }
-    }
-
-    async function rejectSkill(id) {
-        if (!confirm('Reject this skill proposal?\nStaging files are removed; the row is archived.')) {
-            return;
-        }
-        try {
-            await rpc('ltm_reject_skill_proposal', { skill_id: id, reason: 'user_request' });
-            showToast('Rejected.');
-            refreshSkills();
-        } catch (err) {
-            showToast('reject failed: ' + err.message, 'error');
-        }
-    }
-
-    // ── Summary tab (activity digest reader) ────────────────────
-    const sumDate = document.getElementById('admin-sum-date');
-    const sumType = document.getElementById('admin-sum-type');
-    const sumLoad = document.getElementById('admin-sum-load');
-    const sumNarrative = document.getElementById('admin-sum-narrative');
-    const sumMoments = document.getElementById('admin-sum-moments');
-
-    function refreshSummary() {
-        // Default the date picker to today the first time the tab opens.
-        if (!sumDate.value) {
-            sumDate.value = new Date().toISOString().slice(0, 10);
-        }
-        loadSummary();
-    }
-    sumLoad.addEventListener('click', loadSummary);
-    sumType.addEventListener('change', loadSummary);
-    sumDate.addEventListener('change', loadSummary);
-
-    async function loadSummary() {
-        const date = sumDate.value;
-        const type = sumType.value || 'daily';
-        if (!date) { showToast('pick a date', 'error'); return; }
-        try {
-            // The envelope's `type` is the routing key (ltm_query_summary), so
-            // the period rides under `summary_type` to avoid being clobbered.
-            const r = await rpc('ltm_query_summary', { date, summary_type: type, language: 'en' });
-            renderSummary(r);
-        } catch (err) {
-            showToast('load summary failed: ' + err.message, 'error');
-        }
-    }
-
-    function renderSummary(r) {
-        sumMoments.innerHTML = '';
-        if (!r || !r.found) {
-            sumNarrative.textContent = '(no summary for this date / period)';
-            return;
-        }
-        const model = r.generated_model ? ` · ${r.generated_model}` : '';
-        const gen = r.generated_at
-            ? new Date(r.generated_at * 1000).toISOString().slice(0, 19).replace('T', ' ')
-            : '';
-        sumNarrative.textContent =
-            (r.summary_text || '(no narrative)') +
-            `\n\n— ${r.type} · ${r.date}${model} · ${gen}`;
-        const moments = Array.isArray(r.moments) ? r.moments : [];
-        for (const m of moments) {
-            const li = document.createElement('li');
-            const main = document.createElement('div');
-
-            const title = document.createElement('div');
-            title.className = 'admin-entry-summary';
-            title.textContent = m.title || '(untitled moment)';
-            main.appendChild(title);
-
-            const meta = document.createElement('div');
-            meta.className = 'admin-entry-meta';
-            const t = m.time ? String(m.time).slice(0, 19).replace('T', ' ') : '';
-            const imp = (typeof m.importance === 'number')
-                ? ` · importance ${m.importance.toFixed(2)}` : '';
-            meta.textContent = `${m.category || 'other'} · ${t}${imp}`;
-            main.appendChild(meta);
-
-            if (m.summary) {
-                const body = document.createElement('pre');
-                body.className = 'admin-entry-content';
-                body.textContent = m.summary;
-                main.appendChild(body);
-            }
-            li.appendChild(main);
-            sumMoments.appendChild(li);
         }
     }
 
@@ -837,6 +652,325 @@
         }
     });
 
+    // ── Skills overlay (separate menu entry) ────────────────────
+    //
+    // The single hub for the skill lifecycle. Lists installed skills as
+    // cards — enable/disable, edit, delete — including auto-generated ones
+    // (direct-written disabled by triage). "Import" pulls in an external
+    // SKILL.md via a native file dialog. There is no approval queue. RPC
+    // layer is shared via the closure above.
+    const skOverlay = document.getElementById('overlay-skills');
+    const skCloseBtn = document.getElementById('skills-close');
+    const skToast = document.getElementById('skills-toast');
+    const skGrid = document.getElementById('skills-grid');
+    const skCount = document.getElementById('skills-count');
+    const skCreateBtn = document.getElementById('skills-create-btn');
+    const skImportBtn = document.getElementById('skills-import-btn');
+    const skRefreshBtn = document.getElementById('skills-refresh-btn');
+    // Create / edit modal.
+    const skFormOverlay = document.getElementById('overlay-skill-form');
+    const skFormCloseBtn = document.getElementById('skill-form-close');
+    const skFormInner = document.getElementById('skill-form-inner');
+    const skFormTitle = document.getElementById('skill-form-title');
+    const skFormName = document.getElementById('skill-form-name');
+    const skFormDesc = document.getElementById('skill-form-desc');
+    const skFormBody = document.getElementById('skill-form-body');
+    const skFormStanding = document.getElementById('skill-form-standing');
+    const skFormCancel = document.getElementById('skill-form-cancel');
+    const skFormSave = document.getElementById('skill-form-save');
+
+    let allSkills = [];
+    // null → create mode; a name string → editing that skill.
+    let skEditingName = null;
+
+    function showSkillToast(msg, kind) {
+        skToast.textContent = msg;
+        skToast.classList.remove('hidden', 'error');
+        if (kind === 'error') skToast.classList.add('error');
+        clearTimeout(showSkillToast._tmr);
+        showSkillToast._tmr = setTimeout(() => skToast.classList.add('hidden'), 3500);
+    }
+
+    function openSkills() {
+        skOverlay.classList.remove('hidden');
+        skOverlay.setAttribute('aria-hidden', 'false');
+        refreshSkillPanel();
+    }
+    function closeSkills() {
+        skOverlay.classList.add('hidden');
+        skOverlay.setAttribute('aria-hidden', 'true');
+        closeSkillForm();
+    }
+    skCloseBtn.addEventListener('click', closeSkills);
+    skRefreshBtn.addEventListener('click', refreshSkillPanel);
+    document.addEventListener('keydown', (e) => {
+        if (!skOverlay.classList.contains('hidden') && e.key === 'Escape') {
+            if (!skFormOverlay.classList.contains('hidden')) {
+                closeSkillForm();
+            } else {
+                closeSkills();
+            }
+        }
+    });
+
+    async function refreshSkillPanel() {
+        try {
+            const r = await rpc('skill_list', {});
+            allSkills = (r && r.skills) || [];
+            renderSkillCards(allSkills);
+        } catch (err) {
+            showSkillToast('load skills failed: ' + err.message, 'error');
+        }
+    }
+
+    function renderSkillCards(skills) {
+        skGrid.innerHTML = '';
+        skCount.textContent = skills.length
+            ? `${skills.length} installed`
+            : '';
+        if (!skills.length) {
+            const empty = document.createElement('div');
+            empty.className = 'muted skills-empty';
+            empty.textContent = '(no skills installed — click + to create one)';
+            skGrid.appendChild(empty);
+            return;
+        }
+        for (const s of skills) {
+            const card = document.createElement('div');
+            card.className = 'skill-card';
+            if (!s.enabled) card.classList.add('disabled');
+            if (s.standing) card.classList.add('standing');
+
+            const head = document.createElement('div');
+            head.className = 'skill-card-head';
+            const name = document.createElement('span');
+            name.className = 'skill-card-name';
+            name.textContent = s.name;
+            head.appendChild(name);
+
+            if (s.standing) {
+                const badge = document.createElement('span');
+                badge.className = 'skill-card-badge';
+                badge.textContent = 'always on';
+                head.appendChild(badge);
+            }
+
+            // Auto-origin badge: surfaces skills the miner minted from a
+            // recurring task (disabled until the user reviews + enables them).
+            // Editing such a skill in the panel claims ownership (origin→user),
+            // after which the miner will never overwrite it.
+            if (s.origin === 'auto') {
+                const abadge = document.createElement('span');
+                abadge.className = 'skill-card-badge auto';
+                abadge.textContent = s.enabled ? 'auto' : 'auto · review';
+                abadge.title = 'Auto-generated by the skill miner from a recurring '
+                    + 'task. Review it, then flip Enabled to activate. Editing it '
+                    + 'here claims ownership so it won’t be overwritten later.';
+                head.appendChild(abadge);
+            }
+
+            const toggle = document.createElement('label');
+            toggle.className = 'skill-toggle';
+            const cb = document.createElement('input');
+            cb.type = 'checkbox';
+            cb.checked = !!s.enabled;
+            cb.addEventListener('change', () => toggleSkill(s.name, cb.checked, cb));
+            const tlabel = document.createElement('span');
+            tlabel.textContent = 'Enabled';
+            toggle.appendChild(cb);
+            toggle.appendChild(tlabel);
+            head.appendChild(toggle);
+
+            const standingToggle = document.createElement('label');
+            standingToggle.className = 'skill-toggle';
+            const scb = document.createElement('input');
+            scb.type = 'checkbox';
+            scb.checked = !!s.standing;
+            scb.addEventListener('change', () => toggleStanding(s.name, scb.checked, scb));
+            const slabel = document.createElement('span');
+            slabel.textContent = 'Standing';
+            standingToggle.appendChild(scb);
+            standingToggle.appendChild(slabel);
+            head.appendChild(standingToggle);
+            card.appendChild(head);
+
+            const desc = document.createElement('div');
+            desc.className = 'skill-card-desc';
+            desc.textContent = s.description || '(no description)';
+            card.appendChild(desc);
+
+            const problems = Array.isArray(s.problems) ? s.problems : [];
+            for (const p of problems) {
+                const warn = document.createElement('div');
+                warn.className = 'skill-card-problem';
+                warn.textContent = '⚠ ' + p;
+                card.appendChild(warn);
+            }
+
+            const actions = document.createElement('div');
+            actions.className = 'skill-card-actions';
+            const editBtn = document.createElement('button');
+            editBtn.type = 'button';
+            editBtn.textContent = 'Edit';
+            editBtn.addEventListener('click', () => openSkillForm(s.name));
+            const delBtn = document.createElement('button');
+            delBtn.type = 'button';
+            delBtn.className = 'danger';
+            delBtn.textContent = 'Delete';
+            delBtn.addEventListener('click', () => deleteSkillEntry(s.name));
+            actions.appendChild(editBtn);
+            actions.appendChild(delBtn);
+            card.appendChild(actions);
+
+            skGrid.appendChild(card);
+        }
+    }
+
+    async function toggleSkill(name, enabled, cb) {
+        try {
+            const r = await rpc('skill_set_enabled', { name, enabled });
+            if (!r || !r.ok) throw new Error((r && (r.reason || r.error)) || 'unknown');
+            showSkillToast(enabled ? `${name} enabled` : `${name} disabled`);
+            const local = allSkills.find(x => x.name === name);
+            if (local) {
+                // "standing implies enabled": disabling a standing skill clears
+                // standing backend-side. Mirror the authoritative result so
+                // both checkboxes stay consistent.
+                local.enabled = r.enabled;
+                local.standing = r.standing;
+            }
+            renderSkillCards(allSkills);
+        } catch (err) {
+            if (cb) cb.checked = !enabled;   // roll back the optimistic flip
+            showSkillToast('toggle failed: ' + err.message, 'error');
+        }
+    }
+
+    async function toggleStanding(name, standing, cb) {
+        try {
+            const r = await rpc('skill_set_standing', { name, standing });
+            if (!r || !r.ok) throw new Error((r && (r.reason || r.error)) || 'unknown');
+            showSkillToast(standing ? `${name} set standing` : `${name} standing off`);
+            const local = allSkills.find(x => x.name === name);
+            if (local) {
+                // "standing implies enabled": turning standing ON force-enables
+                // the skill backend-side. Mirror the authoritative result so the
+                // Enabled checkbox flips on too — the standing+disabled combo is
+                // simply not representable.
+                local.standing = r.standing;
+                local.enabled = r.enabled;
+            }
+            renderSkillCards(allSkills);   // reflect the enforced enabled+standing
+        } catch (err) {
+            if (cb) cb.checked = !standing;   // roll back the optimistic flip
+            showSkillToast('standing toggle failed: ' + err.message, 'error');
+        }
+    }
+
+    async function deleteSkillEntry(name) {
+        if (!confirm(`Delete skill "${name}"?\nIts SKILL.md directory is removed from disk.`)) {
+            return;
+        }
+        try {
+            const r = await rpc('skill_delete', { name });
+            if (!r || !r.ok) throw new Error((r && (r.reason || r.error)) || 'unknown');
+            showSkillToast(`${name} deleted`);
+            refreshSkillPanel();
+        } catch (err) {
+            showSkillToast('delete failed: ' + err.message, 'error');
+        }
+    }
+
+    function openSkillForm(name) {
+        skEditingName = name || null;
+        if (skEditingName) {
+            const s = allSkills.find(x => x.name === skEditingName) || {};
+            skFormTitle.textContent = 'Edit skill';
+            skFormName.value = s.name || '';
+            skFormDesc.value = s.description || '';
+            skFormBody.value = s.body || '';
+            if (skFormStanding) skFormStanding.checked = !!s.standing;
+        } else {
+            skFormTitle.textContent = 'New skill';
+            skFormName.value = '';
+            skFormDesc.value = '';
+            skFormBody.value = '';
+            if (skFormStanding) skFormStanding.checked = false;
+        }
+        skFormOverlay.classList.remove('hidden');
+        skFormOverlay.setAttribute('aria-hidden', 'false');
+        skFormName.focus();
+    }
+    function closeSkillForm() {
+        skFormOverlay.classList.add('hidden');
+        skFormOverlay.setAttribute('aria-hidden', 'true');
+        skFormSave.textContent = 'Save';
+        skFormSave.disabled = false;
+    }
+    skCreateBtn.addEventListener('click', () => openSkillForm(null));
+    skFormCloseBtn.addEventListener('click', closeSkillForm);
+    skFormCancel.addEventListener('click', closeSkillForm);
+
+    async function submitSkillForm() {
+        const name = skFormName.value.trim();
+        const description = skFormDesc.value.trim();
+        const body = skFormBody.value;
+        const standing = !!(skFormStanding && skFormStanding.checked);
+        if (!name || !description) {
+            showSkillToast('name and description both required', 'error');
+            return;
+        }
+        skFormSave.disabled = true;
+        skFormSave.textContent = 'Saving…';
+        try {
+            let r;
+            if (skEditingName) {
+                r = await rpc('skill_update', {
+                    name: skEditingName, new_name: name, description, body, standing,
+                });
+            } else {
+                r = await rpc('skill_create', { name, description, body, standing });
+            }
+            if (!r || !r.ok) throw new Error((r && (r.reason || r.error)) || 'unknown');
+            showSkillToast(skEditingName ? `${name} updated` : `${name} created`);
+            closeSkillForm();
+            refreshSkillPanel();
+        } catch (err) {
+            showSkillToast('save failed: ' + err.message, 'error');
+        } finally {
+            skFormSave.textContent = 'Save';
+            skFormSave.disabled = false;
+        }
+    }
+    skFormInner.addEventListener('submit', (e) => {
+        e.preventDefault();
+        submitSkillForm();
+    });
+
+    async function importSkillFromFile() {
+        if (!window.handqDialog || !window.handqDialog.pickSkillFile) {
+            showSkillToast('file dialog unavailable', 'error');
+            return;
+        }
+        let picked;
+        try {
+            picked = await window.handqDialog.pickSkillFile();
+        } catch (err) {
+            showSkillToast('import failed: ' + err.message, 'error');
+            return;
+        }
+        if (!picked || picked.canceled || !picked.path) return;
+        try {
+            const r = await rpc('skill_import', { path: picked.path });
+            if (!r || !r.ok) throw new Error((r && (r.reason || r.error)) || 'unknown');
+            showSkillToast(`${r.name} imported`);
+            refreshSkillPanel();
+        } catch (err) {
+            showSkillToast('import failed: ' + err.message, 'error');
+        }
+    }
+    skImportBtn.addEventListener('click', importSkillFromFile);
+
     // ── Bridge response routing ─────────────────────────────────
     // ``handq.onFinal`` / ``onError`` are fan-out subscribe APIs
     // (preload.js pushes onto a listener array), so we simply
@@ -858,5 +992,10 @@
         open: openSchedules,
         close: closeSchedules,
         isOpen: () => !schedOverlay.classList.contains('hidden'),
+    };
+    window.skillPanel = {
+        open: openSkills,
+        close: closeSkills,
+        isOpen: () => !skOverlay.classList.contains('hidden'),
     };
 })();

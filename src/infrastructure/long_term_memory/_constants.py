@@ -193,11 +193,10 @@ LTM_CANDIDATE_RAWTEXT_TTL_DAYS: int = 90
 LTM_RECALL_LOG_TTL_DAYS: int = 90
 # Orphaned-proposal TTL. mem_correction_proposals rows left in status
 # 'pending' are never consumed — HandQ is conversation-as-interface and has
-# no review UI for correction/merge proposals (the only IPC surface lists
-# SKILL proposals, which live in mem_entries, not this table). A 'pending'
-# row therefore only accumulates. The cleanup pass DELETEs pending rows older
-# than this; terminal rows (merged / kept_distinct / applied / stale) are the
-# load-bearing decided-memo + audit trail and are never swept.
+# no review UI for correction/merge proposals. A 'pending' row therefore only
+# accumulates. The cleanup pass DELETEs pending rows older than this; terminal
+# rows (merged / kept_distinct / applied / stale) are the load-bearing
+# decided-memo + audit trail and are never swept.
 LTM_CORRECTION_PROPOSAL_TTL_DAYS: int = 30
 LTM_OBS_SNAPSHOT_TTL_DAYS: int = 7       # raw frames; captured_at is unix MS
 LTM_OBS_EVENT_TTL_DAYS: int = 7          # state-change stream; occurred_at unix MS
@@ -215,23 +214,33 @@ LTM_OBS_PIPELINE_RUN_TTL_DAYS: int = 30  # triage audit ledger; started_at secon
 # is seconds.
 LTM_OBS_SESSION_TTL_DAYS: int = 30
 LTM_OBS_SEMANTIC_EVENT_TTL_DAYS: int = 30
-# Stale skill-proposal backstop. A worth_skill semantic event stages a
-# mem_entries(kind='skill_proposal', skill_status='proposed') row + a chat
-# hint, but activation is user-gated (move the staging file / approve). An
-# un-acted proposal lingers archived=0 forever and holds a slot in the
-# partial-UNIQUE dedup index (idx_mem_skill_dedup). The cleanup pass ARCHIVES
-# (does not delete) proposals older than this: it keeps the audit row, frees
-# the dedup slot so a later recurrence can re-propose, and drops the row from
-# the IPC list (which filters archived=0). created_at is seconds.
-LTM_SKILL_PROPOSAL_TTL_DAYS: int = 30
-# A completed-task skill is only proposed once its pattern RECURS this many
+# A completed-task skill is only minted once its pattern RECURS this many
 # times. The triage skill pass (_apply_session_skill) runs the extractor on
 # every successful SESSION_COMPLETE, clusters by the LLM-normalized
 # skill_fingerprint, and bumps skill_recurrence; only when the count reaches
-# this threshold does it write the mem_entries(skill_proposal) row. One-off
-# tasks stay below it forever and never surface a skill — which is the whole
-# point: skills come from repeated, automatable workflows, not single runs.
+# this threshold does it write a live (disabled) SKILL.md under the Skill root
+# via SkillRegistry. One-off tasks stay below it forever and never surface a
+# skill — which is the whole point: skills come from repeated, automatable
+# workflows, not single runs.
 SKILL_RECURRENCE_THRESHOLD: int = 3
+# Recurrences only count as the "same habit" when they happen within this
+# rolling window. When a new occurrence lands more than this many days after
+# the previous one, bump_skill_recurrence RESETS the counter to 1 (a fresh
+# streak) instead of accumulating. Without this, a task done 3 times over a
+# year would eventually surface as a "skill" even though it isn't a current,
+# repeated workflow — the counter is a lifetime tally otherwise. 45 days keeps
+# the meaning of "recurring" honest and aligns with the proactive-engine TTL.
+SKILL_RECURRENCE_WINDOW_DAYS: int = 45
+# Cosine bar for the SEMANTIC recurrence clusterer (bump_skill_recurrence_semantic).
+# A new skill-worthy session joins the nearest existing cluster when their
+# embeddings are at least this similar; otherwise it starts a new cluster. This
+# replaces exact-string fingerprint matching so trivial wording drift ("restart
+# nginx" vs "bounce the web server") no longer fragments the recurrence counter
+# — the dominant reason skills never minted. Anchored to the proven
+# DREAM_L2_CLUSTER_THRESHOLD (0.55) used for memory synthesis on the same
+# embedder, nudged up because a skill's name+description is shorter and more
+# focused than a memory chunk. Tune via the nearest-cosine logging the bump emits.
+SKILL_RECURRENCE_TAU: float = 0.60
 MERGE_EXACT_THRESHOLD: float = 0.90          # auto-merge bar
 MERGE_LLM_GATE_THRESHOLD: float = 0.85       # [0.85, 0.90) → helper-LLM arbiter
 MERGE_LLM_MAX_PAIRS_PER_SCAN: int = 5        # cap helper-LLM merge calls per full scan
@@ -303,7 +312,7 @@ DREAM_L3_WINDOW_SECONDS: int = 60 * 60 * 24 * 90        # 90 days
 # (its merge bar is ~0.95 for exact, 0.85 for propose; pattern clusters
 # are intentionally looser — we want "same theme" not "same content").
 DREAM_L2_CLUSTER_THRESHOLD: float = 0.55
-DREAM_L3_CLUSTER_THRESHOLD: float = 0.50    # patterns are already
+DREAM_L3_CLUSTER_THRESHOLD: float = 0.35    # patterns are already
                                             # synthesised, looser still
 
 # A cluster needs at least this many members for the LLM to even consider
@@ -386,13 +395,6 @@ RECALL_FTS_OVERFETCH: int = 3
 # is never culled just for being old. 45d ≈ a memory needs ~2x relevance to
 # tie a fresh one after ~1.5 months.
 RECALL_DECAY_HALFLIFE_DAYS: float = 45.0
-
-# Drop passive-observation INSIGHT memories (W-tier UIA activity snapshots,
-# written with source='semantic_event' + dimension='insight') from the recall
-# candidate pool. They consistently surfaced as domain-similar-but-useless
-# noise in task/planner guidance recall. Curated memories and observation-
-# derived KNOWLEDGE are unaffected. One-line reversible kill-switch.
-RECALL_EXCLUDE_OBSERVATION_INSIGHTS: bool = True
 
 # Dynamic K: planner over-fetches then trims by score gap after rerank.
 # Receptionist keeps fixed k=5 (no rerank, latency-sensitive).
@@ -617,8 +619,8 @@ ACTIVITY_MONITOR_ENABLED: bool = True
 # screenshots. A user who power-codes for 10 minutes DOES need that
 # burst captured.
 ACTIVITY_TIER_HOT_INTERVAL_SEC: float = 8.0
-ACTIVITY_TIER_WARM_INTERVAL_SEC: float = 30.0
-ACTIVITY_TIER_COLD_INTERVAL_SEC: float = 120.0
+ACTIVITY_TIER_WARM_INTERVAL_SEC: float = 60.0
+ACTIVITY_TIER_COLD_INTERVAL_SEC: float = 300.0
 ACTIVITY_TIER_DORMANT_INTERVAL_SEC: float = 300.0
 
 ACTIVITY_HOT_RECENCY_SEC: int = 30
@@ -898,6 +900,15 @@ CORRECTION_RECALL_PRIORITY_DAYS: int = 30
 # migrations want the strongest reasoning available, not the helper pool.
 
 
+# ── Legacy dimension registry ─────────────────────────────────────────────
+#
+# Dimension values removed from the MemoryDimension enum. On startup,
+# archive_legacy_dimensions() sets archived=1 for any entry still carrying
+# one of these. Append here when deprecating a dimension; the cleanup is
+# deterministic, idempotent, and runs before DreamWorker.
+LEGACY_DIMENSIONS: list = ["insight"]
+
+
 # ── 14. Pre-insert dedup gate (trigram Jaccard) ─────────────────────────────
 #
 # Catastrophic duplication (prod-observed: "IDLE state" ×6, "SAP Concur" ×7,
@@ -921,3 +932,22 @@ CORRECTION_RECALL_PRIORITY_DAYS: int = 30
 DEDUP_JACCARD_DROP_THRESHOLD: float = 0.70
 DEDUP_JACCARD_UPDATE_THRESHOLD: float = 0.40
 DEDUP_FTS_CANDIDATES: int = 5
+
+
+# ── 15. Activity Arc Aggregation ───────────────────────────────────────────
+#
+# The ArcAggregator sits above SessionAggregator: sessions group snapshots
+# by app window; arcs group sessions by continuous user activity. An arc
+# closes only on a real idle gap (user left the desk / locked screen for
+# ≥ ARC_IDLE_GAP_MS). Continuous app switching (VS Code → Browser → Terminal)
+# stays within one arc.
+#
+# Closed arcs with ≥ ARC_MIN_SESSIONS are the input unit for the
+# SemanticExtractor — enough cross-app context to distill genuine workflow
+# patterns rather than single-app fragments.
+
+ARC_IDLE_GAP_MS: int = 20 * 60 * 1000        # 20 min idle closes an arc
+ARC_MIN_SESSIONS: int = 2                      # min sessions for LLM processing
+ARC_MAX_DURATION_MS: int = 120 * 60 * 1000    # 2h hard cap prevents unbounded growth
+ARC_AGGREGATOR_TICK_SEC: float = 60.0         # worker poll interval
+ARC_MAX_SNAPSHOTS_PER_PROMPT: int = 30        # cap LLM input size per arc

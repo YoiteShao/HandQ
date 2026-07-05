@@ -296,6 +296,10 @@ contextBridge.exposeInMainWorld('handqDialog', {
         preloadLog('dialog:pickHistoryLog');
         return ipcRenderer.invoke('dialog:pickHistoryLog');
     },
+    pickSkillFile: () => {
+        preloadLog('dialog:pickSkillFile');
+        return ipcRenderer.invoke('dialog:pickSkillFile');
+    },
 });
 
 contextBridge.exposeInMainWorld('appInfo', {

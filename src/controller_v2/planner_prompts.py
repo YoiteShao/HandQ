@@ -111,8 +111,6 @@ named; deferred_actions may be [] in that case.
 When uncertain between task and chat, lean toward task only if the user seems to expect the \
 agent to DO something; pure preferences, memory directives, and acknowledgements stay chat.
 
-**Skills note**: Skill activation is the planner's job (Stage 2), not yours.
-
 ## Output Schema (intent first, then response_to_user, then metadata)
 
 ```json
@@ -248,6 +246,15 @@ Compare these against expected_outcomes:
   Set `interrupt_current: true` if an in-progress item is now invalid.
   Inject a corrective item as the new first pending item. Diagnose the
   deviation before retrying the same approach.
+
+**`→ AGENT FLAGS FOR PLANNER` (explicit agent feedback):**
+  A completed item may carry this line. It is the agent telling you directly —
+  usually after reading a skill body it pulled via read_skill, which YOU did not
+  see when planning — that the REMAINING items conflict with reality or with a
+  skill's instructions. Treat it as high-trust (the agent saw the skill body;
+  you only saw the menu). Revise the pending tail to honour it. If it appears on
+  a FAILED item, the agent stopped rather than execute a plan it knew was wrong:
+  inject a corrected item in place of the blocked one.
 
 **Drift signals to watch for:**
 - Agent modified wrong files or targeted wrong identifiers
@@ -535,9 +542,8 @@ the final reply automatically (no need for you to write one).
 ```
 
 Tool needs are NOT a per-item field — see `tools_needed` in the output
-schema. Same for skills (`skills_needed`). These are session-level: once
-activated, the tool/skill stays available for every subsequent item until
-session end.
+schema. This is session-level: once activated, the tool stays available for
+every subsequent item until session end.
 
 Re-emit unchanged items by copying their fields VERBATIM from your context
 ([Current CheckList] section). Do not paraphrase.
@@ -560,7 +566,7 @@ will be picked up after current finishes naturally.
 ## Output Schema
 
 You do NOT write directly to the user — your only outputs shape the
-checklist (items, skills, tools, interrupt). The system generates the
+checklist (items, tools, interrupt). The system generates the
 final task-completion reply automatically from the completed items'
 results; you never write a "task complete" message or any other
 user-facing text.
@@ -577,12 +583,11 @@ Do NOT clarify when:
 Maximum ONE clarification item per task. If the answer is still vague,
 pick the most probable interpretation and proceed.
 
-`skills_needed` and `tools_needed` are **liberal advisory** declarations of
-what remaining items plausibly benefit from. The system diffs against
-already-active state and activates only the delta. Re-listing already-active
-names is safe and expected. The agent can claim additional tools mid-item
-and release tools it no longer needs — your declaration is the opening hand,
-not a contract.
+`tools_needed` is a **liberal advisory** declaration of what remaining items
+plausibly benefit from. The system diffs against already-active state and
+activates only the delta. Re-listing already-active names is safe and
+expected. The agent can claim additional tools mid-item and release tools it
+no longer needs — your declaration is the opening hand, not a contract.
 Tool names must come from the on-demand tools table above.
 
 ```json
@@ -592,7 +597,6 @@ Tool names must come from the on-demand tools table above.
   "post_current_items": [
     {{"item_id": "...", "instruction": "...", "expected_outcomes": [...], "supplement": "", "planner_reasoning": "", "risk_assessment": "", "ssh_target": ""}}
   ],
-  "skills_needed": [],
   "tools_needed": []
 }}
 ```
@@ -611,6 +615,11 @@ def build_plan_modify_system_prompt(
     block + checklist operations description tail + skills section (at END
     for prefix-cache stability — skills_section is the only volatile segment
     and placing it last keeps the ~11KB stable prefix cacheable).
+
+    ``skills_section`` carries the progressive-disclosure awareness block
+    (enabled skill menu + standing bodies) so the planner can reason ABOUT
+    available skills; the planner no longer activates skills — the agent
+    pulls bodies on demand via read_skill.
     """
     if _IS_WINDOWS:
         tools = _PLAN_MODIFY_TOOLS_WINDOWS.format(

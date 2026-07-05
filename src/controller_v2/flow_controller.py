@@ -238,7 +238,7 @@ class FlowControllerV2:
     async def on_user_message(self, message: str) -> str:
         """Single entry point for all user input.
 
-        Forwards to the orchestrator, which handles intent + skill activation
+        Forwards to the orchestrator, which handles intent + tool activation
         + checklist mutations. Replies are delivered to UI via _forward_reply_to_ui.
 
         Brackets the call with the receptionist "thinking…" indicator: on at

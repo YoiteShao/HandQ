@@ -113,7 +113,7 @@ def _looks_structured(text: str) -> bool:
 
 # Path-fragment regex used by the semantic-event promotion guard.
 # Catches the common "I saw VSCode showing C:\foo\bar" type summaries
-# that the LLM kept proposing as INSIGHT memory. Matches: drive-letter
+# that the LLM kept proposing as memory. Matches: drive-letter
 # Windows paths, /Local/... POSIX-ish paths, and any backslash-heavy
 # fragment.
 import re as _re  # local import to keep top-of-file imports unchanged
@@ -225,7 +225,7 @@ def _is_path_inventory(summary: str) -> bool:
     if coverage < _PATH_COVERAGE_BAR:
         return False
     lower = s.lower()
-    if any(v in lower for v in _BEHAVIOUR_VERBS_EN):
+    if _BEHAVIOUR_VERB_RE.search(lower):
         return False
     return True
 
@@ -339,42 +339,130 @@ _SKILL_FP_STOPWORDS: frozenset = frozenset({
 
 _SKILL_FP_TOKEN_RE = _re.compile(r"[a-z0-9]+")
 
+# Minimum length of the *stem* that must remain after stripping a suffix.
+# Guards against mangling short words ("used"→"us", "using"→"us", "ring"→"r").
+# Only tokens whose stem stays >= this length get normalized.
+_SKILL_FP_MIN_STEM = 3
+
+
+def _normalize_skill_token(token: str) -> str:
+    """Collapse common inflectional suffixes so verb/plural forms share a stem.
+
+    Deliberately tiny and conservative — checks a handful of suffixes in
+    priority order, applies at most one strip, and only when the remaining
+    stem stays >= ``_SKILL_FP_MIN_STEM`` chars. It is NOT a real stemmer:
+    the goal is only to keep "deploy"/"deploys"/"deployed"/"deploying" (and
+    "service"/"services") on one fingerprint so phrasing drift doesn't reset
+    the recurrence counter. Edge cases that under-merge (e.g. "code"/"coding")
+    are accepted; over-merging across genuinely different words is avoided by
+    the min-stem guard and the never-strip-"ss" rule.
+    """
+    # "ing" / "ed": verb tense drift ("restarting"→"restart", "deployed"→"deploy")
+    for suffix in ("ing", "ed"):
+        if token.endswith(suffix) and len(token) - len(suffix) >= _SKILL_FP_MIN_STEM:
+            return token[: -len(suffix)]
+    # trailing "s": plural / 3rd-person ("deploys"→"deploy", "services"→"service").
+    # Never touch "ss" endings ("class", "process", "access").
+    if (
+        token.endswith("s")
+        and not token.endswith("ss")
+        and len(token) - 1 >= _SKILL_FP_MIN_STEM
+    ):
+        return token[:-1]
+    return token
+
 
 def _skill_fingerprint_tokens(title: str) -> List[str]:
     """Normalize a skill title to a sorted, de-duplicated token list.
 
-    Lowercase → split on non-alphanumeric runs → drop stopwords → sort+dedup.
-    This is the phrasing-insensitive component of the skill dedup fingerprint:
-    two proposals describing the same action with reordered or reworded titles
-    collapse to one token set, hence one ``skill_fingerprint``.
+    Lowercase → split on non-alphanumeric runs → drop stopwords → light suffix
+    normalization (see ``_normalize_skill_token``) → sort+dedup. This is the
+    phrasing-insensitive component of the skill recurrence fingerprint: two
+    titles describing the same action with reordered, reworded, or differently-
+    inflected wording collapse to one token set, hence one ``skill_fingerprint``.
     """
     tokens = _SKILL_FP_TOKEN_RE.findall(title.lower())
-    return sorted({t for t in tokens if t and t not in _SKILL_FP_STOPWORDS})
+    return sorted(
+        {
+            _normalize_skill_token(t)
+            for t in tokens
+            if t and t not in _SKILL_FP_STOPWORDS
+        }
+    )
 
 
-def _skill_fingerprint(category: Optional[str], title: str) -> str:
-    """sha256 over canonical JSON of ``(category, normalized title tokens)``.
+def _normalize_action_key(raw: object) -> Optional[str]:
+    """Canonicalize the LLM's controlled ``action_key`` ('<verb>:<object>').
 
-    This is BOTH the skill-proposal dedup key (the partial UNIQUE
-    ``idx_mem_skill_dedup``) AND the recurrence-cluster key
-    (``skill_recurrence.fingerprint``). The two share one formula on purpose,
-    so "have we seen this skill 3 times" and "is there an active proposal for
-    it" agree on what counts as the same skill. Using a sorted token *set*
-    (see ``_skill_fingerprint_tokens``) makes it insensitive to word order,
-    stopwords and punctuation; it does NOT stem, so "open" vs "opens" stay
-    distinct — deliberately conservative to avoid over-merging.
+    Returns a normalized ``verb:object`` slug (each side lowercased, tokenized,
+    light-stemmed via ``_normalize_skill_token``, and joined with ``-``) or None
+    when the value is missing or unusable (no colon, or a side that reduces to
+    nothing). The controlled key is far more phrasing-stable across independent
+    LLM calls than a free-text ``name``, so when present it — not the toy token
+    stemmer over the title — anchors the recurrence fingerprint. Each side gets
+    the SAME normalization as the title path (stopword drop + light stem), so
+    "deploy:the services" and "deploys:service" both converge to
+    ``deploy:service``.
+    """
+    if not isinstance(raw, str) or ":" not in raw:
+        return None
+    verb, obj = raw.strip().lower().split(":", 1)
+
+    def _slug(part: str) -> str:
+        toks = _SKILL_FP_TOKEN_RE.findall(part)
+        # Drop stopwords (same set as the title path) so an article the LLM
+        # slips into the object — "the services" — collapses to "service"
+        # instead of splitting the fingerprint. Fall back to the raw tokens if
+        # stopword-dropping would empty the side (e.g. a degenerate key).
+        kept = [t for t in toks if t not in _SKILL_FP_STOPWORDS]
+        return "-".join(_normalize_skill_token(t) for t in (kept or toks))
+
+    verb_slug, obj_slug = _slug(verb), _slug(obj)
+    if not verb_slug or not obj_slug:
+        return None
+    return f"{verb_slug}:{obj_slug}"
+
+
+def _skill_fingerprint(title: str, *, action_key: Optional[str] = None) -> str:
+    """sha256 over canonical JSON of the recurrence key.
+
+    This is the recurrence-cluster key (``skill_recurrence.fingerprint``):
+    it decides what counts as "the same skill" when answering "have we seen
+    this task pattern ``SKILL_RECURRENCE_THRESHOLD`` times yet?".
+
+    Preferred key: the LLM's controlled ``action_key`` (``verb:object``, see
+    ``_normalize_action_key``) — a short, machine-stable phrase that survives
+    the wording drift a free-text title suffers across independent runs. Falls
+    back to the sorted, light-stemmed token *set* of the ``title`` (see
+    ``_skill_fingerprint_tokens``) only when no usable action_key is supplied,
+    so an occasional parse miss still clusters approximately instead of
+    splitting the counter completely. The two payload shapes are namespaced
+    (``action_key`` vs ``tokens``) so they can never collide by coincidence.
     """
     import hashlib
+    ak = _normalize_action_key(action_key)
+    if ak is not None:
+        payload: dict = {"action_key": ak}
+    else:
+        payload = {"tokens": _skill_fingerprint_tokens(title)}
     canonical = json.dumps(
-        {
-            "category": (category or "").strip().lower(),
-            "tokens": _skill_fingerprint_tokens(title),
-        },
+        payload,
         separators=(",", ":"),
         sort_keys=True,
         ensure_ascii=False,
     )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _skill_cluster_text(verdict: dict) -> str:
+    """Task-identity text embedded for SEMANTIC recurrence clustering.
+
+    Joins the skill's name + description — the *what task is this* — and
+    deliberately NOT the steps, which are procedure detail that varies run to
+    run and would blur the cluster. Falls back to whatever field is present.
+    """
+    parts = [str(verdict.get("name") or ""), str(verdict.get("description") or "")]
+    return ". ".join(p.strip() for p in parts if p and p.strip())
 
 
 def _write_memory_note_file(entry_id: str, summary: str, content: str,
@@ -441,10 +529,13 @@ class DreamWorker:
         self._embedder = embedder
         self._pii = pii_filter
         self._config = config
-        # Outbound chat-feed channel (stdio_bridge._emit), injected by
-        # LongTermMemory.init. None in tests / headless runs — every call
-        # site guards on it. Used to surface a hint when a skill proposal
-        # is freshly staged so the user knows it exists and how to activate.
+        # Outbound chat-feed notification channel (stdio_bridge._emit),
+        # injected by LongTermMemory.init; None in tests / headless runs, so
+        # every call site must guard on None. A generic seam for background
+        # workers to push a hint into the chat feed. No live producer today —
+        # its only past user, the retired skill-proposal staging hint, is gone
+        # now that skills are minted directly as disabled files (see
+        # _write_live_skill).
         self._emit = emit
         self._helper_services: List = []
         # Adaptive cadence (see _constants.py §3):
@@ -534,8 +625,8 @@ class DreamWorker:
                 # LTM 2.0 second consumer: obs_semantic_events from the
                 # observation pipeline. These are LLM-abstracted "what user
                 # did" events; we promote them to mem_entries based on the
-                # SemanticExtractor's worth_memory/worth_knowledge/worth_skill
-                # flags. Frame info on the parent session is propagated onto
+                # SemanticExtractor's worth_memory/worth_knowledge flags.
+                # Frame info on the parent session is propagated onto
                 # mem_entries.frame_json so recall can later filter by os/host.
                 try:
                     n_evt = await self._process_semantic_events_batch()
@@ -624,11 +715,12 @@ class DreamWorker:
         """LTM 2.0 path: promote obs_semantic_events into mem_entries.
 
         Reads pending events (accepted_entries IS NULL), then for each event:
-          - if worth_memory: insert mem_entries(kind='memory', dimension=INSIGHT)
+          - if worth_memory: insert mem_entries(kind='memory', dimension=AGENTIC)
             with frame_json from the parent session
           - if worth_knowledge: insert mem_entries(kind='knowledge')
-          - if worth_skill: insert mem_entries(kind='skill_proposal') with
-            skill_fingerprint dedup (partial UNIQUE handles collision)
+          - worth_skill is inert here: skills are minted ONLY from recurring
+            successful task sessions (see _apply_session_skill), never from
+            passive observation.
 
         Returns the count of events processed (with at least one mem_entry
         produced). Events with all worth_* flags false are still marked
@@ -694,8 +786,8 @@ class DreamWorker:
         )
         if not full:
             return []
-        # _worth_skill is intentionally unused. Skill proposals now come
-        # ONLY from successful HandQ task sessions (see _apply_session_skill),
+        # _worth_skill is intentionally unused. Skills are minted ONLY from
+        # recurring successful HandQ task sessions (see _apply_session_skill),
         # not from passive activity observation. The obs_semantic_events
         # .worth_skill column is left inert rather than removed — dropping it
         # would touch insert_obs_semantic_event + the schema for no real gain.
@@ -763,7 +855,7 @@ class DreamWorker:
         if worth_memory and _is_path_inventory(title):
             # Passively-observed file paths ("HandQ project at C:\\...")
             # are not durable preference signal — the user just had an
-            # editor open. Skip the INSIGHT memory track but still let the
+            # editor open. Skip the memory track but still let the
             # knowledge / skill tracks run (they carry reusable facts).
             _logger.info(
                 "semantic event %s: worth_memory skipped (path-inventory title=%r)",
@@ -773,143 +865,114 @@ class DreamWorker:
 
         if worth_memory:
             try:
-                mem_id = await self._store.insert_entry(
-                    kind=EntryKind.MEMORY,
-                    dimension=MemoryDimension.INSIGHT,
-                    summary=title[:120],
-                    content=content,
-                    source="semantic_event",
-                    source_event_id=event_id,
-                    frame=frame,
+                verdict, dup_id = await self._dedup_gate(
+                    new_summary=title[:120], new_content=content,
+                    kind=EntryKind.MEMORY.value,
                 )
-                accepted.append({"kind": "memory", "id": mem_id})
+                if verdict == "drop":
+                    _logger.debug("promote eid=%s: memory dedup→drop (dup=%s)",
+                                  event_id[:8], dup_id and dup_id[:8])
+                else:
+                    source = "personality_arc" if synthetic_origin else "semantic_event"
+                    mem_id = await self._store.insert_entry(
+                        kind=EntryKind.MEMORY,
+                        dimension=MemoryDimension.AGENTIC,
+                        summary=title[:120],
+                        content=content,
+                        source=source,
+                        source_event_id=event_id,
+                        frame=frame,
+                    )
+                    accepted.append({"kind": "memory", "id": mem_id})
             except Exception:
                 _logger.exception("worth_memory promote failed eid=%s", event_id[:8])
 
         if worth_knowledge:
             try:
-                cat = _map_knowledge_category(category)
-                kn_id = await self._store.insert_entry(
-                    kind=EntryKind.KNOWLEDGE,
-                    category=cat,
-                    summary=title[:120],
-                    content=content,
-                    source="semantic_event",
-                    source_event_id=event_id,
+                verdict, dup_id = await self._dedup_gate(
+                    new_summary=title[:120], new_content=content,
+                    kind=EntryKind.KNOWLEDGE.value,
                 )
-                accepted.append({"kind": "knowledge", "id": kn_id})
+                if verdict == "drop":
+                    _logger.debug("promote eid=%s: knowledge dedup→drop (dup=%s)",
+                                  event_id[:8], dup_id and dup_id[:8])
+                else:
+                    cat = _map_knowledge_category(category)
+                    kn_id = await self._store.insert_entry(
+                        kind=EntryKind.KNOWLEDGE,
+                        category=cat,
+                        summary=title[:120],
+                        content=content,
+                        source="semantic_event",
+                        source_event_id=event_id,
+                    )
+                    accepted.append({"kind": "knowledge", "id": kn_id})
             except Exception:
                 _logger.exception("worth_knowledge promote failed eid=%s", event_id[:8])
 
         return accepted
 
-    async def _promote_to_skill_proposal(
-        self,
-        *,
-        title: str,
-        content: str,
-        category: Optional[str],
-        frame: Optional[dict],
-        source: str,
-        source_event_id: Optional[str] = None,
-        source_ref: Optional[str] = None,
-        fingerprint: Optional[str] = None,
-        recurrence_count: int = 1,
-    ) -> Optional[str]:
-        """Insert mem_entries(kind='skill_proposal') + stage + emit.
+    async def _write_live_skill(
+        self, *, title: str, description: str, content: str,
+    ) -> bool:
+        """Write (or update) a live, DISABLED skill under the unified Skill root.
 
-        ``fingerprint`` defaults to ``_skill_fingerprint(category, title)`` when
-        not supplied. Callers that have already computed the fingerprint (the
-        session-skill path, which needs it for recurrence counting) pass it in
-        so promote and the recurrence counter agree on exactly one value. The
-        partial UNIQUE index ``idx_mem_skill_dedup`` enforces a single active
-        proposal per fingerprint at the SQL level — IntegrityError on collision
-        means "this skill already has an active proposal", which we treat as a
-        dedup-merge (no-op).
+        Once a task pattern recurs enough times we mint the skill directly into
+        the unified Skill root (``%USERPROFILE%\\HandQ\\Skill\\<slug>\\SKILL.md``
+        on Windows) with ``enabled: false``. The disable flag is the review
+        mechanism — the user notices new skills in the control panel and flips
+        them on. A disabled skill is invisible to every role (absent from the
+        menu, and ``read_skill`` refuses it) until the user enables it — the
+        file simply exists on disk in the meantime (see ``SkillRegistry``).
+
+        Generate-or-update, with origin protection: if a skill already lives at
+        the slug, we refresh it in place ONLY when it is auto-owned (minted by a
+        previous triage run). If the user created, imported, or hand-edited a
+        skill at that slug, its ``origin`` is ``user`` and we back off entirely
+        — a coincidental name collision (the LLM titles a fresh session the same
+        as an existing hand-tuned skill) must never silently overwrite the
+        user's content. New skills are written ``origin=auto`` so a later run
+        may refresh them.
+
+        Runs in the shared backend process, so ``SkillRegistry.get()`` is the
+        same singleton the agent reads; the write is visible immediately.
         """
-        if fingerprint is None:
-            fingerprint = _skill_fingerprint(category, title)
+        from ..skills import (
+            SKILL_ORIGIN_AUTO,
+            SkillRegistry,
+            slugify_skill_name,
+        )
 
-        try:
-            from .models import SkillProposalStatus
-            skill_id = await self._store.insert_entry(
-                kind=EntryKind.SKILL_PROPOSAL,
-                summary=title[:120],
-                content=content,
-                source=source,
-                source_event_id=source_event_id,
-                source_ref=source_ref,
-                frame=frame,
-                skill_status=SkillProposalStatus.PROPOSED,
-                skill_fingerprint=fingerprint,
-                recurrence_count=recurrence_count,
-            )
-        except Exception as exc:
-            # Partial UNIQUE collision means a duplicate proposal already
-            # exists — that's the dedup-merge happy path.
-            _logger.debug("skill proposal dedup or insert failed: %s", exc)
-            return None
+        slug = slugify_skill_name(title, fallback="skill")
 
-        # Write staging file (phase 7 IPC moves it to live skill dir on approve).
-        # On a successful write, surface a chat-feed hint so the user knows a
-        # new skill was staged and how to activate it.
-        try:
-            staging_md = await self._write_skill_staging_file(
-                skill_id, title, content,
-            )
-        except Exception:
-            _logger.exception("skill staging file write failed sid=%s", skill_id[:8])
-        else:
-            self._emit_skill_proposed(
-                skill_id=skill_id, description=title[:140], staging_md=staging_md,
-            )
-        return skill_id
-
-    async def _write_skill_staging_file(
-        self, skill_id: str, title: str, content: str,
-    ) -> Path:
-        """Write a candidate SKILL.md to %USERPROFILE%\\HandQ\\Skill\\.proposed\\<id>\\.
-
-        Returns the path to the written SKILL.md so the caller can point the
-        user at it in the chat-feed hint.
-        """
-        from pathlib import Path
-        skill_root = Path.home() / "HandQ" / "Skill" / ".proposed" / skill_id[:8]
-        skill_md = skill_root / "SKILL.md"
-
-        def _write() -> None:
-            skill_root.mkdir(parents=True, exist_ok=True)
-            skill_md.write_text(
-                f"---\nname: proposed-{skill_id[:8]}\ndescription: {title[:140]}\n---\n\n{content}\n",
-                encoding="utf-8",
+        def _apply() -> dict:
+            reg = SkillRegistry.get()
+            existing = reg.get_any(slug)
+            if existing is not None:
+                # Origin protection — never clobber user-owned content.
+                if existing.origin != SKILL_ORIGIN_AUTO:
+                    return {"ok": False, "reason": "user_owned", "name": slug}
+                return reg.update_skill(
+                    slug, description=description, body=content,
+                    origin=SKILL_ORIGIN_AUTO,
+                )
+            return reg.create_skill(
+                slug, description, content, enabled=False, origin=SKILL_ORIGIN_AUTO,
             )
 
-        await asyncio.to_thread(_write)
-        return skill_md
-
-    def _emit_skill_proposed(
-        self, *, skill_id: str, description: str, staging_md: Path,
-    ) -> None:
-        """Push a small-text hint into the chat feed for a freshly-staged
-        skill. No-op when no emit channel is wired (tests / headless). The
-        renderer (kind='skill_proposed') renders this as a system bubble;
-        the envelope carries no ``gen`` so it is never dropped by the
-        renderer's session-generation watermark.
-        """
-        if self._emit is None:
-            return
-        live_dir = staging_md.parent.parent.parent  # …/HandQ/Skill
-        try:
-            self._emit({
-                "type": "status",
-                "kind": "skill_proposed",
-                "skill_id": skill_id,
-                "description": description,
-                "staging_path": str(staging_md),
-                "skill_dir": str(live_dir),
-            })
-        except Exception:
-            _logger.exception("skill_proposed emit failed sid=%s", skill_id[:8])
+        res = await asyncio.to_thread(_apply)
+        if not res.get("ok"):
+            if res.get("reason") == "user_owned":
+                _logger.info(
+                    "session skill skipped: slug=%s is user-owned "
+                    "(origin protection — not overwriting hand-tuned content)",
+                    slug,
+                )
+            else:
+                _logger.info("session skill not written slug=%s res=%s", slug, res)
+            return False
+        _logger.info("session skill written slug=%s (disabled)", res.get("name", slug))
+        return True
 
     async def _extract_skill_from_session(self, c: Candidate) -> Optional[dict]:
         """Run the dedicated skill-extraction LLM pass on one task trajectory.
@@ -937,28 +1000,62 @@ class DreamWorker:
         )
         return parse_skill_extraction(result.content or "")
 
+    async def _bump_skill_recurrence(
+        self, verdict: dict, *, title: str, cid: str,
+    ) -> Optional[int]:
+        """Bump the recurrence counter for a skill-worthy session; return the new
+        count (``None`` only on hard failure → caller aborts).
+
+        Prefers SEMANTIC clustering (embedding + cosine, via
+        ``store.bump_skill_recurrence_semantic``) so synonymous phrasings of the
+        same task share one counter — the whole reason skills reach threshold at
+        all. Falls back to the exact-string lexical fingerprint when the embedder
+        is unavailable or embedding fails, mirroring the "embedder down →
+        degrade" pattern used by dream synthesis.
+        """
+        if self._embedder is not None and self._embedder.available:
+            text = _skill_cluster_text(verdict)
+            if text:
+                try:
+                    vec = (await self._embedder.embed([text]))[0]
+                    if vec:
+                        return await self._store.bump_skill_recurrence_semantic(
+                            vec, title=title,
+                            category=verdict.get("category"),
+                            provider=self._embedder.provider,
+                            model=self._embedder.model,
+                        )
+                except Exception:
+                    _logger.exception(
+                        "semantic skill recurrence failed cid=%s; "
+                        "falling back to lexical", cid[:8],
+                    )
+        fp = _skill_fingerprint(title, action_key=verdict.get("action_key"))
+        try:
+            return await self._store.bump_skill_recurrence(fp, title=title)
+        except Exception:
+            _logger.exception("bump_skill_recurrence failed cid=%s", cid[:8])
+            return None
+
     async def _apply_session_skill(self, c: Candidate) -> bool:
         """Extract a candidate skill from a successful task session and, only
-        once the same task pattern has recurred enough times, promote it to a
-        skill proposal.
+        once the same task pattern has recurred enough times, write it as a
+        live (disabled) skill.
 
         Flow: extract (LLM) → PII gate → fingerprint → bump recurrence counter
         → gate on ``SKILL_RECURRENCE_THRESHOLD``. Below threshold we ONLY
-        increment the counter and return False (no proposal written) — that is
-        the whole point: a one-off task never becomes a skill, only a repeated
-        one does. At/above threshold we promote (the partial UNIQUE index then
-        de-dupes against any still-active proposal). Returns True only when a
-        proposal row was actually written.
+        increment the counter and return False (nothing written) — that is the
+        whole point: a one-off task never becomes a skill, only a repeated one
+        does. At/above threshold we write (or update) the skill directly into
+        the unified Skill root with ``enabled: false`` — no approval step.
+        Returns True only when a skill file was actually written.
         """
         verdict = await self._extract_skill_from_session(c)
         if not verdict or verdict.get("worth_skill") is not True:
             return False
 
         title = verdict["name"]
-        content_lines = [
-            f"# {title}",
-            verdict.get("description") or "",
-        ]
+        content_lines = [f"# {title}"]
         when = verdict.get("when_to_use")
         if when:
             content_lines.append(f"**When to use**: {when}")
@@ -970,7 +1067,7 @@ class DreamWorker:
         # PII post-filter. The LLM-generated steps can surface a secret that
         # the raw trajectory's pre-filter didn't (e.g. a token paraphrased
         # into a step). Mirror the memory/knowledge post-filter: a secret-
-        # bearing skill produces no proposal.
+        # bearing skill is dropped and never written.
         if self._pii.has_secret(content):
             _logger.info(
                 "session skill dropped: PII detected in extracted steps cid=%s",
@@ -978,35 +1075,21 @@ class DreamWorker:
             )
             return False
 
-        category = verdict.get("category")
-        fp = _skill_fingerprint(category, title)
-        try:
-            count = await self._store.bump_skill_recurrence(
-                fp, category=category, title=title,
-            )
-        except Exception:
-            _logger.exception("bump_skill_recurrence failed cid=%s", c.id[:8])
+        count = await self._bump_skill_recurrence(verdict, title=title, cid=c.id)
+        if count is None:
             return False
 
         if count < C.SKILL_RECURRENCE_THRESHOLD:
             _logger.info(
-                "session skill below recurrence threshold cid=%s count=%d/%d fp=%s",
-                c.id[:8], count, C.SKILL_RECURRENCE_THRESHOLD, fp[:8],
+                "session skill below recurrence threshold cid=%s count=%d/%d",
+                c.id[:8], count, C.SKILL_RECURRENCE_THRESHOLD,
             )
             return False
 
-        skill_id = await self._promote_to_skill_proposal(
-            title=title,
-            content=content,
-            category=category,
-            frame=_extract_frame(c.metadata),
-            source=c.source,
-            source_event_id=None,
-            source_ref=c.source_ref,
-            fingerprint=fp,
-            recurrence_count=count,
+        description = (verdict.get("description") or title).strip()
+        return await self._write_live_skill(
+            title=title, description=description, content=content,
         )
-        return bool(skill_id)
 
 
     # ── Per-candidate ───────────────────────────────────────────────────────
@@ -1110,12 +1193,11 @@ class DreamWorker:
             verdict.reason = (verdict.reason + " | " + C.REASON_POST_FILTER_KNOWLEDGE)[:200]
 
         # Defensive guard: failed sessions never promote AGENTIC memory,
-        # even if the LLM ignored the prompt rule. INSIGHT memory is fine
-        # (a stable environment fact doesn't become false because a task
-        # failed), and knowledge is also allowed (env constraints are
-        # often the reason for the failure). Mirrors the source-specific
-        # rule in TRIAGE_SYSTEM but enforced in code so misbehaving
-        # models cannot poison the user-preference (agentic) track.
+        # even if the LLM ignored the prompt rule. Knowledge is allowed
+        # (env constraints are often the reason for the failure). Passive
+        # personality_arc observations bypass this (they're not derived
+        # from the failed session's preferences). Enforced in code so
+        # misbehaving models cannot poison the user-preference track.
         if (
             c.source == CandidateSource.SESSION_FAILED.value
             and verdict.worth_memory
@@ -1219,11 +1301,10 @@ class DreamWorker:
 
         # Skill side-channel: a successful task trajectory may also be a
         # reusable skill. This runs INDEPENDENTLY of mem/kn (a session can
-        # produce both a memory and a skill proposal) and only for
-        # SESSION_COMPLETE — failed trajectories are not reusable procedures.
-        # The proposal is written by _apply_session_skill itself; here we only
-        # capture whether one was, to pick a terminal status when nothing else
-        # was written.
+        # produce both a memory and a skill) and only for SESSION_COMPLETE —
+        # failed trajectories are not reusable procedures. The skill is written
+        # by _apply_session_skill itself; here we only capture whether one was,
+        # to pick a terminal status when nothing else was written.
         wrote_skill = False
         if c.source == CandidateSource.SESSION_COMPLETE.value:
             try:
@@ -1373,15 +1454,12 @@ class DreamWorker:
         return True
 
     async def _apply_verbatim_remember(self, c: Candidate, user_text: str) -> None:
-        """Insert a /remember candidate as INSIGHT memory verbatim,
+        """Insert a /remember candidate as AGENTIC memory verbatim,
         skipping the LLM triage stage.
 
-        Why INSIGHT and not AGENTIC: long procedures are usually FACTS
-        about how to do something ("here's the workflow…") rather than
-        agent behaviour rules ("always do X"). INSIGHT keeps them
-        injectable as background context without polluting the agentic
-        track. Users who want a long agentic rule can /remember the
-        short imperative form (which goes through normal triage).
+        Long procedures are usually FACTS about how to do something
+        ("here's the workflow…") or explicit user preferences. AGENTIC
+        dimension is the catch-all for user-personal information.
 
         Storage layout:
           1. The full user_text is written to a .md file under
@@ -1419,7 +1497,7 @@ class DreamWorker:
         file_path = await asyncio.to_thread(
             _write_memory_note_file,
             entry_id, summary, user_text,
-            dimension=MemoryDimension.INSIGHT.value,
+            dimension=MemoryDimension.AGENTIC.value,
             source=c.source,
         )
         # Step 2: insert DB entry. ``source_ref`` becomes the file path
@@ -1428,7 +1506,7 @@ class DreamWorker:
         ref = str(file_path) if file_path is not None else c.source_ref
         actual_id = await self._store.insert_memory_entry_with_id(
             entry_id=entry_id,
-            dimension=MemoryDimension.INSIGHT,
+            dimension=MemoryDimension.AGENTIC,
             summary=summary,
             content=user_text,
             candidate_id=c.id,
@@ -1828,7 +1906,6 @@ class DreamWorker:
           - mem_correction_proposals (status=pending): 30 days (seconds)
           - obs_sessions (done/skipped, ended)       : 30 days (unix MS)
           - obs_semantic_events (triaged)            : 30 days (seconds)
-          - mem_entries skill_proposal (un-acted)    : 30 days (archive, seconds)
           - obs_snapshots                            : 7 days (unix MS)
           - obs_events                               : 7 days (unix MS)
           - obs_pipeline_runs                        : 30 days (seconds)
@@ -1837,9 +1914,8 @@ class DreamWorker:
         obs_sessions.ended_at are in unix MILLISECONDS (the SessionAggregator
         stamps them from the snapshot's captured_at), so those cutoffs are
         multiplied by 1000; the other cutoffs stay in seconds. Deleting a
-        snapshot cascades to obs_ocr_frames and evicts its FTS row. Stale
-        skill proposals are ARCHIVED (not deleted) and their staging dirs
-        removed; everything else is a hard DELETE.
+        snapshot cascades to obs_ocr_frames and evicts its FTS row. Everything
+        here is a hard DELETE.
         """
         now_s = int(time.time())
         cutoff_raw = now_s - C.LTM_CANDIDATE_RAWTEXT_TTL_DAYS * 86400
@@ -1852,37 +1928,20 @@ class DreamWorker:
         n_sess = await self._store.prune_obs_sessions(cutoff_sess_ms)
         cutoff_sem = now_s - C.LTM_OBS_SEMANTIC_EVENT_TTL_DAYS * 86400
         n_sem = await self._store.prune_obs_semantic_events(cutoff_sem)
-        cutoff_skill = now_s - C.LTM_SKILL_PROPOSAL_TTL_DAYS * 86400
-        expired_skill_ids = await self._store.archive_stale_skill_proposals(cutoff_skill)
-        n_skill = len(expired_skill_ids)
-        if expired_skill_ids:
-            import shutil
-            from pathlib import Path
-            staging_root = Path.home() / "HandQ" / "Skill" / ".proposed"
-            for sid in expired_skill_ids:
-                staging_dir = staging_root / sid[:8]
-                try:
-                    if staging_dir.exists():
-                        await asyncio.to_thread(shutil.rmtree, staging_dir, True)
-                except Exception:
-                    _logger.debug(
-                        "auto-expire staging cleanup failed sid=%s",
-                        sid[:8], exc_info=True,
-                    )
         cutoff_snap_ms = (now_s - C.LTM_OBS_SNAPSHOT_TTL_DAYS * 86400) * 1000
         n_snap = await self._store.prune_obs_snapshots(cutoff_snap_ms)
         cutoff_evt_ms = (now_s - C.LTM_OBS_EVENT_TTL_DAYS * 86400) * 1000
         n_evt = await self._store.prune_obs_events(cutoff_evt_ms)
         cutoff_run = now_s - C.LTM_OBS_PIPELINE_RUN_TTL_DAYS * 86400
         n_run = await self._store.prune_obs_pipeline_runs(cutoff_run)
-        if (n_raw or n_log or n_corr or n_sess or n_sem or n_skill
+        if (n_raw or n_log or n_corr or n_sess or n_sem
                 or n_snap or n_evt or n_run):
             _logger.info(
                 "ltm cleanup: raw_text=%d candidates, recall_log=%d rows, "
                 "correction_proposals=%d pending, obs_sessions=%d, "
-                "obs_semantic_events=%d, skill_proposals=%d archived, "
+                "obs_semantic_events=%d, "
                 "obs_snapshots=%d, obs_events=%d, obs_pipeline_runs=%d",
-                n_raw, n_log, n_corr, n_sess, n_sem, n_skill,
+                n_raw, n_log, n_corr, n_sess, n_sem,
                 n_snap, n_evt, n_run,
             )
 
@@ -2365,12 +2424,9 @@ class DreamWorker:
                         "frame_os": frame_os,
                     })
 
-            # LTM 2.0 frame partition: cluster INSIGHT entries (memory.insight)
-            # SEPARATELY per frame_os. AGENTIC / IDENTITY / all-of-knowledge
-            # are frame-agnostic so they cluster unpartitioned. This prevents
-            # the "wine-bug Frankenstein" synthesis where a Linux-frame
-            # observation and a Windows-frame observation get fused into a
-            # single context-blind L2 entry.
+            # All memory entries are now AGENTIC and frame-agnostic;
+            # knowledge is also frame-agnostic. Single unpartitioned
+            # clustering pass.
             clusters = self._cluster_with_frame_partition(
                 decoded, kind=kind,
                 threshold=cluster_threshold, min_size=min_size,
@@ -2457,38 +2513,18 @@ class DreamWorker:
     ) -> List[List[dict]]:
         """LTM 2.0 frame-aware clustering.
 
-        For memory INSIGHT entries: partition by ``frame_os`` so that
-        observations captured on different execution frames (windows vs
-        linux vs remote) never fuse into a single L2 synthesis. This is
-        the structural fix that prevents the "wine-bug Frankenstein"
-        described in the LTM 2.0 plan §4.
-
-        For AGENTIC / IDENTITY / all-of-knowledge: clustering is
-        unpartitioned because those facets carry frame-agnostic
-        information (user preferences, team facts).
+        All memory entries (AGENTIC / IDENTITY) and knowledge are
+        frame-agnostic — clustering is unpartitioned.
         """
         if kind != EntryKind.MEMORY.value:
             # knowledge: no partition
             return cls._greedy_cluster(
                 items, threshold=threshold, min_size=min_size,
             )
-        # Memory: split INSIGHT items by frame_os, AGENTIC unpartitioned.
-        insight_buckets: dict = {}
-        non_insight: List[dict] = []
-        for it in items:
-            if it.get("facet") == MemoryDimension.INSIGHT.value:
-                bucket_key = it.get("frame_os") or "_null_"
-                insight_buckets.setdefault(bucket_key, []).append(it)
-            else:
-                non_insight.append(it)
+        # Memory: all AGENTIC entries clustered without frame partition.
         all_clusters: List[List[dict]] = []
-        for bucket_key, bucket_items in insight_buckets.items():
-            for c in cls._greedy_cluster(
-                bucket_items, threshold=threshold, min_size=min_size,
-            ):
-                all_clusters.append(c)
         for c in cls._greedy_cluster(
-            non_insight, threshold=threshold, min_size=min_size,
+            items, threshold=threshold, min_size=min_size,
         ):
             all_clusters.append(c)
         all_clusters.sort(key=len, reverse=True)
@@ -2579,21 +2615,7 @@ class DreamWorker:
             )
             return False
 
-        # LTM 2.0: when all sources of an INSIGHT cluster share a frame_os
-        # (true by construction because _cluster_with_frame_partition split
-        # them by frame), stamp that frame onto the synthesis row so it
-        # remains filterable by recall. AGENTIC / IDENTITY / knowledge
-        # clusters get frame=None (they're frame-agnostic).
         synth_frame = None
-        if kind == EntryKind.MEMORY.value and facet == MemoryDimension.INSIGHT.value:
-            cluster_frames = {it.get("frame_os") for it in cluster if it.get("frame_os")}
-            if len(cluster_frames) == 1:
-                # Single shared frame — preserve it
-                only_os = next(iter(cluster_frames))
-                synth_frame = {
-                    "os": only_os, "host": "unknown",
-                    "confidence": 0.75, "evidence": f"dream_l{level}_synth",
-                }
 
         synth_id = await self._store.insert_synthesis_entry(
             kind=kind,

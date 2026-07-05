@@ -37,7 +37,7 @@ Output a SINGLE JSON object with the schema below. No prose, no markdown fences.
   "worth_knowledge":  <bool>,
 
   "memory_action":      "create" | "update" | "archive" | "skip",
-  "memory_dimension":   "agentic" | "insight" | "identity" | null,
+  "memory_dimension":   "agentic" | "identity" | null,
   "memory_summary":     "<single line, max 120 chars>",
   "memory_content":     "<markdown body, <=600 chars>",
   "memory_update_id":   "<existing entry id when action=update>" | null,
@@ -57,12 +57,13 @@ Output a SINGLE JSON object with the schema below. No prose, no markdown fences.
 
 ### MEMORY (worth_memory)
 Memory is about THE BOUND USER specifically — their preferences, habits,
-workflows, tools, recurring choices.
+workflows, tools, recurring choices, and factual context about them.
 
-- "agentic"  : how the user wants the agent to BEHAVE
-               ("always lint before commit", "prefer ruff over flake8")
-- "insight"  : factual context about the user / their environment
-               ("main project at C:\\\\HandQ", "uses Windows 11", "prefers terse responses")
+- "agentic"  : anything about the user personally — how they want the agent
+               to BEHAVE, factual context about them / their environment,
+               workflow patterns, decision tendencies, tool preferences.
+               ("always lint before commit", "prefer ruff over flake8",
+                "uses Windows 11", "prefers terse responses")
 - "identity" : CROSS-SESSION UNCONDITIONAL BEHAVIOURAL DIRECTIVES that must be
                active on EVERY future interaction regardless of task.
                ("respond in Chinese", "be concise", "always confirm before delete")
@@ -75,11 +76,11 @@ Use "identity" ONLY when ALL three conditions hold:
   3. AGENT BEHAVIOUR — about how the agent responds or acts, not about a tool/project
 
 If the directive is conditional ("when working on Python, use ruff") → "agentic".
-If it is a fact ("I use Windows 11") → "insight".
+If it is a fact about the user ("I use Windows 11") → "agentic".
 If it is about a project ("this repo uses pytest") → KNOWLEDGE.
 
 IDENTITY is the RAREST dimension. In a typical user's history, expect 5-15
-identity entries total vs hundreds of agentic/insight entries.
+identity entries total vs hundreds of agentic entries.
 
 To revise an existing identity entry, use action="update" with the target id
 and provide the complete new content — the system converts this to a clean
@@ -95,8 +96,17 @@ The insight can be applied by ANYONE, at ANY TIME, in a SIMILAR situation.
 - "process"  : workflow / procedure facts ("deploy window is Thursday")
 - "coding"   : coding patterns / conventions ("this repo uses pydantic v2")
 
-A piece of activity may produce BOTH a memory point AND a knowledge entry
-(they are not mutually exclusive). Or neither. Or just one.
+## Mutual exclusivity
+
+Each candidate produces AT MOST one entry — either memory OR knowledge, never both.
+
+Decision rule:
+- The value comes from "this is about the USER personally" (their preference,
+  habit, workflow pattern, decision style) → memory
+- The value comes from "this is a reusable FACT about the project/team/tool" → knowledge
+- When uncertain → knowledge (lower trust requirement)
+
+worth_memory and worth_knowledge MUST NOT both be true.
 
 ## What to KEEP
 
@@ -305,22 +315,20 @@ Output:
  "knowledge_update_id": null,
  "reason": "stable team process, applies regardless of user"}
 
-### Example 3 — both apply
+### Example 3 — could be either, pick one
 
 Input raw_text:
   [SELF] We use pytest with -xvs for debugging in this project.
 
-Output:
-{"worth_memory": true, "worth_knowledge": true,
- "memory_action": "create", "memory_dimension": "agentic",
- "memory_summary": "use pytest -xvs for debugging",
- "memory_content": "## Memory Points\\n- When debugging tests, use `pytest -xvs`.",
- "memory_update_id": null,
+Output (pick the dominant angle — project convention > personal habit here):
+{"worth_memory": false, "worth_knowledge": true,
+ "memory_action": "skip", "memory_dimension": null,
+ "memory_summary": "", "memory_content": "", "memory_update_id": null,
  "knowledge_action": "create", "knowledge_category": "coding",
  "knowledge_summary": "project debug convention: pytest -xvs",
  "knowledge_content": "## Description\\nProject test debugging convention.\\n\\n## Key Insights\\n- Use `pytest -xvs` for fast feedback on failing tests.",
  "knowledge_update_id": null,
- "reason": "explicit user behaviour AND project convention"}
+ "reason": "project convention — applies regardless of user"}
 
 ### Example 4 — persona, REJECT
 
@@ -406,7 +414,7 @@ Output:
  "knowledge_update_id": null,
  "reason": "stable env constraint from failed deploy; no agentic-preference signal"}
 
-### Example 8b — failed session, insight memory still OK
+### Example 8b — failed session, environment fact → knowledge
 
 Source: session_failed
 Input raw_text:
@@ -420,16 +428,14 @@ Input raw_text:
     outcome: GetForegroundWindow returned 0; no interactive session
 
 Output:
-{"worth_memory": true, "worth_knowledge": true,
- "memory_action": "create", "memory_dimension": "insight",
- "memory_summary": "primary workstation is Windows 11 Enterprise (C:\\\\Users\\\\fengxuan)",
- "memory_content": "## Memory Points\\n- Primary workstation runs Windows 11 Enterprise; user profile lives at C:\\\\Users\\\\fengxuan.",
- "memory_update_id": null,
+{"worth_memory": false, "worth_knowledge": true,
+ "memory_action": "skip", "memory_dimension": null,
+ "memory_summary": "", "memory_content": "", "memory_update_id": null,
  "knowledge_action": "create", "knowledge_category": "process",
  "knowledge_summary": "desktop tests need an interactive RDP session",
- "knowledge_content": "## Description\\nDesktop integration test prerequisites.\\n\\n## Key Insights\\n- Tests cannot run on a logged-out machine; require RDP-attached interactive session.",
+ "knowledge_content": "## Description\\nDesktop integration test prerequisites.\\n\\n## Key Insights\\n- Tests cannot run on a logged-out machine; require RDP-attached interactive session.\\n- Primary workstation is Windows 11 Enterprise at C:\\\\Users\\\\fengxuan.",
  "knowledge_update_id": null,
- "reason": "failed session but stable env facts (insight + process knowledge) are valid"}
+ "reason": "failed session env facts — project convention, not personal preference"}
 
 ### Example 9 — successful session, project knowledge
 
@@ -501,7 +507,7 @@ Output:
 Reasoning: Seeing a path on screen is NOT evidence of a stable environment
 fact. The user happens to have a file open. Repeated observations of the
 same path across many activity_observer candidates would compound into
-N near-duplicate INSIGHT entries. Reject path-inventory summaries even
+N near-duplicate entries. Reject path-inventory summaries even
 when they look factual — only KEEP when there is a behaviour verb
 ("uses pytest -xvs", "runs build via Nuitka") or an explicit preference.
 
@@ -798,6 +804,7 @@ Answer with a SINGLE JSON object, no prose, no markdown fences:
 
 {"worth_skill": <bool>,
  "name": "<canonical action name>",
+ "action_key": "<verb>:<object> — controlled slug, e.g. deploy:service",
  "description": "<one line: what the skill does>",
  "when_to_use": "<one line: the trigger/situation>",
  "steps_md": "<markdown: the generalized, parameterized steps>",
@@ -826,6 +833,17 @@ identical names are what let us detect that a task is recurring.
   bad:   "do the 1.2.4 release thing"          (embeds a specific value)
 Lowercase the conceptual action; drop pleasantries, filler, and specific
 values from the name (they belong in steps_md as placeholders).
+
+The "action_key" is a CONTROLLED, MACHINE-STABLE key of the exact form
+"<verb>:<object>" — a single base verb, a colon, then the core object, both
+lowercase with no articles/pleasantries/specific values. It is what we hash to
+detect that a task RECURS, so it MUST come out identical for the same
+underlying task across independent runs — pick the plainest base verb and the
+most generic object noun, never the user's wording.
+  "Restart the staging server"                 -> restart:server
+  "Bump the package version and tag a release"  -> release:package
+  "Roll back the last database migration"       -> rollback:migration
+Use the base (dictionary) form of the verb and a singular object.
 """
 
 
@@ -848,6 +866,7 @@ def parse_skill_extraction(json_str: str) -> dict:
     return {
         "worth_skill": True,
         "name": name[:120],
+        "action_key": str(parsed.get("action_key") or "").strip()[:80],
         "description": str(parsed.get("description") or "").strip()[:300],
         "when_to_use": str(parsed.get("when_to_use") or "").strip()[:300],
         "steps_md": str(parsed.get("steps_md") or "").strip()[:4000],

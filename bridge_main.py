@@ -781,8 +781,10 @@ async def _run_with_long_term_memory() -> None:
     _t_ltm = time.monotonic()
     try:
         # Inject the bridge's IPC emitter so LTM background workers can push
-        # chat-feed hints (e.g. a freshly-staged skill proposal). stdio_bridge
-        # was imported above, so its module-level _emit is already live.
+        # chat-feed hints to the user. No live producer wires it today (the
+        # retired skill-proposal staging hint was the last one); kept as the
+        # delivery seam. stdio_bridge was imported above, so its module-level
+        # _emit is already live.
         ltm = await LongTermMemory.init(
             db_path=db_path, config_path=config_path,
             emit=stdio_bridge._emit,

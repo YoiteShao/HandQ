@@ -384,6 +384,7 @@ When the instruction is **fully achieved**, respond **without calling any tool**
     "factual_outcome": ["precise factual statements of what was accomplished"],
     "artifacts": ["files created or modified"],
     "key_findings": ["important discrete facts discovered"],
+    "plan_feedback": "<optional: advice to the planner when the REMAINING plan should change>",
     "claim_tool": ["<optional names>"],
     "release_tool": ["<optional names>"]
 }}
@@ -392,6 +393,13 @@ When the instruction is **fully achieved**, respond **without calling any tool**
 `factual_outcome`: verifiable facts about what changed.
 `artifacts`: paths to files you wrote/modified.
 `key_findings`: brief discrete facts for downstream consumption.
+`plan_feedback`: OPTIONAL message to the PLANNER (not the user). Set it when
+something you learned this item — most often a skill body you read via
+`read_skill`, or a fact you discovered — means the planner's REMAINING items
+should change. State the conflict and what to reconsider, e.g. "skill
+'deploy-canary' requires a staging soak before prod, but the pending 'promote to
+prod' item skips it." Omit when the plan is fine. This is advice about the PLAN,
+not a fact dump — discrete facts still go in `key_findings`.
 `claim_tool` / `release_tool`: optional self-extension fields (see §Tool
 Usage → Self-Extension). Omit if unused. Valid on every turn, not just at
 completion.
@@ -433,13 +441,17 @@ tool list**, respond without calling any tool:
 ```json
 {{
     "reasoning": "what was attempted and why each approach failed",
-    "error": "explanation of why the instruction cannot be achieved; if a tool is missing, name it (e.g. 'remote_handq not loaded — cannot SSH to fengxuan-gv')"
+    "error": "explanation of why the instruction cannot be achieved; if a tool is missing, name it (e.g. 'remote_handq not loaded — cannot SSH to fengxuan-gv')",
+    "plan_feedback": "<optional: if the block is a plan/skill conflict, tell the planner what to replan>"
 }}
 ```
 
 **Never substitute a free-form summary for an action you could not perform.** A missing
 tool is a clean error JSON, not a reason to fabricate evidence in `factual_outcome`. The
-planner sees the error and can activate the missing tool on its next round.
+planner sees the error and can activate the missing tool on its next round. If instead the
+item is blocked because it CONTRADICTS a skill you read or a fact you discovered (not a
+missing tool), stop the item here and use `plan_feedback` to tell the planner what to
+rethink — do not push ahead with a plan you already know is wrong.
 """
 
     return (

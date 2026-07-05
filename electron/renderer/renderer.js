@@ -172,6 +172,7 @@
     // Shortcut bar
     const scSettings = document.getElementById('sc-settings');
     const scScheduler = document.getElementById('sc-scheduler');
+    const scSkills = document.getElementById('sc-skills');
     // (Legacy scNew "New" button removed — sessions are created via the
     // "+" button in the session tab bar.)
 
@@ -2760,20 +2761,6 @@
             addGlobalSystemBubble('✅ ' + (evt.message || '网络已恢复，继续执行'));
             pushActivity('✅', 'Network restored', 'resuming');
             setPill('working…');
-        } else if (evt.kind === 'skill_proposed') {
-            // Background LTM hint: a new skill was staged from observed
-            // activity. Passive surface — the user activates it by moving the
-            // staged SKILL.md into the live Skill dir themselves (no buttons).
-            const desc = evt.description || '(no description)';
-            const staged = evt.staging_path || '(unknown path)';
-            const skillDir = evt.skill_dir || '';
-            let msg = '💡 New skill suggested: ' + desc
-                + '\nStaged at: ' + staged;
-            if (skillDir) {
-                msg += '\nMove this file into ' + skillDir + ' to activate it.';
-            }
-            addSystemBubble(msg);
-            pushActivity('💡', 'Skill proposed', desc);
         }
     }
 
@@ -3070,6 +3057,20 @@
             window.schedulePanel.open();
         }
     });
+
+    // Skills shortcut: toggles admin-panel.js's skill control panel
+    // (installed skills, incl. auto-generated disabled ones). window.skillPanel
+    // is set up in admin-panel.js.
+    if (scSkills) {
+        scSkills.addEventListener('click', () => {
+            if (!window.skillPanel) return;
+            if (window.skillPanel.isOpen()) {
+                window.skillPanel.close();
+            } else {
+                window.skillPanel.open();
+            }
+        });
+    }
 
     // (Legacy scNew "New" button handler removed — to start a fresh
     // parallel session use the "+" in the session tab bar; to wipe the
