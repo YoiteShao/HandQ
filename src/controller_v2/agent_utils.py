@@ -4,9 +4,10 @@ Agent utility functions and classes.
 All functions are pure / stateless (except IterationAdvisor which is a
 lightweight in-memory tracker).
 """
+import hashlib
 import re
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Set, Union, TYPE_CHECKING
+from typing import Any, Dict, List, Optional, Set, TYPE_CHECKING
 
 from ..infrastructure.utils import try_parse_json_with_repair_flag
 from ..tools.base_tool import ToolResult
@@ -79,6 +80,11 @@ class TurnDigest:
     and the IterationAdvisor's counters, so it cannot be gamed by an agent that
     claims progress it did not make. Read by the planner (in-flight item view)
     and by the Tier-1 progress watcher.
+
+    ``info_gain`` is the unified per-turn novelty signal (a novel content
+    artifact, a previously-unseen tool observation, a newly-learned failure
+    signature, or an intentional wait_interval). ``no_progress_streak`` is the
+    count of consecutive turns with ``info_gain == False``.
     """
     item_id: str
     iteration: int
@@ -86,17 +92,20 @@ class TurnDigest:
     success_count: int
     fail_count: int
     produced_new_artifact: bool
-    goal_signal_hit: bool
+    info_gain: bool
     no_progress_streak: int
 
 
 @dataclass
 class ProgressConcern:
-    """Tier-1 watcher verdict — watcher → planner only, never shown to agent.
+    """Tier-1 watcher verdict — planner-facing only, never shown to agent.
 
     last-write-wins single slot on the bus. ``verdict`` is one of
-    "diverging" | "false_progress" | "ok"; only the first two are ever stored
-    (an "ok" verdict simply leaves the slot untouched).
+    "diverging" | "false_progress" | "stalled" | "ok". "diverging" and
+    "false_progress" come from the LLM watcher; "stalled" is emitted
+    mechanically by the agent when a hard stall threshold is crossed (no LLM in
+    the path). Only the non-"ok" verdicts are ever stored (an "ok" verdict
+    simply leaves the slot untouched).
     """
     item_id: str
     verdict: str
@@ -183,7 +192,7 @@ def failed_approach_signature(tr: ToolResult) -> Optional[str]:
 # ── Acceptance-loop cross-round info delta ────────────────────────────────────
 #
 # Pure, ungameable pre-gate for the acceptance loop — the mechanical "hard-coded
-# sense" tier, analogous to IterationAdvisor.turns_since_artifact for the in-item
+# sense" tier, analogous to IterationAdvisor.no_info_gain_streak for the in-item
 # loop. Measures the information a freshly-completed acceptance round added over
 # the UNION of all prior acceptance rounds. total_new == 0 ⇒ the candidate is
 # spinning in place (re-attempting with zero new information per round).
@@ -246,35 +255,21 @@ def acceptance_info_delta(
 
 # ── IterationAdvisor ────────────────────────────────────────────────────────
 
-_MODERATE_STAGNATION = 3
-_SEVERE_STAGNATION = 5
 _LTM_REFRESH_THRESHOLD = 3
 _LTM_REFRESH_COOLDOWN = 5
 
-# No-progress detection (Tier 0 progress-sense): fires when tool calls keep
-# SUCCEEDING but the item makes no headway — no new artifact AND no tool output
-# matching the item's expected_outcomes — for this many turns. Distinct from
-# stagnation, which keys off failures. Threshold is small (early, soft signal);
-# cooldown stops it nagging every turn while stuck.
-_NOPROGRESS_ARTIFACT_THRESHOLD = 3
-_NOPROGRESS_GOAL_THRESHOLD = 3
-_NOPROGRESS_COOLDOWN = 5
-# Only treat "no progress" as meaningful when most calls are succeeding — a low
-# success rate is already covered by the stagnation/anti-repeat channels.
-_NOPROGRESS_MIN_SUCCESS_RATE = 0.7
-
-# Goal-keyword extraction (coarse mechanical proxy for "did this turn surface
-# anything related to the goal"). ASCII tokens require >=4 chars; CJK runs are
-# shingled into 2-grams so substring matching works without a CJK tokenizer.
-# Errs toward over-matching (= fewer no-progress warnings), the safe direction.
-_ASCII_TOKEN_RE = re.compile(r"[a-z0-9]{4,}")
-_CJK_RUN_RE = re.compile(r"[一-鿿]{2,}")
-_GOAL_STOPWORDS: frozenset = frozenset({
-    "with", "that", "this", "from", "into", "have", "been", "will", "your",
-    "more", "than", "then", "when", "what", "which", "should", "could", "must",
-    "each", "item", "task", "ensure", "verify", "confirm", "least", "using",
-    "based", "there", "their", "about", "would", "shall", "value", "result",
-})
+# Stall detection (unified mechanical progress-sense). A "stall" is N consecutive
+# turns that added zero new information (no_info_gain_streak) OR N consecutive
+# tool failures. Two tiers:
+#   - SOFT: surface a single bail-out reminder to the agent (cooldown-gated).
+#   - HARD: flip the planner trigger mechanically (no LLM in the path) via the
+#     checklist bus — the incident fix. Higher threshold than SOFT so the agent
+#     gets a chance to self-correct before the planner is woken.
+# _STALL_COOLDOWN gates both so neither fires every turn while stuck.
+_SOFT_STALL_STREAK = 3
+_HARD_STALL_STREAK = 5
+_HARD_FAIL_STREAK = 6
+_STALL_COOLDOWN = 5
 
 _WRITE_PARAM_ERROR_REMINDER: str = (
     "Write Tool Parameter Error — your previous write call failed "
@@ -297,61 +292,95 @@ class IterationAdvisor:
 
     Two output channels:
       A. get_reminder() — text reminder injected into the agent's per-turn
-         instruction message. Merges three signals:
-           1. Anti-repeat guard (failed_approaches tracking)
-           2. Parallelism nudge (turn tool-count tracking)
-           3. Progress stagnation (consecutive failure detection +
-              write_param_error)
+         instruction message. At most three blocks (down from six):
+           0. Directives (planner's advisory constraints, always visible)
+           1. Anti-repeat guard (specific dead-path signatures)
+           2. One stall block — the specific write_param_error fix OR the
+              generic soft-stall bail-out (mutually exclusive).
       B. should_refresh_ltm() — boolean signal that drives a fresh LTM
          recall in PersistentAgent (cooldown-gated). Result is shown as an
          independent block alongside (A); see get_recent_failure_signatures()
          for the query-enrichment helper.
+
+    Progress is measured by a single mechanical primitive, info_gain, recorded
+    per turn. A turn shows info gain iff it wrote a novel content artifact, a
+    tool observation returned previously-unseen (numeric-normalized) bytes, a
+    new failure signature appeared, or it contained an intentional
+    wait_interval. N consecutive turns without info gain (no_info_gain_streak)
+    — or N consecutive tool failures — constitute a stall. hard_stall() reports
+    when a HARD threshold is crossed so PersistentAgent can wake the planner
+    mechanically (no LLM in the trigger path — the incident fix).
     """
 
     def __init__(self) -> None:
         self._success_history: List[bool] = []
         self._last_error_hint: Optional[str] = None
         self._failed_approaches: Dict[str, int] = {}
-        self._iteration_tool_counts: List[int] = []
-        self._parallelism_cooldown: int = 0
         # Cooldown for stagnation-triggered LTM refresh, decremented per turn
         # so the agent doesn't re-query LTM on every turn while stuck.
         self._ltm_refresh_cooldown: int = 0
 
-        # No-progress tracking (Tier 0 progress-sense). Goal keywords are
-        # extracted from the item's expected_outcomes at reset_for_item; the
-        # two counters track consecutive turns without a new artifact / without
-        # a goal-keyword hit. _noprogress_streak counts consecutive turns past
-        # the small threshold (consumed by the Tier 1 watcher's hysteresis gate).
-        self._goal_keywords: Set[str] = set()
-        self._expected_outcomes: List[str] = []
-        self._turns_since_artifact: int = 0
-        self._turns_since_goal_signal: int = 0
-        self._noprogress_cooldown: int = 0
-        self._noprogress_streak: int = 0
+        # Unified progress-sense (replaces the keyword goal-proxy). Every turn
+        # is classified as info-gaining or not; _no_info_gain_streak counts
+        # consecutive turns that added nothing. _seen_obs_hashes is the per-item
+        # observation-novelty ledger (numeric-normalized payload hashes);
+        # _turn_saw_info_gain is the per-turn flag set by record_tool_result and
+        # consumed (then reset) by record_progress_signal.
+        self._seen_obs_hashes: Set[str] = set()
+        self._no_info_gain_streak: int = 0
+        self._turn_saw_info_gain: bool = False
 
-    def reset_for_item(self, expected_outcomes: Optional[List[str]] = None) -> None:
+        # Stall-block cooldowns (soft agent reminder + hard mechanical planner
+        # wake), so neither fires every turn while stuck. Decremented once per
+        # turn in record_progress_signal, and reset when info gain ends an
+        # episode so a fresh stall can fire cleanly.
+        self._soft_stall_cooldown: int = 0
+        self._hard_stall_cooldown: int = 0
+
+        # Directives (Q4): advisory constraints from the planner shown to the
+        # agent each turn via get_reminder(). Weak — agent may violate but is
+        # expected to bail out via plan_feedback rather than silently push
+        # through. Populated on reset_for_item, cleared at item boundary.
+        self._directives: List[str] = []
+
+    def reset_for_item(
+        self,
+        directives: Optional[List[str]] = None,
+    ) -> None:
         """Call at the start of each item."""
         self._success_history.clear()
         self._last_error_hint = None
         self._failed_approaches.clear()
-        self._iteration_tool_counts.clear()
-        self._parallelism_cooldown = 0
         self._ltm_refresh_cooldown = 0
-        self._expected_outcomes = list(expected_outcomes) if expected_outcomes else []
-        self._goal_keywords = self._extract_keywords(expected_outcomes or [])
-        self._turns_since_artifact = 0
-        self._turns_since_goal_signal = 0
-        self._noprogress_cooldown = 0
-        self._noprogress_streak = 0
+        self._seen_obs_hashes.clear()
+        self._no_info_gain_streak = 0
+        self._turn_saw_info_gain = False
+        self._soft_stall_cooldown = 0
+        self._hard_stall_cooldown = 0
+        self._directives = list(directives) if directives else []
 
     def record_tool_result(self, tr: ToolResult) -> None:
         """Record outcome of a tool execution.
 
+        Besides success/failure and failed-approach signatures, this sets the
+        per-turn info-gain flag when the result adds new information:
+          - a SUCCESSFUL tool returned a payload whose numeric-normalized hash
+            was not seen before this item (a novel content artifact or a novel
+            observation), OR
+          - a NEW failure signature appeared (learning a fresh dead path is
+            information; re-hitting a known one is not).
+        The payload is selected PER TOOL TYPE (see _info_payload): for
+        write/edit it is the content written, NEVER tr.output — tr.output is the
+        destination path and changes on every rename, so trusting it would let
+        probe1.sh → probe2.sh with identical bodies inflate novelty forever
+        (the real cause of the item-2 170-turn spin). For every other tool it is
+        the returned output bytes.
+
         wait_interval is infrastructure (intentional yield between observation
         cycles) — it is excluded from success_history so it does not break
         consecutive-failure tracking, and from failed_approaches so repeated
-        waits are never flagged as retried failures.
+        waits are never flagged as retried failures. Its info-gain contribution
+        is handled in record_progress_signal (has_wait_interval).
         """
         if tr.tool_name == "wait_interval":
             return
@@ -365,86 +394,112 @@ class IterationAdvisor:
             if tr.tool_name and tr.tool_name not in INFRA_TOOL_NAMES:
                 sig = failed_approach_signature(tr)
                 if sig:
-                    self._failed_approaches[sig] = self._failed_approaches.get(sig, 0) + 1
-        else:
-            self._last_error_hint = None
-
-    def record_turn_tool_count(self, count: int) -> None:
-        """Record how many tool calls were issued in one LLM turn."""
-        self._iteration_tool_counts.append(count)
-        if len(self._iteration_tool_counts) > 16:
-            self._iteration_tool_counts = self._iteration_tool_counts[-16:]
-        if self._parallelism_cooldown > 0:
-            self._parallelism_cooldown -= 1
-        if self._ltm_refresh_cooldown > 0:
-            self._ltm_refresh_cooldown -= 1
-
-    def record_progress_signal(
-        self, *, produced_new_artifact: bool, goal_signal_hit: bool,
-        has_wait_interval: bool = False,
-    ) -> None:
-        """Record per-turn progress signals (call once per turn).
-
-        Detects "active but not progressing": tool calls may keep succeeding
-        while the item makes no headway toward its expected_outcomes. Unlike the
-        failure-based stagnation check, this fires even when every tool call
-        succeeds but produces no new artifact and surfaces no goal keyword.
-        _noprogress_streak counts consecutive turns past the small threshold;
-        it is read by the Tier 1 watcher's hysteresis gate.
-
-        When has_wait_interval=True, the turn contained an intentional yield
-        (wait_interval tool). This is the agent's explicit "I confirmed the
-        state is normal and will check again later" signal — it resets the
-        no-progress counters because the agent IS progressing through its
-        monitoring duty, just not producing artifacts.
-        """
-        if self._noprogress_cooldown > 0:
-            self._noprogress_cooldown -= 1
-
-        if has_wait_interval:
-            self._turns_since_artifact = 0
-            self._turns_since_goal_signal = 0
-            self._noprogress_streak = 0
+                    prev = self._failed_approaches.get(sig, 0)
+                    self._failed_approaches[sig] = prev + 1
+                    if prev == 0:
+                        self._turn_saw_info_gain = True
             return
 
-        self._turns_since_artifact = (
-            0 if produced_new_artifact else self._turns_since_artifact + 1
-        )
-        self._turns_since_goal_signal = (
-            0 if goal_signal_hit else self._turns_since_goal_signal + 1
-        )
+        self._last_error_hint = None
+        if tr.tool_name in INFRA_TOOL_NAMES:
+            return
+        payload = self._info_payload(tr)
+        if not payload:
+            return
+        h = hashlib.blake2b(
+            _normalize_numeric(payload).encode("utf-8", "replace"),
+            digest_size=16,
+        ).hexdigest()
+        if h not in self._seen_obs_hashes:
+            self._seen_obs_hashes.add(h)
+            self._turn_saw_info_gain = True
 
-        if (self._turns_since_artifact >= _NOPROGRESS_ARTIFACT_THRESHOLD
-                and self._turns_since_goal_signal >= _NOPROGRESS_GOAL_THRESHOLD):
-            self._noprogress_streak += 1
-        else:
-            self._noprogress_streak = 0
+    @staticmethod
+    def _info_payload(tr: ToolResult) -> str:
+        """Substantive payload for novelty hashing, selected per tool type.
 
-    @property
-    def noprogress_streak(self) -> int:
-        """Consecutive turns past the no-progress threshold (Tier 1 gate)."""
-        return self._noprogress_streak
-
-    @property
-    def turns_since_artifact(self) -> int:
-        return self._turns_since_artifact
-
-    def matches_goal(self, text: str) -> bool:
-        """True if any expected-outcome keyword appears in `text`.
-
-        Cheap substring scan. Returns False when the item provided no
-        expected_outcomes (empty keyword set) so a goal-less item never reports
-        spurious goal signals. ASCII keywords are lowercase (text is lowered to
-        match); CJK 2-gram keywords match case-insensitively by construction.
+        write/edit → the content written (tr.tool_parameters['content']); NOT
+        tr.output, which is the destination path. read/bash/ssh/others →
+        str(tr.output). Returns '' when there is nothing substantive to hash.
         """
-        if not self._goal_keywords or not text:
+        params = tr.tool_parameters or {}
+        if tr.tool_name in ("write", "edit"):
+            content = params.get("content")
+            return str(content) if content is not None else ""
+        return str(tr.output) if tr.output is not None else ""
+
+    def record_progress_signal(
+        self, *, has_wait_interval: bool = False,
+    ) -> bool:
+        """Fold this turn's info-gain flag into the no-info-gain streak.
+
+        Call exactly once per turn, AFTER every tool result has been fed to
+        record_tool_result. Returns this turn's info_gain (for the digest). Also
+        the single per-turn clock: decrements the LTM-refresh and both stall
+        cooldowns.
+
+        info_gain is True iff the turn saw a novel observation / content
+        artifact / new failure signature (tracked in record_tool_result) OR the
+        turn contained an intentional wait_interval — the agent's explicit "I
+        confirmed the state and will re-check later" monitoring signal, which is
+        real progress through a monitoring duty even though it produces no
+        artifact. A stall is a run of consecutive turns with info_gain == False;
+        an info-gaining turn ends the episode (streak → 0) and clears the stall
+        cooldowns so a subsequent stall can fire cleanly.
+        """
+        if self._ltm_refresh_cooldown > 0:
+            self._ltm_refresh_cooldown -= 1
+        if self._soft_stall_cooldown > 0:
+            self._soft_stall_cooldown -= 1
+        if self._hard_stall_cooldown > 0:
+            self._hard_stall_cooldown -= 1
+
+        info_gain = self._turn_saw_info_gain or has_wait_interval
+        if info_gain:
+            self._no_info_gain_streak = 0
+            self._soft_stall_cooldown = 0
+            self._hard_stall_cooldown = 0
+        else:
+            self._no_info_gain_streak += 1
+
+        self._turn_saw_info_gain = False
+        return info_gain
+
+    @property
+    def no_info_gain_streak(self) -> int:
+        """Consecutive turns that added zero new information."""
+        return self._no_info_gain_streak
+
+    def hard_stall(self) -> bool:
+        """True once per stall episode when a HARD threshold is crossed.
+
+        Crossed when no_info_gain_streak >= _HARD_STALL_STREAK OR consecutive
+        tool failures >= _HARD_FAIL_STREAK. Cooldown-gated (_STALL_COOLDOWN) so
+        a persistent stall re-wakes the planner periodically rather than every
+        turn. PersistentAgent calls this after record_progress_signal and, when
+        True, flips the planner trigger mechanically via set_progress_concern —
+        NO LLM in the path (the incident fix).
+        """
+        if self._hard_stall_cooldown > 0:
             return False
-        low = text.lower()
-        return any(kw in low for kw in self._goal_keywords)
+        if (self._no_info_gain_streak >= _HARD_STALL_STREAK
+                or self._count_consecutive_failures() >= _HARD_FAIL_STREAK):
+            self._hard_stall_cooldown = _STALL_COOLDOWN
+            return True
+        return False
 
     def get_reminder(self) -> Optional[str]:
         """Generate combined reminder string, or None if nothing to say."""
         parts: List[str] = []
+
+        # 0. Directives — planner's advisory constraints, always visible while
+        # active ("警钟长鸣"). Placed first so the agent re-reads them every
+        # turn. Weak constraint: agent may violate but is expected to bail out
+        # via plan_feedback rather than silently push through — see the
+        # "Directive Conflicts" section of the agent system prompt.
+        directives_msg = self._format_directives()
+        if directives_msg:
+            parts.append(directives_msg)
 
         # 1. Anti-repeat guard (highest priority — specific dead paths)
         repeat_offenders = sorted(
@@ -459,53 +514,39 @@ class IterationAdvisor:
                 "tool, command, or decomposition:\n" + "\n".join(lines)
             )
 
-        # 2. Parallelism nudge (with cooldown)
-        if self._parallelism_cooldown <= 0 and len(self._iteration_tool_counts) >= 5:
-            recent = self._iteration_tool_counts[-5:]
-            if all(c == 1 for c in recent):
+        # 2. Stall block — exactly one of two mutually-exclusive messages.
+        #    The specific write_param_error fix takes precedence (immediately
+        #    actionable, ungated) over the generic soft-stall bail-out. The
+        #    soft-stall block fires when no_info_gain_streak OR consecutive
+        #    failures cross _SOFT_STALL_STREAK, cooldown-gated so we don't nag
+        #    every turn. This single block replaces the former parallelism
+        #    nudge, stagnation prose, replan advisory, and no-progress prose.
+        if self._last_error_hint == "write_param_error":
+            parts.append(_WRITE_PARAM_ERROR_REMINDER)
+        else:
+            consecutive_fails = self._count_consecutive_failures()
+            if (self._soft_stall_cooldown <= 0
+                    and (self._no_info_gain_streak >= _SOFT_STALL_STREAK
+                         or consecutive_fails >= _SOFT_STALL_STREAK)):
+                if consecutive_fails >= _SOFT_STALL_STREAK:
+                    fact = f"{consecutive_fails} consecutive tool failures"
+                else:
+                    fact = (
+                        f"{self._no_info_gain_streak} consecutive turns added no "
+                        f"new information (same observations, no new artifact, no "
+                        f"new failure mode)"
+                    )
                 parts.append(
-                    "PARALLELISM CHECK — the last 5 turns each issued one tool call. "
-                    "Before sending the next response, ask yourself: were those calls "
-                    "genuinely sequential, or could some have run in parallel? "
-                    "Batch independent operations in one response."
+                    f"STALL CHECK — {fact}. If the current approach is "
+                    f"structurally wrong (wrong assumption, tool, or target), stop "
+                    f"tweaking and bail out to the planner: emit completion or "
+                    f"error JSON with `plan_feedback` describing what you tried, "
+                    f"what kept failing, and what you now suspect the real blocker "
+                    f"is. If the expected outcomes are already met, complete the "
+                    f"item. Bailing out when the approach is structurally wrong is "
+                    f"the correct action — not a failure."
                 )
-                self._parallelism_cooldown = 5
-
-        # 3. Progress stagnation / write_param_error
-        stagnation_msg = self._check_stagnation()
-        if stagnation_msg:
-            parts.append(stagnation_msg)
-
-        # 4. No-progress (active but not advancing toward expected_outcomes).
-        #    Distinct from #3, which keys off FAILURES: this fires when tool
-        #    calls keep SUCCEEDING but produce no new artifact and surface no
-        #    goal-keyword signal. Soft fact — the smarter agent may override it.
-        if (self._noprogress_cooldown <= 0
-                and self._goal_keywords
-                and self._turns_since_artifact >= _NOPROGRESS_ARTIFACT_THRESHOLD
-                and self._turns_since_goal_signal >= _NOPROGRESS_GOAL_THRESHOLD
-                and self._get_success_rate() >= _NOPROGRESS_MIN_SUCCESS_RATE):
-            goal_anchor = ""
-            if self._expected_outcomes:
-                goals = "; ".join(self._expected_outcomes[:3])
-                goal_anchor = (
-                    f"\n\nGOAL RE-ANCHOR — your expected outcomes are: [{goals}]. "
-                    f"Is your current line of work the most DIRECT path to these "
-                    f"outcomes? If not, change approach now rather than continuing "
-                    f"a tangent."
-                )
-            parts.append(
-                f"PROGRESS CHECK — the last {self._turns_since_artifact} turns "
-                f"completed without producing a new artifact, and the last "
-                f"{self._turns_since_goal_signal} turns surfaced nothing matching "
-                f"this item's expected outcomes, yet tool calls are succeeding. "
-                f"You may be active without advancing. Re-read the expected "
-                f"outcomes and ask: is the current line of work actually moving "
-                f"toward them, or should the approach change? If the outcomes are "
-                f"already met, complete the item; if truly blocked, use the "
-                f"\"error\" field.{goal_anchor}"
-            )
-            self._noprogress_cooldown = _NOPROGRESS_COOLDOWN
+                self._soft_stall_cooldown = _STALL_COOLDOWN
 
         if not parts:
             return None
@@ -520,11 +561,11 @@ class IterationAdvisor:
         }
 
     def should_refresh_ltm(self) -> bool:
-        """Return True when stagnation justifies a fresh LTM recall.
+        """Return True when a run of failures justifies a fresh LTM recall.
 
-        Fires once per stagnation episode (cooldown applied) so a stuck agent
-        gets one LTM refresh, not one per turn. Threshold is identical to
-        moderate stagnation (3 consecutive failures): the per-item LTM was
+        Fires once per failure episode (cooldown applied) so a stuck agent
+        gets one LTM refresh, not one per turn. Threshold is
+        _LTM_REFRESH_THRESHOLD (3) consecutive failures: the per-item LTM was
         chosen for the happy-path query at item start, so once the agent has
         failed three times the original recall is likely the wrong angle.
 
@@ -556,29 +597,6 @@ class IterationAdvisor:
 
     # ── Internal ────────────────────────────────────────────────────────────
 
-    def _extract_keywords(self, outcomes: List[str]) -> Set[str]:
-        """Build a keyword set from expected_outcomes for cheap substring
-        matching against tool outputs.
-
-        ASCII alphanumeric tokens require >=4 chars (and aren't stopwords); CJK
-        runs are shingled into 2-grams so matching works without a CJK
-        tokenizer. The result errs toward over-matching, which is the safe
-        direction — a spurious goal-signal hit merely suppresses a soft
-        no-progress note rather than over-warning the agent.
-        """
-        kws: Set[str] = set()
-        for outcome in outcomes:
-            if not outcome:
-                continue
-            lowered = outcome.lower()
-            for tok in _ASCII_TOKEN_RE.findall(lowered):
-                if tok not in _GOAL_STOPWORDS:
-                    kws.add(tok)
-            for run in _CJK_RUN_RE.findall(outcome):
-                for i in range(len(run) - 1):
-                    kws.add(run[i:i + 2])
-        return kws
-
     def _count_consecutive_failures(self) -> int:
         count = 0
         for success in reversed(self._success_history):
@@ -594,51 +612,25 @@ class IterationAdvisor:
         window = self._success_history[-10:]
         return sum(window) / len(window)
 
-    def _check_stagnation(self) -> Optional[str]:
-        if self._last_error_hint == "write_param_error":
-            return _WRITE_PARAM_ERROR_REMINDER
+    def _format_directives(self) -> Optional[str]:
+        """Render the current item's directives as a per-turn reminder block.
 
-        consecutive = self._count_consecutive_failures()
-        if consecutive < _MODERATE_STAGNATION:
+        Called by get_reminder(). Directives are the planner's advisory
+        constraints — derived from user directives, prior lessons, and skill
+        non-negotiables. They stay visible every turn ("警钟长鸣") until the
+        item boundary; agent may violate but is expected to bail out via
+        plan_feedback rather than silently push through.
+        """
+        if not self._directives:
             return None
-
-        rate = self._get_success_rate()
-        goal_anchor = ""
-        if self._expected_outcomes:
-            goals = "; ".join(self._expected_outcomes[:3])
-            goal_anchor = (
-                f"\n\nGOAL RE-ANCHOR — your expected outcomes are: [{goals}]. "
-                f"Evaluate whether your current approach is the most direct path "
-                f"to these outcomes, or if you have drifted into solving a "
-                f"different problem."
-            )
-
-        if consecutive >= _SEVERE_STAGNATION:
-            return (
-                f"Significant Challenge Detected: {consecutive} consecutive "
-                f"failures observed (success rate: {rate:.1%}).\n\n"
-                f"The current approach may need fundamental reconsideration:\n"
-                f"  - Is the current strategy addressing the root problem?\n"
-                f"  - Are there alternative tools or methods?\n"
-                f"  - Could the instruction be approached from a completely different angle?\n"
-                f"  - Is this instruction achievable with available tools?\n\n"
-                f"Options:\n"
-                f"  - Continue with a radically different strategy\n"
-                f"  - Use the \"error\" field if the instruction is truly unachievable"
-                f"{goal_anchor}"
-            )
-        return (
-            f"Progress Note: Recent operations show {consecutive} consecutive "
-            f"failures (success rate: {rate:.1%}).\n\n"
-            f"Consider:\n"
-            f"  - Reflect on what's not working and why\n"
-            f"  - Consider alternative approaches or strategies\n"
-            f"  - Avoid repeating the same failed operation\n"
-            f"  - Think creatively about solving the problem differently\n\n"
-            f"The \"error\" field is available if you determine the instruction is "
-            f"fundamentally unachievable."
-            f"{goal_anchor}"
-        )
+        lines = [
+            "🔔 [Directives — planner guidance; follow by default. "
+            "If a directive contradicts observed reality, bail out with "
+            "plan_feedback rather than silently violate — see \"Directive "
+            "Conflicts\" in your system prompt.]"
+        ]
+        lines.extend(f"  • {d}" for d in self._directives)
+        return "\n".join(lines)
 
 
 # ── TurnOutcome ────────────────────────────────────────────────────────────

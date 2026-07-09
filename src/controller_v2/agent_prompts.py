@@ -174,7 +174,50 @@ into action is drift.
 
 Two consecutive failures with the same approach = wrong approach. Change strategy.
 
-### 5. Verify Orthogonally, Never Redundantly
+### 5. Directive Conflicts — Bail Out to Replan, Don't Silently Violate
+
+Your per-turn reminder may include a `🔔 [Directives ...]` block: the
+planner's advisory guidance for the current item, derived from your goal +
+user's explicit constraints + prior lessons. Default posture: follow them.
+They stay visible every turn because they encode context the planner had at
+planning time — routing venue (local vs a specific remote host), platform
+target (Windows exe vs Linux bin), user constraints ("only on gv"), and
+similar. Silent violation is the pattern that produced the 273-iteration
+disaster the directive channel exists to prevent.
+
+If during execution you find a directive contradicts observed reality —
+the named path doesn't exist, a tool behaves differently than the directive
+assumes, or the user's actual intent (as revealed by tool evidence) diverges
+from what the directive states — do NOT push through in silence. **End the
+item early** so the planner can reconcile:
+
+  - Some useful work was done → emit completion JSON. Put what you learned
+    in `factual_outcome`. Put the conflict in `plan_feedback`, naming the
+    directive verbatim and citing the specific tool evidence that contradicts
+    it.
+  - Nothing usable was done → emit error JSON with the same `plan_feedback`
+    explaining the conflict.
+
+Bailing early on directive conflict is the CORRECT behavior when your
+ground truth contradicts the plan. It is not failure. The planner will
+either retire the directive (reality refuted it), sharpen it (with your
+evidence), or escalate to the user for clarification.
+
+**The same bail-out applies when you see a `⚠ REPLAN ADVISORY` in the
+reminder**: it means many same-signature failures or high total-failure
+count have accumulated in this item — your current approach is structurally
+wrong, not a tweak-away issue. Bail out with `plan_feedback` describing
+what you tried, what kept failing, and what you now suspect the real
+blocker is. The planner will re-plan.
+
+Do NOT proceed against an active directive without either:
+  (a) `reasoning` on this turn that explicitly justifies the deviation
+      with tool-observed evidence, or
+  (b) bailing out with `plan_feedback` as above.
+Silent override — acting contrary to a directive without either — is the
+one thing this channel exists to prevent.
+
+### 6. Verify Orthogonally, Never Redundantly
 
 After producing output, verify from a DIFFERENT ANGLE — never by repeating
 the same computation.
@@ -199,13 +242,13 @@ more than ten redundant re-reads.
     command → just run that command. It IS your verification.
   - The action is trivially correct (single file write with known content).
 
-### 6. Build on What You Know
+### 7. Build on What You Know
 
 Each observation is evidence — use it:
 - Key facts discovered should inform your next tool call directly
 - Don't re-discover what you already know
 
-### 7. Cache Discovery Results
+### 8. Cache Discovery Results
 
 When a discovery command returns a large result set (>20 entries) that will be
 needed later, save it to a temp file immediately.
@@ -214,7 +257,7 @@ needed later, save it to a temp file immediately.
 
 {_cache_naming}
 
-### 8. Complete, Not Just Started
+### 9. Complete, Not Just Started
 
 The instruction is achieved when the full deliverable is ready:
 - Partial results are not results
@@ -222,7 +265,7 @@ The instruction is achieved when the full deliverable is ready:
 - Done = every item in the `[Expected Outcomes]` contract is satisfied (see §The Item
   Contract) — not more, not less
 
-### 9. Monitoring Loops — Long-Running Observation
+### 10. Monitoring Loops — Long-Running Observation
 
 When the item instruction describes a polling/monitoring cycle (observe a
 process, watch for completion/error/hang), execute this pattern:
@@ -472,25 +515,48 @@ AGENT_SYSTEM_PROMPT: str = _generate_system_prompt()
 
 
 COMPACT_CONVERSATION_PROMPT: str = """\
-You are compressing an AI agent's conversation history to free context-window space.
+You are compressing an AI agent's conversation history to free context-window space. \
+This summary is consumed ONLY by the agent itself to resume work — never shown to a \
+human — so favor completeness over brevity: a fact you drop cannot be recovered later, \
+while a few extra tokens cost nothing compared to re-discovering it.
+
 Below is a sequence of turns showing the agent's reasoning and tool call results.
 
-PRODUCE a concise narrative summary that preserves:
-1. Key discoveries (file paths, config values, function names, env vars)
-2. Actions taken and their outcomes (especially writes/edits that changed state)
-3. Failed approaches and WHY they failed (critical — the agent must not retry them)
-4. Current state of the work (what is done, what remains)
+First, work through the trace inside <analysis> tags: identify every discovery, every \
+state-changing action, every failed approach and why it failed, and what the current \
+instruction still requires. Do this BEFORE writing the summary — do not skip straight \
+to the output.
+
+Then PRODUCE a concise narrative summary that preserves:
+1. Key discoveries — file paths, config values, function names, env vars — copied \
+VERBATIM, not paraphrased. A path or identifier that is reworded even slightly becomes \
+useless for a later exact-match lookup.
+2. Actions taken and their outcomes (especially writes/edits that changed state). For \
+any file that was created or modified, include its FULL path and the key code/config \
+lines VERBATIM — enough that the agent could recognize the change without re-reading \
+the file.
+3. Failed approaches and WHY they failed (critical — the agent must not retry them). \
+Keep the actual error text verbatim when it explains the failure.
+4. Current state of the work (what is done, what remains).
+5. Next Step — end with a line starting "Next Step:" that quotes VERBATIM the most \
+recent instruction or expected outcome this work is trying to satisfy. This is the \
+single most important line for the agent to pick up correctly after compaction.
 
 COMPRESSION RULES:
 - MERGE repeated reads/polls of the same target → one mention with final state
 - DROP verbose intermediate output that produced no lasting artefact
-- KEEP all discovered file paths, function signatures, and config values
-- KEEP error messages that explain WHY an approach failed
+- KEEP all discovered file paths, function signatures, and config values VERBATIM
+- KEEP error messages that explain WHY an approach failed VERBATIM
 - CONDENSE verbose command output → extract only key facts
+- Within the token budget below, favor completeness over brevity: when in doubt
+  about whether a detail matters, keep it rather than cut it
 
-FORMAT — a numbered narrative, past tense, ≤800 tokens:
+FORMAT — an <analysis> block, then a numbered narrative in past tense, then the
+Next Step line. Target ≤800 tokens for the narrative + Next Step (the
+<analysis> block is scratch work and is not counted against this budget).
   1. <what was done and what was learned>
   2. ...
+Next Step: <verbatim quote of the current instruction/expected outcome>
 
 Do NOT output JSON — plain text only.
 
@@ -504,8 +570,9 @@ PROGRESS_WATCHER_PROMPT: str = """\
 You are a progress auditor for an autonomous agent working a single task item.
 You are given the item's expected outcomes and a sequence of MECHANICAL per-turn
 digests (tool calls, success/fail counts, whether a new file artifact appeared,
-whether anything matching the expected outcomes surfaced). The digests are facts,
-not the agent's self-assessment.
+and an ``info_gain`` flag — true when the turn added new information: novel tool
+output bytes, a new file artifact, a newly-discovered failure signature, or an
+intentional wait). The digests are facts, not the agent's self-assessment.
 
 Decide whether the agent is genuinely advancing toward the expected outcomes, or
 spinning — repeating work, producing nothing new, and surfacing nothing relevant,
@@ -520,8 +587,9 @@ Return STRICT JSON, no prose, with exactly these keys:
 }}
 
 Guidance:
-- "false_progress": tools keep succeeding but no new artifact and no goal signal
-  across several turns — busywork that will not reach the outcomes.
+- "false_progress": tools keep succeeding but info_gain is false across several
+  turns (no new artifact, no novel output, nothing new learned) — busywork that
+  will not reach the outcomes.
 - "diverging": the line of work is heading somewhere unrelated to the outcomes.
 - "ok": evidence is consistent with real progress; prefer this when unsure.
 - suggest_interrupt only when continuing is clearly wasteful; suggest_replan when

@@ -250,6 +250,15 @@ class FlowControllerV2:
         if not self._started or self._orchestrator is None:
             return "Session not started."
 
+        # Record the verbatim user prompt as its own log record — one per send,
+        # before mention-preprocessing / planner translation, so the raw prompt
+        # is preserved alongside the planner-derived item goals.
+        if self._ctx is not None and self._ctx.execution_recorder is not None:
+            try:
+                self._ctx.execution_recorder.write_user_request(message)
+            except Exception:
+                pass
+
         if self.interaction_manager is not None:
             try:
                 self.interaction_manager.notify_receptionist_thinking()

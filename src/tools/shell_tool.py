@@ -138,8 +138,64 @@ _DANGEROUS_PATTERNS_WIN: list[tuple[re.Pattern, str, str]] = [
 ]
 
 
+# ── Self-termination guard ────────────────────────────────────────────────────
+# The agent runs *inside* the bridge process, so a shell command that kills the
+# bridge's OWN PID terminates the agent mid-task. This is not hypothetical: an
+# agent that recompiled the bridge ran `taskkill /F /PID <n>` to free the locked
+# exe for a hot-swap — the PID was its own, and it killed itself. Only HandQ's
+# own process is protected; killing any other process is left untouched.
+
+_KILL_VERB = re.compile(
+    r'\btaskkill\b|\bkill\b|\bpkill\b|\bkillall\b|\bskill\b'
+    r'|Stop-Process|Remove-Process',
+    re.IGNORECASE,
+)
+# A standalone run of digits (not glued to a word char and not a signal like
+# "-9"). Over-capture is safe: a captured number only blocks when it equals the
+# bridge's own PID, a specific, large runtime value.
+_PID_TOKEN = re.compile(r'(?<![\w-])(\d+)(?![\w])')
+
+# In a dev run the bridge is `python bridge_main.py`, so the executable basename
+# is a generic interpreter; name-based blocking would then be far too broad (the
+# agent may legitimately kill a python/node subprocess it spawned). Name-based
+# self-kill blocking therefore applies only to a frozen host exe.
+_INTERPRETER_STEMS = frozenset({
+    "python", "pythonw", "python3", "node", "deno", "bun",
+    "pwsh", "powershell", "cmd", "sh", "bash", "zsh", "dash",
+})
+
+
+def _check_self_kill(command: str) -> str | None:
+    if not _KILL_VERB.search(command):
+        return None
+    own = os.getpid()
+    for match in _PID_TOKEN.finditer(command):
+        if int(match.group(1)) == own:
+            return (
+                f"BLOCKED: this command targets PID {own}, the HandQ bridge's own "
+                f"process. Killing it would terminate the agent itself. "
+                f"Suggestion: never kill HandQ's own PID — if a new build must "
+                f"take effect, ask the user to restart HandQ rather than "
+                f"hot-swapping the running process."
+            )
+    # Name-based image kill, frozen production host only.
+    exe_stem = Path(sys.executable).stem.lower()
+    if len(exe_stem) >= 4 and exe_stem not in _INTERPRETER_STEMS:
+        if re.search(rf'\b{re.escape(exe_stem)}\b', command, re.IGNORECASE):
+            return (
+                f"BLOCKED: this command targets the image '{exe_stem}', the "
+                f"running HandQ bridge. Killing it would terminate the agent "
+                f"itself. Suggestion: ask the user to restart HandQ instead of "
+                f"killing the bridge process."
+            )
+    return None
+
+
 def _check_dangerous_command(command: str) -> str | None:
     stripped = command.strip()
+    self_kill = _check_self_kill(stripped)
+    if self_kill:
+        return self_kill
     for pattern, reason, suggestion in _DANGEROUS_PATTERNS:
         if pattern.search(stripped):
             return f"BLOCKED: {reason}. Suggestion: {suggestion}"
@@ -254,6 +310,28 @@ def _resolve_shell(shell: Optional[str]) -> list[str]:
             return [found, "-c"]
 
     return [shell, "-c"]
+
+
+def _shell_label(executable: str) -> str:
+    """Return a stable, agent-friendly name for a resolved shell executable.
+
+    ``_resolve_shell`` returns the full path to the interpreter, which is
+    accurate but not what the agent needs when it's asking itself "was that
+    PowerShell or bash?" — the path contains version numbers, install
+    prefixes, and drive letters. Normalize to one of the shell family names
+    the agent's tool description already talks about, so its next
+    self-correction (e.g. picking Here-String vs single-quoted string
+    for a multiline python -c) has an unambiguous signal to key off.
+    """
+    name = os.path.basename(executable).lower()
+    if name in ("pwsh", "pwsh.exe", "powershell", "powershell.exe"):
+        return "powershell"
+    if name in ("cmd", "cmd.exe"):
+        return "cmd"
+    for base in ("bash", "zsh", "sh", "fish", "dash"):
+        if name.startswith(base):
+            return base
+    return name or "unknown"
 
 
 def _get_output_encoding() -> str:
@@ -631,6 +709,7 @@ class ShellTool(BaseTool):
                 "status": "running",
                 "command": command,
                 "description": description,
+                "shell_used": _shell_label(shell_argv[0]),
                 "message": f"Command launched in background. Use task_id='{task_id}' to check status or kill.",
             },
             execution_time=time.time() - start_time,
@@ -781,6 +860,7 @@ class ShellTool(BaseTool):
                                 "cwd_used": effective_cwd,
                                 "command": command,
                                 "shell": executable,
+                                "shell_used": _shell_label(executable),
                                 "venv": self.venv_path,
                             },
                             error=f"Command execution timeout ({effective_timeout}s): {command}",
@@ -809,6 +889,7 @@ class ShellTool(BaseTool):
                                 "cwd_used": effective_cwd,
                                 "command": command,
                                 "shell": executable,
+                                "shell_used": _shell_label(executable),
                                 "venv": self.venv_path,
                             },
                             error=f"Command execution timeout ({effective_timeout}s): {command}",
@@ -836,6 +917,7 @@ class ShellTool(BaseTool):
                     "cwd_used": effective_cwd,
                     "command": command,
                     "shell": executable,
+                    "shell_used": _shell_label(executable),
                     "returncode": process.returncode,
                     "cwd": effective_cwd,
                     "venv": self.venv_path,

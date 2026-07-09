@@ -307,7 +307,7 @@ class PersistentAgent:
 
     async def _execute_item(self, item: CheckListItem) -> None:
         """Execute a single CheckList item with full feature parity."""
-        self._advisor.reset_for_item(item.expected_outcomes)
+        self._advisor.reset_for_item(item.directives)
         self._current_item_turn_count = 0
 
         # Item-static context — persisted until the next item begins.
@@ -433,8 +433,6 @@ class PersistentAgent:
                 instruction, reminder, extra_ltm_block
             )
             _token_usage += _iter_token_usage
-
-            self._advisor.record_turn_tool_count(len(turn_result.tool_calls or []))
 
             # Apply agent-driven self-extension (claim_tool / release_tool)
             # BEFORE the per-turn branching. Claim makes the tool available
@@ -699,25 +697,40 @@ class PersistentAgent:
                     )
 
             # ── 8. Update advisor + per-turn progress signal ─────────────────
-            goal_signal_hit = False
             has_wait_interval = False
             for tr in tool_results:
                 self._advisor.record_tool_result(tr)
                 if tr.tool_name == "wait_interval" and tr.success:
                     has_wait_interval = True
-                if not goal_signal_hit and tr.success and tr.output is not None:
-                    goal_signal_hit = self._advisor.matches_goal(str(tr.output)[:2000])
-            self._advisor.record_progress_signal(
-                produced_new_artifact=len(_produced_paths) > prev_artifacts,
-                goal_signal_hit=goal_signal_hit,
+            info_gain = self._advisor.record_progress_signal(
                 has_wait_interval=has_wait_interval,
             )
+
+            # Mechanical planner wake (the incident fix): when either mechanical
+            # signal crosses its HARD threshold, flip the planner trigger
+            # DIRECTLY via the checklist bus — no LLM in the path, no dependency
+            # on a helper pool. hard_stall() is cooldown-gated so this fires at
+            # most once per stall episode. Guarded by the item_id staleness
+            # check for parity with the watcher path.
+            if self._advisor.hard_stall():
+                current = self._checklist.get_current_item()
+                if current is not None and current.item_id == item.item_id:
+                    self._checklist.set_progress_concern(ProgressConcern(
+                        item_id=item.item_id,
+                        verdict="stalled",
+                        rationale=(
+                            "mechanical hard stall — crossed the no-progress / "
+                            "consecutive-failure threshold without adding new "
+                            "information; approach likely needs re-planning"
+                        ),
+                        suggest_replan=True,
+                    ))
 
             # ── 9. Mechanical digest + Tier-1 watcher (fire-and-forget) ──────
             # Write one bus digest per turn (cheap, synchronous) so the planner
             # has an in-flight view of this running item. Then, only after the
-            # Tier-0 no-progress streak has persisted (hysteresis), launch the
-            # cheap LLM watcher — never awaited on this critical path.
+            # no-info-gain streak has persisted (hysteresis), launch the cheap
+            # LLM watcher — never awaited on this critical path.
             self._checklist.append_turn_digest(TurnDigest(
                 item_id=item.item_id,
                 iteration=iteration,
@@ -725,8 +738,8 @@ class PersistentAgent:
                 success_count=sum(1 for tr in tool_results if tr.success),
                 fail_count=sum(1 for tr in tool_results if not tr.success),
                 produced_new_artifact=len(_produced_paths) > prev_artifacts,
-                goal_signal_hit=goal_signal_hit,
-                no_progress_streak=self._advisor.noprogress_streak,
+                info_gain=info_gain,
+                no_progress_streak=self._advisor.no_info_gain_streak,
             ))
             self._maybe_launch_progress_watcher(item)
 
@@ -763,7 +776,7 @@ class PersistentAgent:
             return
         if self._watcher_inflight:
             return
-        if self._advisor.noprogress_streak < WATCHER_STREAK_GATE:
+        if self._advisor.no_info_gain_streak < WATCHER_STREAK_GATE:
             return
         self._watcher_inflight = True
         self._watcher_task = asyncio.create_task(
@@ -818,7 +831,7 @@ class PersistentAgent:
             digest_lines.append(
                 f"iter {d.iteration}: tools={tools} ok={d.success_count} "
                 f"fail={d.fail_count} new_artifact={d.produced_new_artifact} "
-                f"goal_hit={d.goal_signal_hit} "
+                f"info_gain={d.info_gain} "
                 f"no_progress_streak={d.no_progress_streak}"
             )
         prompt = PROGRESS_WATCHER_PROMPT.format(
@@ -1127,17 +1140,14 @@ class PersistentAgent:
         # boundary history. Both change slowly (summary on compaction, boundary
         # on item completion), so this stays stable across a single item's many
         # iterations and keeps the turn trace below it cache-resident.
+        #
+        # Note: the user's verbatim original request is NOT injected here — it
+        # rides in the bottom item block instead, adjacent to the current-task
+        # instruction. LLMs pay markedly more attention to the very top and very
+        # bottom of the context; bundling user-msg + item at the bottom gives
+        # the agent grounded orientation on every turn (not just iter 0) at the
+        # position where attention is strongest.
         top_parts: List[str] = []
-        # User's verbatim message — only on first iteration of this item.
-        # After that, the agent's reasoning chain carries the user intent.
-        if self._current_item_turn_count == 0:
-            user_msg = self._checklist.get_latest_user_message()
-            if user_msg:
-                top_parts.append(
-                    "[User Original Request — for grounding only; the "
-                    "actionable contract is the [New Task] instruction below]\n"
-                    f'"{user_msg}"'
-                )
         if self._conversation_summary:
             top_parts.append(
                 f"---\n[Earlier session progress]\n{self._conversation_summary}\n---"
@@ -1203,16 +1213,33 @@ class PersistentAgent:
         # context. On the first turn of an item, include full task block + LTM +
         # host context. On subsequent turns, abbreviate to avoid repeating static
         # content the model has already reasoned about.
+        #
+        # User's verbatim latest message is prepended on every turn (not just
+        # iter 0). Bundling user-msg + item block at the high-attention bottom
+        # position keeps the agent grounded across long items (100+ iter) where
+        # the trace above may have drifted from the user's original intent.
+        # `_latest_user_message` is last-write-wins: mid-flight instructions
+        # ("also do X", "actually only on gv") overwrite the initial message,
+        # but the initial content is already captured in the planner-generated
+        # item.instruction, so overwriting is safe.
+        bottom_parts: List[str] = []
+        user_msg = self._checklist.get_latest_user_message()
+        if user_msg:
+            bottom_parts.append(
+                "[User Directive — verbatim; honor this over any paraphrased "
+                "reformulation]\n"
+                f'"{user_msg}"'
+            )
         if self._current_item_turn_count == 0:
-            bottom_parts: List[str] = [
+            bottom_parts.append(
                 self._current_item_block or f"[Current Task]\n{instruction}"
-            ]
+            )
             if self._current_ltm_block:
                 bottom_parts.append(self._current_ltm_block)
             if self._current_item_hint:
                 bottom_parts.append(f"[Host Context]\n{self._current_item_hint}")
         else:
-            bottom_parts: List[str] = [f"[Continuing: {instruction[:120]}]"]
+            bottom_parts.append(f"[Continuing: {instruction[:120]}]")
             if self._current_item_hint and "ssh" in (self._current_item_hint or "").lower():
                 bottom_parts.append(f"[Host Context]\n{self._current_item_hint}")
         # Reminder section. extra_ltm_block (when present) is the
@@ -1918,7 +1945,7 @@ class PersistentAgent:
                 dict(messages=[{"role": "user", "content": summary_prompt}], json_mode=False),
             )
             if result.content and result.content.strip():
-                return result.content.strip()
+                return self._strip_analysis_scratch(result.content.strip())
         except Exception as e:
             self.logger.warning(
                 f"[{self.current_iteration}][Compact] LLM call failed: {e}; using fallback",
@@ -1926,6 +1953,18 @@ class PersistentAgent:
             )
 
         return self._rule_based_fallback_summary(turn_count)
+
+    @staticmethod
+    def _strip_analysis_scratch(summary: str) -> str:
+        """Drop the COMPACT_CONVERSATION_PROMPT's <analysis> scratch block.
+
+        The prompt asks the model to think through the trace inside
+        <analysis> tags before writing the actual summary — that block is
+        disposable reasoning, not part of the summary we want to spend the
+        MAX_SUMMARY_CHARS budget on.
+        """
+        stripped = re.sub(r"<analysis>.*?</analysis>", "", summary, flags=re.DOTALL).strip()
+        return stripped or summary
 
     def _rule_based_fallback_summary(self, compress_count: int) -> str:
         """Deterministic fallback when LLM compression fails."""

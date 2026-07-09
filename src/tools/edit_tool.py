@@ -138,6 +138,16 @@ class EditTool(BaseTool):
                 {"path": path, "old_content": old_content, "new_content": new_content, "replace_all": replace_all}
             )
 
+            if not old_content:
+                return ToolResult(
+                    success=False,
+                    output=None,
+                    error="old_content must not be empty",
+                    execution_time=time.time() - start_time,
+                    tool_name=self.name,
+                    tool_parameters={"path": path, "old_content": old_content, "new_content": new_content},
+                )
+
             # Resolve relative paths against the per-session workspace, not the
             # process cwd. Downstream Path(path), FileState staleness check, and
             # the displayed .absolute() path all use this single resolved value.
@@ -188,6 +198,29 @@ class EditTool(BaseTool):
 
             # (1) Unique match validation
             match_count = content.count(old_content)
+            used_normalized = False
+            working_content = content
+            working_old_content = old_content
+
+            if match_count == 0:
+                # CRLF friction retry: old_content may be \n-only while the
+                # file on disk uses \r\n (or vice versa). Normalize both
+                # sides once and recount before falling back to the fuzzy
+                # match failure below. Adopting the normalized count even
+                # when it's >1 lets the existing "must be unique" check
+                # further down produce an accurate error instead of a
+                # misleading "not found" for a match that actually exists
+                # (just ambiguously).
+                normalized_content = content.replace("\r\n", "\n")
+                normalized_old = old_content.replace("\r\n", "\n")
+                if normalized_content != content or normalized_old != old_content:
+                    normalized_count = normalized_content.count(normalized_old)
+                    if normalized_count >= 1:
+                        match_count = normalized_count
+                        used_normalized = True
+                        working_content = normalized_content
+                        working_old_content = normalized_old
+
             if match_count == 0:
                 # (3) Fuzzy match hint: suggest closest actual string in the file
                 # Split content into chunks roughly the size of old_content for comparison
@@ -236,9 +269,19 @@ class EditTool(BaseTool):
                 )
 
             if replace_all:
-                new_file_content = content.replace(old_content, new_content)
+                new_file_content = working_content.replace(working_old_content, new_content)
             else:
-                new_file_content = content.replace(old_content, new_content, 1)
+                new_file_content = working_content.replace(working_old_content, new_content, 1)
+
+            if used_normalized and content != working_content:
+                # The original file used CRLF line endings and old_content was
+                # matched only after normalizing both to \n — restore CRLF in
+                # the written result so the file's line-ending style is
+                # preserved. Normalize any \r\n already present in
+                # new_file_content (e.g. if new_content itself contained \r\n)
+                # before reintroducing it, so this is idempotent rather than
+                # doubling up into \r\r\n.
+                new_file_content = new_file_content.replace("\r\n", "\n").replace("\n", "\r\n")
 
             # Write via temp file for atomicity. The temp-file dance is
             # synchronous and can stall on slow filesystems → executor.

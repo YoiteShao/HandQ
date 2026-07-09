@@ -780,16 +780,39 @@ class TeamsTool(BaseTool):
                 "from the user's Teams Web session.",
                 component="TeamsTool",
             )
-            # Tell the user a browser is about to open and that they need to
-            # cooperate. Only reached on the cold-start / expired path — the
-            # fast path above returns before here, so a cached token raises no
-            # banner. Fire-and-forget chat notice, not a blocking prompt.
+            # Gate the browser bootstrap behind a top-level risk-confirmation
+            # modal so the user actually sees the prompt (previously used
+            # notify_inline_event, which the renderer folds into a collapsed
+            # activity group — easy to miss). Same primitive as
+            # browser_tool.request_user_login / attach_browser.
             im = getattr(self.ctx, "interaction_manager", None) if self.ctx else None
             if im is not None:
-                im.notify_inline_event(
-                    "🔐",
-                    "Teams Login required: The browser window is open. Please wait a moment after completing the login…",
+                description = (
+                    "HandQ needs to sign into Microsoft Teams to fetch a "
+                    "fresh session token.\n\n"
+                    "When you click continue, an Edge window will open on "
+                    "teams.microsoft.com. Please sign in there (including "
+                    "MFA if prompted). The window closes automatically once "
+                    "sign-in is detected.\n\n"
+                    "Your credentials never leave the browser; HandQ only "
+                    "reads the resulting session token from the browser "
+                    "profile at %USERPROFILE%\\HandQ\\teams_cache\\tokens.json."
                 )
+                confirmation = await im.request_risk_confirmation(
+                    description,
+                    title="Teams Login required",
+                    approve_label="Open browser and sign in",
+                )
+                if confirmation.is_rejected():
+                    return (
+                        "User declined the Teams sign-in prompt. Teams "
+                        "action cancelled — ask the user to retry when ready."
+                    )
+                if confirmation.has_new_message():
+                    return (
+                        f"User provided guidance instead of approving Teams "
+                        f"sign-in: {confirmation.message}"
+                    )
             try:
                 await bootstrap_from_teams_web()
             except BootstrapError as exc:

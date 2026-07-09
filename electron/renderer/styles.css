@@ -85,9 +85,9 @@ html[data-vt-scope="session"]::view-transition-new(*) {
     text-align: center;
     color: #1a1d22;
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    background: rgba(255, 255, 255, 0.68);
-    backdrop-filter: blur(2px) saturate(140%);
-    -webkit-backdrop-filter: blur(2px) saturate(140%);
+    background: rgba(255, 255, 255, 0.92);
+    backdrop-filter: blur(20px) saturate(115%);
+    -webkit-backdrop-filter: blur(20px) saturate(115%);
     border: none;
     border-radius: 20px;
     box-shadow: var(--shadow-floating), var(--bevel-strong);
@@ -143,12 +143,12 @@ html[data-vt-scope="session"]::view-transition-new(*) {
     padding: 8px 14px;
     font-size: 12px;
     color: #3a3f48;
-    background: rgba(255, 255, 255, 0.45);
+    background: rgba(255, 255, 255, 0.88);
     border: none;
     border-radius: 8px;
     max-width: 360px;
-    backdrop-filter: blur(8px);
-    -webkit-backdrop-filter: blur(8px);
+    backdrop-filter: blur(14px) saturate(115%);
+    -webkit-backdrop-filter: blur(14px) saturate(115%);
     box-shadow: var(--bevel);
 }
 .boot-hint.hidden { display: none; }
@@ -256,40 +256,36 @@ html, body {
     overflow: hidden;
     background: transparent;
     border: none;
-    /* Layered box-shadow mirrors the .session-card rim so the outer
-       window frame reads with the same intensity as each card's edge
-       (was subtle by comparison — the WebGL rim in glass-effect.js is
-       alpha-capped at 0.7 and only carries the sharp spike). Warm-purple
-       L / cool-blue R chromatic aberration matches the session-card and
-       .app::before palette. LR band wider than TB to mirror the WebGL
-       shader's BEVEL_WIDTH_LR (0.07) > BEVEL_WIDTH_TB (0.02) ratio.
-       Only inset layers now — the outer 0.5px black outline and outer
-       24px drop-shadow were removed because .app fills the window and
-       any outer shadow gets sharp-cut at the rectangular window
-       boundary, creating a visible hard edge. Recovering an outer drop
-       shadow requires making .app inset from html/body so the shadow
-       has transparent margin to render into. */
-    /* Layered box-shadow mirrors the .session-card rim so the outer
-       window frame reads with the same intensity as each card's edge
-       (was subtle by comparison — the WebGL rim in glass-effect.js is
-       alpha-capped at 0.7 and only carries the sharp spike). Warm-purple
-       L / cool-blue R chromatic aberration matches the session-card and
-       .app::before palette. LR band wider than TB to mirror the WebGL
-       shader's BEVEL_WIDTH_LR (0.07) > BEVEL_WIDTH_TB (0.02) ratio. */
+    /* Layered box-shadow gives the outer window frame a glass-edge bevel.
+       Kept strictly neutral (white/black only) — chromatic dispersion used
+       to live here as a static purple/blue decal meant to echo the WebGL
+       edge-refraction shader, but per-panel color fringing belongs ONLY on
+       .session-card now; every other surface (this outer frame, titlebar,
+       buttons) should read as one continuous, colorless piece of glass so
+       the app doesn't look like a patchwork of tinted panels. The real
+       "glass" identity for this outer edge comes from glass-effect.js's
+       WebGL canvas underneath, which already carries its own (now also
+       neutral) chromatic fringe at the true window boundary.
+       Only inset layers — an outer 0.5px black outline and outer 24px
+       drop-shadow were removed because .app fills the window and any outer
+       shadow gets sharp-cut at the rectangular window boundary, creating a
+       visible hard edge. Recovering an outer drop shadow requires making
+       .app inset from html/body so the shadow has transparent margin to
+       render into. */
     box-shadow:
         /* outer hairline outline */
         0 0 0 0.5px rgba(0, 0, 0, 0.12),
-        /* frame chromatic aberration — LR strong, TB narrower echo */
-        inset 8px 0 16px -2px rgba(184, 175, 196, 0.60),
-        inset -8px 0 16px -2px rgba(130, 180, 220, 0.55),
-        inset 0 4px 10px -2px rgba(184, 175, 196, 0.24),
-        inset 0 -4px 10px -2px rgba(130, 180, 220, 0.22),
+        /* neutral depth bevel — soft dark falloff on the outer edges */
+        inset 10px 0 20px -2px rgba(0, 0, 0, 0.10),
+        inset -10px 0 20px -2px rgba(0, 0, 0, 0.10),
+        inset 0 5px 12px -2px rgba(0, 0, 0, 0.08),
+        inset 0 -5px 12px -2px rgba(0, 0, 0, 0.08),
         /* bright glass-rim hairline */
-        inset 0 0 0 1px rgba(255, 255, 255, 0.55),
+        inset 0 0 0 1px rgba(255, 255, 255, 0.65),
         /* soft interior glow */
-        inset 0 0 0 2.5px rgba(255, 255, 255, 0.10),
+        inset 0 0 0 3px rgba(255, 255, 255, 0.14),
         /* top specular hair-line */
-        inset 0 1.5px 0 rgba(255, 255, 255, 0.85),
+        inset 0 1.5px 0 rgba(255, 255, 255, 0.90),
         /* ambient drop-shadow */
         0 24px 80px rgba(0, 0, 0, 0.14);
     backdrop-filter: none;
@@ -311,9 +307,7 @@ html, body {
             rgba(255, 255, 255, 0.06) 0%,
             transparent 35%,
             transparent 70%,
-            rgba(0, 0, 0, 0.035) 100%),
-        radial-gradient(ellipse 100% 80% at 20% 10%, rgba(184, 175, 196, 0.15), transparent 60%),
-        radial-gradient(ellipse 80% 100% at 80% 90%, rgba(130, 180, 220, 0.13), transparent 60%);
+            rgba(0, 0, 0, 0.035) 100%);
     /* CSS mask is decoupled from the WebGL shader's BEVEL_WIDTH_LR /
        BEVEL_WIDTH_TB — the shader handles the sharp edge refraction (~2-7%
        of min dim); this mask handles the soft interior haze. Asymmetric on
@@ -340,9 +334,9 @@ html, body {
     border-radius: inherit;
     background:
         linear-gradient(180deg,
-            rgba(255, 255, 255, 0.45) 0%,
-            rgba(255, 255, 255, 0.12) 3px,
-            transparent 6px
+            rgba(255, 255, 255, 0.60) 0%,
+            rgba(255, 255, 255, 0.18) 3px,
+            transparent 8px
         );
     pointer-events: none;
     z-index: 2;
@@ -354,9 +348,13 @@ html, body {
     flex: 0 0 28px;
     display: flex;
     align-items: center;
-    /* Fully transparent — the outer chrome is the "outer transparent" end
-       of the whole-page gradient. Brand text and window buttons rely on
-       their own halo / hover states for readability. */
+    /* Fully transparent — this strip carries no fill/blur of its own. An
+       earlier attempt gave it its own backdrop-filter blur, but blurring a
+       28px-tall strip pulls in samples from outside the window (nothing to
+       blur there) and, combined with a white tint, just reads as a flat
+       whitish smear rather than glass. The real glass work for this area
+       is the WebGL edge-refraction canvas underneath (glass-effect.js) —
+       this element just needs to stay see-through so that canvas shows. */
     background: transparent;
     position: relative;
     z-index: 20;
@@ -439,8 +437,11 @@ html, body {
     color: var(--fg-soft);
     /* Persistent soft-frost background so the three window controls
        are visible on any wallpaper (was transparent — invisible on
-       flat-colour desktops). Hover / active intensify. */
-    background: rgba(255, 255, 255, 0.28);
+       flat-colour desktops). Hover / active intensify. Carries its own
+       blur so it reads as a frosted puck rather than a flat plastic dot. */
+    background: rgba(255, 255, 255, 0.24);
+    backdrop-filter: blur(10px) saturate(130%);
+    -webkit-backdrop-filter: blur(10px) saturate(130%);
     transition: background 180ms var(--ease-glass),
                 color 180ms var(--ease-glass),
                 transform 120ms var(--spring);
@@ -517,9 +518,9 @@ html, body {
     padding: 0;
     border: none;
     border-radius: 50%;
-    background: rgba(255, 255, 255, 0.62);
-    backdrop-filter: blur(12px) saturate(160%);
-    -webkit-backdrop-filter: blur(12px) saturate(160%);
+    background: rgba(255, 255, 255, 0.85);
+    backdrop-filter: blur(20px) saturate(140%);
+    -webkit-backdrop-filter: blur(20px) saturate(140%);
     color: var(--tint-strong);
     line-height: 1;
     cursor: pointer;
@@ -563,13 +564,13 @@ html, body {
     height: 20px;
     overflow: hidden;
     border-radius: 10px;
-    background: rgba(255, 255, 255, 0.62);
-    backdrop-filter: blur(20px) saturate(180%) brightness(1.06);
-    -webkit-backdrop-filter: blur(20px) saturate(180%) brightness(1.06);
+    background: rgba(255, 255, 255, 0.88);
+    backdrop-filter: blur(16px) saturate(115%);
+    -webkit-backdrop-filter: blur(16px) saturate(115%);
     box-shadow:
         0 4px 20px rgba(0, 0, 0, 0.12),
         0 1px 4px rgba(0, 0, 0, 0.06),
-        inset 0 1px 0 rgba(255, 255, 255, 0.90),
+        inset 0 1px 0 rgba(255, 255, 255, 0.70),
         inset 0 -0.5px 0 rgba(0, 0, 0, 0.05);
     -webkit-app-region: no-drag;
     app-region: no-drag;
@@ -585,11 +586,11 @@ html, body {
 
 .titlebar-island:hover:not(.expanded) {
     transform: scale(1.07);
-    background: rgba(255, 255, 255, 0.78);
+    background: rgba(255, 255, 255, 0.94);
     box-shadow:
         0 6px 24px rgba(0, 0, 0, 0.16),
         0 1px 4px rgba(0, 0, 0, 0.06),
-        inset 0 1px 0 rgba(255, 255, 255, 1),
+        inset 0 1px 0 rgba(255, 255, 255, 0.85),
         inset 0 -0.5px 0 rgba(0, 0, 0, 0.05);
 }
 
@@ -597,11 +598,11 @@ html, body {
     width: 260px;
     height: 140px;
     border-radius: 18px;
-    background: rgba(255, 255, 255, 0.65);
+    background: rgba(255, 255, 255, 0.92);
     box-shadow:
         0 12px 40px rgba(0, 0, 0, 0.20),
         0 2px 6px rgba(0, 0, 0, 0.08),
-        inset 0 1px 0 rgba(255, 255, 255, 1),
+        inset 0 1px 0 rgba(255, 255, 255, 0.85),
         inset 0 -0.5px 0 rgba(0, 0, 0, 0.06);
 }
 
@@ -757,14 +758,17 @@ html, body {
     padding: 10px 14px;
     border-radius: 16px;
     border: none;
-    /* Frosted chip. Each bubble carries its own backdrop-filter because the
-       parent session-card is intentionally near-transparent — the card body
-       is the "structural" high-transparency zone, bubbles are the "content"
-       frost zone. */
-    background: rgba(255, 255, 255, 0.72);
-    backdrop-filter: blur(24px) saturate(180%) brightness(1.06);
-    -webkit-backdrop-filter: blur(24px) saturate(180%) brightness(1.06);
-    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.08);
+    /* Frosted chip. At high fill opacity (needed for text contrast on any
+       background, including plain white), a heavy blur/chromatic-decal
+       treatment stops reading as "glass" and starts reading as a dyed
+       plastic sticker — a solid-colored surface with a printed gradient on
+       it. The material cue instead comes from a soft elevation shadow plus
+       a single crisp top highlight (light catching a bevelled edge), the
+       same recipe real glossy/glass UI chrome uses at high opacity. */
+    background: rgba(255, 255, 255, 0.90);
+    backdrop-filter: blur(20px) saturate(120%);
+    -webkit-backdrop-filter: blur(20px) saturate(120%);
+    box-shadow: 0 2px 6px rgba(20, 20, 30, 0.10), inset 0 1px 0 rgba(255, 255, 255, 0.70);
     line-height: 1.5;
     word-wrap: break-word;
     overflow-wrap: break-word;
@@ -789,12 +793,12 @@ html, body {
 
 .bubble.user {
     align-self: flex-end;
-    background: rgba(255, 255, 255, 0.85);
+    background: rgba(255, 255, 255, 0.94);
     border: none;
     color: var(--fg);
     border-top-right-radius: 6px;
     border-top-left-radius: 16px;
-    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.06);
+    box-shadow: 0 2px 8px rgba(20, 20, 30, 0.08), inset 0 1px 0 rgba(255, 255, 255, 0.75);
 }
 
 .bubble.system {
@@ -1077,9 +1081,9 @@ html, body {
        basically disappeared into the transparent titlebar. Denser fill +
        a hair-line dark rim + heavier label weight = readable on any
        background without breaking the liquid-glass aesthetic. */
-    background: rgba(255, 255, 255, 0.62);
-    backdrop-filter: blur(12px) saturate(160%);
-    -webkit-backdrop-filter: blur(12px) saturate(160%);
+    background: rgba(255, 255, 255, 0.85);
+    backdrop-filter: blur(16px) saturate(120%);
+    -webkit-backdrop-filter: blur(16px) saturate(120%);
     color: var(--fg);
     font: inherit;
     font-family: var(--sans);
@@ -1097,16 +1101,16 @@ html, body {
                 transform 120ms var(--spring);
 }
 .shortcut-btn:hover {
-    background: rgba(255, 255, 255, 0.82);
+    background: rgba(255, 255, 255, 0.95);
     transform: translateY(-0.5px);
 }
 .shortcut-btn:active {
-    background: rgba(255, 255, 255, 0.28);
+    background: rgba(255, 255, 255, 0.75);
     transform: translateY(0) scale(0.97);
 }
 .shortcut-btn:focus  { outline: none; }
 .shortcut-btn:focus-visible {
-    background: rgba(255, 255, 255, 0.55);
+    background: rgba(255, 255, 255, 0.90);
     box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.55),
                 inset 0 -0.5px 0 rgba(0, 0, 0, 0.04),
                 0 0 0 2px rgba(184, 175, 196, 0.35);
@@ -1120,113 +1124,6 @@ html, body {
     font-size: 12px;
 }
 
-.activity-item {
-    background: rgba(255, 255, 255, 0.15);
-    border: none;
-    border-radius: 10px;
-    padding: 6px 9px;
-    font-size: 11.5px;
-    line-height: 1.45;
-    color: var(--fg);
-    word-break: break-word;
-    cursor: pointer;
-    box-shadow: var(--bevel), 0 1px 4px rgba(0, 0, 0, 0.03);
-    transition: background 180ms var(--ease-glass),
-                border-color 180ms var(--ease-glass),
-                transform 180ms var(--spring);
-    animation: liquid-entrance 220ms var(--spring-soft) both;
-}
-.activity-item:hover {
-    background: rgba(255, 255, 255, 0.28);
-    transform: translateY(-1px);
-}
-
-.activity-item .ai-head {
-    display: flex;
-    align-items: baseline;
-    gap: 6px;
-}
-.activity-item .ai-icon {
-    flex: 0 0 auto;
-    font-size: 12px;
-    line-height: 1;
-}
-.activity-item .ai-label {
-    flex: 1 1 auto;
-    font-weight: 600;
-    color: var(--tint-strong);
-    font-size: 11.5px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-}
-.activity-item .ai-time {
-    flex: 0 0 auto;
-    color: var(--fg-mute);
-    font-size: 10px;
-    font-family: var(--mono);
-}
-.activity-item .ai-content {
-    display: -webkit-box;
-    margin-top: 3px;
-    color: var(--fg-soft);
-    font-family: var(--mono);
-    font-size: 11px;
-    line-height: 1.4;
-    white-space: pre-wrap;
-    word-break: break-all;
-    -webkit-line-clamp: 6;
-    -webkit-box-orient: vertical;
-    overflow: hidden;
-}
-.activity-item.expanded .ai-content {
-    display: block;
-    -webkit-line-clamp: unset;
-    max-height: 200px;
-    overflow-y: auto;
-}
-
-/* Threaded result line: rendered inside the same <li> as the matching
-   pre-exec entry so the user can see what each Executing produced. */
-.activity-item .ai-result {
-    display: -webkit-box;
-    margin-top: 4px;
-    padding-left: 10px;
-    color: var(--fg-soft);
-    font-family: var(--mono);
-    font-size: 11px;
-    line-height: 1.45;
-    white-space: pre-wrap;
-    word-break: break-all;
-    -webkit-line-clamp: 4;
-    -webkit-box-orient: vertical;
-    overflow: hidden;
-    border-left: 2px solid rgba(0, 0, 0, 0.08);
-}
-.activity-item.expanded .ai-result {
-    display: block;
-    -webkit-line-clamp: unset;
-    max-height: 200px;
-    overflow-y: auto;
-}
-.activity-item .ai-result.ai-json {
-    white-space: normal;
-    display: block;
-}
-
-/* JSON visualization inside activity items */
-.activity-item .ai-content.ai-json {
-    white-space: normal;
-    display: block;
-}
-.activity-item .ai-content.ai-json:not(.ai-json-expanded) {
-    max-height: 3.6em;
-    overflow: hidden;
-}
-.activity-item.expanded .ai-content.ai-json {
-    max-height: none;
-    overflow: visible;
-}
 .ai-json-tree {
     margin: 0;
     padding: 0;
@@ -1283,17 +1180,14 @@ html, body {
     max-height: 86vh;
     display: flex;
     flex-direction: column;
-    background: rgba(255, 255, 255, 0.72);
-    backdrop-filter: blur(2px) saturate(140%);
-    -webkit-backdrop-filter: blur(2px) saturate(140%);
+    background: rgba(255, 255, 255, 0.92);
+    backdrop-filter: blur(20px) saturate(115%);
+    -webkit-backdrop-filter: blur(20px) saturate(115%);
     border: none;
     border-radius: 18px;
-    box-shadow: 0 24px 80px rgba(0, 0, 0, 0.15),
-                0 8px 24px rgba(0, 0, 0, 0.06),
-                inset 0 2px 0 rgba(255, 255, 255, 0.90),
-                inset 0 -2px 0 rgba(0, 0, 0, 0.08),
-                inset 2px 0 0 rgba(255, 255, 255, 0.55),
-                inset -2px 0 0 rgba(0, 0, 0, 0.04);
+    box-shadow: 0 20px 60px rgba(20, 20, 30, 0.16),
+                0 6px 18px rgba(20, 20, 30, 0.07),
+                inset 0 1px 0 rgba(255, 255, 255, 0.85);
     overflow: hidden;
     animation: liquid-entrance 350ms var(--spring-soft) both;
     position: relative;
@@ -1712,7 +1606,7 @@ code {
     height: 380px;
     display: flex;
     flex-direction: column;
-    background: rgba(28, 30, 38, 0.75);
+    background: rgba(28, 30, 38, 0.55);
     border: 1.5px solid rgba(255, 255, 255, 0.12);
     border-radius: 12px;
     box-shadow: 0 16px 48px rgba(0, 0, 0, 0.30),
@@ -1720,8 +1614,8 @@ code {
                 inset 0 1px 0 rgba(255, 255, 255, 0.12),
                 inset 0 -1px 0 rgba(0, 0, 0, 0.20);
     z-index: 900;
-    backdrop-filter: blur(14px) saturate(150%);
-    -webkit-backdrop-filter: blur(14px) saturate(150%);
+    backdrop-filter: blur(28px) saturate(140%);
+    -webkit-backdrop-filter: blur(28px) saturate(140%);
     overflow: hidden;
     animation: liquid-entrance 320ms var(--spring-soft) both;
 }
@@ -1906,9 +1800,9 @@ code {
     display: flex;
     align-items: center;
     justify-content: center;
-    background: rgba(255, 255, 255, 0.72);
-    backdrop-filter: blur(4px);
-    -webkit-backdrop-filter: blur(4px);
+    background: rgba(255, 255, 255, 0.90);
+    backdrop-filter: blur(16px) saturate(115%);
+    -webkit-backdrop-filter: blur(16px) saturate(115%);
     border-radius: inherit;
     z-index: 5;
 }
@@ -2167,12 +2061,14 @@ code {
     color: var(--fg);
     border: none;
     border-radius: 999px;
-    background: rgba(255, 255, 255, 0.80);
+    background: rgba(255, 255, 255, 0.90);
+    backdrop-filter: blur(16px) saturate(115%);
+    -webkit-backdrop-filter: blur(16px) saturate(115%);
     cursor: pointer;
     transition: background 180ms var(--ease-glass);
 }
 .checklist-header:hover {
-    background: rgba(255, 255, 255, 0.88);
+    background: rgba(255, 255, 255, 0.98);
 }
 .checklist-header .cl-chevron {
     font-family: var(--mono);
@@ -2201,9 +2097,9 @@ code {
     padding: 10px 12px;
     border: none;
     border-radius: 12px;
-    background: rgba(255, 255, 255, 0.80);
-    backdrop-filter: blur(16px) saturate(170%);
-    -webkit-backdrop-filter: blur(16px) saturate(170%);
+    background: rgba(255, 255, 255, 0.92);
+    backdrop-filter: blur(18px) saturate(115%);
+    -webkit-backdrop-filter: blur(18px) saturate(115%);
     box-shadow: var(--shadow-floating), var(--bevel);
     z-index: 20;
     animation: liquid-entrance 250ms var(--spring-soft) both;
@@ -2230,6 +2126,13 @@ code {
 .checklist-item.cl-running            { font-weight: 600; }
 .checklist-item.cl-failed .cl-glyph   { color: #c0392b; }
 .checklist-item.cl-interrupted .cl-glyph { color: #d08a1e; }
+.checklist-item.cl-skipped .cl-glyph  { color: var(--fg-mute); opacity: 0.7; }
+.checklist-item.cl-skipped .cl-text   {
+    color: var(--fg-mute);
+    text-decoration: line-through;
+    text-decoration-style: dashed;
+    opacity: 0.85;
+}
 .checklist-item.cl-pending .cl-glyph,
 .checklist-item.cl-pending .cl-text   { color: var(--fg-mute); }
 
@@ -2381,41 +2284,26 @@ code {
        coherent vertical stack. */
     border-radius: 20px / 14px 14px 20px 20px;
     /* Whole-page gradient rule: transparency INCREASES toward the outside,
-       DECREASES toward the inside. On a card, that means centre dense
-       (readable) and edges fade toward transparent (blend into the app
-       frame). The visible card shape is defined by the box-shadow bevels
-       below — the fill just holds the interior density.
-       Edge minimum is 32% (not lower) so dark text near the card edge
-       still has enough light backing to read on dark wallpapers, without
-       giving up the see-through look at the very corners. */
+       DECREASES toward the inside. Fill floor raised to 0.88 at the center
+       (was as low as 0.32) — below that, chat text stops being reliably
+       readable once the card sits over a plain white/light background, not
+       just busy wallpaper. At this opacity the surface is doing almost none
+       of its "glass" work by seeing through to what's behind it, so the
+       material cue moves to elevation: a soft ambient shadow + one crisp
+       top highlight, not a stack of tinted inset bevels (those read as a
+       printed decal on an opaque card, i.e. plastic, once alpha is this
+       high). */
     background:
         radial-gradient(ellipse closest-side at center,
-                        rgba(255, 255, 255, 0.75) 0%,
-                        rgba(255, 255, 255, 0.60) 55%,
-                        rgba(255, 255, 255, 0.42) 100%);
+                        rgba(255, 255, 255, 0.94) 0%,
+                        rgba(255, 255, 255, 0.90) 60%,
+                        rgba(255, 255, 255, 0.82) 100%);
+    backdrop-filter: blur(20px) saturate(115%);
+    -webkit-backdrop-filter: blur(20px) saturate(115%);
     box-shadow:
-        /* outer lift */
-        0 4px 20px rgba(0, 0, 0, 0.10),
-        0 1px 4px rgba(0, 0, 0, 0.05),
-        /* Chromatic-aberrated edge bevel — mirrors the outer window's
-           WebGL rim (glass-effect.js: BEVEL_WIDTH_LR 0.07 > TB 0.02,
-           with R/G/B refracted at different scales). Cranked up from
-           the earlier subtle 3px / 0.45 so the card edge visibly
-           matches the outer window's refractive glass rim: wider
-           warm-purple L / cool-blue R on the sides, narrower echo on
-           top and bottom, sharp specular hair-line, deeper bottom
-           refraction shadow, wider inner glow. */
-        inset 7px 0 14px -2px rgba(184, 175, 196, 0.70),
-        inset -7px 0 14px -2px rgba(130, 180, 220, 0.65),
-        inset 0 3px 8px -1px rgba(184, 175, 196, 0.30),
-        inset 0 -3px 8px -1px rgba(130, 180, 220, 0.28),
-        /* top specular spike + soft falloff */
-        inset 0 1px 0 rgba(255, 255, 255, 1),
-        inset 0 3px 2px rgba(255, 255, 255, 0.50),
-        /* bottom refraction shadow */
-        inset 0 -2px 2px rgba(0, 0, 0, 0.14),
-        /* broad inner refractive glow */
-        inset 0 0 32px rgba(255, 255, 255, 0.13);
+        0 4px 16px rgba(20, 20, 30, 0.10),
+        0 1px 3px rgba(20, 20, 30, 0.06),
+        inset 0 1px 0 rgba(255, 255, 255, 0.85);
     overflow: hidden;
     /* Isolate paint + layout so window-level repaints (drag) don't re-rasterize
        the card's content. Combined with overflow:hidden the card becomes its
@@ -2428,30 +2316,16 @@ code {
 
 .session-card:hover {
     box-shadow:
-        0 6px 28px rgba(0, 0, 0, 0.14),
-        0 1px 4px rgba(0, 0, 0, 0.06),
-        inset 7px 0 14px -2px rgba(184, 175, 196, 0.80),
-        inset -7px 0 14px -2px rgba(130, 180, 220, 0.75),
-        inset 0 3px 8px -1px rgba(184, 175, 196, 0.36),
-        inset 0 -3px 8px -1px rgba(130, 180, 220, 0.34),
-        inset 0 1px 0 rgba(255, 255, 255, 1),
-        inset 0 3px 2px rgba(255, 255, 255, 0.60),
-        inset 0 -2px 2px rgba(0, 0, 0, 0.16),
-        inset 0 0 32px rgba(255, 255, 255, 0.16);
+        0 6px 22px rgba(20, 20, 30, 0.14),
+        0 1px 4px rgba(20, 20, 30, 0.07),
+        inset 0 1px 0 rgba(255, 255, 255, 0.95);
 }
 
 .session-card.active {
     box-shadow:
-        0 0 0 2px rgba(184, 175, 196, 0.40),
-        0 6px 28px rgba(0, 0, 0, 0.12),
-        inset 7px 0 14px -2px rgba(184, 175, 196, 0.85),
-        inset -7px 0 14px -2px rgba(130, 180, 220, 0.80),
-        inset 0 3px 8px -1px rgba(184, 175, 196, 0.40),
-        inset 0 -3px 8px -1px rgba(130, 180, 220, 0.38),
-        inset 0 1px 0 rgba(255, 255, 255, 1),
-        inset 0 3px 2px rgba(255, 255, 255, 0.65),
-        inset 0 -2px 2px rgba(0, 0, 0, 0.16),
-        inset 0 0 32px rgba(255, 255, 255, 0.18);
+        0 0 0 2px rgba(184, 175, 196, 0.45),
+        0 6px 22px rgba(20, 20, 30, 0.12),
+        inset 0 1px 0 rgba(255, 255, 255, 1);
 }
 
 .session-card-head {
@@ -2591,10 +2465,12 @@ code {
     font-family: var(--sans);
     line-height: 1.4;
     color: var(--fg);
-    /* Frosted input — the composer is a text zone, so it gets frost. */
-    background: rgba(255, 255, 255, 0.65);
-    backdrop-filter: blur(20px) saturate(180%) brightness(1.06);
-    -webkit-backdrop-filter: blur(20px) saturate(180%) brightness(1.06);
+    /* Frosted input — the composer is a text zone, so it gets frost. Fill
+       raised to stay readable on light backgrounds; blur eased down since
+       it's no longer doing heavy see-through work at this opacity. */
+    background: rgba(255, 255, 255, 0.90);
+    backdrop-filter: blur(18px) saturate(115%);
+    -webkit-backdrop-filter: blur(18px) saturate(115%);
     box-shadow: none;
     transition: border-color 200ms var(--ease-glass),
                 box-shadow 200ms var(--ease-glass);
@@ -2708,13 +2584,14 @@ code {
     margin: 6px 4px;
     border: none;
     border-left: 3px solid rgba(184, 175, 196, 0.35);
-    border-radius: 6px;
-    background: rgba(255, 255, 255, 0.80);
-    backdrop-filter: blur(6px);
-    -webkit-backdrop-filter: blur(6px);
+    border-radius: 10px;
+    background: rgba(255, 255, 255, 0.90);
+    backdrop-filter: blur(14px) saturate(115%);
+    -webkit-backdrop-filter: blur(14px) saturate(115%);
     font-size: 12px;
     color: #555;
     box-shadow: var(--bevel);
+    overflow: hidden;
     animation: liquid-entrance 200ms var(--spring-soft) both;
 }
 
@@ -2836,6 +2713,17 @@ code {
 .activity-item.expanded .ai-result {
     max-height: 200px;
     overflow-y: auto;
+}
+
+/* JSON-rendered content/result (see renderJsonContent) — a block of
+   .ai-json-tree markup rather than preformatted text, so it needs
+   white-space:normal instead of pre-wrap. Height/scroll behavior stays
+   identical to the plain-text case above (same collapsed/expanded rules)
+   so expand always yields a scrollable box, never an unbounded one. */
+.activity-item .ai-content.ai-json,
+.activity-item .ai-result.ai-json {
+    white-space: normal;
+    text-overflow: clip;
 }
 
 /* ── List header: [+ Create task] [Delete] sit above the list ─── */
@@ -3171,22 +3059,11 @@ button.danger:hover:not(:disabled) {
 /* Liquid Glass — session card tilt (no specular highlight)     */
 /* ============================================================ */
 
-/* Liquid glass refraction-style gradient on active session card */
-.session-card.active::after {
-    content: '';
-    position: absolute;
-    inset: 0;
-    border-radius: inherit;
-    background: linear-gradient(
-        135deg,
-        rgba(184, 175, 196, 0.12) 0%,
-        transparent 35%,
-        transparent 65%,
-        rgba(184, 175, 196, 0.08) 100%
-    );
-    pointer-events: none;
-    z-index: 0;
-}
+/* Removed: a static purple linear-gradient ::after decal on .active cards.
+   At the high fill opacity needed for white-background readability, a
+   painted diagonal tint reads as a smudge/sticker rather than depth — the
+   .active state's box-shadow ring + brighter top highlight (see .session-card
+   rules above) already communicates "focused" without it. */
 
 /* Chat region — slightly transparent so desktop bleeds through */
 .chat-region {
@@ -3211,17 +3088,14 @@ button.danger:hover:not(:disabled) {
     z-index: 50;
     display: flex;
     flex-direction: column;
-    background: rgba(255, 255, 255, 0.85);
-    backdrop-filter: blur(14px) saturate(160%);
-    -webkit-backdrop-filter: blur(14px) saturate(160%);
+    background: rgba(255, 255, 255, 0.92);
+    backdrop-filter: blur(20px) saturate(115%);
+    -webkit-backdrop-filter: blur(20px) saturate(115%);
     border: none;
     border-radius: 14px;
-    box-shadow: 0 24px 80px rgba(0, 0, 0, 0.18),
-                0 8px 24px rgba(0, 0, 0, 0.08),
-                inset 0 1.5px 0 rgba(255, 255, 255, 0.90),
-                inset 0 -1.5px 0 rgba(0, 0, 0, 0.08),
-                inset 1.5px 0 0 rgba(255, 255, 255, 0.55),
-                inset -1.5px 0 0 rgba(0, 0, 0, 0.04);
+    box-shadow: 0 20px 60px rgba(20, 20, 30, 0.16),
+                0 6px 18px rgba(20, 20, 30, 0.08),
+                inset 0 1px 0 rgba(255, 255, 255, 0.85);
     overflow: hidden;
     animation: liquid-entrance 260ms var(--spring-soft) both;
 }
@@ -3321,6 +3195,112 @@ button.danger:hover:not(:disabled) {
     border-right: 2px solid rgba(0, 0, 0, 0.20);
     border-bottom: 2px solid rgba(0, 0, 0, 0.20);
     border-bottom-right-radius: 2px;
+}
+
+
+/* ---- @-mention path autocomplete dropdown -------------------------------- */
+/* Frosted-glass popover anchored under the focused composer textarea. Same
+   design language as .floating-composer; sits above it (z-index 60 > 50). */
+
+.mention-dropdown {
+    position: fixed;
+    z-index: 60;
+    min-width: 320px;
+    max-width: 560px;
+    max-height: 320px;
+    overflow-y: auto;
+    background: rgba(255, 255, 255, 0.92);
+    backdrop-filter: blur(18px) saturate(115%);
+    -webkit-backdrop-filter: blur(18px) saturate(115%);
+    border: 1px solid rgba(255, 255, 255, 0.60);
+    border-radius: 12px;
+    box-shadow:
+        0 12px 36px rgba(20, 20, 30, 0.16),
+        0 2px 8px rgba(20, 20, 30, 0.08),
+        inset 0 1px 0 rgba(255, 255, 255, 0.80);
+    padding: 4px;
+    animation: liquid-entrance 200ms var(--spring-soft) both;
+    font-size: 13px;
+    color: #1d1d1f;
+}
+.mention-dropdown.hidden { display: none; }
+
+.mention-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+    border-radius: 8px;
+    cursor: pointer;
+    line-height: 1.35;
+    user-select: none;
+}
+.mention-item:hover,
+.mention-item.selected {
+    background: rgba(0, 122, 255, 0.14);
+}
+.mention-item-icon {
+    flex: 0 0 auto;
+    width: 18px;
+    text-align: center;
+    opacity: 0.75;
+    font-size: 14px;
+}
+.mention-item-name {
+    flex: 1 1 auto;
+    font-weight: 500;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    min-width: 0;
+}
+.mention-item-parent {
+    flex: 0 1 auto;
+    color: #888;
+    font-size: 11px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    direction: rtl;
+    max-width: 280px;
+    margin-left: 8px;
+}
+
+/* ---- @-path chip in rendered message bubbles ---------------------------- */
+/* Inline "pill" replacing @-path text so users can see at a glance which
+   fragment is a resolved path mention. Composer (textarea) stays plain text —
+   this only kicks in after render, on messages already in the transcript. */
+
+.mention-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 1px 8px 1px 6px;
+    margin: 0 2px;
+    background: rgba(0, 122, 255, 0.10);
+    border: 1px solid rgba(0, 122, 255, 0.28);
+    border-radius: 6px;
+    font-size: 0.92em;
+    line-height: 1.4;
+    color: #0057b8;
+    vertical-align: baseline;
+    white-space: nowrap;
+    max-width: 320px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    cursor: default;
+}
+.mention-chip-icon {
+    flex: 0 0 auto;
+    font-size: 0.9em;
+    opacity: 0.85;
+}
+.mention-chip-label {
+    flex: 1 1 auto;
+    font-weight: 500;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
 

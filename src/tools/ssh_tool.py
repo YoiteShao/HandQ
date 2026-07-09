@@ -302,9 +302,28 @@ def _detect_os_and_shell(client: Any) -> Tuple[str, str]:
     try:
         # $SHELL is set to the login shell path on Linux/macOS/Cygwin.
         # On Windows $SHELL is absent; 'ver' prints the Windows version.
-        probe = "uname -s 2>/dev/null || ver; echo __SHELL__$SHELL"
-        stdout, _, _ = _exec_command(client, probe, timeout=10.0)
+        # Wrap the probe in `sh -c` so its own `2>/dev/null` parses correctly
+        # regardless of the user's login shell — tcsh/csh reject numeric-fd
+        # redirection outright ("Ambiguous output redirect."), and while the
+        # trailing `; echo __SHELL__$SHELL` used to survive that on its own,
+        # relying on tcsh's post-error statement-separator behaviour was
+        # fragile. `sh` is POSIX-guaranteed on essentially every Unix; on
+        # pure Windows OpenSSH there's no sh and the exec will fail through
+        # to the except → ("linux", "unknown") fallback below, which is safe.
+        probe_inner = 'uname -s 2>/dev/null || ver; echo __SHELL__$SHELL'
+        probe = f"sh -c {shlex.quote(probe_inner)}"
+        stdout, stderr, rc = _exec_command(client, probe, timeout=10.0)
+        # rc≠0 + no useful stdout signal → the probe itself failed to
+        # execute (e.g., no `sh` on the remote). Don't hallucinate a login
+        # shell from the empty string; fall back like the outer except would.
+        # We keep the check narrow (only when NO sentinel/OS keyword is
+        # present) so that a partial-success probe on an OS that emits stderr
+        # noise but real stdout is still trusted.
         out_lower = stdout.strip().lower()
+        if rc != 0 and "__shell__" not in out_lower and not any(
+            kw in out_lower for kw in ("windows", "microsoft", "cygwin", "linux", "darwin")
+        ):
+            return "linux", "unknown"
 
         # Pure Windows (no Cygwin): uname absent, 'ver' shows "Microsoft Windows"
         if ("windows" in out_lower or "microsoft" in out_lower) and "cygwin" not in out_lower:
@@ -713,7 +732,9 @@ def _exec_bg_linux(
     # correctly regardless of the user's login shell (tcsh/csh use a different
     # variable-assignment syntax and reject `_PID=$!`).
     # paramiko exec_command sends commands via the login shell; wrapping in
-    # bash -c bypasses that and guarantees POSIX behaviour.
+    # bash -c bypasses that and guarantees POSIX behaviour. The user-facing
+    # `action=exec` route also wraps in bash -c by default (wrap_shell="auto"),
+    # so agent-authored commands hit bash regardless of which entry point they use.
     bash_body = (
         f"mkdir -p {log_dir} && "
         f"nohup bash -c {shlex.quote(inner)} > {log_path} 2>&1 & "
@@ -1010,6 +1031,19 @@ class StatelessSSHTool(BaseTool):
                     "the timeout (default 30s); for anything longer use exec_bg or run_script."
                 ),
             },
+            "wrap_shell": {
+                "type": "string",
+                "enum": ["auto", "bash", "none"],
+                "description": (
+                    "[exec] How to route the command. 'auto' (default) wraps in "
+                    "`bash -c '<cmd>'` unless the remote is Windows/PowerShell — safe on "
+                    "hosts whose login shell is tcsh/csh/zsh/sh (POSIX fd redirects "
+                    "like `2>/dev/null` parse correctly), no-op semantically on bash. "
+                    "'bash' forces the wrap. 'none' passes the command raw to the "
+                    "remote login shell (use only if you specifically need "
+                    "tcsh/csh/PowerShell-native syntax)."
+                ),
+            },
             "workdir": {
                 "type": "string",
                 "description": "[exec / exec_bg / run_script] Remote working directory (cd before running).",
@@ -1219,6 +1253,9 @@ class StatelessSSHTool(BaseTool):
 
         workdir: Optional[str] = kwargs.get("workdir")
         timeout: float = float(kwargs.get("timeout", 30.0))
+        wrap_shell = str(kwargs.get("wrap_shell", "auto")).strip().lower()
+        if wrap_shell not in ("auto", "bash", "none"):
+            wrap_shell = "auto"
 
         try:
             with _connect(creds, self.pool) as (client, host_key):
@@ -1228,6 +1265,16 @@ class StatelessSSHTool(BaseTool):
                         command = f"cd /d {workdir} && {command}"
                     else:
                         command = f"cd {shlex.quote(workdir)} && {command}"
+                # Wrap AFTER the workdir prefix so `cd X && cmd` is one bash unit.
+                # auto = wrap unless the remote is Windows/PowerShell (no bash there);
+                # bash = force wrap; none = pass raw (opt-out for tcsh/csh/PS-native).
+                if wrap_shell == "bash" or (
+                    wrap_shell == "auto" and login_shell != "powershell"
+                ):
+                    command = f"bash -c {shlex.quote(command)}"
+                    wrapper_applied = "bash"
+                else:
+                    wrapper_applied = "none"
                 stdout, stderr, exit_code = _exec_command(client, command, timeout=timeout)
         except Exception as exc:
             return ToolResult(
@@ -1246,19 +1293,27 @@ class StatelessSSHTool(BaseTool):
             "stderr":     stderr,
             "exit_code":  exit_code,
             "login_shell": login_shell,
+            "shell_wrapper_used": wrapper_applied,
         }
         if stdout_truncated or stderr_truncated:
             out["truncated"] = True
-        # Warn when the login shell is not bash so the agent knows to wrap its
-        # own commands.  Built-in actions (exec_bg / job_status / safe_exit)
-        # already use 'bash -c' internally and are unaffected.
-        if login_shell not in ("bash", "unknown", "powershell"):
+        # Only warn about a non-bash login shell when the caller opted OUT of the
+        # auto-wrap (wrap_shell='none') on a non-bash Unix host — that's the only
+        # case where the agent's own command hits the login shell raw. With the
+        # default 'auto' wrap, the login shell doesn't see agent syntax and
+        # tcsh/csh idiosyncrasies are invisible to callers. Built-in actions
+        # (exec_bg / job_status / safe_exit) have always wrapped internally.
+        if (
+            wrapper_applied == "none"
+            and login_shell not in ("bash", "unknown", "powershell")
+        ):
             out["shell_warning"] = (
-                f"Remote login shell is '{login_shell}' (not bash). "
-                "Built-in SSH actions (exec_bg, job_status, safe_exit) wrap "
-                "commands in 'bash -c' internally and work correctly. "
-                "For action='exec' with your own commands, use: "
-                "command='bash -c \"your_command_here\"'"
+                f"Remote login shell is '{login_shell}' (not bash) and "
+                "wrap_shell='none' was requested. Commands with POSIX-only "
+                "syntax (e.g. `2>/dev/null`, `$()`, `[[ ]]`, process substitution) "
+                "will not parse under tcsh/csh. Either drop wrap_shell='none' "
+                "to let the tool auto-wrap in bash -c, or wrap your command "
+                "explicitly: command='bash -c \"your_command_here\"'."
             )
         return ToolResult(
             success=success,

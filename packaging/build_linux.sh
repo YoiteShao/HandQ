@@ -337,9 +337,31 @@ build_linux() {
     # Config at top level — easy for users to find and edit before running setup
     cp "${PROJECT_ROOT}/handq_config.example.yaml" "${DIST_DIR}/handq_config.yaml"
 
+    # ── Version stamp (single source of truth = electron/package.json) ──────────
+    # The source .example.yaml ships a fixed 'version: 0.0.0' placeholder; stamp
+    # the real release version into the packaged config here so runtime
+    # (--version / config-migration) reads a correct value that was never
+    # hand-maintained. Same value names the auto-deploy tarball below, so the
+    # remote's config version and the tarball filename always agree.
+    APP_VERSION=$(grep -oP '"version":\s*"\K[^"]+' "${PROJECT_ROOT}/electron/package.json" | head -1)
+    [ -z "$APP_VERSION" ] && { print_error "Could not read version from electron/package.json"; cd packaging; return 1; }
+    sed -i "s/^version:.*/version: '${APP_VERSION}'/" "${DIST_DIR}/handq_config.yaml"
+    print_info "Stamped version ${APP_VERSION} into ${DIST_DIR}/handq_config.yaml"
+
     print_info "Package contents:"
     ls -lh "${DIST_DIR}/handq_config.yaml" "${DIST_DIR}/handq_setup.sh"
     echo "  handq_linux.dist/  ($(du -sh "${DIST_DIR}/handq_linux.dist" | cut -f1) standalone binary + deps)"
+
+    # ── Auto-deploy tarball ────────────────────────────────────────────────────
+    # Consumed by remote_handq_tool.py's _ensure_installed (Windows side): it
+    # scans update.linux_share_path for the highest-semver
+    # handq-linux-<X.Y.Z>.tar.gz, pushes it over SFTP, and runs handq_setup.sh
+    # itself. Deliberately excludes handq_config.yaml — the Windows side seeds
+    # the remote config from its own live config instead of a blank template.
+    AUTODEPLOY_TARBALL="$(dirname "${DIST_DIR}")/handq-linux-${APP_VERSION}.tar.gz"
+    print_info "Building auto-deploy tarball: ${AUTODEPLOY_TARBALL}"
+    tar -czf "$AUTODEPLOY_TARBALL" -C "${DIST_DIR}" handq_setup.sh handq_linux.dist
+    print_success "Auto-deploy tarball: ${AUTODEPLOY_TARBALL} — drop this on update.linux_share_path"
 
     print_success "Linux build completed successfully!"
     print_info "============================================================================"

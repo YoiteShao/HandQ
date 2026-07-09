@@ -11,7 +11,7 @@ import collections
 import uuid as _uuid
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import AbstractSet, Any, Callable, Deque, Dict, Iterable, List, Optional, Set
+from typing import AbstractSet, Any, Callable, Deque, Dict, Iterable, List, Optional, Set, Tuple
 
 from ..models.token_usage import TokenUsage
 from .agent_utils import ProgressConcern, TurnDigest
@@ -41,6 +41,12 @@ class CheckListItem:
     # ssh_target is surfaced separately via the per-item host hint provider)
     risk_assessment: str = ""
     ssh_target: str = ""
+    # Advisory constraints derived from user directives + prior lessons +
+    # skill non-negotiables. Injected into the agent's per-turn reminder
+    # (via IterationAdvisor) as an always-visible "警钟长鸣" block. Weak
+    # constraint: the agent may violate, but must bail out with plan_feedback
+    # (early-end + trigger replan) rather than silently push through.
+    directives: List[str] = field(default_factory=list)
 
     @classmethod
     def from_planner_dict(cls, data: dict) -> "CheckListItem":
@@ -60,6 +66,7 @@ class CheckListItem:
             planner_reasoning=data.get("planner_reasoning", ""),
             risk_assessment=data.get("risk_assessment", ""),
             ssh_target=data.get("ssh_target", ""),
+            directives=_coerce_list(data.get("directives")),
         )
 
     def to_agent_message(self) -> str:
@@ -119,6 +126,17 @@ class SharedCheckList:
         self._items: List[CheckListItem] = []
         self._results: List[ItemResult] = []
         self._current_index: int = 0
+
+        # Pending items dropped by replace_post_current when the planner
+        # re-emits a shorter/different tail (see planner_prompts.py's
+        # "re-emit the whole post-current list" contract — anything NOT
+        # re-included is intentionally abandoned, not failed). UI-only
+        # bookkeeping: never read by planner/agent-facing surfaces
+        # (items/total_items/get_pending_items/etc.), only by
+        # get_ui_snapshot. Each entry is (anchor_item_id, item) where
+        # anchor_item_id is head[-1].item_id at drop time — stable forever
+        # since head only grows by append.
+        self._skipped: List[Tuple[str, CheckListItem]] = []
         self._lock = asyncio.Lock()
         self._item_available = asyncio.Event()
         self._interrupt_event = asyncio.Event()
@@ -332,6 +350,12 @@ class SharedCheckList:
                 self._current_index = 0
             else:
                 head = self._items[: self._current_index + 1]
+                old_tail = self._items[self._current_index + 1:]
+                new_ids = {it.item_id for it in new_pending}
+                anchor_id = head[-1].item_id
+                for dropped in old_tail:
+                    if dropped.item_id not in new_ids:
+                        self._skipped.append((anchor_id, dropped))
                 self._items = head + new_pending
             if self._items and self._current_index < len(self._items):
                 self._item_available.set()
@@ -435,7 +459,7 @@ class SharedCheckList:
                     f"  · iter {d.iteration}: tools={tools} "
                     f"ok={d.success_count} fail={d.fail_count} "
                     f"new_artifact={d.produced_new_artifact} "
-                    f"goal_hit={d.goal_signal_hit} "
+                    f"info_gain={d.info_gain} "
                     f"no_progress_streak={d.no_progress_streak}"
                 )
             concern = self._progress_concern
@@ -495,8 +519,19 @@ class SharedCheckList:
           - i == _current_index      → "running"
           - otherwise                → "pending"
 
+        Additionally, items dropped from the pending tail by
+        replace_post_current (planner re-emitted a shorter/different tail)
+        are rendered with status "skipped", spliced in immediately after the
+        item that was "current" at the moment they were dropped (see
+        _skipped) — same relative position they occupied before being cut,
+        so a shrinking tail stays legible instead of silently vanishing.
+
         Each entry: {"item_id", "instruction", "status"}.
         """
+        skipped_by_anchor: Dict[str, List[CheckListItem]] = {}
+        for anchor_id, skipped_item in self._skipped:
+            skipped_by_anchor.setdefault(anchor_id, []).append(skipped_item)
+
         snapshot: List[Dict[str, Any]] = []
         done_count = len(self._results)
         for i, item in enumerate(self._items):
@@ -517,6 +552,12 @@ class SharedCheckList:
                 "instruction": item.instruction,
                 "status": status,
             })
+            for skipped_item in skipped_by_anchor.get(item.item_id, []):
+                snapshot.append({
+                    "item_id": skipped_item.item_id,
+                    "instruction": skipped_item.instruction,
+                    "status": "skipped",
+                })
         return snapshot
 
     def _notify_checklist_changed(self) -> None:

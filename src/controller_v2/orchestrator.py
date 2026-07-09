@@ -319,14 +319,36 @@ class Orchestrator(PlannerMixin, ReceptionistMixin):
         )
 
         if intent != "task":
-            # Emit the reply only if it wasn't already streamed. When the
-            # INTENT stream fell back to non-streaming (or no chunk hook was
-            # set), `_last_response_streamed` is False and a non-empty reply
-            # still needs to go out via the batch sink.
+            # Emit the reply if it wasn't already streamed. When the INTENT
+            # stream fell back to non-streaming (or no chunk hook was set),
+            # `_last_response_streamed` is False and the reply still needs to
+            # go out via the batch sink. Fall back to the default sentence
+            # when `reply` is empty (e.g. both the streaming parse AND the
+            # one non-streaming retry in `_call_and_parse_streaming` failed
+            # to produce JSON) — some callers (e.g. the stdio bridge's
+            # `user_input` path) discard this function's return value
+            # entirely and rely solely on the `_on_reply_to_user` callback,
+            # so an empty `reply` must not silently skip the emit.
             quality_prefetch.cancel()
-            if reply and self._on_reply_to_user and not self._last_response_streamed:
-                self._on_reply_to_user(reply)
-            return reply or "I'm here. Send me a task when you're ready."
+            if not reply and parsed:
+                # JSON parsed fine (parsed is non-empty) but response_to_user
+                # itself was empty/missing — distinct from a total parse
+                # failure (parsed == {}), where the model's actual answer was
+                # silently swallowed by the fallback sentence below. Only
+                # the "non-JSON — one non-streaming retry" WARNING hints at
+                # this from the logs otherwise; this makes the swallow itself
+                # visible.
+                self.logger.warning(
+                    f"[Orchestrator] INTENT parsed successfully but "
+                    f"response_to_user was empty (intent={intent!r}) — "
+                    f"falling back to default sentence; model's real answer "
+                    f"was lost",
+                    component="Orchestrator",
+                )
+            final_reply = reply or "I'm here. Send me a task when you're ready."
+            if self._on_reply_to_user and not self._last_response_streamed:
+                self._on_reply_to_user(final_reply)
+            return final_reply
 
         # Task path: ensure the speculative QUALITY recall has finished and
         # populated _ltm_block_cache before _run_planner reads it. The rerank
@@ -362,6 +384,7 @@ class Orchestrator(PlannerMixin, ReceptionistMixin):
         _task_idle = _cl.total_items == _cl.completed_count
         if self._task_root_query is None or _task_idle:
             self._task_root_query = message
+            self._task_started_at = time.monotonic()
         async with self._planner_lock:
             plan_reply = await self._run_planner(
                 trigger="user_msg",
@@ -418,6 +441,7 @@ class Orchestrator(PlannerMixin, ReceptionistMixin):
         completed_results = self._checklist.get_completed_results()
         loop_warning = self._detect_loops(completed_results)
         failure_tail_warning = self._build_failed_tail_warning(completed_results)
+        budget_warning = self._build_budget_warning()
         last_user = self._last_user_message()
         epistemic_preamble = self._build_epistemic_inventory_warning(
             last_user, completed_results
@@ -446,6 +470,7 @@ class Orchestrator(PlannerMixin, ReceptionistMixin):
             epistemic_preamble=epistemic_preamble,
             loop_warning=loop_warning,
             failure_tail_warning=failure_tail_warning,
+            budget_warning=budget_warning,
             user_message=last_user,
         )
 
@@ -505,6 +530,7 @@ class Orchestrator(PlannerMixin, ReceptionistMixin):
                         {"post_current_items": [
                             {"instruction": a} for a in fallback_actions
                         ]},
+                        min_instruction_len=0,
                     )
                     recovered = (
                         self._checklist.get_current_item() is not None
@@ -973,12 +999,15 @@ class Orchestrator(PlannerMixin, ReceptionistMixin):
         self._planner_trigger.set()
 
     def _on_progress_concern_sync(self, concern: ProgressConcern) -> None:
-        """Callback from CheckList — wake the planner_loop on a watcher verdict.
+        """Callback from CheckList — wake the planner_loop on a progress concern.
 
-        Identical mechanism to _on_item_done_sync: set the trigger and let the
-        planner_loop read the concern (and the in-flight digests) off the
-        checklist context. Runs synchronously in the agent coroutine via the
-        bus callback, so it does no real work beyond flipping the event.
+        The concern may be an LLM watcher verdict ("diverging"/"false_progress")
+        or a mechanical hard-stall verdict ("stalled") emitted by the agent with
+        no LLM in the path. Either way the handling is identical to
+        _on_item_done_sync: set the trigger and let the planner_loop read the
+        concern (and the in-flight digests) off the checklist context. Runs
+        synchronously in the agent coroutine via the bus callback, so it does no
+        real work beyond flipping the event.
         """
         self._planner_trigger.set()
 
@@ -1031,7 +1060,9 @@ class Orchestrator(PlannerMixin, ReceptionistMixin):
                 return turn.get("content", "")
         return ""
 
-    async def _apply_planner_output(self, parsed: dict) -> bool:
+    async def _apply_planner_output(
+        self, parsed: dict, min_instruction_len: int = 20
+    ) -> bool:
         """Apply a planner LLM response to the checklist.
 
         Schema:
@@ -1045,6 +1076,13 @@ class Orchestrator(PlannerMixin, ReceptionistMixin):
         The planner has no user-facing channel — there is no response_to_user
         field. The only planner-originated user message is the completion
         summary composed in `_emit_completion_reply`.
+
+        `min_instruction_len` gates planner-authored instructions to weed out
+        empty/garbage output (the planner schema requires >20 chars — see
+        `planner_prompts.py`). The deferred-action fallback path in
+        `_run_planner` passes a lower value: those instructions are verbatim
+        user requests already accepted by INTENT as actionable ("echo hi"),
+        not planner prose that needs a minimum-detail bar.
 
         Returns True iff the resulting checklist has nothing in flight (no
         current item AND no pending) — this is the trigger for emitting the
@@ -1073,7 +1111,7 @@ class Orchestrator(PlannerMixin, ReceptionistMixin):
             if not isinstance(data, dict):
                 continue
             item = CheckListItem.from_planner_dict(data)
-            if item.instruction and len(item.instruction.strip()) > 20:
+            if item.instruction and len(item.instruction.strip()) > min_instruction_len:
                 new_items.append(item)
 
         # Order matters: write the new post-current tail FIRST, then send
@@ -1367,7 +1405,7 @@ class Orchestrator(PlannerMixin, ReceptionistMixin):
 
         if verdict.verdict in ("PASS", "TRIVIAL"):
             self._submit_session_to_ltm(success=True)
-            self._emit_completion_reply()
+            self._emit_completion_reply(user_summary=verdict.user_summary)
             await self._run_task_complete_cleanup()
             return
 
@@ -1381,7 +1419,7 @@ class Orchestrator(PlannerMixin, ReceptionistMixin):
                 f"(verification: {verdict.gap_summary})\n"
                 if verdict.gap_summary else ""
             )
-            self._emit_completion_reply(prefix=prefix)
+            self._emit_completion_reply(prefix=prefix, user_summary=verdict.user_summary)
             await self._run_task_complete_cleanup()
             return
 
@@ -1449,14 +1487,21 @@ class Orchestrator(PlannerMixin, ReceptionistMixin):
         except Exception:
             pass
 
-    def _emit_completion_reply(self, prefix: str = "") -> None:
-        """Compose + send the final task-completion reply (private helper)."""
+    def _emit_completion_reply(self, prefix: str = "", user_summary: str = "") -> None:
+        """Compose + send the final task-completion reply (private helper).
+
+        ``user_summary`` is the verifier's narrative conclusion (see
+        AcceptanceVerdict.user_summary) — the only LLM-authored prose in the
+        reply. It answers the user's original request directly and is
+        rendered ABOVE the structured outcomes/findings/artifacts block
+        rather than duplicating it.
+        """
         # Reaching here means a terminal verdict (PASS / TRIVIAL / ACCEPT /
         # unknown) — the checklist has nothing in flight. Settle the activity
         # strip to idle before the summary goes out; covers the no-body early
         # return below too, so the strip never stays stuck on "designing…".
         self._notify_state("idle")
-        body = self._compose_completion_reply()
+        body = self._compose_completion_reply(user_summary=user_summary)
         if not body:
             return
         # Separate the verification/finalisation prefix from the markdown body
@@ -1470,7 +1515,7 @@ class Orchestrator(PlannerMixin, ReceptionistMixin):
             except Exception:
                 pass
 
-    def _compose_completion_reply(self) -> str:
+    def _compose_completion_reply(self, user_summary: str = "") -> str:
         """Stitch a final task-completion reply from the agent's results.
 
         Called when planner output leaves the checklist with no pending and
@@ -1479,6 +1524,11 @@ class Orchestrator(PlannerMixin, ReceptionistMixin):
         key_findings as bullet lists, and artifacts aggregated + deduped
         across every completed item (artifacts accrue over the whole task,
         not just the final step).
+
+        ``user_summary`` (optional), when non-empty, is prepended as its own
+        paragraph ABOVE the `## Task complete` header — it's the verifier's
+        narrative conclusion, not another rendering of the same data, so it
+        sits alongside rather than inside the structured block.
         """
         completed = self._checklist.get_completed_results()
         if not completed:
@@ -1495,7 +1545,11 @@ class Orchestrator(PlannerMixin, ReceptionistMixin):
                     seen.add(a)
                     artifacts.append(a)
 
-        sections: List[str] = ["## Task complete"]
+        sections: List[str] = []
+        user_summary = user_summary.strip()
+        if user_summary:
+            sections.append(user_summary)
+        sections.append("## Task complete")
         if last.factual_outcome:
             sections.append(
                 "**Outcomes**\n"

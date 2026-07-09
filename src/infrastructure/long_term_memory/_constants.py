@@ -223,6 +223,16 @@ LTM_OBS_SEMANTIC_EVENT_TTL_DAYS: int = 30
 # skill — which is the whole point: skills come from repeated, automatable
 # workflows, not single runs.
 SKILL_RECURRENCE_THRESHOLD: int = 3
+# Bypass valve for SKILL_RECURRENCE_THRESHOLD: a session whose step_count (see
+# Candidate.metadata, set by candidates.submit_session_complete) reaches this
+# many steps is treated as high-complexity enough that the workflow is worth
+# capturing (disabled, pending review) even the FIRST time it's seen — the
+# recurrence gate exists to avoid minting skills from trivial one-offs, but a
+# genuinely elaborate multi-step trajectory is not trivial just because it
+# hasn't recurred yet, and fingerprint fragmentation (wording drift splitting
+# the recurrence counter) means many valuable one-off procedures would
+# otherwise never reach the threshold at all.
+SKILL_HIGH_COMPLEXITY_STEP_COUNT: int = 15
 # Recurrences only count as the "same habit" when they happen within this
 # rolling window. When a new occurrence lands more than this many days after
 # the previous one, bump_skill_recurrence RESETS the counter to 1 (a fresh

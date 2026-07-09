@@ -525,30 +525,64 @@ Windows HandQ 可以将复杂任务委托给远程 Linux HandQ 代理自主执�
 
 ### 8.1 架构原则
 
-- **通信 only**：Windows 端仅通过 SSH 与已安装的 Linux HandQ 通信，不负责部署
-- **Linux 端由用户预装**：用户在 Linux 上运行 `bash handq_setup.sh --config <config>`
+- **通信为主，部署可选**：Windows 端默认仅通过 SSH 与已安装的 Linux HandQ 通信；当 `update.linux_share_path` 配置了打包好的 Linux 版本时，Windows 端也会在 `submit_goal`/`new_session` 前自动探测远端版本并按需推送升级（见 8.2a、`remote_handq_tool.py::_ensure_installed`）
+- **Linux 端预装（默认路径）**：未配置 `linux_share_path` 时，用户仍需在 Linux 上运行 `bash handq_setup.sh --config <config>`
 - **文件 IPC**：通过 `state.json`（状态）和 `messages/`（消息队列）交互
 - **on-demand 工具**：planner 声明 `tools_required: ["remote_handq"]` 时才激活
 - **地址由 prompt 提供**：远端地址不在 yaml 配置中硬编码，适应频繁变动的开发机
 
-### 8.2 前置条件
+### 8.2 Linux 端用户怎么用
 
-1. Linux 端已安装 HandQ（`handq` 在 PATH 或 `~/.local/bin/`）— 用户运行 `bash handq_setup.sh`
-2. Windows 端可 SSH 到该 Linux 主机（凭据由 SSHSetupManager 首次交互时建立）
-3. 用户在对话中提供目标地址（`user@hostname`）
+对 Linux 机器上的人来说，`handq_linux` 是一个独立于 Windows 委托机制、随时可以直接手动使用的本地命令行工具（不是只能被动等 Windows 唤醒）：
 
-### 8.3 通信协议
+```bash
+handq_linux                       # 打开交互式控制台（自动拉起 daemon）
+handq_linux "分析这段代码的性能瓶颈"   # 直接提交一个目标，等待并打印回复
+handq_linux --new                 # 丢弃当前 session，开始一个全新的
+handq_linux --status              # 打印 daemon 的 state.json（含 session_id / working_dir）
+handq_linux --exit                # 停止 daemon
+handq_linux --version             # 打印当前安装的版本
+```
+（`handq`、`hi` 是同一个命令的别名，由 `handq_setup.sh` 装好）
 
-Windows 端通过 SSH exec 读写 Linux 端的文件 IPC：
+**session / working dir 的感知**：每条非 daemon 命令执行前都会先打印一行 session 横幅（当前 `session_id` + 工作目录），并明确区分三种情形——首次、`continuing <session>`（和上次是同一个 session）、`NEW session (previous ... is gone)`（daemon 重启过、或有人跑过 `--new`，旧 session 已不在）。这条判断来自客户端在 IPC 目录里留的一个 `.last_seen_session` 面包屑（记录本 console 上次见到的 session_id），与 daemon 写进 `state.json` 的当前 `session_id` 比对得出。用户据此判断"接着上次干"还是"该开新的"。控制台内还支持两个不退出的子命令：`new`（当场开新 session，并打印新横幅）、`status`（查看当前状态）。工作目录是 `~/<workspace_base>/<session_id>/`（`workspace_base` 默认 `.workspace`），由 `session_id` 唯一确定，agent 的所有文件产物都落在这里。
 
-| Windows 动作 | 远端操作 | 用途 |
+daemon 是 `setsid` 脱离终端常驻的：控制台退出后 daemon 继续活着，Windows 随时可以通过 SSH 接管同一个 daemon（两边共享同一份 `~/.handq/<user>@<host>/` 文件 IPC，谁先提交谁先服务，后来者看到的是同一个会话状态）。人和 Windows 是两个平等的客户端，不存在谁"优先"、谁必须等谁的关系——但同一时刻只有一个任务在跑：如果人刚提交了一个目标，Windows 这时候 `get_status` 看到的就是 `task_status: "running"`，需要等它变成 `idle` 或主动 `interrupt`。
+
+安装方式两种（见 8.2a）：
+1. **手动**：把打包好的 dist（`handq_linux.dist/` + `handq_setup.sh`）拷到 Linux 机器上，跑 `bash handq_setup.sh --config <config>`，自己填好 `handq_config.yaml`（API_KEY、模型池）。
+2. **免手动**：什么都不用做——只要 Windows 配置了 `update.linux_share_path`，第一次从 Windows 委托任务时会自动帮你装好，配置也是照抄 Windows 本机当前的（API_KEY、模型池同一份），装完之后人一样可以马上 `handq_linux --version` 确认、直接手动用。
+
+### 8.2a 自动部署（可选，Windows → Linux 单向）
+
+配置 `update.linux_share_path` 指向存放 `handq-linux-<X.Y.Z>.tar.gz` 打包产物的共享目录（`packaging/build_linux.sh` 产出，格式对齐 Windows 侧的 `update.share_path` / `HandQ Setup <X.Y.Z>.exe` 惯例）后，`submit_goal`/`new_session` 会先调用 `_ensure_installed`：
+
+1. `discover` 探测远端已装版本（`handq_linux --version`），未装或 daemon 正在跑则跳过整个流程（daemon 存活时永不重新部署，避免抽掉正在跑的进程的文件；等下次 daemon 自然重启后再补上版本检查）
+2. 扫描 `linux_share_path` 取最高 semver 的 tarball；版本 ≥ 已装版本则跳过（**Linux 端允许落后于共享目录最新版**——多数改动只涉及 Windows 侧，不需要每次都重新打包/重新部署 Linux）
+3. 否则 SFTP 推送 tarball 到远端临时文件，解压到**暂存目录**并用其中的二进制真实跑一次 `--version` 验证可执行 —— **验证通过前，线上的 `~/handq/handq_linux.dist/` 完全不受影响**；验证失败（解压失败/二进制缺失/无法运行）直接中止，旧版本原封不动。验证通过才把旧目录挪到临时备份、新目录原子换入、再清理暂存和备份（见 `_DEPLOY_SCRIPT`）
+4. 把 Windows 本机当前配置（`ConfigManager().get_config()`，含 API_KEY / 模型池）写成远端的 `handq_config.yaml`，其中 `version` 字段**强制覆盖为这次实际部署的版本号**（不透传 Windows 自己的版本号——否则远端 `--version` 会汇报出 Windows 的版本而不是自己实际运行的二进制版本，悄悄破坏下一轮的版本比较）
+5. 额外单纯为人类操作者调用一次 `handq_setup.sh`（best-effort，忽略其退出码/自检结果）：只为装好 `handq`/`hi` 别名和 PATH，方便日后手动 SSH 登录时体验和 Windows 内部一致；这一步失败不影响部署结果——Windows 侧永远通过 `_discover()` 解析出的绝对路径调用，从不依赖别名或 PATH
+6. 重新 `discover(force=True)` 刷新缓存
+
+未配置 `linux_share_path` 时行为与之前完全一致（包括找不到 `handq_linux` 时的报错文案）。也可显式调用 `remote_handq` 的 `ensure_installed` 动作单独触发这一流程。
+
+### 8.3 `remote_handq` 工具的 11 个动作 —— 分别对应什么操作
+
+Windows 侧 agent（或用户直接要求）调用 `remote_handq` 工具时，每个 `action` 对应远端的什么真实动作：
+
+| action | 等价于人在 Linux 上做什么 | 备注 |
 |---|---|---|
-| `discover` | probe `~/.handq/<user>@<host>/` + `which handq` | 确认已安装、定位工作目录 |
-| `submit_goal` | `handq --new` + write `messages/<ts>.txt` | 启动空闲 HandQ 并提交任务 |
-| `get_status` | read `state.json`（可 poll） | 轮询进度 |
-| `send_message` | write `messages/<ts>_msg.txt` | 中途注入指令/修正 |
-| `get_result` | read `state.json` + tail execution log | 收集最终结果 |
-| `exit_handq` | `handq --exit` | 清理关闭 |
+| `discover` | 探测 `~/.handq/<user>@<host>/` 在哪、`handq_linux` 装没装、daemon 活没活 | 只读，不改变远端任何状态 |
+| `ensure_installed` | 见 8.2a——版本比对 + 按需自动部署/升级 | 只读→写，仅当版本落后且共享目录有新包时才有副作用 |
+| `submit_goal` | 唤醒 daemon（若未活）+ 相当于人执行 `handq_linux "<goal>"` | 内部先跑一次 `ensure_installed` 再提交 |
+| `send_message` | 相当于人在控制台里，任务跑到一半时敲一行新指令插进去 | 要求 daemon 已经在跑一个任务 |
+| `get_status` | 相当于人敲 `handq_linux --status` | 可轮询（`wait_timeout`），并会顺带读出待处理的 confirmation |
+| `get_result` | 用 `submit_goal`/`send_message` 返回的 `message_id` 去 `reply/<id>.txt` 里取那次的最终回复 | 任务未完成时可轮询等待 |
+| `get_confirmation` | 相当于人在控制台里看到一条 "是否批准 xxx？" 的提示 | 远端任务卡在一个 risk/tool/secret/ask_human 确认点，等待放行 |
+| `answer_confirmation` | 相当于人在控制台里回答那条提示（y/n/message，或填一个密钥/文本值） | 回答后远端任务才会继续往下跑 |
+| `new_session` | 相当于人执行 `handq_linux --new` | 会把当前会话整个丢弃，正在跑的任务被中止 |
+| `interrupt` | 相当于人在控制台按 Ctrl+C 打断当前任务，但 daemon 本身不退出 | 只清空待跑的 checklist 尾部，不重置 session |
+| `exit_handq` | 相当于人执行 `handq_linux --exit` | 停止远端 daemon 进程 |
 
 ### 8.4 Planner 路由
 
@@ -559,8 +593,8 @@ Windows 端通过 SSH exec 读写 Linux 端的文件 IPC：
 ### 8.5 平台限制
 
 - 工具和 provider 仅在 `sys.platform == "win32"` 时注册
-- `tool_registry.py`: `if _IS_WINDOWS:` 门控
-- `flow_controller.py`: `if not _is_windows: return` 早退
+- `tool_registry.py`: `if _IS_WINDOWS:` 门控（`RemoteHandQTool` 的实际注册点见 8.6）
+- `flow_controller.py`: 同样以 `_IS_WINDOWS` 门控 provider 注册
 
 Linux HandQ 不需要委托给自己。
 
@@ -568,11 +602,14 @@ Linux HandQ 不需要委托给自己。
 
 | 文件 | 职责 |
 |---|---|
-| `src/tools/remote_handq_tool.py` | RemoteHandQTool — SSH 通信层（8 actions：discover/submit_goal/send_message/get_status/get_result/new_session/interrupt/exit_handq） |
+| `src/tools/remote_handq_tool.py` | RemoteHandQTool — SSH 通信层 + 自动部署（11 actions，见 8.3） |
 | `src/infrastructure/remote_handq_setup.py` | RemoteHandQContextProvider — 凭据建立 + HANDQ_DIR 发现 |
-| `src/infrastructure/memory.py` | per-host 缓存（`_remote_handq_contexts`） |
-| `src/tools/tool_registry.py` | on-demand 注册（Windows-only, line ~954） |
-| `src/controller/flow_controller.py` | provider 注册（Windows-only, line ~958） |
+| `src/controller_v2/context.py` | `ProviderCache` — per-host 缓存的通用存储（各 provider 共用，非 remote_handq 专属） |
+| `src/tools/tool_registry.py` | on-demand 注册（`_IS_WINDOWS` 门控，line ~1077） |
+| `src/controller_v2/flow_controller.py` | provider 注册（line ~523） |
+| `handq_linux.py` | Linux 端入口——console 客户端 + 常驻 daemon（见 8.2 的命令列表） |
+| `handq_setup.sh` | 安装 `handq_linux`/`handq`/`hi` 命令、PATH、（可选）人工首次安装时的依赖/配置校验 |
+| `packaging/build_linux.sh` | 打 Linux dist 包 + `handq-linux-<version>.tar.gz`（供 8.2a 自动部署使用） |
 
 ---
 

@@ -121,6 +121,20 @@
             sink.call(console, line);
         } catch (_) { /* ignore */ }
         appendToPanel(line);
+        // Forward to main so renderer logs also land in handq-frontend.log —
+        // previously __handqLog only reached the console + in-window panel
+        // (Ctrl+Shift+L), which is why the file was all PRELOAD lines and this
+        // whole class of renderer bug was invisible in logs. DEBUG is gated on
+        // the main side (HANDQ_FRONTEND_DEBUG) so the per-event onStatus /
+        // reply_delta firehose doesn't flood the file by default.
+        try {
+            if (window.handqLog && typeof window.handqLog.write === 'function') {
+                const msg = args
+                    .map((a) => (typeof a === 'string' ? a : safeStringify(a)))
+                    .join(' ');
+                window.handqLog.write(lvl, msg);
+            }
+        } catch (_) { /* logging must never throw */ }
     };
 
     window.__handqTrunc = function (value, n) {
@@ -589,6 +603,7 @@
                 () => (sessions.get(sid) || {}).name || sid.slice(0, 8),
                 (finalText) => submitText(sid, finalText, ta));
         });
+        _MentionAutocomplete.attach(ta);
 
         sessions.set(sid, s);
         _updateLayout();
@@ -675,6 +690,9 @@
         if (!sessions.has(sid)) return;
         closedSessions.add(sid);
         window.__handqLog('INFO', 'closeSession', { sid });
+        // Finalize any tool cards still spinning before the session's data is
+        // dropped below — nothing will ever deliver their matching result now.
+        _forceFinalizePendingActivity(sessions.get(sid));
         // Kill the floating pop-out editor if it was pointed at this session
         // — its backing textarea is about to be removed from the DOM.
         try { _FloatingComposer.destroyFor(sid); } catch (_) { /* ignore */ }
@@ -691,6 +709,7 @@
         await _runVT(() => {
             const s = sessions.get(sid);
             if (s && s.card && s.card.parentNode) {
+                if (s.composerInput) _MentionAutocomplete.detach(s.composerInput);
                 s.card.parentNode.removeChild(s.card);
             }
             sessions.delete(sid);
@@ -829,6 +848,7 @@
             el.appendChild(headEl);
             el.appendChild(body);
             document.body.appendChild(el);
+            _MentionAutocomplete.attach(textareaEl);
 
             const inst = {
                 sid, el, headEl, titleEl, closeBtn, textareaEl, resizeEl,
@@ -1047,6 +1067,314 @@
         return { onSourceInput, closeFor, destroyFor, isOpenFor };
     })();
 
+    // ----- @-mention path autocomplete -----------------------------------
+    // Attaches to any composer textarea (session card + floating variant).
+    // On input, detects an @-token before the cursor and queries the main
+    // process's PowerShell worker via window.handq.searchPaths. The dropdown
+    // sits under the textarea. Enter/Tab inserts; Esc cancels; ↑↓ navigates.
+    // Paths containing whitespace are auto-wrapped in double quotes so the
+    // backend preprocess_mentions (normalize_at_quoted) parses them as one
+    // mention.
+    const _MentionAutocomplete = (function () {
+        const DEBOUNCE_MS = 200;
+        const MIN_LEN = 2;
+        const MAX_LEN = 50;
+
+        // Backend lookbehind (src/controller_v2/mention_preprocessing.py):
+        // '@' must not be preceded by [\w/.] — avoids emails, decorators,
+        // /@paths. Quoted form allows whitespace inside the @-token; bare
+        // form does not.
+        const QUOTED_RE = /(?:^|[^\w/.])@"([^"]*)$/;
+        const BARE_RE   = /(?:^|[^\w/.])@([^\s"]*)$/;
+
+        let dropdownEl = null;
+        let itemsEl = null;
+        const attached = new Set();
+
+        let activeTextarea = null;
+        let currentResults = [];
+        let selectedIndex = 0;
+        let currentAtStart = -1;
+        let debounceTimer = null;
+        let latestQueryId = 0;
+
+        function _ensureDropdown() {
+            if (dropdownEl) return dropdownEl;
+            dropdownEl = document.createElement('div');
+            dropdownEl.className = 'mention-dropdown hidden';
+            itemsEl = document.createElement('div');
+            dropdownEl.appendChild(itemsEl);
+            document.body.appendChild(dropdownEl);
+            // Keep focus on the textarea when clicking a candidate.
+            dropdownEl.addEventListener('mousedown', (ev) => ev.preventDefault());
+            return dropdownEl;
+        }
+
+        function _detectMention(textarea) {
+            const cursor = textarea.selectionStart;
+            const before = textarea.value.slice(0, cursor);
+            const mQuoted = before.match(QUOTED_RE);
+            if (mQuoted) {
+                const atOffset = mQuoted[0].indexOf('@');
+                return { query: mQuoted[1], atStart: mQuoted.index + atOffset };
+            }
+            const mBare = before.match(BARE_RE);
+            if (mBare) {
+                const atOffset = mBare[0].indexOf('@');
+                return { query: mBare[1], atStart: mBare.index + atOffset };
+            }
+            return null;
+        }
+
+        function _renderItems() {
+            itemsEl.innerHTML = '';
+            currentResults.forEach((r, idx) => {
+                const item = document.createElement('div');
+                item.className = 'mention-item' + (idx === selectedIndex ? ' selected' : '');
+
+                const icon = document.createElement('span');
+                icon.className = 'mention-item-icon';
+                icon.textContent = r.isDir ? '📁' : '📄';
+                item.appendChild(icon);
+
+                const name = document.createElement('span');
+                name.className = 'mention-item-name';
+                name.textContent = r.name || (r.path || '').split(/[\\/]/).pop() || '(unnamed)';
+                item.appendChild(name);
+
+                if (r.parent) {
+                    const parent = document.createElement('span');
+                    parent.className = 'mention-item-parent';
+                    parent.textContent = r.parent;
+                    item.appendChild(parent);
+                }
+
+                item.addEventListener('click', () => {
+                    selectedIndex = idx;
+                    _insert();
+                });
+                itemsEl.appendChild(item);
+            });
+        }
+
+        function _positionDropdown(textarea) {
+            const rect = textarea.getBoundingClientRect();
+            const margin = 8;
+            const width = Math.max(320, Math.min(rect.width, 560));
+
+            // Horizontal: prefer aligned to textarea left edge, but clamp so the
+            // right edge doesn't spill outside the window (Electron/Chromium
+            // won't render page content past the window border).
+            let left = rect.left;
+            if (left + width > window.innerWidth - margin) {
+                left = window.innerWidth - width - margin;
+            }
+            if (left < margin) left = margin;
+
+            // Vertical: flip above the textarea when there isn't enough room
+            // below. Height is only measurable while the element has layout,
+            // so _show() reveals the element (visibility:hidden) before calling
+            // us — offsetHeight is then valid.
+            const height = dropdownEl.offsetHeight || 320;
+            const spaceBelow = window.innerHeight - rect.bottom - margin;
+            const spaceAbove = rect.top - margin;
+            let top;
+            if (spaceBelow >= height + 4) {
+                top = rect.bottom + 4;
+            } else if (spaceAbove > spaceBelow) {
+                top = Math.max(margin, rect.top - height - 4);
+            } else {
+                // Neither side comfortable — anchor below and let CSS max-height
+                // + overflow-y handle any clipping.
+                top = rect.bottom + 4;
+            }
+
+            dropdownEl.style.left = Math.round(left) + 'px';
+            dropdownEl.style.top = Math.round(top) + 'px';
+            dropdownEl.style.width = width + 'px';
+        }
+
+        function _show(textarea) {
+            _ensureDropdown();
+            _renderItems();
+            // Reveal with visibility:hidden first so offsetHeight is measurable
+            // (display:none via .hidden zeroes it), position, then reveal for
+            // real. Avoids a one-frame flash at the previous position.
+            dropdownEl.style.visibility = 'hidden';
+            dropdownEl.classList.remove('hidden');
+            _positionDropdown(textarea);
+            dropdownEl.style.visibility = '';
+        }
+
+        function _hide() {
+            if (dropdownEl) dropdownEl.classList.add('hidden');
+            activeTextarea = null;
+            currentResults = [];
+            selectedIndex = 0;
+            currentAtStart = -1;
+            latestQueryId += 1;   // invalidate any in-flight response
+        }
+
+        function _insert() {
+            if (!activeTextarea || !currentResults[selectedIndex]) return _hide();
+            const path = currentResults[selectedIndex].path || '';
+            const t = activeTextarea;
+            const cursor = t.selectionStart;
+            const before = t.value.slice(0, cursor);
+            const after = t.value.slice(cursor);
+            if (currentAtStart < 0) return _hide();
+            const hasSpace = /\s/.test(path);
+            const token = hasSpace ? '@"' + path + '"' : '@' + path;
+            t.value = before.slice(0, currentAtStart) + token + ' ' + after;
+            const pos = currentAtStart + token.length + 1;
+            t.setSelectionRange(pos, pos);
+            // Mirror into the floating composer (if this was the source).
+            t.dispatchEvent(new Event('input', { bubbles: true }));
+            _hide();
+        }
+
+        async function _runQuery(textarea, detection) {
+            const query = detection.query;
+            const myId = ++latestQueryId;
+            activeTextarea = textarea;
+            currentAtStart = detection.atStart;
+
+            // UNC branch: fs.readdir over the parent path. SystemIndex ignores
+            // network shares, so a bare LIKE query would always return empty.
+            // Wait until the user has typed at least "\\host\share\" (i.e.,
+            // parent is listable) — otherwise stay silent.
+            if (query.startsWith('\\\\')) {
+                const parsed = _parseUncQuery(query);
+                if (!parsed) {
+                    _hide();
+                    return;
+                }
+                let resp;
+                try {
+                    resp = await window.handq.listDirectory(parsed.parent, parsed.filter);
+                } catch (_) {
+                    resp = { results: [] };
+                }
+                if (myId !== latestQueryId) return;
+                if (activeTextarea !== textarea) return;
+                currentResults = (resp && resp.results) || [];
+                selectedIndex = 0;
+                if (!currentResults.length) {
+                    _hide();
+                    return;
+                }
+                _show(textarea);
+                return;
+            }
+
+            // SystemIndex branch — min length applies here to avoid firing on
+            // single-char queries that match a huge slice of the index.
+            if (query.length < MIN_LEN || query.length > MAX_LEN) {
+                _hide();
+                return;
+            }
+
+            let resp;
+            try {
+                resp = await window.handq.searchPaths(query);
+            } catch (_) {
+                resp = { results: [] };
+            }
+            if (myId !== latestQueryId) return;         // superseded
+            if (activeTextarea !== textarea) return;    // focus moved
+
+            currentResults = (resp && resp.results) || [];
+            selectedIndex = 0;
+            if (!currentResults.length) {
+                _hide();
+                return;
+            }
+            _show(textarea);
+        }
+
+        function _parseUncQuery(query) {
+            // Expects query starts with "\\". Splits into { parent, filter }
+            // where parent is a listable path (\\host\share or deeper).
+            // Returns null when parent isn't listable yet — the user is still
+            // typing host or share.
+            if (!query.startsWith('\\\\')) return null;
+            const lastBs = query.lastIndexOf('\\');
+            const parent = query.slice(0, lastBs);
+            const filter = query.slice(lastBs + 1);
+            if (!parent.startsWith('\\\\')) return null;
+            // After the "\\" prefix the parent must contain at least one more
+            // backslash ("host\share" pattern) to be a listable UNC path.
+            if (!parent.slice(2).includes('\\')) return null;
+            return { parent, filter };
+        }
+
+        function _onInput(ev) {
+            const t = ev.currentTarget;
+            const detection = _detectMention(t);
+            if (!detection) {
+                _hide();
+                return;
+            }
+            clearTimeout(debounceTimer);
+            debounceTimer = setTimeout(() => _runQuery(t, detection), DEBOUNCE_MS);
+        }
+
+        function _onKeydown(ev) {
+            if (!dropdownEl || dropdownEl.classList.contains('hidden')) return;
+            if (activeTextarea !== ev.currentTarget) return;
+            if (ev.key === 'ArrowDown') {
+                ev.preventDefault(); ev.stopPropagation();
+                selectedIndex = (selectedIndex + 1) % currentResults.length;
+                _renderItems();
+            } else if (ev.key === 'ArrowUp') {
+                ev.preventDefault(); ev.stopPropagation();
+                selectedIndex = (selectedIndex - 1 + currentResults.length) % currentResults.length;
+                _renderItems();
+            } else if (ev.key === 'Enter' && !ev.ctrlKey) {
+                // Ctrl+Enter falls through to the composer's submit handler.
+                ev.preventDefault(); ev.stopPropagation();
+                _insert();
+            } else if (ev.key === 'Tab') {
+                ev.preventDefault(); ev.stopPropagation();
+                _insert();
+            } else if (ev.key === 'Escape') {
+                ev.preventDefault(); ev.stopPropagation();
+                _hide();
+            }
+        }
+
+        function _onBlur(ev) {
+            // Small delay so a candidate click registers first.
+            setTimeout(() => {
+                if (activeTextarea === ev.currentTarget
+                    && document.activeElement !== ev.currentTarget) {
+                    _hide();
+                }
+            }, 120);
+        }
+
+        function attach(textarea) {
+            if (!textarea || attached.has(textarea)) return;
+            attached.add(textarea);
+            // capture:true so we intercept Enter/Tab before the composer's
+            // own submit/focus handlers.
+            textarea.addEventListener('keydown', _onKeydown, true);
+            textarea.addEventListener('input', _onInput);
+            textarea.addEventListener('blur', _onBlur);
+        }
+
+        function detach(textarea) {
+            if (!textarea || !attached.has(textarea)) return;
+            attached.delete(textarea);
+            textarea.removeEventListener('keydown', _onKeydown, true);
+            textarea.removeEventListener('input', _onInput);
+            textarea.removeEventListener('blur', _onBlur);
+            if (activeTextarea === textarea) _hide();
+        }
+
+        return { attach, detach };
+    })();
+
     // ----- end multi-session state ---------------------------------------
 
     // Session straggler filter. gateGen() drops envelopes that arrive for
@@ -1138,6 +1466,40 @@
             .replace(/'/g, '&#39;');
     }
 
+    // @-path mention chip — recognises three forms in already-HTML-escaped
+    // text (as emitted by escapeHtml above):
+    //   - quoted:      @&quot;<any-non-&-non-quote>&quot;
+    //   - drive path:  @C:\... or @C:/...
+    //   - UNC \\:      @\\host\share\...
+    //   - UNC //:      @//host/share/...   (post-normalisation form)
+    // Backend lookbehind is mirrored: '@' must not follow [\w/.] so we don't
+    // touch emails, decorators, or /@paths. The bare-path body is a whitelist
+    // (letters, digits, . _ - / \, plus CJK U+4E00–U+9FFF for Chinese file
+    // names) — anything outside terminates the match, so trailing Chinese/
+    // Western punctuation like '。' or ',' does not get swallowed.
+    const _AT_PATH_RE =
+        /(?<![\w/.])@(?:&quot;([^&\n"]+?)&quot;|([A-Za-z]:[\\/][A-Za-z0-9._\-\\/一-鿿]+|\\\\[A-Za-z0-9._\-一-鿿]+\\[A-Za-z0-9._\-\\/一-鿿]+|\/\/[A-Za-z0-9._\-一-鿿]+\/[A-Za-z0-9._\-\\/一-鿿]+))/g;
+
+    function _renderMentionChip(rawPath) {
+        // rawPath is captured from already-escaped text and does not carry
+        // HTML metacharacters (they can't survive the source escape without
+        // being '&…;', and our regex bails on '&'). Re-escape anyway before
+        // embedding into HTML attributes / text content.
+        const path = String(rawPath || '');
+        const isDir = /[\\/]$/.test(path);
+        const stripped = path.replace(/[\\/]+$/, '');
+        const sepIdx = Math.max(stripped.lastIndexOf('\\'), stripped.lastIndexOf('/'));
+        const rawLabel = sepIdx >= 0 ? stripped.slice(sepIdx + 1) : stripped;
+        const label = rawLabel || path;
+        const icon = isDir ? '📁' : '📄';
+        const safePath = escapeHtml(path);
+        const safeLabel = escapeHtml(label);
+        return '<span class="mention-chip" data-path="' + safePath + '" title="' + safePath + '">' +
+               '<span class="mention-chip-icon" aria-hidden="true">' + icon + '</span>' +
+               '<span class="mention-chip-label">' + safeLabel + '</span>' +
+               '</span>';
+    }
+
     function renderMarkdownInline(s) {
         // Operates on already-HTML-escaped text. Inline code is captured
         // first so its content is shielded from emphasis processing.
@@ -1145,6 +1507,15 @@
         s = s.replace(/`([^`\n]+)`/g, (_, p) => {
             codeSpans.push(p);
             return _MD_INLINE + (codeSpans.length - 1) + _MD_INLINE;
+        });
+
+        // @-path mentions — extract BEFORE markdown syntax so characters like
+        // '_' or '*' inside a path don't get eaten by emphasis matching.
+        // Restored to HTML at the end alongside the code-span restore.
+        const chipTokens = [];
+        s = s.replace(_AT_PATH_RE, (_m, quoted, bare) => {
+            chipTokens.push(quoted !== undefined ? quoted : bare);
+            return _MD_INLINE + 'CHIP' + (chipTokens.length - 1) + _MD_INLINE;
         });
 
         // Bold (**, __) before italic (*, _) so ** isn't half-eaten.
@@ -1170,6 +1541,10 @@
         // Restore inline code spans.
         s = s.replace(new RegExp(_MD_INLINE + '(\\d+)' + _MD_INLINE, 'g'),
             (_, i) => '<code>' + codeSpans[+i] + '</code>');
+
+        // Restore mention chips.
+        s = s.replace(new RegExp(_MD_INLINE + 'CHIP(\\d+)' + _MD_INLINE, 'g'),
+            (_, i) => _renderMentionChip(chipTokens[+i]));
 
         return s;
     }
@@ -1373,10 +1748,36 @@
 
     function _getOrCreateActivityGroup(pane) {
         if (!pane) return null;
-        if (pane._activeActivityGroup) return pane._activeActivityGroup;
+        if (pane._activeActivityGroup) {
+            if (pane._activeActivityGroup.isConnected) return pane._activeActivityGroup;
+            // Stale reference to a node no longer in the document (e.g. an
+            // ancestor got rebuilt/replaced out from under it). Reusing it
+            // would keep appending items into an invisible group forever —
+            // drop it and fall through to create a fresh, attached one.
+            window.__handqLog('WARN', 'activity group detached, recreating', {
+                count: pane._activeActivityGroup._count,
+            });
+            pane._activeActivityGroup = null;
+        }
+        // Accordion: collapse any previously-sealed group in this pane before
+        // opening the new one. We only reach here when there's no live group
+        // (the pointer was nulled by _sealActivityGroup), so every open group
+        // found is completed history — tidy it into a chip so the transcript
+        // doesn't grow unbounded with expanded blocks, while the just-finished
+        // task's activity stays visible until the next turn actually starts.
+        try {
+            pane.querySelectorAll(':scope > .activity-group[open]')
+                .forEach((g) => { g.open = false; });
+        } catch (_) { /* querySelectorAll :scope unsupported — non-fatal */ }
         const group = document.createElement('details');
         group.className = 'activity-group';
-        group.open = false;
+        // Open the live group so activity is visible as it streams in. It stays
+        // open after the turn's reply seals it (the pointer is nulled but the
+        // DOM node is untouched), so completed activity remains on screen — and
+        // the next task opens a fresh visible group. Collapsing here was the
+        // regression that made activity look like it "disappeared" on task
+        // completion and never reappeared on session continuation.
+        group.open = true;
         const summary = document.createElement('summary');
         summary.className = 'activity-group-summary';
         const sCount = document.createElement('span');
@@ -1392,10 +1793,18 @@
         group._countLabel = sCount;
         pane.appendChild(group);
         pane._activeActivityGroup = group;
+        window.__handqLog('DEBUG', 'activity group created', {
+            paneConnected: pane.isConnected,
+        });
         return group;
     }
 
     function _sealActivityGroup(pane) {
+        if (pane && pane._activeActivityGroup) {
+            window.__handqLog('DEBUG', 'activity group sealed', {
+                count: pane._activeActivityGroup._count,
+            });
+        }
         if (pane) pane._activeActivityGroup = null;
     }
 
@@ -1535,6 +1944,37 @@
         if (!s) return;
         s.activityItems = [];
         if (s.pane) s.pane._activeActivityGroup = null;
+    }
+
+    function _forceFinalizePendingActivity(s) {
+        // Defensive cleanup for activity cards left stuck in the "running"
+        // spinner state (pending:true) because the task ended abnormally
+        // (bridge crash, fatal error, session closed) before the matching
+        // tool-result event arrived to flip them via updateActivityResult.
+        // Operates directly on the given session bucket rather than
+        // _dispatchSession() so it also works from contexts with no
+        // in-flight dispatch (e.g. closeSession).
+        if (!s || !Array.isArray(s.activityItems)) return;
+        for (const entry of s.activityItems) {
+            if (!entry.pending) continue;
+            entry.icon = '⊗';
+            entry.label = (entry.label || entry.tool || 'tool') + ' (interrupted)';
+            entry.resultIcon = '⊗';
+            entry.resultContent = '';
+            entry.pending = false;
+            if (entry._el) {
+                const head = entry._el.querySelector('.ai-head');
+                if (head) {
+                    const icon = head.querySelector('.ai-icon');
+                    const label = head.querySelector('.ai-label');
+                    if (icon)  icon.textContent  = entry.icon;
+                    if (label) label.textContent = entry.label;
+                }
+                if (!entry._el.querySelector('.ai-result')) {
+                    _appendActivityResult(entry._el, entry);
+                }
+            }
+        }
     }
 
     function briefToolContext(tool, params) {
@@ -1695,13 +2135,65 @@
         scrollToBottom();
     }
 
+    function _findSafeCommitBoundary(lines, fromLine) {
+        // Returns how many LEADING LINES (from the start of `lines`, i.e. an
+        // absolute index) are guaranteed final — no text appended after this
+        // point could ever change how those lines render. Scans only from
+        // `fromLine` onward: every prior call already established that
+        // `fromLine` is itself a safe boundary, and a safe boundary is by
+        // definition never inside an open fence (see below) — so resuming
+        // the scan from there with inFence=false is always correct and
+        // avoids re-walking the whole accumulated text every frame.
+        //
+        // A line index is a safe cut point when the line is blank AND we are
+        // not inside an unclosed fenced code block at that point. Every
+        // block-continuation loop in renderMarkdown (list/table/blockquote/
+        // paragraph) stops at a blank line and never looks past it, so
+        // content up to and including a blank line can never be retroactively
+        // reinterpreted by later text — UNLESS that blank line is actually
+        // inside an open ``` fence (fences intentionally preserve blank
+        // lines as code content, and a fence's own closing ``` might not
+        // have arrived yet).
+        let inFence = false;
+        let safeLineCount = fromLine;
+        for (let idx = fromLine; idx < lines.length; idx++) {
+            const line = lines[idx];
+            if (/^```/.test(line)) {
+                inFence = !inFence;
+                continue; // the fence delimiter line itself is never a cut point
+            }
+            if (!inFence && line.trim() === '') {
+                safeLineCount = idx + 1;
+            }
+        }
+        return safeLineCount;
+    }
+
     function scheduleMarkdownRender(span) {
         if (span._renderPending) return;
         span._renderPending = true;
         requestAnimationFrame(() => {
             span._renderPending = false;
             try {
-                span.innerHTML = renderMarkdown(span._rawText || '');
+                const text = span._rawText || '';
+                const lines = text.split('\n');
+                const committedLineCount = span._committedLineCount || 0;
+                const safeLineCount = _findSafeCommitBoundary(lines, committedLineCount);
+                if (safeLineCount > committedLineCount) {
+                    // Newly-finalized lines since the last commit: render just
+                    // that slice and append its HTML to the committed prefix
+                    // instead of re-parsing everything accumulated so far.
+                    const newlyCommitted = lines.slice(committedLineCount, safeLineCount);
+                    span._committedHtml = (span._committedHtml || '') +
+                        renderMarkdown(newlyCommitted.join('\n'));
+                    span._committedLineCount = safeLineCount;
+                }
+                // The tail — content after the last safe boundary — is the
+                // only part still re-parsed every frame. Its size is bounded
+                // by the length of the last in-progress block (typically one
+                // paragraph/list/table), not the whole accumulated reply.
+                const tailLines = lines.slice(span._committedLineCount || 0);
+                span.innerHTML = (span._committedHtml || '') + renderMarkdown(tailLines.join('\n'));
             } catch (err) {
                 // Fallback to plain text if the parser ever throws — never
                 // strand a streaming bubble blank.
@@ -2424,9 +2916,12 @@
         panel.classList.toggle('collapsed', !expanded);
 
         const GLYPH = {
-            done: '✓', running: '▶', pending: '○', failed: '✗', interrupted: '⊗',
+            done: '✓', running: '▶', pending: '○', failed: '✗', interrupted: '⊗', skipped: '⊘',
         };
         const doneCount = items.filter((it) => it && it.status === 'done').length;
+        const failedCount = items.filter((it) => it && it.status === 'failed').length;
+        const interruptedCount = items.filter((it) => it && it.status === 'interrupted').length;
+        const skippedCount = items.filter((it) => it && it.status === 'skipped').length;
         const current = items.find((it) => it && it.status === 'running');
 
         panel.innerHTML = '';
@@ -2441,12 +2936,14 @@
         chevron.textContent = expanded ? '▾' : '▸';
         const label = document.createElement('span');
         label.className = 'cl-summary';
-        let summary = 'Task plan · ' + doneCount + '/' + items.length;
+        let summary = 'Task plan · ' + doneCount + ' done';
+        if (failedCount) summary += ' · ' + failedCount + ' failed';
+        if (interruptedCount) summary += ' · ' + interruptedCount + ' interrupted';
+        if (skippedCount) summary += ' · ' + skippedCount + ' skipped';
+        summary += ' / ' + items.length;
         if (!expanded && current) {
             // Collapsed: surface what's running so the panel is useful unopened.
             summary += ' · ▶ ' + String(current.instruction || '');
-        } else {
-            summary += ' done';
         }
         label.textContent = summary;
         header.appendChild(chevron);
@@ -2470,8 +2967,9 @@
                 glyph.className = 'cl-glyph';
                 glyph.textContent = GLYPH[status] || '·';
                 const text = document.createElement('span');
-                text.className = 'cl-text';
-                text.textContent = String((it && it.instruction) || '');
+                text.className = 'cl-text md-rendered';
+                text.innerHTML = renderMarkdownInline(
+                    escapeHtml(String((it && it.instruction) || '')));
                 row.appendChild(glyph);
                 row.appendChild(text);
                 list.appendChild(row);
@@ -2537,6 +3035,17 @@
         }
         try {
             return _onStatusBody(evt);
+        } catch (err) {
+            // Without this catch, a throw partway through a kind-specific
+            // branch (e.g. mid-pushActivity) is swallowed by the browser's
+            // default unhandled-exception handling — invisible in
+            // handq-frontend.log, since the 'onStatus' debug line above
+            // already logged the event as "received" before the throw.
+            window.__handqLog('ERROR', 'onStatus handler threw', {
+                kind: evt && evt.kind,
+                error: err && err.message,
+                stack: err && err.stack,
+            });
         } finally {
             _dispatchSid = null;
         }
@@ -2691,6 +3200,10 @@
             if (s) s.sessionState = 'bridge exited';
             setPill('bridge exited');
             pushActivity('⚠', 'Bridge exited', 'code=' + evt.code + ' signal=' + evt.signal);
+            // The whole backend process died — every session's in-flight
+            // tool cards would otherwise spin forever. Finalize them all,
+            // not just the dispatching session's.
+            for (const [, sess] of sessions) _forceFinalizePendingActivity(sess);
         } else if (evt.kind === 'reply') {
             addAssistantTextBubble(evt.text || '');
         } else if (evt.kind === 'reply_delta') {
@@ -2718,7 +3231,13 @@
         } else if (evt.kind === 'receptionist_thinking_off') {
             removeThinkingBubble();
             if (!isTaskRunning()) {
+                // clearWorking() only strips the spin animation class — it never
+                // resets pillText/textContent. Without setPill(''), a leftover
+                // label from an intermediate signal (e.g. "🧠 recalling…") stays
+                // stuck on the pill forever on the chat path, which never visits
+                // state_changed→idle or reply_delta (the only other resets).
                 clearWorking();
+                setPill('');
             }
         } else if (evt.kind === 'session_event') {
             handleSessionEvent(evt.event, evt.data || {});
@@ -2770,6 +3289,11 @@
         _dispatchSid = _resolveSid(evt);
         try {
             return _onFinalBody(evt);
+        } catch (err) {
+            window.__handqLog('ERROR', 'onFinal handler threw', {
+                error: err && err.message,
+                stack: err && err.stack,
+            });
         } finally {
             _dispatchSid = null;
         }
@@ -2810,6 +3334,11 @@
         _dispatchSid = _resolveSid(evt);
         try {
             return _onErrorBody(evt);
+        } catch (err) {
+            window.__handqLog('ERROR', 'onError handler threw', {
+                error: err && err.message,
+                stack: err && err.stack,
+            });
         } finally {
             _dispatchSid = null;
         }
@@ -2841,6 +3370,7 @@
         if (evt.fatal) {
             const s = _dispatchSession();
             if (s) s.sessionState = 'fatal';
+            _forceFinalizePendingActivity(s);
             setPill('fatal');
         }
     }

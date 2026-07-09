@@ -1039,16 +1039,18 @@ class DreamWorker:
 
     async def _apply_session_skill(self, c: Candidate) -> bool:
         """Extract a candidate skill from a successful task session and, only
-        once the same task pattern has recurred enough times, write it as a
+        once the same task pattern has recurred enough times (or the session
+        is complex enough to be worth capturing on its own), write it as a
         live (disabled) skill.
 
         Flow: extract (LLM) → PII gate → fingerprint → bump recurrence counter
-        → gate on ``SKILL_RECURRENCE_THRESHOLD``. Below threshold we ONLY
-        increment the counter and return False (nothing written) — that is the
-        whole point: a one-off task never becomes a skill, only a repeated one
-        does. At/above threshold we write (or update) the skill directly into
-        the unified Skill root with ``enabled: false`` — no approval step.
-        Returns True only when a skill file was actually written.
+        → gate on ``SKILL_RECURRENCE_THRESHOLD`` OR
+        ``SKILL_HIGH_COMPLEXITY_STEP_COUNT``. Below both thresholds we ONLY
+        increment the counter and return False (nothing written) — a one-off
+        trivial task never becomes a skill. At/above either threshold we
+        write (or update) the skill directly into the unified Skill root with
+        ``enabled: false`` — no approval step. Returns True only when a skill
+        file was actually written.
         """
         verdict = await self._extract_skill_from_session(c)
         if not verdict or verdict.get("worth_skill") is not True:
@@ -1079,12 +1081,22 @@ class DreamWorker:
         if count is None:
             return False
 
-        if count < C.SKILL_RECURRENCE_THRESHOLD:
+        step_count = (c.metadata or {}).get("step_count", 0) or 0
+        is_high_complexity = step_count >= C.SKILL_HIGH_COMPLEXITY_STEP_COUNT
+
+        if count < C.SKILL_RECURRENCE_THRESHOLD and not is_high_complexity:
             _logger.info(
-                "session skill below recurrence threshold cid=%s count=%d/%d",
-                c.id[:8], count, C.SKILL_RECURRENCE_THRESHOLD,
+                "session skill below recurrence threshold cid=%s count=%d/%d steps=%d",
+                c.id[:8], count, C.SKILL_RECURRENCE_THRESHOLD, step_count,
             )
             return False
+
+        if count < C.SKILL_RECURRENCE_THRESHOLD:
+            _logger.info(
+                "session skill high-complexity bypass cid=%s count=%d/%d steps=%d/%d",
+                c.id[:8], count, C.SKILL_RECURRENCE_THRESHOLD,
+                step_count, C.SKILL_HIGH_COMPLEXITY_STEP_COUNT,
+            )
 
         description = (verdict.get("description") or title).strip()
         return await self._write_live_skill(

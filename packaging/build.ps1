@@ -210,6 +210,20 @@ if (-not $ElectronOnly) {
 
     New-Item -ItemType Directory -Force $NUITKA_CACHE | Out-Null
 
+    # ── Version stamp (single source of truth = electron/package.json) ──────────
+    # The source handq_config.example.yaml ships a fixed 'version: 0.0.0'
+    # placeholder; stamp the real release version into a temp copy and embed
+    # THAT, so the shipped handq_config.yaml carries a correct version that was
+    # never hand-maintained. Without this, bridge_main._merge_user_config_with_seed
+    # would see 0.0.0 and never migrate an upgrading user's config.
+    $APP_VERSION = (Get-Content "$ELECTRON_DIR\package.json" -Raw | ConvertFrom-Json).version
+    if (-not $APP_VERSION) { Fail "Could not read version from electron\package.json" }
+    $STAMPED_CONFIG = "$NUITKA_CACHE\handq_config.stamped.yaml"
+    (Get-Content "$REPO_ROOT\handq_config.example.yaml") `
+        -replace '^version:.*', "version: '$APP_VERSION'" `
+        | Set-Content -Encoding utf8 $STAMPED_CONFIG
+    Ok "Stamped version $APP_VERSION into shipped handq_config.yaml"
+
     $verboseFlags = @()
     if ($ShowProgress) { $verboseFlags = @('--show-progress', '--show-memory') }
 
@@ -288,7 +302,10 @@ if (-not $ElectronOnly) {
         # it to %USERPROFILE%\HandQ\handq_config.yaml on first run, where the
         # user fills in their API key. Embedding the dev's working yaml would
         # leak whichever API key happens to be in it.
-        "--include-data-files=$REPO_ROOT\handq_config.example.yaml=handq_config.yaml",
+        # We embed the version-stamped temp copy (see $STAMPED_CONFIG above),
+        # not the raw source file, so the shipped config carries the real
+        # release version rather than the 0.0.0 placeholder.
+        "--include-data-files=$STAMPED_CONFIG=handq_config.yaml",
 
         # uia_query.ps1 — PowerShell UI Automation worker script for the LTM
         # Dream/Personality pipeline. Spawned as a long-lived child process by

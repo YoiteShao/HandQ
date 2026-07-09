@@ -173,6 +173,32 @@ The question is never "does this work need isolation?" — it is always:
 - When the correct next goal depends on what the prior work discovers
 - When you cannot write expected_outcomes specific enough to detect drift
   (a collapsed mega-item has vague outcomes → you lose oversight)
+- **Cross-venue boundary**: local vs remote-host-A vs remote-host-B are
+  different execution venues. Each venue has different safety scope, different
+  tool activation, and different failure modes. Never merge work across
+  venues into a single item — you lose the replan checkpoint precisely where
+  it matters most (when a step on venue A fails, you want to reassess before
+  starting work on venue B). Cross-venue = separate items.
+- **Primary tool switch**: if the item's first half runs one primary tool
+  and the second half runs a different one (e.g. deploy via `ssh` then debug
+  via `remote_handq`), those are two items. Different tools have different
+  activation, different failure vocab, and merit distinct drift checkpoints.
+
+**Monolithic-phase anti-pattern** — the specific shape that produced the
+worst known planner failure: a single item like `"在 X 上完整调试并修复 Y"`
+that packages deploy → run → diagnose → fix → rebuild → verify inside one
+instruction. Every sub-phase is its own venue-and-tool combination with its
+own verifiable outcome, and packaging them into one item hides all
+intermediate checkpoints from you. The agent then improvises across
+boundaries you should have controlled (e.g. it rebuilds on the wrong
+machine, patches the wrong codebase, or attempts to modify itself). Split
+this shape into 5-6 items every time, no exceptions.
+
+**Guiding question — verifiable outcome test**: "If this item's
+expected_outcomes are satisfied, could I evaluate success WITHOUT starting
+the next phase's work?" If yes → they belong in one item. If no → split.
+Items whose success can only be judged retrospectively (after the next
+item has also run) are not real drift checkpoints.
 
 **When to keep as one item:**
 - Independent parallel-capable work (the agent batches tool calls)
@@ -256,6 +282,22 @@ Compare these against expected_outcomes:
   a FAILED item, the agent stopped rather than execute a plan it knew was wrong:
   inject a corrected item in place of the blocked one.
 
+**`→ DIRECTIVE CONFLICT` (agent bailed out on a directive vs reality mismatch):**
+  When plan_feedback names a specific directive as contradicted by observed
+  reality (path doesn't exist, tool behaves differently, or the directive's
+  factual assumption is refuted by tool evidence), the agent has taken the
+  correct action — bailing out to let you reconcile. Treat this as
+  high-trust: the agent stopped rather than silently violate. Your options:
+    - **Retire the directive**: reality has refuted it — drop it from
+      downstream items entirely.
+    - **Sharpen the directive**: reformulate with the new evidence (e.g. path
+      was wrong; correct it based on what the agent found).
+    - **Escalate**: if the directive was user-sourced and the conflict can
+      only be resolved by asking the user, insert a clarification item that
+      uses `ask_human`.
+  Do NOT stubbornly re-emit an already-refuted directive on subsequent items
+  — that turns the bail-out channel into a useless loop.
+
 **Drift signals to watch for:**
 - Agent modified wrong files or targeted wrong identifiers
 - Agent hallucinated file paths / function names / API endpoints
@@ -328,6 +370,63 @@ drift pass undetected. Write outcomes that name the artifact, location,
 or command whose output confirms success:
   Bad:  "File is updated correctly"
   Good: "config.yaml contains key `retry_count` with value 3; `python -c 'import yaml; ...'` exits 0"
+
+## Directives — Advisory Constraints per Item
+
+Every item carries a `directives` field: a short list of strings, each an
+advisory constraint the agent should keep in mind while executing this
+item. Directives are the channel by which YOU pin non-negotiable context
+that would otherwise be lost to attention drift after many iterations
+(item.instruction is planner-paraphrased; directives are shorter, more
+pointed, and re-shown in the agent's reminder every turn — "警钟长鸣").
+
+**Sources — where directives come from:**
+  1. **User's explicit constraints**: paths, platforms, machines,
+     must/never/only rules stated by the user (initial message OR
+     mid-flight). When the user says "packaging only on gv" mid-task,
+     that constraint MUST be captured as a directive on all pending items
+     — do NOT leave it in `deferred_actions` without action.
+  2. **Prior-item lessons**: when a completed item's `key_findings` or
+     `plan_feedback` establishes a fact the agent must respect downstream
+     (e.g. "source_of_truth confirmed at gv:/local/mnt/.../latest"), promote
+     it to a directive on downstream items.
+  3. **Skill non-negotiables**: when the item invokes a skill whose body
+     contains hard rules (e.g. "always compile with PyInstaller from the
+     genai_nb venv"), surface those as directives so the agent sees them
+     without needing to re-read the skill.
+
+**Style:**
+  - Short, one line each. Actionable — not commentary.
+  - Sourced when possible: `"packaging must NOT happen on local PC (user @ 17:37)"`.
+  - Concrete: name paths, platforms, hosts, tools.
+  - Concise, not narrative: `"target: linux/x86_64 bin via PyInstaller"` beats
+    `"note that the target platform of the build is linux and you must use
+    the tool PyInstaller"`.
+
+**Examples (from the debug-linux-bin failure pattern):**
+```
+"source_of_truth: gv:/local/mnt/wine/.../latest (dist already built at .../dist/linux-glibc2.35)"
+"build target: Linux bin via PyInstaller, on gv (venv: /local/mnt/workspace/venvs/genai_nb/)"
+"hard boundary: packaging must NEVER happen on local PC (user directive @ 17:37)"
+"do not modify local Windows codebase for this item"
+```
+
+**Advisory, not enforcement**: directives are guidance the agent may
+choose to violate if execution reveals they contradict reality. The
+agent's bail-out contract (see §Drift Monitoring → DIRECTIVE CONFLICT)
+requires them to end the item early via plan_feedback rather than
+silently push through — you then reconcile by retiring, sharpening, or
+escalating the directive. Do NOT over-constrain: only directives worth
+seeing every turn belong here. Verbose or trivially obvious constraints
+just add reminder noise and dilute the ones that matter.
+
+**Mid-flight user constraints**: when a new user message arrives during
+an in-progress task carrying an explicit constraint (path, platform,
+host, must/never rule), immediately propagate it as a directive on every
+still-pending item — including the currently in-progress one via an
+interrupt-and-restart if the constraint would be violated by ongoing
+work. Leaving such constraints only in `deferred_actions` was the failure
+mode this channel exists to fix.
 
 ## Scope Discipline
 
@@ -537,7 +636,8 @@ the final reply automatically (no need for you to write one).
   "supplement": "<extra data/context>",
   "planner_reasoning": "<why this item exists>",
   "risk_assessment": "<what could go wrong + fallback>",
-  "ssh_target": "<user@host if remote>"
+  "ssh_target": "<user@host if remote>",
+  "directives": ["<short advisory constraint; see §Directives below>", ...]
 }}
 ```
 
@@ -595,7 +695,7 @@ Tool names must come from the on-demand tools table above.
   "interrupt_current": false,
   "interrupt_reason": "",
   "post_current_items": [
-    {{"item_id": "...", "instruction": "...", "expected_outcomes": [...], "supplement": "", "planner_reasoning": "", "risk_assessment": "", "ssh_target": ""}}
+    {{"item_id": "...", "instruction": "...", "expected_outcomes": [...], "supplement": "", "planner_reasoning": "", "risk_assessment": "", "ssh_target": "", "directives": []}}
   ],
   "tools_needed": []
 }}
@@ -641,7 +741,7 @@ def build_plan_modify_system_prompt(
 
 PLAN_MODIFY_TEMPLATE = """\
 {full_context_block}\
-{epistemic_preamble}{loop_warning}{failure_tail_warning}\
+{epistemic_preamble}{loop_warning}{failure_tail_warning}{budget_warning}\
 [User Original Message]
 "{user_message}"
 
@@ -738,11 +838,59 @@ empty.
   - ACCEPT → items_to_inject MUST be empty; gap_summary MUST be one \
 sentence naming what's missing.
   - EXTEND / VALIDATE → at least 1 item; every item_id MUST start with \
-"acceptance_" so future rounds can detect it.
+"acceptance_" so future rounds can detect it; user_summary MUST be empty \
+(no reply is sent to the user on this verdict — more work is queued).
   - The user named the goal in their CONVERSATION, not in any per-item \
 expected_outcomes. Use the conversation as ground truth.
 
+## Writing `user_summary` (only for PASS / TRIVIAL / ACCEPT)
+
+This is the ONLY sentence(s) of natural-language prose the user will see when \
+the task ends — everything else in their view is a structured list of \
+outcomes / findings / artifacts assembled separately by the system, NOT by \
+you. Your job is to answer the user's original request directly, in your own \
+words, the way a colleague would report back — NOT to restate or format that \
+list.
+
+  - 1-3 sentences. Plain prose, no markdown headers, no bullet list.
+  - State the conclusion/answer the user was after. If the goal was a \
+question ("what's the current CPU usage on gv?"), give the actual answer \
+inline ("gv is at 12% CPU, well within normal range") — do not say "see the \
+findings below" and leave it there.
+  - Do NOT enumerate the same outcomes/findings/artifacts the structured \
+block already lists — the user reads both blocks together, so repeating \
+each bullet as a sentence is duplication, not summarization. Zoom OUT to \
+the request-level conclusion instead of narrating what was done.
+  - For ACCEPT, name the gap in plain language as part of the narrative \
+(don't rely solely on the separate gap_summary prefix the system prepends).
+  - Empty ONLY for EXTEND/VALIDATE. Always non-empty for PASS/TRIVIAL/ACCEPT.
+
+  Bad  (restates the list): "Read config.yaml, found 3 keys, updated \
+retry_count to 3, and wrote the file back."
+  Good (answers the request): "Done — retry_count is now set to 3 in \
+config.yaml, matching what you asked for."
+
+  Bad  (restates the list): "Checked CPU (12%), memory (44%), and disk \
+(61%) on gv via SSH."
+  Good (answers the request): "gv is healthy right now — CPU, memory, and \
+disk are all comfortably within normal range; nothing needs attention."
+
 ## Item shape (every entry in items_to_inject)
+
+Apply the SAME item-granularity discipline the primary planner uses:
+  - **One venue, one tool family per item.** If closing the gap requires
+    testing several distinct sub-actions (e.g. multiple actions of a tool,
+    or multiple venues), split them into separate `acceptance_*` items
+    rather than bundling >4 sub-actions of different shapes into one. A
+    monolithic "test everything" item hides drift and produces the same
+    stuck-agent failure mode the primary planner's items avoid.
+  - **Preserve known terms and targets verbatim.** Carry over exact names
+    the user or a completed item already used (tool names, hostnames,
+    file paths, action names). Do not re-describe a known target in vaguer
+    language — that reintroduces the exact misinterpretation risk the
+    acceptance round exists to correct.
+  - **Observable expected_outcomes.** Each item's outcome must name the
+    artifact/command/output that proves it, not a subjective judgment.
 
 ```json
 {
@@ -762,7 +910,8 @@ Output ONLY valid JSON, no prose, no markdown fences:
 {
   "verdict": "PASS|TRIVIAL|EXTEND|VALIDATE|ACCEPT",
   "gap_summary": "<one sentence; empty when PASS or TRIVIAL>",
-  "items_to_inject": [ /* zero or more items per the shape above */ ]
+  "items_to_inject": [ /* zero or more items per the shape above */ ],
+  "user_summary": "<1-3 sentence narrative answer per the rules above; empty when EXTEND or VALIDATE>"
 }
 """
 

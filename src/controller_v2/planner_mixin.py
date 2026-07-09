@@ -19,6 +19,7 @@ Usage:
           ...
 """
 import re
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, cast
 
@@ -61,11 +62,22 @@ class AcceptanceVerdict:
                          (non-empty for EXTEND/VALIDATE; empty otherwise).
       fallback         — True when synthesis raised and we returned a
                          fail-open ACCEPT default.
+      user_summary     — 2-3 sentence narrative answer to the user's original
+                         request, written when the verifier terminates the
+                         task (PASS/TRIVIAL/ACCEPT). Empty for EXTEND/VALIDATE
+                         (no completion reply is emitted at that point) and
+                         for the fail-open fallback. This is the ONLY LLM-
+                         authored prose in the completion reply — Orchestrator
+                         ._compose_completion_reply renders it above the
+                         structured outcomes/findings/artifacts block instead
+                         of duplicating them, so the verifier is instructed to
+                         conclude rather than re-list.
     """
     verdict: str = "PASS"
     gap_summary: str = ""
     items_to_inject: List[CheckListItem] = field(default_factory=list)
     fallback: bool = False
+    user_summary: str = ""
 
     @classmethod
     def from_dict(cls, data: dict) -> 'AcceptanceVerdict':
@@ -86,6 +98,7 @@ class AcceptanceVerdict:
             verdict = 'ACCEPT'
 
         gap_summary = (data.get('gap_summary') or '').strip()
+        user_summary = (data.get('user_summary') or '').strip()
 
         items_raw = data.get('items_to_inject') or []
         if not isinstance(items_raw, list):
@@ -104,11 +117,18 @@ class AcceptanceVerdict:
             items = []
         if verdict in ('PASS', 'TRIVIAL'):
             gap_summary = ''
+        if verdict in ('EXTEND', 'VALIDATE'):
+            # No completion reply is emitted on these verdicts — more work is
+            # queued. A stray user_summary here would be silently dropped by
+            # the dispatcher anyway; clear it so from_dict's output is a
+            # faithful contract, not just what happens to be discarded later.
+            user_summary = ''
 
         return cls(
             verdict=verdict,
             gap_summary=gap_summary,
             items_to_inject=items,
+            user_summary=user_summary,
         )
 
     @classmethod
@@ -149,6 +169,11 @@ class PlannerMixin:
         # to non-streaming (no fragments emitted) — callers use this to decide
         # whether a non-empty reply still needs a batch emit.
         self._last_response_streamed: bool = False
+        # Wall-clock anchor for the current task, set alongside
+        # _task_root_query in _handle_user_message (same "task just started"
+        # boundary). None while idle / before the first task. See
+        # _TASK_WALLCLOCK_BUDGET_SEC for how this is used.
+        self._task_started_at: Optional[float] = None
 
     # ── Loop detection ───────────────────────────────────────────────────────
 
@@ -312,6 +337,36 @@ class PlannerMixin:
             "unrecoverable blocker either.\n"
         )
 
+    def _build_budget_warning(self) -> str:
+        """Advisory warning once the task's wall-clock budget is exhausted.
+
+        Supervisor, not enforcer — same posture as `_build_failed_tail_warning`
+        and `_detect_loops`: returns a prompt-injection string that tells the
+        planner to wrap up, but does not touch the checklist itself. No item
+        is cancelled and no in-flight tool call is interrupted; a planner that
+        ignores this and keeps extending is still bounded by the existing
+        `_ACCEPTANCE_SEATBELT_ROUNDS` once a task-complete candidate state is
+        finally reached.
+
+        Returns "" when there is no active task timer (idle) or the budget
+        has not yet been exceeded.
+        """
+        if self._task_started_at is None:
+            return ""
+        elapsed = time.monotonic() - self._task_started_at
+        if elapsed <= self._TASK_WALLCLOCK_BUDGET_SEC:
+            return ""
+
+        return (
+            "⏱️ TASK BUDGET EXCEEDED — this task has been running for "
+            f"{elapsed / 60:.0f} minutes (soft budget: "
+            f"{self._TASK_WALLCLOCK_BUDGET_SEC / 60:.0f} minutes).\n"
+            "  → Do NOT open new exploratory work. Only add items that are "
+            "strictly necessary to close out what is already in progress, or "
+            "end the task now with whatever has been accomplished — noting "
+            "any known gap explicitly rather than continuing to explore.\n"
+        )
+
     # ── Summary builders ─────────────────────────────────────────────────────
     #
     # NOTE: V2 deliberately does NOT have v1's tiered _build_completed_summary
@@ -334,6 +389,19 @@ class PlannerMixin:
     # timestamped artifact paths that always read as "new"). Hitting it is
     # logged at WARNING; it must never be the deciding mechanism in normal runs.
     _ACCEPTANCE_SEATBELT_ROUNDS = 6
+
+    # Task-level wall-clock soft budget. Bounds the gap between
+    # MAX_ITEM_ITERATIONS (per-item, near-unlimited) and
+    # _ACCEPTANCE_SEATBELT_ROUNDS (per-acceptance-round, only reachable once a
+    # task-complete candidate state is reached): a planner that keeps
+    # extending post_current_items without ever emptying the checklist would
+    # otherwise have no ceiling at all. This is advisory, not a hard abort —
+    # see _run_planner's use of _task_started_at: once exceeded, the planner
+    # prompt is told to wrap up rather than open new exploratory work, but no
+    # in-flight item or asyncio task is cancelled. If the planner still keeps
+    # extending, the existing acceptance seatbelt above is the real backstop
+    # once a task-complete candidate is finally reached.
+    _TASK_WALLCLOCK_BUDGET_SEC = 1800
 
     async def synthesize_acceptance(
         self,

@@ -31,17 +31,27 @@ Commands:
   handq_linux --version        print the version and exit
   handq_linux --_daemon        internal: run the resident daemon (setsid target)
 
+Every non-daemon command prints a one-line session banner first — the current
+session_id and its working directory — and flags whether it continues the
+session this console last talked to or a fresh one has taken its place (daemon
+restart, or someone ran ``--new``). Inside the console, ``new`` starts a fresh
+session and ``status`` inspects the current one without leaving. This is how a
+Linux user tells "same session as before, keep going" from "start over".
+
 File IPC layout (``~/.handq/<user>@<host>/``):
   state.json            daemon writes coarse status + latest_tool + checklist
+                        (includes session_id + working_dir)
   messages/<id>.txt     inbound goal / follow-up (console AND Windows write here)
   commands/<id>.json    inbound new_session / interrupt
   reply/<id>.txt        outbound reply (console fetches it; keyed by message id)
+  .last_seen_session    client-side breadcrumb: session_id this console last saw
   confirmation_request.json / confirmation_response.json
                         bidirectional tool / risk / secret / ask_human confirms
 """
 from __future__ import annotations
 
 import argparse
+import contextvars
 import getpass
 import json
 import os
@@ -72,9 +82,13 @@ if _REPO_ROOT not in sys.path:
 # non-existent ``python3`` next to the binary → FileNotFoundError on daemon spawn.
 _IS_FROZEN = bool(getattr(sys, "frozen", False)) or ("__compiled__" in globals())
 
-# App version. Fallback only — the deployed version is read from the config's
-# top-level ``version:`` when present (see ``_resolve_version``).
-__version__ = "1.3.0"
+# Pure fallback — NOT the source of truth and NOT a build input. The single
+# version authority is electron/package.json; build_linux.sh stamps that value
+# into the packaged handq_config.yaml's top-level ``version:``, and
+# ``_resolve_version`` reads it from there at runtime. This constant is only
+# consulted when the config has no ``version:`` at all (source-run / unpackaged
+# dev checkout), so it may drift harmlessly — production never reads it.
+__version__ = "0.0.0"
 
 
 # ── IPC layout (~/.handq/<user>@<host>/) ─────────────────────────────────────
@@ -101,6 +115,23 @@ PROCESSED_DIR = MESSAGES_DIR / ".processed"
 CONFIRM_REQUEST_FILE = HANDQ_DIR / "confirmation_request.json"
 CONFIRM_RESPONSE_FILE = HANDQ_DIR / "confirmation_response.json"
 DAEMON_LOG = HANDQ_DIR / "daemon.log"
+# Client-side breadcrumb: the session_id this console last talked to. Lets a
+# later invocation distinguish "same session I was on" from "the daemon
+# restarted / someone ran --new since". Written by the client, never the
+# daemon — it records the client's own view, not authoritative state.
+LAST_SEEN_SESSION_FILE = HANDQ_DIR / ".last_seen_session"
+
+# The msgid whose on_user_message() call is currently on this asyncio Task's
+# call stack — set for the duration of _drain_messages' await, unset outside
+# it. _on_agent_reply reads this to tell a DIRECT synchronous reply (chat, or
+# a synchronous planner-failure fallback — same Task, sees the var) apart from
+# an ASYNC task-completion summary arriving from the daemon's independent
+# agent/planner background Tasks, which snapshot their context at creation
+# time (in ``start()``, before any message exists) and so never observe a
+# later ``.set()`` from _drain_messages, regardless of lock/await interleaving.
+_current_msgid: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
+    "_current_msgid", default=None
+)
 
 
 def _default_config_path() -> Path:
@@ -188,8 +219,9 @@ class StateMirror:
     this class deliberately omits the receptionist-streaming hooks.
     """
 
-    def __init__(self, session_id: str) -> None:
+    def __init__(self, session_id: str, working_dir: str = "") -> None:
         self._session_id = session_id
+        self._working_dir = working_dir
         self._checklist: Any = None
         self._status = "idle"
         # "" = no task yet, "running" = task in flight, "idle" = settled.
@@ -200,8 +232,12 @@ class StateMirror:
     def attach_checklist(self, checklist: Any) -> None:
         self._checklist = checklist
 
-    def reset(self, session_id: str) -> None:
+    def set_working_dir(self, working_dir: str) -> None:
+        self._working_dir = working_dir
+
+    def reset(self, session_id: str, working_dir: str = "") -> None:
         self._session_id = session_id
+        self._working_dir = working_dir
         self._status = "idle"
         self._task_status = ""
         self._latest_tool = None
@@ -260,6 +296,7 @@ class StateMirror:
             "pid": os.getpid(),
             "handq_active": True,
             "session_id": self._session_id,
+            "working_dir": self._working_dir,
             "task_status": self._task_status,
             "status_text": self._status,
             "latest_tool": self._latest_tool,
@@ -381,11 +418,10 @@ class _LinuxDaemon:
         self._consolidated: List[Any] = []
         self._helper: List[Any] = []
         self._logger: Any = None
-        # The message id currently being processed by on_user_message. The
-        # on_reply_to_user sink uses it to key the reply file, since the real
-        # completion summary is delivered asynchronously (after on_user_message
-        # has already returned the plan ack).
-        self._active_msgid: Optional[str] = None
+        # Message ids awaiting an asynchronous task-completion broadcast (see
+        # _on_agent_reply). Includes the message currently being drained plus
+        # any follow-up submitted while a task was still running.
+        self._pending_msgids: set = set()
         # Message ids for which the sink has already written the authoritative
         # reply, so _drain_messages' post-return ack write won't clobber it.
         self._final_reply_msgids: set = set()
@@ -412,7 +448,8 @@ class _LinuxDaemon:
 
         self._consolidated, self._helper = _build_llm_services(self._config_path)
         session_id = _new_session_id()
-        self._mirror = StateMirror(session_id)
+        session_dir = self._session_dir(session_id)
+        self._mirror = StateMirror(session_id, working_dir=str(session_dir))
         self._flow = self._build_flow(session_id)
         await self._flow.start()
         self._bind_mirror()
@@ -421,18 +458,27 @@ class _LinuxDaemon:
         self._mirror.set_task_status("")
         self._mirror.snapshot()
         self._logger.info(
-            "[handq_linux] daemon up pid=%s session=%s dir=%s",
-            os.getpid(), session_id, HANDQ_DIR,
+            f"[handq_linux] daemon up pid={os.getpid()} session={session_id} "
+            f"workdir={session_dir} ipc={HANDQ_DIR}"
         )
 
-    def _build_flow(self, session_id: str) -> Any:
-        from src.controller_v2.flow_controller import FlowControllerV2
-        from src.infrastructure.config_manager import ConfigManager
+    def _session_dir(self, session_id: str) -> Path:
+        """The per-session working directory: ~/<workspace_base>/<session_id>/.
 
+        Deterministic from session_id, so both _build_flow (which the agent
+        works inside) and the StateMirror (which reports it to the user via
+        state.json) resolve the exact same path.
+        """
+        from src.infrastructure.config_manager import ConfigManager
         cm = ConfigManager(self._config_path)
         sess_cfg = cm.get_section("session") or {}
         workspace_base = sess_cfg.get("workspace_base", ".workspace") or ".workspace"
-        session_dir = Path.home() / workspace_base / session_id
+        return Path.home() / workspace_base / session_id
+
+    def _build_flow(self, session_id: str) -> Any:
+        from src.controller_v2.flow_controller import FlowControllerV2
+
+        session_dir = self._session_dir(session_id)
         session_dir.mkdir(parents=True, exist_ok=True)
         # Linux CLI keeps expose_session_storage_in_prompt at its default (True):
         # the agent's mental model is the session dir, where it works directly.
@@ -457,24 +503,38 @@ class _LinuxDaemon:
         V2 runs task execution in a background task: ``on_user_message`` returns
         only the initial plan ack, and the real completion summary is emitted
         later via ``Orchestrator._emit_completion_reply`` (unconditional, full
-        text). This sink writes that FULL reply to the active message's reply
-        file and records its id so the post-return ack write in
-        ``_drain_messages`` can't clobber it.
+        text). This callback carries no per-task correlation id, and more than
+        one msgid can be pending at once (a follow-up submitted via
+        send_message while a task is still running). We tell the two firing
+        modes apart via ``_current_msgid`` (module-level ContextVar):
 
-        For the chat path the sink fires synchronously inside ``on_user_message``
-        (same id) — harmless, the reply file simply gets the chat reply.
-
-        Known limitation: overlapping goals share ``_active_msgid``, so a reply
-        is attributed to whichever message is currently active.
+          * DIRECT — fires synchronously inside _drain_messages' own
+            ``await on_user_message(...)`` (the chat path, or a synchronous
+            planner-failure fallback). ``_current_msgid.get()`` is non-None
+            here, naming exactly the message this reply belongs to.
+          * ASYNC — fires later from the daemon's independent agent/planner
+            background Tasks (the real task-completion summary).
+            ``_current_msgid.get()`` is None here — those Tasks' contexts were
+            snapshotted at ``start()``, before any message existed, so they
+            never observe _drain_messages' ``.set()``. With no correlation id
+            to target, broadcast to every msgid still awaiting its reply.
         """
-        msgid = self._active_msgid
-        if not msgid:
-            return
-        try:
-            _atomic_write_text(REPLY_DIR / f"{msgid}.txt", reply or "")
-            self._final_reply_msgids.add(msgid)
-        except Exception:
-            pass
+        direct = _current_msgid.get()
+        targets = [direct] if direct is not None else list(self._pending_msgids)
+        for msgid in targets:
+            if msgid in self._final_reply_msgids:
+                continue
+            try:
+                _atomic_write_text(REPLY_DIR / f"{msgid}.txt", reply or "")
+                self._final_reply_msgids.add(msgid)
+            except Exception:
+                pass
+        # Once the checklist has genuinely settled, every id this broadcast
+        # covered is done — drop them so a later, unrelated task's completion
+        # doesn't get broadcast to them too.
+        cl = self._flow._checklist if self._flow is not None else None
+        if direct is None and cl is not None and cl.get_current_item() is None and not cl.has_pending:
+            self._pending_msgids.clear()
         if self._mirror is not None:
             self._mirror.snapshot()
 
@@ -482,12 +542,13 @@ class _LinuxDaemon:
         """Tear down the current session and start a fresh one (handq --new)."""
         old = self._flow
         session_id = _new_session_id()
-        self._active_msgid = None
+        session_dir = self._session_dir(session_id)
+        self._pending_msgids.clear()
         self._final_reply_msgids.clear()
         self._flow = self._build_flow(session_id)
         await self._flow.start()
         assert self._mirror is not None
-        self._mirror.reset(session_id)
+        self._mirror.reset(session_id, working_dir=str(session_dir))
         self._bind_mirror()
         self._mirror.snapshot()
         if old is not None:
@@ -496,7 +557,7 @@ class _LinuxDaemon:
             except Exception:
                 pass
         if self._logger:
-            self._logger.info("[handq_linux] new session=%s", session_id)
+            self._logger.info(f"[handq_linux] new session={session_id} workdir={session_dir}")
 
     async def stop(self) -> None:
         if self._flow is not None:
@@ -589,21 +650,43 @@ class _LinuxDaemon:
             _archive(msg_file)
             if not text.strip():
                 continue
-            # Key the reply sink to this message BEFORE awaiting, so a reply
-            # emitted during on_user_message (chat) or later by the background
-            # task (completion summary) lands in the right reply file.
-            self._active_msgid = stem
+            # Mark this message the DIRECT target for any reply produced
+            # synchronously within the upcoming await (chat, or a synchronous
+            # planner-failure fallback) — see _on_agent_reply / _current_msgid.
+            # Deliberately NOT added to _pending_msgids yet: that set is what
+            # an unrelated task's ASYNC completion broadcasts to, and until
+            # on_user_message returns we don't yet know whether this message
+            # became a real in-flight task — adding it early would expose it
+            # to a same-event-loop race where another task's background
+            # completion fires (and broadcasts) while this await is still
+            # in flight, clobbering this message's reply before it starts.
             if self._mirror is not None:
                 self._mirror.set_task_status("running")
                 self._mirror.snapshot()
+            token = _current_msgid.set(stem)
             try:
                 reply = await self._flow.on_user_message(text)
             except Exception as exc:
                 reply = f"[handq_linux] error: {exc}"
+            finally:
+                _current_msgid.reset(token)
+            # on_user_message has returned; the planner (if any) has already
+            # applied its items synchronously. Only now can we tell whether
+            # this message left real work in flight — if so, register it so
+            # the eventual ASYNC completion (background planner_task) knows
+            # to broadcast to it too.
+            cl = self._flow._checklist if self._flow is not None else None
+            still_in_flight = cl is not None and (
+                cl.get_current_item() is not None or cl.has_pending
+            )
+            if still_in_flight and stem not in self._final_reply_msgids:
+                self._pending_msgids.add(stem)
             # Write the return value only if the sink hasn't already delivered
             # the authoritative reply for this id. Chat → the return IS the
-            # reply. Task → the return is the plan ack; it serves as an
-            # immediate placeholder, and the sink overwrites it with the full
+            # reply (the sink already wrote it as the DIRECT target above, so
+            # this is normally a no-op guarded by _final_reply_msgids). Task →
+            # the return is the plan ack; it serves as an immediate
+            # placeholder, and the async sink overwrites it with the full
             # completion summary once the task settles (which, for a very fast
             # task, may have already happened — hence the guard).
             if stem not in self._final_reply_msgids:
@@ -617,8 +700,7 @@ class _LinuxDaemon:
                 # never emits an "idle" state change; without this the optimistic
                 # "running" set above would strand and get_status would report a
                 # finished chat reply as a perpetually running task.
-                cl = self._flow._checklist if self._flow is not None else None
-                if cl is not None and cl.get_current_item() is None:
+                if not still_in_flight:
                     self._mirror.set_task_status("idle")
                 self._mirror.snapshot()
 
@@ -751,6 +833,77 @@ def _ensure_daemon(config_path: Optional[str], timeout: float = 15.0) -> bool:
     return False
 
 
+def _session_banner() -> str:
+    """One line telling the user which session they're on and where it works.
+
+    Read straight from the daemon's state.json so it reflects the live
+    session — the same session_id / working_dir the agent is actually using.
+    Returns "" if the daemon isn't up yet or hasn't written state.
+    """
+    state = _read_json(STATE_FILE) or {}
+    sid = state.get("session_id", "")
+    wd = state.get("working_dir", "")
+    if not sid:
+        return ""
+    parts = [f"session {sid}"]
+    if wd:
+        parts.append(f"workdir {wd}")
+    return "  ".join(parts)
+
+
+def _remember_session_id() -> Optional[str]:
+    """The session_id this client last saw, persisted in the IPC dir so a
+    later `handq_linux` invocation can tell 'same session as before' from
+    'the daemon restarted / someone ran --new since I was last here'."""
+    return _read_text(LAST_SEEN_SESSION_FILE).strip() or None
+
+
+def _write_seen_session_id(sid: str) -> None:
+    if sid:
+        _atomic_write_text(LAST_SEEN_SESSION_FILE, sid)
+
+
+def _wait_new_session(timeout: float = 15.0) -> None:
+    """After posting a new_session command, wait for the daemon to actually
+    swap in a session_id different from the one we last saw. Best-effort: on
+    timeout we just fall through and let the banner report whatever's current."""
+    prev = _remember_session_id()
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        sid = (_read_json(STATE_FILE) or {}).get("session_id", "")
+        if sid and sid != prev:
+            return
+        time.sleep(POLL_INTERVAL)
+
+
+def _announce_session(config_path: Optional[str]) -> None:
+    """Print the current session banner and whether it continues the one this
+    client last interacted with — the signal a user needs to decide whether to
+    keep going or start fresh with `--new` / the console `new` command."""
+    # The daemon writes state.json immediately after the pid file, but
+    # _ensure_daemon returns on pid-file liveness alone; give the session_id a
+    # brief moment to appear so a freshly-spawned daemon still gets a banner.
+    deadline = time.time() + 3.0
+    state: Dict[str, Any] = {}
+    while time.time() < deadline:
+        state = _read_json(STATE_FILE) or {}
+        if state.get("session_id"):
+            break
+        time.sleep(POLL_INTERVAL)
+    sid = state.get("session_id", "")
+    if not sid:
+        return
+    prev = _remember_session_id()
+    banner = _session_banner()
+    if prev is None:
+        print(f"· {banner}", file=sys.stderr)
+    elif prev == sid:
+        print(f"· continuing {banner}", file=sys.stderr)
+    else:
+        print(f"· NEW session (previous {prev} is gone) — {banner}", file=sys.stderr)
+    _write_seen_session_id(sid)
+
+
 def _submit_message(text: str) -> str:
     _ensure_dirs()
     msgid = datetime.now().strftime("%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:8]
@@ -837,6 +990,7 @@ def cmd_goal(text: str, config_path: Optional[str]) -> int:
     if not _ensure_daemon(config_path):
         print("handq_linux: failed to start daemon (see daemon.log).", file=sys.stderr)
         return 1
+    _announce_session(config_path)
     msgid = _submit_message(text)
     print("· submitted; waiting for reply…", file=sys.stderr)
     reply = _wait_reply(msgid)
@@ -852,8 +1006,9 @@ def cmd_console(config_path: Optional[str]) -> int:
     if not _ensure_daemon(config_path):
         print("handq_linux: failed to start daemon (see daemon.log).", file=sys.stderr)
         return 1
-    print("HandQ (Linux) — type a goal, or 'exit' to leave the console "
-          "(daemon keeps running).")
+    _announce_session(config_path)
+    print("HandQ (Linux) — type a goal, 'new' for a fresh session, 'status' to "
+          "inspect, or 'exit' to leave the console (daemon keeps running).")
     while True:
         try:
             line = input("handq> ").strip()
@@ -867,6 +1022,13 @@ def cmd_console(config_path: Optional[str]) -> int:
         if line == "status":
             cmd_status()
             continue
+        if line == "new":
+            _send_command("new_session")
+            # The daemon swaps the session asynchronously; wait for the new
+            # session_id to land so the banner reflects reality, not the old one.
+            _wait_new_session()
+            _announce_session(config_path)
+            continue
         msgid = _submit_message(line)
         reply = _wait_reply(msgid)
         print(reply if reply is not None else
@@ -876,12 +1038,14 @@ def cmd_console(config_path: Optional[str]) -> int:
 def cmd_new(config_path: Optional[str]) -> int:
     if _daemon_alive():
         _send_command("new_session")
+        _wait_new_session()
         print("· new session requested.")
     else:
         if not _ensure_daemon(config_path):
             print("handq_linux: failed to start daemon (see daemon.log).", file=sys.stderr)
             return 1
         print("· daemon started with a fresh session.")
+    _announce_session(config_path)
     return 0
 
 
@@ -890,6 +1054,11 @@ def cmd_status() -> int:
         print("handq_linux: daemon not running.")
         return 1
     state = _read_json(STATE_FILE) or {}
+    # Human-readable session/workdir line to stderr; full JSON stays on stdout
+    # so anything parsing --status output is unaffected.
+    banner = _session_banner()
+    if banner:
+        print(f"· {banner}", file=sys.stderr)
     print(json.dumps(state, ensure_ascii=False, indent=2))
     return 0
 

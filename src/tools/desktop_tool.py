@@ -23,9 +23,14 @@ as the primary local engine.  ``find_element`` walks:
   1. screenshot the chosen region
   2. RapidOCR → list of (text, bbox)
   3. rapidfuzz match `description` against OCR texts (token_set_ratio)
-  4. on hit: return bbox center, source='ocr', elapsed ~1 s
+  4. on hit: return bbox center, source='ocr', elapsed ~2.8 s
   5. on miss: optionally fall back to LLM vision (vision_client.query
-     with a JSON output_schema), source='vision', elapsed ~5 s
+     with a JSON output_schema), source='vision', elapsed ~4 s
+     (anthropic::claude-4-5-haiku via the QGenie gateway)
+
+  NB: a UIA `snapshot` is ~170 ms — ~16x cheaper than the OCR pass here.
+  Prefer snapshot to name a control, then click it directly; reserve
+  find_element for visual-only descriptors or UIA-invisible targets.
 
 Sensitive window guard
 ----------------------

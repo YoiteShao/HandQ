@@ -89,7 +89,11 @@ const pendingByid = new Map();
 ipcRenderer.on('handq:event', (_evt, evt) => {
     if (!evt || typeof evt !== 'object') return;
     const t = evt.type;
-    preloadLog('event', { type: t, id: evt.id });
+    // Skip per-token streaming envelopes — they'd otherwise flood the log at
+    // one line per token. Every other status kind still logs.
+    if (!(t === 'status' && evt.kind === 'reply_delta')) {
+        preloadLog('event', { type: t, kind: evt.kind, id: evt.id });
+    }
 
     if (t === 'status') {
         if (!statusReplayed && statusListeners.length === 0) {
@@ -241,6 +245,27 @@ contextBridge.exposeInMainWorld('handq', {
                 });
         });
     },
+
+    /**
+     * searchPaths(query) — Promise resolving to
+     *   { results: [{path, name, parent, isDir}, ...], disabled?, notReady?, timedOut? }
+     * Backed by the resident PowerShell worker in main.js that runs SQL over
+     * the Windows SystemIndex. Never throws; on any failure the results array
+     * is empty so the caller can silently hide the dropdown.
+     */
+    searchPaths: (query) => {
+        return ipcRenderer.invoke('handq:searchPaths', { query });
+    },
+
+    /**
+     * listDirectory(dirPath, filter) — Promise resolving to
+     *   { results: [{path, name, parent, isDir}, ...], timedOut?, error? }
+     * Backs the mention dropdown's UNC / raw-directory fallback: renderer
+     * detects a path-style @-token, main.js runs fs.readdir + fuzzy filter.
+     */
+    listDirectory: (dirPath, filter) => {
+        return ipcRenderer.invoke('handq:listDirectory', { path: dirPath, filter });
+    },
 });
 
 // Custom-titlebar window controls (frameless window). The renderer ships its
@@ -306,6 +331,32 @@ contextBridge.exposeInMainWorld('appInfo', {
     getVersion: () => {
         preloadLog('app:getVersion');
         return ipcRenderer.invoke('app:getVersion');
+    },
+});
+
+// Renderer-side log forwarding. The renderer's window.__handqLog writes to the
+// console + in-window debug panel; this bridge also ships each line to main so
+// it lands in handq-frontend.log alongside the PRELOAD lines. Level is passed
+// through as the component-adjacent tag; main.js gates DEBUG behind
+// HANDQ_FRONTEND_DEBUG (see logLineDebug) so the high-volume per-event firehose
+// doesn't flood the file, while INFO/WARN/ERROR always persist.
+contextBridge.exposeInMainWorld('handqLog', {
+    write: (level, msg) => {
+        try {
+            const lvl = String(level || 'INFO').toUpperCase();
+            const component = 'RENDER-' + lvl;
+            if (lvl === 'DEBUG') {
+                // Route DEBUG through a dedicated channel main.js logs via
+                // logLineDebug (gated on HANDQ_FRONTEND_DEBUG).
+                ipcRenderer.send('handq:logDebug', {
+                    component, msg: String(msg == null ? '' : msg),
+                });
+            } else {
+                ipcRenderer.send('handq:log', {
+                    component, msg: String(msg == null ? '' : msg),
+                });
+            }
+        } catch (_) { /* logging must never throw */ }
     },
 });
 

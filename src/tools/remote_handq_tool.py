@@ -25,11 +25,21 @@ loss and is resumable. ``<launch>`` is discovered on the remote, in priority:
   3. a source checkout (``python3 <root>/handq_linux.py``), preferring a
      ``.venv``/``venv`` interpreter co-located with the script.
 
-Prerequisite: the user has put HandQ on the remote — normally by copying the
-built dist package (``handq_linux.dist/`` + ``handq_config.yaml`` + setup) and
-running ``handq_setup.sh`` to install the ``handq_linux`` command; a source
-checkout (``handq_linux.py`` next to ``src/``) also works. This tool never
-deploys software; it only communicates and wakes the daemon.
+Prerequisite: handq_linux must be present on the remote. Two ways to get
+there:
+  1. Auto-deploy (opt-in) — set ``update.linux_share_path`` in the local
+     config to a folder holding built ``handq-linux-<X.Y.Z>.tar.gz``
+     packages (see ``packaging/build_linux.sh``). ``submit_goal`` and
+     ``new_session`` then check the remote's installed version against the
+     newest package on the share and push/upgrade automatically before
+     proceeding — see ``_ensure_installed``. The remote's config is seeded
+     from this Windows install's own live config (API key, model pool),
+     never from a blank template or a prompt.
+  2. Manual — copy the built dist package (``handq_linux.dist/`` +
+     ``handq_config.yaml`` + setup) to the remote and run
+     ``handq_setup.sh`` yourself; a source checkout (``handq_linux.py``
+     next to ``src/``) also works. Always available, regardless of whether
+     auto-deploy is configured.
 
 Reuses the SSH connection pool + credential infrastructure from ssh_tool.py.
 """
@@ -39,7 +49,9 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
 import posixpath
+import re
 import time
 import uuid
 from datetime import datetime
@@ -66,9 +78,37 @@ def _host_key(creds: Dict[str, Any]) -> str:
 
 
 def _exec(creds: Dict[str, Any], command: str, timeout: float = 15.0) -> Tuple[str, str, int]:
-    """Run one command on the remote via a pooled connection. (stdout, stderr, rc)."""
+    """Run one command on the remote via a pooled connection. (stdout, stderr, rc).
+
+    Prefer ``_remote_bash`` for anything using POSIX shell syntax — see its
+    docstring for why the bash wrapper is not optional.
+    """
     with _connect(creds, _default_pool) as (client, _):
         return _exec_command(client, command, timeout=timeout)
+
+
+def _remote_bash(
+    creds: Dict[str, Any], inner: str, timeout: float = 15.0,
+) -> Tuple[str, str, int]:
+    """Run *inner* on the remote wrapped in ``bash -c '<inner>'``.
+
+    The bash wrapper is mandatory: paramiko's exec_command uses the remote
+    user's login shell, which on some hosts is tcsh/csh — those don't grok
+    POSIX numeric-fd redirections (``2>/dev/null``, ``2>&1``) and will emit
+    ``Ambiguous output redirect.`` on the stderr channel with an empty
+    stdout, which looks indistinguishable from "file not found" to callers.
+    Everything remote-side goes through this helper so the shell semantics
+    stay constant regardless of the login shell.
+    """
+    return _exec(creds, f"bash -c {_shq(inner)}", timeout=timeout)
+
+
+def _probe_home(creds: Dict[str, Any]) -> str:
+    """Return the remote user's $HOME. Used when _discover() has nothing to
+    offer yet (handq_linux not found at all) but a deploy target dir is
+    still needed."""
+    stdout, _, _ = _remote_bash(creds, "echo $HOME", timeout=10.0)
+    return stdout.strip() or "."
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -76,7 +116,10 @@ def _exec(creds: Dict[str, Any], command: str, timeout: float = 15.0) -> Tuple[s
 # ─────────────────────────────────────────────────────────────────────────────
 _PROBE = r"""
 U=$(whoami); H=$(hostname -s 2>/dev/null || hostname); HM="$HOME"
-echo "USER=$U"; echo "HOST=$H"
+echo "USER=$U"; echo "HOST=$H"; echo "HOME=$HM"
+LSH=$(getent passwd "$U" 2>/dev/null | cut -d: -f7)
+[ -z "$LSH" ] && LSH="$SHELL"
+echo "LOGIN_SHELL=$LSH"
 D="$HM/.handq/${U}@${H}"
 echo "HANDQDIR=$D"
 [ -d "$D" ] && echo "DIREXISTS=1" || echo "DIREXISTS=0"
@@ -127,7 +170,19 @@ def _discover(creds: Dict[str, Any], *, force: bool = False) -> Dict[str, str]:
     if not force and hk in _discovery_cache:
         return _discovery_cache[hk]
 
-    stdout, _, _ = _exec(creds, f"bash -c {_shq(_PROBE)}", timeout=15.0)
+    # _PROBE is a multi-line POSIX script. Embedding its literal newlines
+    # inside a single-quoted `bash -c` argument breaks under a tcsh/csh
+    # login shell: sshd runs the command via `$SHELL -c "..."`, and tcsh's
+    # line-oriented parser doesn't handle a quoted token that spans several
+    # physical lines the way bash does — it loses track of the closing
+    # quote and reinterprets the remaining lines as tcsh commands (surfaces
+    # as "Unmatched '''." / "Illegal variable name." on the remote side).
+    # Base64-transport the script instead, same idiom as
+    # _write_remote_file: the payload becomes a single alnum/+//= token
+    # with nothing left for any shell to misparse.
+    b64 = base64.b64encode(_PROBE.encode("utf-8")).decode("ascii")
+    probe_inner = f"printf %s {_shq(b64)} | base64 -d | bash"
+    stdout, _, _ = _remote_bash(creds, probe_inner, timeout=15.0)
     fields: Dict[str, str] = {}
     for line in stdout.splitlines():
         line = line.strip()
@@ -161,6 +216,8 @@ def _discover(creds: Dict[str, Any], *, force: bool = False) -> Dict[str, str]:
         "launch": launch,
         "remote_user": fields.get("USER", ""),
         "remote_host": fields.get("HOST", ""),
+        "remote_home": fields.get("HOME", ""),
+        "login_shell": fields.get("LOGIN_SHELL", ""),
         "alive": fields.get("ALIVE", "0"),
         "dir_exists": fields.get("DIREXISTS", "0"),
     }
@@ -189,17 +246,53 @@ def _write_remote_file(creds: Dict[str, Any], remote_path: str, content: str) ->
         f'mkdir -p {_shq(d)} && printf %s {_shq(b64)}'
         f' | base64 -d > {_shq(tmp)} && mv {_shq(tmp)} {_shq(remote_path)}'
     )
-    cmd = f"bash -c {_shq(_inner)}"
-    _, stderr, rc = _exec(creds, cmd, timeout=15.0)
+    _, stderr, rc = _remote_bash(creds, _inner, timeout=15.0)
     if rc != 0:
         raise RuntimeError(f"Failed to write {remote_path}: {stderr.strip()}")
 
 
 def _read_remote_file(creds: Dict[str, Any], remote_path: str) -> Optional[str]:
-    """Return file contents, or None if missing/empty."""
-    cmd = f"cat {_shq(remote_path)} 2>/dev/null"
-    stdout, _, _ = _exec(creds, cmd, timeout=15.0)
+    """Return file contents, or None if missing/empty.
+
+    Routed through ``_remote_bash`` so the ``2>/dev/null`` fd-redirection
+    parses correctly regardless of the remote user's login shell (tcsh/csh
+    would otherwise emit "Ambiguous output redirect." and clobber stdout).
+    """
+    stdout, _, _ = _remote_bash(creds, f"cat {_shq(remote_path)} 2>/dev/null", timeout=15.0)
     return stdout if stdout.strip() else None
+
+
+def _tail_remote_file(creds: Dict[str, Any], remote_path: str, n: int = 30) -> Optional[str]:
+    """Return the last *n* lines of a remote file, or None if missing/empty.
+
+    Used for failure diagnostics (daemon.log / daemon_error.txt) where the
+    file can be large — ``tail`` avoids shipping the whole thing over SSH.
+    Same login-shell caveat as ``_read_remote_file`` — go through
+    ``_remote_bash`` so ``2>/dev/null`` is guaranteed to parse.
+    """
+    stdout, _, _ = _remote_bash(
+        creds, f"tail -n {int(n)} {_shq(remote_path)} 2>/dev/null", timeout=15.0,
+    )
+    return stdout if stdout.strip() else None
+
+
+def _sftp_put_file(creds: Dict[str, Any], local_path: str, remote_path: str) -> None:
+    """Upload a local file to *remote_path* via real SFTP (not base64+bash).
+
+    Reserved for large binary payloads (a Nuitka standalone dist tarball can
+    be tens of MB) — base64 transport through ``_write_remote_file`` would
+    inflate that by ~33% and route it through the exec channel instead of
+    SFTP's own framing.
+    """
+    d = posixpath.dirname(remote_path)
+    with _connect(creds, _default_pool) as (client, _):
+        if d:
+            _exec_command(client, f"mkdir -p {_shq(d)}", timeout=15.0)
+        sftp = client.open_sftp()
+        try:
+            sftp.put(local_path, remote_path)
+        finally:
+            sftp.close()
 
 
 def _read_state(creds: Dict[str, Any], handq_dir: str) -> Dict[str, Any]:
@@ -218,8 +311,7 @@ def _daemon_alive(creds: Dict[str, Any], handq_dir: str) -> bool:
         f'P=$(cat {_shq(pf)} 2>/dev/null); '
         '[ -n "$P" ] && kill -0 "$P" 2>/dev/null && echo ALIVE || echo DEAD'
     )
-    cmd = f"bash -c {_shq(_inner)}"
-    stdout, _, _ = _exec(creds, cmd, timeout=10.0)
+    stdout, _, _ = _remote_bash(creds, _inner, timeout=10.0)
     return stdout.strip() == "ALIVE"
 
 
@@ -231,7 +323,7 @@ def _wake_daemon(creds: Dict[str, Any], info: Dict[str, str], config_path: str =
     # nohup + setsid: detached from the SSH session's process group so it
     # survives the connection closing (and Windows power/network loss).
     wake = f"nohup setsid {launch} --_daemon{cfg} >/dev/null 2>&1 </dev/null & echo WOKE"
-    _exec(creds, f"bash -c {_shq(wake)}", timeout=20.0)
+    _remote_bash(creds, wake, timeout=20.0)
     deadline = time.time() + 15.0
     while time.time() < deadline:
         if _daemon_alive(creds, handq_dir):
@@ -244,9 +336,20 @@ def _ensure_daemon(creds: Dict[str, Any], info: Dict[str, str], config_path: str
     if _daemon_alive(creds, info["handq_dir"]):
         return
     if not _wake_daemon(creds, info, config_path):
+        handq_dir = info["handq_dir"]
+        diag = ""
+        try:
+            err_tail = _tail_remote_file(creds, posixpath.join(handq_dir, "daemon_error.txt"))
+            log_tail = _tail_remote_file(creds, posixpath.join(handq_dir, "daemon.log"))
+            if err_tail:
+                diag += f"\n\n--- daemon_error.txt (tail) ---\n{err_tail.strip()}"
+            if log_tail:
+                diag += f"\n\n--- daemon.log (tail) ---\n{log_tail.strip()}"
+        except Exception:
+            pass  # diagnostics are best-effort; never mask the original failure
         raise RuntimeError(
             f"Failed to wake remote HandQ daemon on {creds['hostname']}. "
-            f"Launch tried: {info['launch']} --_daemon (see ~/.handq/.../daemon.log)."
+            f"Launch tried: {info['launch']} --_daemon.{diag}"
         )
 
 
@@ -254,11 +357,249 @@ def _new_msg_id() -> str:
     return datetime.now().strftime("%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:8]
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  Auto-deploy — push a packaged Linux build from a share when the remote is
+#  missing handq_linux or is running an older version than what's available.
+#  Opt-in: inert unless update.linux_share_path is set in the local config.
+# ─────────────────────────────────────────────────────────────────────────────
+_VERSION_TARBALL_RE = re.compile(r"^handq-linux-(\d+\.\d+\.\d+)\.tar\.gz$")
+_INSTALLED_VERSION_RE = re.compile(r"handq_linux\s+(\S+)")
+
+
+def _parse_version(s: str) -> Tuple[int, ...]:
+    """Parse '1.2.0' → (1, 2, 0). Returns () on any failure — an empty tuple
+    compares smaller than any real version, so an unparsable/missing version
+    is treated as "very old" and forces a redeploy."""
+    if not isinstance(s, str) or not s.strip():
+        return ()
+    try:
+        return tuple(int(p) for p in s.strip().split("."))
+    except ValueError:
+        return ()
+
+
+def _resolve_linux_share_version(share_path: str) -> Optional[Tuple[str, str]]:
+    """Scan *share_path* for the highest-semver ``handq-linux-<X.Y.Z>.tar.gz``.
+
+    Returns ``(version, local_tarball_path)``, or ``None`` if the share is
+    blank, unreachable, or has no matching file. Mirrors electron/updater.js's
+    ``scanLatestVersion`` — same file-naming convention, same "just read the
+    filesystem" approach (a UNC path is a plain local path from Windows).
+    """
+    if not share_path:
+        return None
+    try:
+        entries = os.listdir(share_path)
+    except OSError:
+        return None
+    best: Optional[Tuple[Tuple[int, ...], str, str]] = None
+    for name in entries:
+        m = _VERSION_TARBALL_RE.match(name)
+        if not m:
+            continue
+        version = m.group(1)
+        parsed = _parse_version(version)
+        if best is None or parsed > best[0]:
+            best = (parsed, version, name)
+    if best is None:
+        return None
+    _, version, name = best
+    return version, os.path.join(share_path, name)
+
+
+def _get_installed_version(creds: Dict[str, Any], info: Dict[str, str]) -> str:
+    """Return the remote's installed handq_linux version, or "" on any failure."""
+    stdout, _, rc = _remote_bash(creds, info['launch'] + ' --version', timeout=15.0)
+    if rc != 0:
+        return ""
+    m = _INSTALLED_VERSION_RE.search(stdout)
+    return m.group(1) if m else ""
+
+
+# Deploy script: extract to a staging dir, verify the extracted binary
+# actually launches, THEN atomically swap it into place. The live
+# handq_linux.dist/ is never touched until the new one has proven it runs —
+# a corrupt transfer or bad build aborts with the old install fully intact.
+# Base64-transported like _PROBE (see its comment): a multi-line here-doc
+# breaks under a tcsh/csh login shell, so the whole script travels as one
+# opaque token and only ever runs through `| bash` on the far side.
+_DEPLOY_SCRIPT = r"""
+set -e
+ROOT={root}
+STAGING={staging}
+BACKUP={backup}
+TARBALL={tarball}
+
+mkdir -p "$ROOT"
+rm -rf "$STAGING"
+mkdir -p "$STAGING"
+if ! tar xzf "$TARBALL" -C "$STAGING" 2>&1; then
+  echo "STAGE=extract_failed"
+  rm -rf "$STAGING" "$TARBALL"
+  exit 1
+fi
+rm -f "$TARBALL"
+
+BIN="$STAGING/handq_linux.dist/handq_linux.bin"
+if [ ! -x "$BIN" ]; then
+  echo "STAGE=binary_missing"
+  rm -rf "$STAGING"
+  exit 1
+fi
+
+if ! VEROUT=$("$BIN" --version 2>&1); then
+  echo "STAGE=verify_failed"
+  echo "$VEROUT"
+  rm -rf "$STAGING"
+  exit 1
+fi
+echo "STAGE=verify_ok $VEROUT"
+
+rm -rf "$BACKUP"
+if [ -d "$ROOT/handq_linux.dist" ]; then
+  mv "$ROOT/handq_linux.dist" "$BACKUP"
+fi
+mv "$STAGING/handq_linux.dist" "$ROOT/handq_linux.dist"
+# handq_setup.sh travels alongside the binary dir in the tarball but isn't
+# part of the runtime install — copy it over too so _install_human_aliases
+# (and any human who wants to re-run it by hand) finds it at $ROOT.
+[ -f "$STAGING/handq_setup.sh" ] && cp "$STAGING/handq_setup.sh" "$ROOT/handq_setup.sh"
+rm -rf "$STAGING" "$BACKUP"
+echo "STAGE=swap_ok"
+"""
+
+_DEPLOY_STAGE_MESSAGES = {
+    "extract_failed": "failed to extract the package (corrupt transfer or disk full)",
+    "binary_missing": "extracted package has no handq_linux.dist/handq_linux.bin — bad tarball",
+    "verify_failed": "extracted binary failed to run (--version did not succeed) — old install left untouched",
+}
+
+
+def _deploy_linux_package(
+    creds: Dict[str, Any], info: Dict[str, str], tarball_local_path: str, version: str,
+) -> None:
+    """Push a packaged Linux build to the remote and swap it into place.
+
+    Target root is ``~/handq`` — the same un-installed-copy location the
+    discovery probe already searches (see _PROBE), and the layout
+    ``handq_linux.py``'s own frozen-config resolution expects (dist root one
+    level above ``handq_linux.dist/``). The swap itself does NOT depend on
+    ``handq_setup.sh`` — ``_discover()`` finds an un-installed dist directly
+    via its SBIN probe, so the daemon is launchable immediately after the
+    swap, before handq_setup.sh ever runs (see _install_human_aliases below).
+
+    Extraction is staged and verified before touching the live install (see
+    _DEPLOY_SCRIPT) — a bad transfer or broken build never deletes a working
+    old version. Config comes from Windows' own live config (ConfigManager)
+    with ``version`` explicitly forced to *version* (the tarball just
+    deployed) rather than passed through — otherwise the remote's
+    ``--version`` would echo back Windows' version instead of its own,
+    silently breaking the next round of version comparison.
+
+    After the swap, ``handq_setup.sh`` is invoked once more, best-effort, for
+    its side effect only: installing the ``handq``/``hi`` aliases and PATH
+    entry so a human who later logs in by hand gets the same command Windows
+    already uses internally (_discover resolves an absolute path and never
+    depends on PATH/aliases, so this step is purely a courtesy — its exit
+    code and self-test results are deliberately ignored).
+    """
+    remote_home = info.get("remote_home") or "~"
+    remote_root = posixpath.join(remote_home, "handq")
+    remote_tmp = posixpath.join(remote_home, f".handq_deploy_{version}.tar.gz")
+    staging_dir = posixpath.join(remote_root, f".handq_staging_{version}")
+    backup_dir = posixpath.join(remote_root, ".handq_backup_dist")
+
+    _sftp_put_file(creds, tarball_local_path, remote_tmp)
+
+    script = _DEPLOY_SCRIPT.format(
+        root=_shq(remote_root), staging=_shq(staging_dir),
+        backup=_shq(backup_dir), tarball=_shq(remote_tmp),
+    )
+    b64 = base64.b64encode(script.encode("utf-8")).decode("ascii")
+    inner = f"printf %s {_shq(b64)} | base64 -d | bash"
+    stdout, stderr, rc = _remote_bash(creds, inner, timeout=90.0)
+    if rc != 0:
+        stage = next((s for s in _DEPLOY_STAGE_MESSAGES if f"STAGE={s}" in stdout), "")
+        reason = _DEPLOY_STAGE_MESSAGES.get(stage, f"deploy script exited {rc}")
+        raise RuntimeError(
+            f"Failed to deploy Linux HandQ {version} on {creds['hostname']}: "
+            f"{reason}\n{stdout.strip()}\n{stderr.strip()}"
+        )
+
+    from ..infrastructure.config_manager import ConfigManager
+    import yaml as _yaml
+    local_config = dict(ConfigManager().get_config())
+    local_config["version"] = version
+    remote_config_path = posixpath.join(remote_root, "handq_config.yaml")
+    _write_remote_file(creds, remote_config_path, _yaml.safe_dump(local_config, sort_keys=False))
+
+    _install_human_aliases(creds, remote_root, remote_config_path)
+
+
+def _install_human_aliases(creds: Dict[str, Any], remote_root: str, remote_config_path: str) -> None:
+    """Best-effort: run handq_setup.sh so a human who logs in by hand later
+    gets the handq/hi aliases + PATH entry. Never raises — this is pure
+    convenience, not load-bearing for Windows' own control path (_discover
+    finds the binary by absolute path regardless of whether this succeeds)."""
+    setup_script = posixpath.join(remote_root, "handq_setup.sh")
+    inner = (
+        f"chmod +x {_shq(setup_script)} 2>/dev/null; "
+        f"bash {_shq(setup_script)} --config {_shq(remote_config_path)} >/dev/null 2>&1 || true"
+    )
+    try:
+        _remote_bash(creds, inner, timeout=60.0)
+    except Exception:
+        pass
+
+
+
+def _ensure_installed(creds: Dict[str, Any]) -> Dict[str, str]:
+    """Discover the remote; auto-deploy/upgrade if a newer package is on the
+    configured share. No-op (existing behavior) when linux_share_path is
+    blank or the discovered version is already current.
+
+    Never redeploys while the daemon is alive: _deploy_linux_package rm -rf's
+    handq_linux.dist/, which would yank files out from under a resident
+    process. The stale build keeps serving until the daemon is next
+    restarted (new_session / exit_handq), at which point the version check
+    catches up.
+    """
+    try:
+        info = _discover(creds)
+        discover_exc: Optional[RuntimeError] = None
+    except RuntimeError as exc:
+        info = None
+        discover_exc = exc
+
+    if info is not None and _daemon_alive(creds, info["handq_dir"]):
+        return info
+
+    from ..infrastructure.config_manager import ConfigManager
+    share_path = ConfigManager().get_section("update").get("linux_share_path", "") or ""
+    latest = _resolve_linux_share_version(share_path)
+    if latest is None:
+        if info is None:
+            # No share configured (or nothing on it) and nothing installed —
+            # surface _discover's own error verbatim so behavior is unchanged
+            # from before auto-deploy existed when the feature isn't in use.
+            raise discover_exc
+        return info
+
+    latest_version, tarball_path = latest
+    installed_version = _get_installed_version(creds, info) if info is not None else ""
+    if info is None or _parse_version(installed_version) < _parse_version(latest_version):
+        deploy_info = info if info is not None else {"remote_home": _probe_home(creds)}
+        _deploy_linux_package(creds, deploy_info, tarball_path, latest_version)
+        info = _discover(creds, force=True)
+    return info
+
+
 class RemoteHandQTool(BaseTool):
     """Drive a remote Linux HandQ daemon over SSH.
 
     Actions:
       discover      Locate handq_linux + report daemon state
+      ensure_installed  Deploy/upgrade handq_linux from update.linux_share_path if configured
       submit_goal   Wake daemon if needed + queue a goal (optionally wait for reply)
       send_message  Queue a follow-up message into the running task
       get_status    Read state.json (task_status, status_text, latest_tool, checklist)
@@ -279,8 +620,8 @@ class RemoteHandQTool(BaseTool):
             "action": {
                 "type": "string",
                 "enum": [
-                    "discover", "submit_goal", "send_message", "get_status",
-                    "get_result", "get_confirmation", "answer_confirmation",
+                    "discover", "ensure_installed", "submit_goal", "send_message",
+                    "get_status", "get_result", "get_confirmation", "answer_confirmation",
                     "new_session", "interrupt", "exit_handq",
                 ],
                 "description": "Action to perform on the remote HandQ daemon.",
@@ -361,6 +702,7 @@ class RemoteHandQTool(BaseTool):
 
         handler = {
             "discover": self._action_discover,
+            "ensure_installed": self._action_ensure_installed,
             "submit_goal": self._action_submit_goal,
             "send_message": self._action_send_message,
             "get_status": self._action_get_status,
@@ -374,7 +716,7 @@ class RemoteHandQTool(BaseTool):
         if not handler:
             return self._fail(
                 params,
-                f"Unknown action: {action}. Valid: discover, submit_goal, "
+                f"Unknown action: {action}. Valid: discover, ensure_installed, submit_goal, "
                 f"send_message, get_status, get_result, get_confirmation, "
                 f"answer_confirmation, new_session, interrupt, exit_handq",
             )
@@ -401,6 +743,18 @@ class RemoteHandQTool(BaseTool):
             info["handq_dir"] = override
         return info
 
+    def _info_ensured(self, creds: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, str]:
+        """Like _info, but auto-deploys/upgrades first when a newer package
+        is available on update.linux_share_path. Used only by the two
+        actions that actually need a runnable daemon (submit_goal,
+        new_session) — discovery/status/send_message stay read-only."""
+        info = _ensure_installed(creds)
+        override = params.get("handq_dir", "")
+        if override:
+            info = dict(info)
+            info["handq_dir"] = override
+        return info
+
     # ── actions ────────────────────────────────────────────────────────────
     def _action_discover(self, creds: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, Any]:
         info = self._info(creds, params, force=True)
@@ -412,16 +766,39 @@ class RemoteHandQTool(BaseTool):
             "launch": info["launch"],
             "remote_user": info.get("remote_user", ""),
             "remote_hostname": info.get("remote_host", ""),
+            # The remote user's login shell (from getent passwd / $SHELL). Only
+            # a diagnostic hint — this tool routes everything remote-side
+            # through `bash -c` internally, so the login shell doesn't affect
+            # any action on this tool. Surfaced so callers writing their own
+            # SSH commands to the same host know to wrap in bash themselves
+            # when the shell isn't bash (tcsh/csh don't grok `2>/dev/null`).
+            "login_shell": info.get("login_shell", ""),
             "daemon_alive": alive,
             "session_id": state.get("session_id", ""),
             "task_status": state.get("task_status", ""),
+        }
+
+    def _action_ensure_installed(self, creds: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            pre_info = _discover(creds)
+        except RuntimeError:
+            pre_info = None
+        pre_version = _get_installed_version(creds, pre_info) if pre_info else ""
+        info = self._info_ensured(creds, params)
+        post_version = _get_installed_version(creds, info)
+        return {
+            "handq_dir": info["handq_dir"],
+            "launch": info["launch"],
+            "deployed": (pre_info is None) or (pre_version != post_version),
+            "old_version": pre_version,
+            "new_version": post_version,
         }
 
     def _action_submit_goal(self, creds: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, Any]:
         goal = params.get("goal", "")
         if not goal:
             raise ValueError("'goal' is required for submit_goal.")
-        info = self._info(creds, params)
+        info = self._info_ensured(creds, params)
         _ensure_daemon(creds, info, params.get("config_path", ""))
         return self._post_and_maybe_wait(creds, info, goal, params, label="Goal")
 
@@ -473,6 +850,23 @@ class RemoteHandQTool(BaseTool):
                 status["handq_active"] = False
                 status["note"] = "Daemon is not alive; state.json may be stale."
                 return status
+            # alive=True but state.json is unreadable → read path is broken,
+            # not "daemon has nothing to say". state.json is rewritten on
+            # every snapshot; a healthy daemon must produce non-empty state.
+            # Common causes: remote read plumbing regressed (e.g., a shell
+            # incompatibility in _read_remote_file), or file permissions
+            # changed. Surface loudly instead of returning empty fields that
+            # look indistinguishable from an idle daemon.
+            if not state:
+                status["handq_active"] = False
+                status["_read_path_failed"] = True
+                status["note"] = (
+                    "Daemon is alive but state.json is unreadable or empty. "
+                    "This usually means the remote read path failed (e.g., login "
+                    "shell doesn't grok POSIX redirections, or file permissions "
+                    f"changed). Cross-check on-remote: cat {handq_dir}/state.json"
+                )
+                return status
             # Surface a pending confirmation so the agent knows it must answer
             # before the task can make progress. A confirmation can only be
             # pending while a task runs (the agent blocks mid-item on the
@@ -517,6 +911,17 @@ class RemoteHandQTool(BaseTool):
         }
         if not alive and reply is None:
             out["note"] = "Daemon is not alive and no reply was found; the task may have died with the daemon."
+        # alive + missing reply + empty state → the reply file may already
+        # exist on disk but the read path can't see it. Same failure mode as
+        # _action_get_status: don't disguise a broken pipe as "still running".
+        elif alive and reply is None and not state:
+            out["_read_path_failed"] = True
+            out["note"] = (
+                "Daemon is alive but state.json is unreadable AND no reply was "
+                "found — the remote read path may be broken. The reply file may "
+                "already exist on-remote; cross-check: "
+                f"cat {handq_dir}/reply/{msgid}.txt"
+            )
         return out
 
     def _action_get_confirmation(self, creds: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, Any]:
@@ -567,26 +972,40 @@ class RemoteHandQTool(BaseTool):
         }
 
     def _action_new_session(self, creds: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, Any]:
-        info = self._info(creds, params)
+        info = self._info_ensured(creds, params)
+        was_running = (
+            _daemon_alive(creds, info["handq_dir"])
+            and _read_state(creds, info["handq_dir"]).get("task_status") == "running"
+        )
         _ensure_daemon(creds, info, params.get("config_path", ""))
         self._post_command(creds, info["handq_dir"], {"action": "new_session"})
-        return {"success": True, "note": "Fresh session requested on the remote daemon."}
+        note = "Fresh session requested on the remote daemon."
+        if was_running:
+            note += (
+                " Warning: a task was in flight and has been aborted — "
+                "new_session tears down the old session entirely."
+            )
+        return {"success": True, "note": note}
 
     def _action_interrupt(self, creds: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, Any]:
         info = self._info(creds, params)
         if not _daemon_alive(creds, info["handq_dir"]):
             return {"success": False, "note": "Daemon not running; nothing to interrupt."}
+        was_running = _read_state(creds, info["handq_dir"]).get("task_status") == "running"
         self._post_command(creds, info["handq_dir"], {
             "action": "interrupt",
             "reason": params.get("reason", "remote interrupt"),
         })
-        return {"success": True, "note": "Interrupt queued; the in-flight task will be aborted and its pending tail cleared."}
+        if was_running:
+            note = "Interrupt queued; the in-flight task will be aborted and its pending tail cleared."
+        else:
+            note = "No task is in flight; cleared any pending tail (no-op if none)."
+        return {"success": True, "note": note}
 
     def _action_exit_handq(self, creds: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, Any]:
         info = self._info(creds, params)
         hk = _host_key(creds)
-        cmd = f"bash -c {_shq(info['launch'] + ' --exit 2>&1 || true')}"
-        _exec(creds, cmd, timeout=20.0)
+        _remote_bash(creds, info['launch'] + ' --exit 2>&1 || true', timeout=20.0)
         _discovery_cache.pop(hk, None)
         return {"success": True, "note": "Remote HandQ daemon shutdown requested."}
 
@@ -682,6 +1101,7 @@ class RemoteHandQTool(BaseTool):
             "task_status": state.get("task_status", ""),
             "status_text": state.get("status_text", ""),
             "session_id": state.get("session_id", ""),
+            "working_dir": state.get("working_dir", ""),
             "latest_tool": state.get("latest_tool"),
             "checklist": state.get("checklist", ""),
             "completed": state.get("completed", 0),

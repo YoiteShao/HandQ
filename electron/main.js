@@ -1128,8 +1128,8 @@ function createWindow() {
     const windowIcon = loadLogoImage();
 
     mainWindow = new BrowserWindow({
-        width: 1000,
-        height: 680,
+        width: 840,
+        height: 560,
         minWidth: 720,
         minHeight: 480,
         title: 'HandQ',
@@ -1272,6 +1272,7 @@ if (!gotLock) {
         seedUserConfigForVersion();
 
         pythonChild = spawnBridge();
+        spawnMentionSearch();
         ensureTray();
         createWindow();
 
@@ -1283,6 +1284,223 @@ if (!gotLock) {
                 mainWindow.focus();
             }
         });
+    });
+}
+
+// --- mention search worker (Windows SystemIndex via powershell.exe) --------
+//
+// A resident PowerShell child that answers renderer @-mention path queries by
+// running SQL over the Windows SystemIndex (ADODB, Provider=Search.CollatorDSO).
+// Same line-delimited JSON idiom as the Python bridge, but the response comes
+// back to `ipcMain.handle` directly (no reverse event bus) — this is a
+// self-contained side-channel that Python knows nothing about.
+//
+// If Search is disabled or the worker crashes past the restart budget the
+// feature goes dark for the rest of this app lifetime and the renderer just
+// stops showing the dropdown.
+
+// In dev, __dirname is the electron/ source dir. In the packaged app, main.js
+// runs from inside resources/app.asar, so __dirname resolves to a virtual asar
+// path that powershell.exe (an external process) cannot open. The script is
+// listed under `asarUnpack` in package.json so it also lands on real disk at
+// resources/app.asar.unpacked/mention_search.ps1 — point spawn there instead.
+const MENTION_SEARCH_SCRIPT = app.isPackaged
+    ? path.join(process.resourcesPath, 'app.asar.unpacked', 'mention_search.ps1')
+    : path.join(__dirname, 'mention_search.ps1');
+const MENTION_QUERY_TIMEOUT_MS = 1500;
+const MENTION_MAX_RESTARTS = 1;
+
+let mentionChild = null;
+let mentionReady = false;
+let mentionDisabled = false;
+let mentionRestarts = 0;
+const mentionPending = new Map();   // id → { resolve, timer }
+let mentionSeq = 0;
+
+function spawnMentionSearch() {
+    if (mentionDisabled) return;
+    logLine('MENTION', 'spawning powershell worker', {
+        script: MENTION_SEARCH_SCRIPT,
+    });
+    let child;
+    try {
+        child = spawn('powershell.exe', [
+            '-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass',
+            '-File', MENTION_SEARCH_SCRIPT,
+        ], {
+            stdio: ['pipe', 'pipe', 'pipe'],
+            windowsHide: true,
+        });
+    } catch (err) {
+        logLine('MENTION', 'spawn failed; disabling feature', {
+            err: err && err.message,
+        });
+        mentionDisabled = true;
+        return;
+    }
+    mentionChild = child;
+    mentionReady = false;
+
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    const rl = readline.createInterface({ input: child.stdout, crlfDelay: Infinity });
+
+    rl.on('line', (line) => {
+        const trimmed = line.trim();
+        if (!trimmed) return;
+        let evt;
+        try {
+            evt = JSON.parse(trimmed);
+        } catch (err) {
+            logLine('MENTION', 'malformed JSON from worker', {
+                err: err && err.message,
+                raw: trimmed.slice(0, 200),
+            });
+            return;
+        }
+        // Startup handshake — first line is {"ready":true|false}.
+        if (typeof evt.ready === 'boolean') {
+            mentionReady = evt.ready;
+            if (!evt.ready) {
+                logLine('MENTION', 'worker signalled unavailable', {
+                    error: evt.error,
+                });
+                mentionDisabled = true;
+            } else {
+                logLine('MENTION', 'worker ready');
+            }
+            return;
+        }
+        // Per-request response.
+        if (evt.id && mentionPending.has(evt.id)) {
+            const pending = mentionPending.get(evt.id);
+            mentionPending.delete(evt.id);
+            clearTimeout(pending.timer);
+            pending.resolve({
+                results: Array.isArray(evt.results) ? evt.results : [],
+                error: evt.error || null,
+            });
+        }
+    });
+
+    child.stderr.on('data', (chunk) => {
+        logLineDebug('MENTION-STDERR', String(chunk).trim());
+    });
+
+    child.on('error', (err) => {
+        logLine('MENTION', 'worker process error', { err: err && err.message });
+    });
+
+    child.on('exit', (code, signal) => {
+        logLine('MENTION', 'worker exited', {
+            code, signal, restarts: mentionRestarts, ready: mentionReady,
+        });
+        mentionReady = false;
+        // Drain pending resolvers so callers move on.
+        for (const [, pending] of mentionPending) {
+            clearTimeout(pending.timer);
+            pending.resolve({ results: [], error: 'worker_exit' });
+        }
+        mentionPending.clear();
+        mentionChild = null;
+
+        if (isShuttingDown || isQuitting) return;
+        if (mentionDisabled) return;
+        if (mentionRestarts >= MENTION_MAX_RESTARTS) {
+            logLine('MENTION', 'restart budget exhausted; disabling feature');
+            mentionDisabled = true;
+            return;
+        }
+        mentionRestarts += 1;
+        setTimeout(spawnMentionSearch, 250);
+    });
+}
+
+async function mentionSearch(query) {
+    if (mentionDisabled) return { results: [], disabled: true };
+    if (!mentionChild || !mentionReady) {
+        return { results: [], notReady: true };
+    }
+    if (!query || typeof query !== 'string' || query.length > 50) {
+        return { results: [] };
+    }
+    const id = 'm' + (++mentionSeq);
+    return await new Promise((resolve) => {
+        const timer = setTimeout(() => {
+            if (mentionPending.has(id)) {
+                mentionPending.delete(id);
+                resolve({ results: [], timedOut: true });
+            }
+        }, MENTION_QUERY_TIMEOUT_MS);
+        mentionPending.set(id, { resolve, timer });
+        try {
+            mentionChild.stdin.write(JSON.stringify({ id, query }) + '\n');
+        } catch (err) {
+            mentionPending.delete(id);
+            clearTimeout(timer);
+            resolve({ results: [], error: err && err.message });
+        }
+    });
+}
+
+// --- UNC / arbitrary-directory listing -------------------------------------
+//
+// Backs the mention dropdown when the query looks like a UNC path
+// (\\host\share\...). SystemIndex does not index network locations by
+// default, so we fall back to fs.readdir over the parent path and fuzzy-
+// filter by the trailing suffix. Wrapped in a Promise.race timeout so an
+// unreachable host doesn't hang the dropdown — SMB's own timeout is 60s+.
+
+const LIST_DIR_TIMEOUT_MS = 1500;
+const LIST_DIR_MAX_RESULTS = 20;
+
+function _fuzzyMatchSubsequence(query, name) {
+    // Case-insensitive sub-sequence: true if every char of `query` appears
+    // in `name` in order. Mirrors the "%q1%q2%..." SQL fuzzy pattern used
+    // by mention_search.ps1 so both branches feel identical to the user.
+    if (!query) return true;
+    const q = query.toLowerCase();
+    const n = name.toLowerCase();
+    let qi = 0;
+    for (let ni = 0; ni < n.length && qi < q.length; ni++) {
+        if (n[ni] === q[qi]) qi++;
+    }
+    return qi === q.length;
+}
+
+async function listDirectory(dir, filter) {
+    if (!dir || typeof dir !== 'string') return { results: [] };
+    return await new Promise((resolve) => {
+        let done = false;
+        const timer = setTimeout(() => {
+            if (done) return;
+            done = true;
+            resolve({ results: [], timedOut: true });
+        }, LIST_DIR_TIMEOUT_MS);
+        fs.promises.readdir(dir, { withFileTypes: true })
+            .then((entries) => {
+                if (done) return;
+                done = true;
+                clearTimeout(timer);
+                const results = [];
+                for (const e of entries) {
+                    if (!_fuzzyMatchSubsequence(filter || '', e.name)) continue;
+                    results.push({
+                        path: path.join(dir, e.name),
+                        name: e.name,
+                        parent: dir,
+                        isDir: e.isDirectory(),
+                    });
+                    if (results.length >= LIST_DIR_MAX_RESULTS) break;
+                }
+                resolve({ results });
+            })
+            .catch((err) => {
+                if (done) return;
+                done = true;
+                clearTimeout(timer);
+                resolve({ results: [], error: err && err.message });
+            });
     });
 }
 
@@ -1322,6 +1540,17 @@ ipcMain.handle('handq:setConfig', (_event, payload) => {
     return ok;
 });
 
+ipcMain.handle('handq:searchPaths', async (_event, payload) => {
+    const query = payload && payload.query;
+    return await mentionSearch(query);
+});
+
+ipcMain.handle('handq:listDirectory', async (_event, payload) => {
+    const dir = payload && payload.path;
+    const filter = payload && payload.filter;
+    return await listDirectory(dir, filter);
+});
+
 // Renderer/preload-originated log forwarding. Preload runs in an isolated
 // world and cannot write to fs directly; it forwards every log line to us so
 // all frontend logs land in a single file.
@@ -1330,6 +1559,18 @@ ipcMain.on('handq:log', (_event, payload) => {
     const component = payload.component || 'PRELOAD';
     const msg = payload.msg || '';
     logLine(component, msg, payload.extra);
+});
+
+// Debug-level variant — gated behind HANDQ_FRONTEND_DEBUG via logLineDebug so
+// the renderer's high-volume per-event firehose (onStatus per envelope,
+// reply_delta streaming) doesn't flood handq-frontend.log by default. The
+// renderer's window.__handqLog routes DEBUG here; INFO/WARN/ERROR go to
+// handq:log above and always persist.
+ipcMain.on('handq:logDebug', (_event, payload) => {
+    if (!payload || typeof payload !== 'object') return;
+    const component = payload.component || 'RENDER-DEBUG';
+    const msg = payload.msg || '';
+    logLineDebug(component, msg, payload.extra);
 });
 
 // Custom titlebar -> main control IPC. The window is frameless, so the
@@ -1361,11 +1602,11 @@ ipcMain.on('window:hide', () => {
 //   * Sizes are clamped to the current display's work area so the window
 //     doesn't spill onto an adjacent monitor.
 const AUTO_RESIZE_TABLE = [
-    { w: 1000, h: 680 },  // 1 card
-    { w: 1180, h: 720 },  // 2 cards
-    { w: 1360, h: 760 },  // 3 cards
-    { w: 1440, h: 820 },  // 4 cards
-    { w: 1560, h: 880 },  // 5 cards
+    { w: 840,  h: 560 },  // 1 card
+    { w: 1000, h: 600 },  // 2 cards
+    { w: 1140, h: 640 },  // 3 cards
+    { w: 1220, h: 680 },  // 4 cards
+    { w: 1320, h: 720 },  // 5 cards
 ];
 const AUTO_RESIZE_MAXIMIZE_AT = 6;
 
@@ -1520,6 +1761,12 @@ ipcMain.handle('dialog:pickSkillFile', async () => {
 app.on('before-quit', (event) => {
     isQuitting = true;
     globalShortcut.unregisterAll();
+    // Reap the mention search worker unconditionally — no state to flush,
+    // no grace budget needed.
+    if (mentionChild && mentionChild.exitCode === null) {
+        try { mentionChild.stdin.end(); } catch (_) { /* ignore */ }
+        try { mentionChild.kill(); } catch (_) { /* ignore */ }
+    }
     // Tear down the takeover overlay if a task is still mid-flight on shutdown.
     try { hideTakeoverOverlay(); } catch (_) { /* ignore */ }
     if (isShuttingDown) {

@@ -249,6 +249,25 @@ class ExecutionRecorder:
     # Backward-compat alias — V2 flow_controller still passes plan_id="persistent_session"
     write_plan_end = write_session_end
 
+    # ── User request (verbatim, one record per user send) ─────────────────────
+
+    def write_user_request(self, message: str) -> None:
+        """Record a verbatim user message as its own top-level record.
+
+        One record per user send — deliberately NOT folded into ITEM blocks.
+        Stored in full (no truncation): this is the user's raw prompt, the
+        ground truth from which the planner's item-instruction ``goal`` is
+        derived, so it must survive unflattened.
+        """
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        lines = [
+            "USER_REQUEST",
+            f"ts        : {now}",
+            self._multiline("message", message or ""),
+            _SEP, "",
+        ]
+        self._append("\n".join(lines))
+
     # ── Item header / footer ─────────────────────────────────────────────────
 
     def write_agent_start(
@@ -472,6 +491,7 @@ class ExecutionRecorder:
             "session_id": "", "goal": "", "status": "unknown",
             "started_at": "", "ended_at": None, "completion": "",
             "items": [],
+            "user_requests": [],
             "stats": {"total_items": 0, "completed_items": 0,
                       "failed_items": 0, "total_iters": 0},
         }
@@ -676,6 +696,13 @@ class ExecutionRecorder:
                     "status": "running",
                     "ts": fields.get("ts", ""),
                 }
+
+            # ── User request (verbatim, session-level) ───────────────────────
+            elif tag == "USER_REQUEST":
+                result["user_requests"].append({
+                    "ts": fields.get("ts", ""),
+                    "message": fields.get("message", ""),
+                })
 
             # ── Skip PLAN/REVIEW/VERIFY — older planner tags ─────────────────
             elif tag in ("PLAN", "REVIEW", "VERIFY"):

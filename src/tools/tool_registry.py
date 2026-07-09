@@ -467,6 +467,19 @@ JSON/YAML/CSV processing, conditionals, loops, error handling, anything
 beyond 2-3 piped commands. Easier to debug than PS object pipelines.
   e.g.  python -c "import json; d=json.load(open('a.json')); print(d['x'][0])"
 
+MULTILINE `python -c "..."` IN POWERSHELL — the double-quoted arg is parsed
+by PowerShell first (backticks, $var, embedded quotes), then by python. Two
+safe patterns instead of hoping the quoting works:
+  - Here-String: python -c @'
+    import json
+    print(json.load(open('a.json'))['x'])
+    '@                       # single-quoted, literal; closing '@ AT COL 0
+  - Temp file: write .py via the 'write' tool, then `python that_file.py`.
+    The temp-file route also handles non-ASCII code correctly.
+Symptom when you get this wrong:
+  "python.exe: ScriptBlock should only be specified as a value ..." — that's
+  PowerShell rejecting your string, not python.
+
 POWERSHELL 7+ ESSENTIALS
   Pipeline    | passes objects (not text) — use Select-Object/Where-Object
   Variables   | $var = "x";  $env:NAME for env vars (NOT bash's $VAR)
@@ -1532,7 +1545,7 @@ TOOL CHOICE HIERARCHY (read before EACH desktop call)
   browser. Read the verb-target pair carefully.
 
   PENALTY for misuse vs the correct tool:
-    - 5-10x slower (OCR ~1s + pyautogui PAUSE 50ms vs browser DOM ~50ms)
+    - 5-10x slower (OCR ~2.8s + pyautogui PAUSE 50ms vs browser DOM ~50ms)
     - Non-deterministic (OCR fuzzy match vs CSS selector exact)
     - Steals user's actual mouse / keyboard
     - Requires per-task user approval the first time
@@ -1555,6 +1568,24 @@ PREREQUISITES (the agent must NOT skip these)
      mouse / keyboard action. Sensitive-window guard checks the foreground
      before each action and refuses on banking / password manager match.
 
+COST HIERARCHY (measured on this platform — internalise before choosing an action)
+  The dominant cost in desktop work is the number of agent decision
+  ROUND-TRIPS (~4s each), not the primitive. Fewer rounds beats a faster
+  primitive every time. Measured per-primitive costs:
+    - snapshot (UIA tree)      ~170 ms   ← nearly free; this is your eyes
+    - input action (click/key) ~100 ms   + a state_after delta, no capture
+    - screenshot capture       ~200 ms
+    - OCR (find_element hit)   ~2.8 s    ← NOT cheap; ~16x a snapshot
+    - vision fallback          ~4 s      (OCR miss only; anthropic::claude-4-5-haiku)
+  Rule of thumb, cheapest-to-most-expensive intent:
+    snapshot  <  pywinauto-batch  <  find_and_click  <  find_element+OCR  <  vision
+
+  A 5-control native-app task costs, by strategy (simulated on measured costs):
+    - screenshot+OCR each, verify after   → ~20 rounds, ~97 s   (AVOID)
+    - snapshot + find_and_click per step   → ~7 rounds,  ~29 s
+    - snapshot once + ONE pywinauto batch  → ~2 rounds,  ~10 s   (PREFER for
+      native apps: collapse a whole click-sequence into a single shell call)
+
 WORKFLOW (typical)
   1. action='list_windows' — see what is open and which is foregrounded.
   2. action='snapshot' — STRUCTURED listing of every interactable control
@@ -1563,29 +1594,35 @@ WORKFLOW (typical)
      names work even on iconless buttons (gear / refresh / close X) —
      PREFER snapshot over screenshot+OCR 90% of the time. Falls back
      automatically to screenshot+OCR when UIA returns nothing (custom-
-     rendered Electron, games). ~100 ms on the UIA path.
-  3. **For native Windows apps, drop into pywinauto via shell** — once
-     snapshot tells you the target's name / automation_id, drive it
-     directly with one shell call instead of click_at + verification
-     loops:
+     rendered Electron, games). ~170 ms on the UIA path — treat it as free.
+  3. **PREFERRED for native Windows apps — batch the whole sequence into ONE
+     pywinauto shell call.** Once snapshot gives you the names /
+     automation_ids, do NOT drive click_at one control at a time (that is
+     one ~4s agent round PER control). Instead write a single shell call
+     that resolves and drives them all at once:
         shell: python -c "
         import pywinauto
         app = pywinauto.Application(backend='uia').connect(handle=<HWND>)
         win = app.window(handle=<HWND>)
         win.child_window(title='New Notebook', control_type='Button').click()
+        win.child_window(auto_id='NameEdit', control_type='Edit').set_text('X')
+        win.child_window(title='Create', control_type='Button').click()
         "
-     Deterministic, 5-10x faster than the screenshot/click/screenshot
-     loop, survives UI shifts. Reach for desktop.click_at only when
-     pywinauto cannot reach the target (canvas-rendered subregions,
-     custom controls, Electron apps without UIA).
+     Deterministic, survives UI shifts, and collapses N click rounds into 1.
+     Simulated ~3x faster than per-step find_and_click, ~10x faster than the
+     screenshot/click/screenshot loop. Reach for desktop.click_at only when
+     pywinauto cannot reach the target (canvas-rendered subregions, custom
+     controls, Electron apps without UIA).
   4. action='screenshot', region='foreground'[, with_ocr=true] — only
      when you actually need the PIXELS (vision_query input, sending the
      image to a vision LLM, debugging). Default to with_ocr=false now
      that snapshot covers the "what's on screen" question with a much
      smaller payload.
-  5. action='find_element' / 'find_and_click' — fallback when snapshot
-     missed the target or you only have a visual descriptor. Same OCR +
-     vision_fallback pipeline as before.
+  5. action='find_element' / 'find_and_click' — use when pywinauto is
+     overkill (a single click) or snapshot missed the target / you only
+     have a visual descriptor. Note the OCR pass alone is ~2.8s (≈16x a
+     snapshot), so on a control snapshot already named, a direct click_at
+     or pywinauto call is cheaper than round-tripping through find_element.
   6. action='hover_at', x, y — TOOLTIP READER. Move cursor to (x, y),
      wait ~800 ms for the Windows tooltip, OCR a 250×120 px region
      around the cursor, return text in 'nearby_text'. Use for
@@ -1662,11 +1699,14 @@ USER REVOKE (HARD)
 OCR vs VISION FALLBACK
   find_element first asks RapidOCR for every visible text region in the
   capture, then fuzzy-matches description with rapidfuzz token_set_ratio
-  (default threshold 70). On match: ~1 s, source='ocr'.
+  (default threshold 70). On match: ~2.8 s, source='ocr'.
   When OCR misses (visual-only descriptors like "the orange button" /
   "the icon shaped like a gear"), it falls back to a single LLM-vision
-  call (~5-7 s, source='vision'). Disable with vision_fallback=false
-  when you know the target is plain text.
+  call (~4 s, source='vision', anthropic::claude-4-5-haiku). Disable with
+  vision_fallback=false when you know the target is plain text.
+  Note: both paths are far more expensive than a snapshot (~170 ms). If
+  snapshot already named the control, click it directly — don't pay the
+  OCR round-trip to re-find what you can already see.
 
 EXAMPLES
   GOOD: action='list_windows'
