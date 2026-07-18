@@ -174,7 +174,7 @@ async def dispatch_scheduled_task(task) -> bool:  # type: ignore[no-untyped-def]
     2. Refuse if shutdown is in progress (``_shutdown_requested``).
     3. Otherwise mint a fresh ``sched-{uuid}`` session, build a
        FlowControllerV2 for it, run the goal through ``on_user_message``,
-       and block until the receptionist's reply returns. The session
+       and block until the coordinator's reply returns. The session
        remains mounted in the UI after completion so the user can see the
        execution record.
 
@@ -591,7 +591,7 @@ class _StdioUI:
     # ── Non-Protocol forwarders (called by IM via ``_ui_call``) ──────────
     # The V2 ``UIDelegate`` Protocol is intentionally minimal. These methods
     # receive events the Protocol doesn't list — the IM's ``_ui_call`` resolves
-    # them by string name and silently skips when missing. Tools / receptionist
+    # them by string name and silently skips when missing. Tools / coordinator
     # streaming hook here; renderer-side handlers stay unchanged.
 
     def notify_desktop_takeover_started(self, reason: str = "input_action") -> None:
@@ -630,30 +630,43 @@ class _StdioUI:
                "data": data if isinstance(data, dict) else {}},
               session_id=self._session_id)
 
-    def notify_checklist_changed(self, items: Any = None) -> None:
-        """Live checklist snapshot → renderer ``kind=checklist`` task panel.
+    def notify_task_plan_changed(self, items: Any = None) -> None:
+        """Live task-plan snapshot → renderer ``kind=task_plan`` panel.
         ``items`` is the list of ``{item_id, instruction, status}`` dicts from
-        ``SharedCheckList.get_ui_snapshot``; an empty list tells the renderer to
+        ``TaskChannel.get_ui_snapshot``; an empty list tells the renderer to
         drop the panel."""
-        _ui_logger.debug("notify_checklist_changed: %d item(s)",
+        _ui_logger.debug("notify_task_plan_changed: %d item(s)",
                          len(items) if isinstance(items, list) else 0)
-        _emit({"type": "status", "kind": "checklist",
+        _emit({"type": "status", "kind": "task_plan",
                "items": items if isinstance(items, list) else []},
               session_id=self._session_id)
 
-    def show_receptionist_thinking(self) -> None:
-        _emit({"type": "status", "kind": "receptionist_thinking_on"},
+    def notify_agent_todo_changed(self, todos: Any = None) -> None:
+        """Live snapshot of the agent's own todo → renderer ``kind=agent_todo``
+        panel. ``todos`` is the list of ``{content, status}`` dicts the agent
+        writes via the `todo_write` tool; an empty list tells the renderer to
+        drop the panel. Distinct from ``notify_task_plan_changed`` (that one
+        shows the Coordinator↔Agent IPC queue, which is at most one item —
+        this is the agent's own multi-step breakdown of that item)."""
+        _ui_logger.debug("notify_agent_todo_changed: %d item(s)",
+                         len(todos) if isinstance(todos, list) else 0)
+        _emit({"type": "status", "kind": "agent_todo",
+               "todos": todos if isinstance(todos, list) else []},
               session_id=self._session_id)
 
-    def clear_receptionist_thinking(self) -> None:
-        _emit({"type": "status", "kind": "receptionist_thinking_off"},
+    def show_coordinator_thinking(self) -> None:
+        _emit({"type": "status", "kind": "coordinator_thinking_on"},
               session_id=self._session_id)
 
-    def stream_receptionist_reply_chunk(self, text: str) -> None:
+    def clear_coordinator_thinking(self) -> None:
+        _emit({"type": "status", "kind": "coordinator_thinking_off"},
+              session_id=self._session_id)
+
+    def stream_coordinator_reply_chunk(self, text: str) -> None:
         _emit({"type": "status", "kind": "reply_delta", "text": str(text)},
               session_id=self._session_id)
 
-    def seal_receptionist_reply(self) -> None:
+    def seal_coordinator_reply(self) -> None:
         _emit({"type": "status", "kind": "reply_done"},
               session_id=self._session_id)
 
@@ -749,7 +762,7 @@ class _StdioUI:
             "tool": str(tool_name),
             "hint": str(hint),
         }
-        if str(tool_name) == "desktop":
+        if str(tool_name).startswith("desktop_") or str(tool_name) == "desktop":
             payload["scope"] = "task"
             payload["description"] = (
                 "The agent is requesting control of your desktop "
@@ -1288,6 +1301,7 @@ class StdioBridge:
                         str(msg.get("description") or ""),
                         str(msg.get("body") or ""),
                         standing=bool(msg.get("standing")),
+                        allowed_tools=msg.get("allowed_tools"),
                     )
                 elif msg_type == "skill_update":
                     name = str(msg.get("name") or "")
@@ -1304,6 +1318,7 @@ class StdioBridge:
                         description=msg.get("description"),
                         body=msg.get("body"),
                         standing=msg.get("standing"),
+                        allowed_tools=msg.get("allowed_tools"),
                         origin=SKILL_ORIGIN_USER,
                     )
                 elif msg_type == "skill_delete":
@@ -1489,9 +1504,9 @@ class StdioBridge:
                 flow = self._flows[sid]
                 if not flow.started:
                     await flow.start()
-                # ``on_user_message`` returns the receptionist's
+                # ``on_user_message`` returns the coordinator's
                 # reply string (sync conversational answer); background
-                # agent + planner work proceeds inside the flow's own
+                # agent work proceeds inside the flow's own
                 # asyncio tasks and emits status events through the IM
                 # delegate as it happens. ``final`` correlates with this
                 # request id; subsequent activity arrives as status events.
@@ -1637,6 +1652,7 @@ class StdioBridge:
                 schedule_str = (msg.get("schedule") or "").strip()
                 prompt_str = str(msg.get("prompt", ""))
                 dispatch_prompt = ""
+                inference_failed = False
                 if not schedule_str:
                     from src.infrastructure.scheduler.inferer import infer_schedule
                     # Single-use LLM service built from current config —
@@ -1644,6 +1660,10 @@ class StdioBridge:
                     config = self._load_config_dict()
                     result = await infer_schedule(prompt_str, config)
                     schedule_str = result.schedule
+                    # result.ok is False when inference failed and fell back to
+                    # daily 09:00 — surface it so the UI warns instead of the
+                    # user silently getting "tomorrow 9am" for "in 1 minute".
+                    inference_failed = not result.ok
                     # Empty dispatch_prompt = "use prompt verbatim at fire
                     # time"; honour that by leaving the field blank on the
                     # task. Avoids storing a redundant duplicate when the
@@ -1662,7 +1682,7 @@ class StdioBridge:
                 )
             except ScheduleSyntaxError as exc:
                 return {"ok": False, "error": str(exc)}
-            return {"ok": True, "task": t}
+            return {"ok": True, "task": t, "inference_failed": inference_failed}
 
         if msg_type == "cron_delete":
             tid = str(msg.get("task_id") or msg.get("id") or "")
@@ -1697,12 +1717,12 @@ class StdioBridge:
 
         Scheduled fires are just-another-user-message. ``ok`` passed to
         :meth:`Scheduler.notify_task_finished` therefore means "the
-        receptionist returned a reply without raising", NOT "the agent
+        coordinator returned a reply without raising", NOT "the agent
         finished its background work". The persistent flow has no per-task
-        completion signal — the planner / agent run continuously until the
-        next user message. If finer-grained tracking is needed later, hook
-        into ``SharedCheckList.on_item_done`` for the items the planner
-        spawned in response to this dispatch.
+        completion signal — the agent runs continuously until the next user
+        message. If finer-grained tracking is needed later, hook into
+        ``TaskChannel.on_item_done`` for the items enqueued in response to
+        this dispatch.
         """
         if self._shutdown_requested:
             logger.info(
@@ -1987,10 +2007,10 @@ class StdioBridge:
         for svc in self._services_by_session[session_id]:
             svc.on_server_error = _on_llm_server_error
 
-        # ``on_reply_to_user`` callback bound to this session so the receptionist
+        # ``on_reply_to_user`` callback bound to this session so the coordinator
         # reply lands on the correct chat tab.
         def _on_reply(text: str) -> None:
-            self._on_receptionist_reply(session_id, text)
+            self._on_coordinator_reply(session_id, text)
 
         flow = FlowControllerV2(
             llm_services=consolidated_services,
@@ -2061,9 +2081,9 @@ class StdioBridge:
         # without session_id. The renderer shows them as system bubbles
         # in the active tab.
 
-    def _on_receptionist_reply(self, session_id: str, text: str) -> None:
+    def _on_coordinator_reply(self, session_id: str, text: str) -> None:
         """``FlowControllerV2.on_reply_to_user`` callback. Emits the
-        receptionist's chat reply as a ``kind=reply`` status envelope so
+        coordinator's chat reply as a ``kind=reply`` status envelope so
         the renderer can render an assistant text bubble. Streaming
         (``reply_delta`` / ``reply_done``) is currently unwired — V2
         baseline emits the full reply once. session_id is closed-over when
@@ -2088,8 +2108,7 @@ class StdioBridge:
     #  (3) NO ORPHAN SUBPROCESSES on Windows. The shell tool spawns child
     #      processes with CREATE_NEW_PROCESS_GROUP. ``flow.cancel_all_tasks``
     #      cancels the asyncio tasks that own them; cooperative shutdown
-    #      via the orchestrator's planner_loop / agent's run_loop catches
-    #      CancelledError and drains.
+    #      via the agent's run_loop catches CancelledError and drains.
     #
     # Stragglers: if a child task ignores cancellation entirely, it survives
     # as a background coroutine. It can emit a short tail of status envelopes
@@ -2297,7 +2316,7 @@ class StdioBridge:
                 t0 = time.monotonic()
                 if flow is not None:
                     try:
-                        # ``flow.destroy()`` is async: it trips the checklist
+                        # ``flow.destroy()`` is async: it trips the TaskChannel
                         # interrupt event, cancels both run-loops, and awaits
                         # ``SessionContext.close()`` to tear down all per-session
                         # resources (browser / shells / SSH pool / desktop state /

@@ -37,11 +37,12 @@ class CandidateSource(str, Enum):
 
     - ``SESSION_COMPLETE``  : a task ended successfully. Mine durable user
       preferences (memory) and reusable team/project conventions (knowledge).
-    - ``SESSION_FAILED``    : a task ended in failure (planner gave up, or
+    - ``SESSION_FAILED``    : a task ended in failure (agent gave up, or
       progress tracker aborted). Knowledge ONLY; memory is hard-blocked
       because user actions on a failed run are not consent.
-    - ``RECEPTIONIST_TURN`` : per-message capture from receptionist eval.
-      Most user messages are skipped by triage; explicit preferences pass.
+    - ``RECEPTIONIST_TURN`` : per-message capture from the coordinator's
+      INTENT eval. Most user messages are skipped by triage; explicit
+      preferences pass.
     - ``MANUAL_REMEMBER``   : explicit ``/remember <text>`` command. P4.
       Higher trust than ambient sources; bias toward action='create'.
     - ``POST_COMMIT``       : git post-commit hook (P4). Captures project
@@ -394,6 +395,14 @@ class ScheduledTask:
     last_status: SchedulerTaskStatus = SchedulerTaskStatus.IDLE
     last_error: str = ""
     dispatch_prompt: str = ""
+    # durable=True  → persisted to scheduled_tasks.json, survives restart
+    #                 (the default; every UI-created task is durable).
+    # durable=False → session-only: kept in the live scheduler's memory and
+    #                 scheduled/listed normally, but never written to disk, so
+    #                 it vanishes when the bridge process exits. The agent's
+    #                 schedule_create defaults to False, matching Claude Code's
+    #                 CronCreate default (durable is opt-in).
+    durable: bool = True
     created_at: int = field(default_factory=lambda: int(time.time()))
     updated_at: int = field(default_factory=lambda: int(time.time()))
 
@@ -411,6 +420,7 @@ class ScheduledTask:
             "last_status": self.last_status.value,
             "last_error": self.last_error,
             "dispatch_prompt": self.dispatch_prompt,
+            "durable": self.durable,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -434,6 +444,7 @@ class ScheduledTask:
             last_status=status,
             last_error=str(d.get("last_error") or ""),
             dispatch_prompt=str(d.get("dispatch_prompt") or ""),
+            durable=bool(d.get("durable", True)),
             created_at=int(d.get("created_at") or int(time.time())),
             updated_at=int(d.get("updated_at") or int(time.time())),
         )

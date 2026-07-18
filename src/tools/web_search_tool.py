@@ -32,6 +32,7 @@ provider activation.
 """
 from __future__ import annotations
 
+import html
 import json
 import re
 import time
@@ -39,6 +40,8 @@ import urllib.parse
 from collections import OrderedDict
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional, Tuple
+
+import httpx
 
 from .base_tool import BaseTool, ToolResult
 from .browser_tool import evaluate_fetch, is_browser_available, _module_holder
@@ -50,7 +53,7 @@ from ..infrastructure.logger import get_logger
 _DEFAULT_LIMIT = 10
 _HARD_MAX_LIMIT = 25
 _DEFAULT_SNIPPET_MAX_CHARS = 300
-_DEFAULT_ORBIT_TIMEOUT_MS = 10_000
+_DEFAULT_ORBIT_TIMEOUT_MS = 30_000
 
 # Per-process cache for repeat (source, query, limit) lookups. Bounded LRU
 # with a 60s TTL — covers the common case where the agent re-runs the same
@@ -64,25 +67,32 @@ _DEFAULT_ORBIT_TIMEOUT_MS = 10_000
 # fetches don't collide on same_origin navigation).
 _QUERY_CACHE_TTL = 60.0
 _QUERY_CACHE_MAX = 50
-_query_cache: "OrderedDict[Tuple[str, str, int], Tuple[float, List[Dict[str, Any]]]]" = OrderedDict()
+# Cache key includes offset/cursor so paged results never collide with or
+# shadow page-1 results. Cached value is the full (hits, has_more,
+# next_cursor) tuple so a cache hit is transparent to pagination metadata.
+_CacheKey = Tuple[str, str, int, int, str]
+_CacheValue = Tuple[List[Dict[str, Any]], bool, Optional[str]]
+_query_cache: "OrderedDict[_CacheKey, Tuple[float, _CacheValue]]" = OrderedDict()
 
 
-def _cache_get(key: Tuple[str, str, int]) -> Optional[List[Dict[str, Any]]]:
-    """Return cached hits if present and unexpired; refresh LRU position."""
+def _cache_get(key: _CacheKey) -> Optional[_CacheValue]:
+    """Return cached (hits, has_more, next_cursor) if present and unexpired;
+    refresh LRU position."""
     entry = _query_cache.get(key)
     if entry is None:
         return None
-    timestamp, hits = entry
+    timestamp, value = entry
     if (time.time() - timestamp) > _QUERY_CACHE_TTL:
         _query_cache.pop(key, None)
         return None
     _query_cache.move_to_end(key)
-    return hits
+    return value
 
 
-def _cache_put(key: Tuple[str, str, int], hits: List[Dict[str, Any]]) -> None:
-    """Insert hits into the cache, evicting the oldest entry on overflow."""
-    _query_cache[key] = (time.time(), hits)
+def _cache_put(key: _CacheKey, value: _CacheValue) -> None:
+    """Insert a (hits, has_more, next_cursor) value, evicting the oldest
+    entry on overflow."""
+    _query_cache[key] = (time.time(), value)
     _query_cache.move_to_end(key)
     while len(_query_cache) > _QUERY_CACHE_MAX:
         _query_cache.popitem(last=False)
@@ -138,8 +148,26 @@ def _is_auth_failure(status: int, body: str) -> bool:
 
 
 def _strip_html(s: str) -> str:
-    """Cheap tag stripper for excerpt fields (Confluence highlights, SP <c0>)."""
-    return _HTML_TAG_RE.sub("", s or "").strip()
+    """Cheap tag stripper for excerpt fields (Confluence highlights, SP <c0>).
+
+    Also decodes HTML entities left behind after tag removal (e.g.
+    "Audio &amp; Streaming" -> "Audio & Streaming") — found via real
+    confluence/sharepoint data during 2026-07-17 E2E verification.
+    """
+    return html.unescape(_HTML_TAG_RE.sub("", s or "")).strip()
+
+
+_WHITESPACE_RE = re.compile(r"\s+")
+
+
+def _normalize_snippet(s: str) -> str:
+    """Collapse runs of whitespace (including NBSP, \\r\\n, multi-newline
+    table dumps) into single spaces. Found necessary via real data
+    2026-07-17: jira titles carried literal trailing NBSP bytes,
+    sharepoint/confluence snippets carried raw \\r\\n / multi-newline table
+    dumps — all pure noise for an LLM reader, none of it substantive content.
+    """
+    return _WHITESPACE_RE.sub(" ", s or "").strip()
 
 
 def _extract_sp_cells(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -173,6 +201,77 @@ class _AuthRequired(RuntimeError):
         )
 
 
+# ── Fast path: bare httpx using the live browser's real cookies ────────────
+#
+# evaluate_fetch's page.goto(origin) round trip exists purely to hold
+# cookies for the fetch() that follows — the actual API call is a single
+# GET. Verified live 2026-07-17 against real jira-dc.qualcomm.com,
+# qualcomm-confluence.atlassian.net, and qualcomm.sharepoint.com: a bare
+# httpx GET carrying the live session's real cookies gets an identical 200
+# + real JSON body, cutting per-call latency from ~2-6s (evaluate_fetch,
+# dominated by the goto) down to ~0.5-0.9s for jira/confluence. sharepoint's
+# win is smaller since its own backend reports 4+ seconds of server-side
+# search time regardless of fetch mechanism — the bottleneck there is
+# SharePoint's search latency, not ours.
+#
+# An earlier pass concluded sharepoint needed an unidentified CSRF/
+# X-RequestDigest token after seeing a 403 — that was wrong, caused by
+# testing with the stale on-disk shared/storage_state.json instead of the
+# live in-memory cookie jar. Cookies read via session.context.cookies()
+# (what this helper actually does) work fine; no token is needed.
+#
+# orbit has no JSON API at all (DOM-extract only) — it does not use this path.
+#
+# Lock scoping (2026-07-17): the httpx attempt touches NO DOM — it reads
+# holder.session (a plain attribute, not a critical section) and
+# session.context.cookies() (a Playwright API call, not a DOM op), then
+# fires an independent httpx.AsyncClient request. None of that needs
+# BrowserSessionHolder's lock, whose real job is serialising DOM operations
+# on the shared BrowserSession. So the httpx attempt runs lock-free —
+# concurrent jira/confluence/sharepoint calls genuinely run in parallel
+# instead of queueing. The lock is only acquired if/when this falls through
+# to evaluate_fetch (real page navigation), which DOES touch the DOM.
+_HTTPX_TIMEOUT_S = 30.0
+_BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0"
+)
+
+
+async def _fetch_direct_or_browser(
+    holder: Any, *, url: str, headers: Dict[str, str], cookie_url: str,
+) -> Dict[str, Any]:
+    """Try a bare httpx GET using the live browser's real cookies, without
+    holding the browser session lock (see module comment above). Falls back
+    to evaluate_fetch (real page navigation + in-page fetch(), under the
+    lock) on any failure. Returns the same ``{status, body}``-shaped dict
+    either path produces, so callers need no changes downstream of this call.
+    """
+    session = holder.session
+    if session is None:
+        raise RuntimeError(
+            "browser session is not launched. Call "
+            "browser.launch_browser before reusing the browser session."
+        )
+    try:
+        cookies = await session.context.cookies(urls=[cookie_url])
+        cookie_dict = {c["name"]: c["value"] for c in cookies}
+        async with httpx.AsyncClient(verify=False, timeout=_HTTPX_TIMEOUT_S) as client:
+            r = await client.get(
+                url, cookies=cookie_dict,
+                headers={**headers, "User-Agent": _BROWSER_UA},
+                follow_redirects=True,
+            )
+        return {"status": r.status_code, "body": r.text}
+    except Exception:
+        pass  # fall through to the locked browser path below
+
+    async with holder.acquire() as locked_session:
+        return await evaluate_fetch(
+            locked_session, url=url, method="GET", headers=headers, same_origin=True,
+        )
+
+
 class WebSearchTool(BaseTool):
     """Cross-source internal search. See module docstring for auth model."""
 
@@ -197,15 +296,16 @@ class WebSearchTool(BaseTool):
                 "enum": ["confluence", "jira", "sharepoint", "orbit"],
                 "description": (
                     "Which source to query. Choose ONE per call; agent can "
-                    "fan out by issuing parallel calls — note that calls "
-                    "serialise on the browser session lock under the hood, "
-                    "so 'parallel' fan-out is effectively sequential. Pick "
-                    "the most likely source first; recommended order when "
-                    "you do not know which: jira → sharepoint → orbit → "
-                    "confluence (confluence is the flakiest under SSO and "
-                    "should be tried last). Sources can be individually "
-                    "disabled in handq_config.yaml under "
-                    "web_search.sources.<name>.enabled."
+                    "fan out by issuing parallel calls — jira/confluence/"
+                    "sharepoint genuinely run concurrently (each independently "
+                    "reads live cookies + fires its own request); only orbit "
+                    "serialises on the browser session lock (real page "
+                    "navigation + DOM read). Pick the most likely source "
+                    "first; recommended order when you do not know which: "
+                    "jira → sharepoint → orbit → confluence (confluence is "
+                    "the flakiest under SSO and should be tried last). "
+                    "Sources can be individually disabled in "
+                    "handq_config.yaml under web_search.sources.<name>.enabled."
                 ),
             },
             "limit": {
@@ -213,6 +313,31 @@ class WebSearchTool(BaseTool):
                 "description": (
                     f"Max results to return. Default {_DEFAULT_LIMIT}. "
                     f"Hard cap {_HARD_MAX_LIMIT}; values above are clamped."
+                ),
+            },
+            "offset": {
+                "type": "integer",
+                "description": (
+                    "0-indexed starting position for pagination (default 0). "
+                    "jira/sharepoint/orbit: any value works (orbit rounds "
+                    "down to the nearest page boundary — page by multiples "
+                    "of limit for predictable results). confluence: this "
+                    "source paginates via an opaque cursor, not a numeric "
+                    "offset — pass offset=0 for the first page, then read "
+                    "'next_cursor' from the result and pass it back as the "
+                    "'cursor' parameter (not offset) to get the next page. "
+                    "Passing a nonzero offset to confluence without a prior "
+                    "cursor fails clearly rather than silently returning "
+                    "page 1 again."
+                ),
+            },
+            "cursor": {
+                "type": "string",
+                "description": (
+                    "confluence-only: the opaque 'next_cursor' value from a "
+                    "previous confluence search result, used to fetch the "
+                    "next page. Ignored by other sources (they use 'offset' "
+                    "instead)."
                 ),
             },
         },
@@ -273,6 +398,10 @@ class WebSearchTool(BaseTool):
         limit = int(raw_limit) if raw_limit is not None else default_limit
         limit = max(1, min(limit, max_limit))
 
+        raw_offset = kwargs.get("offset")
+        offset = max(0, int(raw_offset)) if raw_offset is not None else 0
+        cursor = kwargs.get("cursor") or None
+
         executors = {
             "confluence": self._search_confluence,
             "jira":       self._search_jira,
@@ -284,14 +413,15 @@ class WebSearchTool(BaseTool):
             return self._fail(params, start, f"unknown source {source!r}.")
 
         # Per-process cache lookup — skips the browser round-trip when the
-        # same (source, query, limit) was answered recently. Orbit isn't
-        # cached because its DOM-extract may legitimately change.
-        cache_key: Optional[Tuple[str, str, int]] = (
-            None if source == "orbit" else (source, query, limit)
+        # same (source, query, limit, offset, cursor) was answered recently.
+        # Orbit isn't cached because its DOM-extract may legitimately change.
+        cache_key: Optional[_CacheKey] = (
+            None if source == "orbit" else (source, query, limit, offset, cursor or "")
         )
         if cache_key is not None:
-            cached_hits = _cache_get(cache_key)
-            if cached_hits is not None:
+            cached = _cache_get(cache_key)
+            if cached is not None:
+                cached_hits, cached_has_more, cached_next_cursor = cached
                 return ToolResult(
                     success=True,
                     output={
@@ -299,6 +429,8 @@ class WebSearchTool(BaseTool):
                         "query": query,
                         "count": len(cached_hits),
                         "hits": cached_hits,
+                        "has_more": cached_has_more,
+                        "next_cursor": cached_next_cursor,
                         "cached": True,
                     },
                     tool_name=self.name,
@@ -307,12 +439,13 @@ class WebSearchTool(BaseTool):
                 )
 
         try:
-            async with self.holder.acquire() as session:
-                hits = await executor(session, query, limit, src_cfg)
+            hits, has_more, next_cursor = await executor(query, limit, offset, cursor, src_cfg)
         except _AuthRequired as exc:
             return self._fail(params, start, str(exc))
         except RuntimeError as exc:
-            # holder.acquire raises this when no session is launched.
+            # holder.acquire raises this when no session is launched;
+            # _search_confluence also raises this for a bad offset/cursor
+            # combination (see its docstring).
             return self._fail(
                 params, start,
                 f"{source}: {exc}",
@@ -326,15 +459,18 @@ class WebSearchTool(BaseTool):
             )
             return self._fail(params, start, f"{source}: {exc}")
 
-        # Snippet truncation — applied last so per-source parsers can see
-        # full excerpts during normalisation.
+        # Whitespace normalization + snippet truncation — applied last so
+        # per-source parsers can see full excerpts during normalisation.
         for h in hits:
-            if h.snippet and len(h.snippet) > snippet_max:
-                h.snippet = h.snippet[:snippet_max] + "…"
+            h.title = _normalize_snippet(h.title)
+            if h.snippet:
+                h.snippet = _normalize_snippet(h.snippet)
+                if len(h.snippet) > snippet_max:
+                    h.snippet = h.snippet[:snippet_max] + "…"
 
         hit_dicts = [h.to_dict() for h in hits]
         if cache_key is not None:
-            _cache_put(cache_key, hit_dicts)
+            _cache_put(cache_key, (hit_dicts, has_more, next_cursor))
 
         return ToolResult(
             success=True,
@@ -343,6 +479,8 @@ class WebSearchTool(BaseTool):
                 "query": query,
                 "count": len(hits),
                 "hits": hit_dicts,
+                "has_more": has_more,
+                "next_cursor": next_cursor,
             },
             tool_name=self.name,
             tool_parameters=params,
@@ -352,8 +490,21 @@ class WebSearchTool(BaseTool):
     # ── Per-source executors ─────────────────────────────────────────────────
 
     async def _search_confluence(
-        self, session: Any, query: str, limit: int, src_cfg: Dict[str, Any],
-    ) -> List[SearchHit]:
+        self, query: str, limit: int, offset: int, cursor: Optional[str],
+        src_cfg: Dict[str, Any],
+    ) -> Tuple[List[SearchHit], bool, Optional[str]]:
+        """Confluence paginates via an opaque cursor, NOT a numeric offset —
+        confirmed live 2026-07-17: this Atlassian Cloud instance's CQL
+        search endpoint silently ignores a plain `start` param (start=0 and
+        start=3 returned byte-identical `results`). The real mechanism is
+        the response's `_links.next` field, which carries an opaque `cursor`
+        token that must be forwarded verbatim to advance. There is no way
+        to jump to an arbitrary offset, so a nonzero `offset` without a
+        `cursor` is rejected with a clear error rather than silently
+        re-returning page 1 (the same silent-noise failure mode this
+        session's other fixes have been closing, not a pattern to repeat
+        at the tool layer).
+        """
         base_url = (src_cfg.get("base_url") or "https://qualcomm-confluence.atlassian.net").rstrip("/")
         api_path = src_cfg.get("api_path") or "/wiki/rest/api/search"
         # CQL: free-text against all content. Caller can pass a full CQL
@@ -364,12 +515,27 @@ class WebSearchTool(BaseTool):
         else:
             escaped = query.replace('"', '\\"')
             cql = f'text ~ "{escaped}"'
-        qs = urllib.parse.urlencode({"cql": cql, "limit": limit})
+
+        if cursor:
+            # Mirrors the exact shape observed in a real _links.next value:
+            # /rest/api/search?next=true&cursor=<opaque>&limit=N&cql=...
+            qs = urllib.parse.urlencode({
+                "next": "true", "cursor": cursor, "limit": limit, "cql": cql,
+            })
+        else:
+            if offset > 0:
+                raise RuntimeError(
+                    "confluence does not support an arbitrary numeric "
+                    "offset — pass cursor='<next_cursor from a previous "
+                    "confluence result>' instead to get the next page. "
+                    "offset is only valid as 0 (first page) for this source."
+                )
+            qs = urllib.parse.urlencode({"cql": cql, "limit": limit})
         url = f"{base_url}{api_path}?{qs}"
 
-        result = await evaluate_fetch(
-            session, url=url, method="GET",
-            headers={"Accept": "application/json"}, same_origin=True,
+        result = await _fetch_direct_or_browser(
+            self.holder, url=url, headers={"Accept": "application/json"},
+            cookie_url=base_url,
         )
         status = int(result.get("status") or 0)
         body = result.get("body") or ""
@@ -412,11 +578,24 @@ class WebSearchTool(BaseTool):
                 source="confluence",
                 last_modified=last_modified,
             ))
-        return hits
+
+        # Extract the opaque cursor token from _links.next (a relative URL
+        # like "/rest/api/search?next=true&cursor=<opaque>&limit=N&cql=...")
+        # so callers get back a plain token, not the full internal URL shape.
+        next_link = (data.get("_links") or {}).get("next")
+        next_cursor: Optional[str] = None
+        if next_link:
+            parsed_qs = urllib.parse.parse_qs(urllib.parse.urlparse(next_link).query)
+            cursor_values = parsed_qs.get("cursor")
+            if cursor_values:
+                next_cursor = cursor_values[0]
+        has_more = next_cursor is not None
+        return hits, has_more, next_cursor
 
     async def _search_jira(
-        self, session: Any, query: str, limit: int, src_cfg: Dict[str, Any],
-    ) -> List[SearchHit]:
+        self, query: str, limit: int, offset: int, cursor: Optional[str],
+        src_cfg: Dict[str, Any],
+    ) -> Tuple[List[SearchHit], bool, Optional[str]]:
         base_url = (src_cfg.get("base_url") or "https://jira-dc.qualcomm.com").rstrip("/")
         api_path = src_cfg.get("api_path") or "/rest/api/2/search"
 
@@ -432,12 +611,15 @@ class WebSearchTool(BaseTool):
             "jql": jql,
             "fields": "summary,description,updated,status,priority,assignee",
             "maxResults": limit,
+            # Real offset pagination — confirmed live 2026-07-17: startAt=3
+            # returns the next distinct 3 issues, no overlap with startAt=0.
+            "startAt": offset,
         })
         url = f"{base_url}{api_path}?{qs}"
 
-        result = await evaluate_fetch(
-            session, url=url, method="GET",
-            headers={"Accept": "application/json"}, same_origin=True,
+        result = await _fetch_direct_or_browser(
+            self.holder, url=url, headers={"Accept": "application/json"},
+            cookie_url=base_url,
         )
         status = int(result.get("status") or 0)
         body = result.get("body") or ""
@@ -464,7 +646,17 @@ class WebSearchTool(BaseTool):
             if not isinstance(desc_raw, str):
                 desc_raw = ""
             # Strip Jira wiki-markup macros: {color:red}foo{color}, {code}, etc.
-            desc_clean = re.sub(r"\{[^}]+\}", "", desc_raw).strip()
+            desc_clean = re.sub(r"\{[^}]+\}", "", desc_raw)
+            # [text|scheme://url] -> text ; bare [scheme://url] -> dropped
+            # entirely. Jira wiki-link syntax otherwise leaves a raw URL
+            # burning a large fraction of the snippet budget on a bare
+            # link instead of substantive text — found via real data
+            # 2026-07-17 (AUTORFI-18466's http(s) case, BLIP-169031/
+            # APTAUTOSH-37537's file:// UNC-path case — any URI scheme,
+            # not just http(s), so the pattern matches a generic
+            # "letters followed by ://" scheme rather than hardcoding http).
+            desc_clean = re.sub(r"\[([^|\]]*)\|[a-zA-Z][a-zA-Z0-9+.-]*://[^\]]+\]", r"\1", desc_clean)
+            desc_clean = re.sub(r"\[[a-zA-Z][a-zA-Z0-9+.-]*://[^\]]+\]", "", desc_clean).strip()
             updated = fields.get("updated") or ""
             full_url = f"{base_url}/browse/{key}" if key else base_url
             title = f"{key}: {summary}" if key else summary
@@ -475,11 +667,14 @@ class WebSearchTool(BaseTool):
                 source="jira",
                 last_modified=updated,
             ))
-        return hits
+        total = int(data.get("total") or 0)
+        has_more = (offset + len(hits)) < total
+        return hits, has_more, None
 
     async def _search_sharepoint(
-        self, session: Any, query: str, limit: int, src_cfg: Dict[str, Any],
-    ) -> List[SearchHit]:
+        self, query: str, limit: int, offset: int, cursor: Optional[str],
+        src_cfg: Dict[str, Any],
+    ) -> Tuple[List[SearchHit], bool, Optional[str]]:
         base_url = (src_cfg.get("base_url") or "https://qualcomm.sharepoint.com").rstrip("/")
         api_path = src_cfg.get("api_path") or "/_api/search/query"
 
@@ -492,6 +687,9 @@ class WebSearchTool(BaseTool):
             "querytext": f"'{escaped_q}'",
             "rowlimit": limit,
             "selectproperties": f"'{select_props}'",
+            # Real offset pagination — confirmed live 2026-07-17: startrow=3
+            # returns distinct titles with no overlap against startrow=0.
+            "startrow": offset,
         })
         url = f"{base_url}{api_path}?{qs}"
 
@@ -500,10 +698,10 @@ class WebSearchTool(BaseTool):
         # so) made the search service return HTTP 500 "Unknown Error".
         # ``odata=nometadata`` flattens the response so callers don't wade
         # through __metadata wrappers.
-        result = await evaluate_fetch(
-            session, url=url, method="GET",
+        result = await _fetch_direct_or_browser(
+            self.holder, url=url,
             headers={"Accept": "application/json;odata=nometadata"},
-            same_origin=True,
+            cookie_url=base_url,
         )
         status = int(result.get("status") or 0)
         body = result.get("body") or ""
@@ -517,12 +715,8 @@ class WebSearchTool(BaseTool):
             raise RuntimeError(f"sharepoint returned non-JSON ({len(body)} bytes): "
                 f"{(body[:200] or '<empty body>')!r}")
 
-        rows = (
-            ((data.get("PrimaryQueryResult") or {})
-             .get("RelevantResults") or {})
-            .get("Table", {})
-            .get("Rows")
-        ) or []
+        relevant = ((data.get("PrimaryQueryResult") or {}).get("RelevantResults") or {})
+        rows = (relevant.get("Table", {}) or {}).get("Rows") or []
 
         hits: List[SearchHit] = []
         for row in rows[:limit]:
@@ -542,18 +736,23 @@ class WebSearchTool(BaseTool):
                 source="sharepoint",
                 last_modified=last_modified,
             ))
-        return hits
+        # TotalRows (confirmed live 2026-07-17: deduped total-match count,
+        # distinct from TotalRowsIncludingDuplicates) drives has_more.
+        total_rows = int(relevant.get("TotalRows") or 0)
+        has_more = (offset + len(hits)) < total_rows
+        return hits, has_more, None
 
     async def _search_orbit(
-        self, session: Any, query: str, limit: int, src_cfg: Dict[str, Any],
-    ) -> List[SearchHit]:
+        self, query: str, limit: int, offset: int, cursor: Optional[str],
+        src_cfg: Dict[str, Any],
+    ) -> Tuple[List[SearchHit], bool, Optional[str]]:
         # Orbit has no documented JSON API in this project — DOM-extract is
-        # the fallback. The selector is configurable so it can be tuned
-        # without code changes when the portal markup shifts.
+        # the fallback, so unlike the other three sources it always needs
+        # the browser session lock (real page navigation + DOM read).
         base_url = (src_cfg.get("base_url") or "https://orbit").rstrip("/")
         template = src_cfg.get("search_url_template") or "https://orbit/?q={q}"
         result_selector = src_cfg.get("result_selector") or "a"
-        # 10s default keeps stalled-DNS failures actionable. Override via
+        # 30s default keeps stalled-DNS failures actionable. Override via
         # web_search.sources.orbit.timeout_ms when the portal is genuinely slow.
         goto_timeout_ms = int(src_cfg.get("timeout_ms") or _DEFAULT_ORBIT_TIMEOUT_MS)
 
@@ -562,68 +761,98 @@ class WebSearchTool(BaseTool):
         except Exception as exc:
             raise RuntimeError(f"orbit search_url_template invalid: {exc}")
 
-        tab_id = session.first_tab_id()
-        if tab_id is None:
-            page = await session.context.new_page()
-            tab_id = session.mint_tab_id()
-            session.tabs[tab_id] = page
-        else:
-            page = session.tabs[tab_id]
+        # Orbit paginates by 1-indexed page number, not raw offset — confirmed
+        # live 2026-07-17: &page=2 returned 10 distinct real CR numbers with
+        # zero overlap against page 1. Only exact multiples of `limit` land
+        # on a page boundary (documented in the schema's offset description).
+        page_num = (offset // limit) + 1
+        if page_num > 1:
+            separator = "&" if "?" in search_url else "?"
+            search_url = f"{search_url}{separator}page={page_num}"
 
-        try:
-            await page.goto(
-                search_url, wait_until="domcontentloaded", timeout=goto_timeout_ms,
-            )
-        except Exception as exc:
-            raise RuntimeError(f"orbit navigate {search_url} failed: {exc}")
+        async with self.holder.acquire() as session:
+            tab_id = session.first_tab_id()
+            if tab_id is None:
+                page = await session.context.new_page()
+                tab_id = session.mint_tab_id()
+                session.tabs[tab_id] = page
+            else:
+                page = session.tabs[tab_id]
 
-        # SSO redirect detection — if the user isn't logged in, orbit will
-        # bounce to the corporate IdP. Use the post-navigation URL as the
-        # signal; same body markers used elsewhere.
-        landed = (page.url or "").lower()
-        for marker in _SSO_BODY_MARKERS:
-            if marker in landed:
-                raise _AuthRequired("orbit", base_url, 302)
+            try:
+                await page.goto(
+                    search_url, wait_until="domcontentloaded", timeout=goto_timeout_ms,
+                )
+            except Exception as exc:
+                raise RuntimeError(f"orbit navigate {search_url} failed: {exc}")
 
-        js = """
-            ({selector, limit, baseUrl}) => {
-                const items = [];
-                const els = document.querySelectorAll(selector);
-                for (let i = 0; i < els.length && items.length < limit; i++) {
-                    const a = els[i];
-                    if (!a || !a.href) continue;
-                    const title = (a.innerText || a.textContent || '').trim().slice(0, 200);
-                    if (!title) continue;
-                    let snippet = '';
-                    let parent = a.closest('.search-result, .result, article, li, .card');
-                    if (!parent) parent = a.parentElement;
-                    if (parent) {
-                        const sib = parent.querySelector(
-                            '.summary, .snippet, .description, p'
-                        );
-                        if (sib && sib !== a) {
-                            snippet = (sib.innerText || sib.textContent || '')
-                                .trim().slice(0, 500);
+            # SSO redirect detection — if the user isn't logged in, orbit will
+            # bounce to the corporate IdP. Use the post-navigation URL as the
+            # signal; same body markers used elsewhere.
+            landed = (page.url or "").lower()
+            for marker in _SSO_BODY_MARKERS:
+                if marker in landed:
+                    raise _AuthRequired("orbit", base_url, 302)
+
+            js = """
+                ({selector, limit, baseUrl}) => {
+                    const items = [];
+                    const els = document.querySelectorAll(selector);
+                    for (let i = 0; i < els.length && items.length < limit; i++) {
+                        const a = els[i];
+                        if (!a || !a.href) continue;
+                        const title = (a.innerText || a.textContent || '').trim().slice(0, 200);
+                        if (!title) continue;
+                        let snippet = '';
+                        let parent = a.closest('.search-result, .result, article, li, .card');
+                        if (!parent) parent = a.parentElement;
+                        // Real orbit structure: a sibling `.description` div
+                        // under the same .search-result parent holds the
+                        // actual description text (confirmed via live DOM
+                        // probe 2026-07-17). Check this first.
+                        if (parent) {
+                            const descSibling = parent.querySelector('.description');
+                            if (descSibling) {
+                                snippet = (descSibling.innerText || descSibling.textContent || '')
+                                    .trim().slice(0, 500);
+                            }
                         }
+                        // Generic fallback for other portal layouts / selector
+                        // overrides that don't match this exact shape.
+                        if (!snippet && parent) {
+                            const sib = parent.querySelector('.summary, .snippet, p');
+                            if (sib && sib !== a) {
+                                snippet = (sib.innerText || sib.textContent || '')
+                                    .trim().slice(0, 500);
+                            }
+                        }
+                        items.push({title, url: a.href, snippet});
                     }
-                    items.push({title, url: a.href, snippet});
+                    return items;
                 }
-                return items;
-            }
-        """
-        try:
-            raw = await page.evaluate(
-                js,
-                {"selector": result_selector, "limit": limit, "baseUrl": base_url},
-            )
-        except Exception as exc:
-            raise RuntimeError(f"orbit DOM extract failed: {exc}")
+            """
+            try:
+                raw = await page.evaluate(
+                    js,
+                    {"selector": result_selector, "limit": limit, "baseUrl": base_url},
+                )
+            except Exception as exc:
+                raise RuntimeError(f"orbit DOM extract failed: {exc}")
 
         hits: List[SearchHit] = []
         for r in raw or []:
             url_val = (r.get("url") or "").strip()
             title_val = (r.get("title") or "").strip()
             if not url_val or not title_val:
+                continue
+            # Defense-in-depth: the default result_selector is now
+            # `a.request-link`, which already excludes the portal's own
+            # "create new CR" shortcuts (/CR/Create/Bug etc., bare <a> with
+            # no class, confirmed via live DOM probe 2026-07-17) at the
+            # selector level. This URL-substring check stays as a cheap
+            # secondary filter in case a custom selector override ever
+            # matches one of those chrome links too.
+            if "/Create/" in url_val:
                 continue
             hits.append(SearchHit(
                 title=title_val,
@@ -632,7 +861,11 @@ class WebSearchTool(BaseTool):
                 source="orbit",
                 last_modified=None,
             ))
-        return hits
+        # No total-count signal was found on the page during probing (no
+        # "N results" text) — heuristic only: a full page of `limit` hits
+        # suggests more may exist; an under-full page is treated as the last.
+        has_more = len(hits) >= limit
+        return hits, has_more, None
 
     # ── Helpers ──────────────────────────────────────────────────────────────
 

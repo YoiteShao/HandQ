@@ -16,48 +16,12 @@ to be worth pushing into LTM. Both are deliberately simple:
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional, Set, Tuple
+from typing import Any, Optional, Set
 
 _logger = logging.getLogger("handq.activity.diff")
 
 
 # ── Perceptual hash ────────────────────────────────────────────────────────
-
-
-def perceptual_hash(image_path: str, *, downsample_px: int = 16) -> Optional[int]:
-    """Return a 256-bit dHash-style fingerprint as a Python int, or None.
-
-    Implementation: load with Pillow, convert to grayscale, resize to
-    ``downsample_px x downsample_px``, compute the mean pixel value,
-    then bit-pack ``pixel >= mean`` for each cell.
-
-    Why mean threshold rather than dHash row-difference: mean tolerates
-    one bright element appearing without flipping the entire fingerprint
-    (e.g. a notification balloon). For our "is this the same idle screen?"
-    use case, that's the right tradeoff.
-    """
-    try:
-        from PIL import Image
-    except Exception:
-        return None
-    try:
-        with Image.open(image_path) as im:
-            small = im.convert("L").resize(
-                (downsample_px, downsample_px), Image.NEAREST,
-            )
-            data = list(small.getdata())
-    except Exception:
-        _logger.debug("perceptual_hash open failed for %s", image_path,
-                      exc_info=True)
-        return None
-    if not data:
-        return None
-    mean = sum(data) / len(data)
-    bits = 0
-    for i, v in enumerate(data):
-        if v >= mean:
-            bits |= (1 << i)
-    return bits
 
 
 def perceptual_hash_array(
@@ -160,16 +124,3 @@ def excerpt(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
     return text[:max_chars].rstrip() + "…"
-
-
-def short_signature(image_path: str) -> Tuple[Optional[int], Optional[float]]:
-    """Return (perceptual_hash, file_size_bytes) for diagnostics. Either
-    field may be None on failure; caller decides whether to proceed.
-    """
-    import os
-    h = perceptual_hash(image_path)
-    try:
-        sz = float(os.path.getsize(image_path))
-    except OSError:
-        sz = None
-    return h, sz

@@ -1,25 +1,25 @@
 """
-PersistentAgent — long-lived agent loop driven by SharedCheckList.
+PersistentAgent — long-lived agent loop driven by TaskChannel.
 
 Implements the Observe-Think-Act loop directly with streaming tool dispatch.
 
 Feature set:
   - Full PTL recovery (semantic compaction → hard half-drop → retry)
   - IterationAdvisor (anti-repeat guard + parallelism nudge + stagnation detection)
-  - Execution recorder (agent_start / write_iteration / agent_end per item)
-  - Progressive tool loading via checklist callbacks
+  - Execution recorder (agent_start / write_turn / agent_end per item)
+  - Progressive tool loading via task-channel callbacks
   - Interrupt handling at iteration level
   - Per-item static context: item description + provider hint + LTM recall
     (persistent fields, rebuilt into instruction every turn)
   - Effective obs budget (subtracts prelude/summary/item-static overhead)
-  - Cross-item boundary view via SharedCheckList.get_recent_results_for_agent
+  - Cross-item boundary view via TaskChannel.get_recent_results_for_agent
   - User confirmation via InteractionManager (risk + tool-specific)
   - Stale-snapshot supersession
 """
 import asyncio
 import json
 import re
-from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional, Set, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
 
 from ..infrastructure.anthropic_streaming_service import (
     StreamDoneEvent,
@@ -30,13 +30,13 @@ from ..infrastructure.llm_service import LLMChatResult, LLMService
 from ..infrastructure.logger import get_logger
 from ..infrastructure.config_manager import ConfigManager
 from ..infrastructure.execution_recorder import ExecutionRecorder
-from ..infrastructure.utils import try_parse_json
 from ..models.token_usage import TokenUsage
 from ..tools.base_tool import BaseTool, ToolResult
 from ..tools.tool_registry import ToolRegistry
+from ..tools.shell_tool import looks_read_only
 
 from .interaction_manager import InteractionManager
-from .shared_checklist import SharedCheckList, CheckListItem, ItemResult, INTERRUPTED_BY_PLANNER
+from .task_channel import TaskChannel, TaskSpec, TaskResult, INTERRUPTED_BY_COORDINATOR
 from .risk_check import is_high_risk, get_risk_description, is_path_within_working_dir
 from .user_confirmation import UserConfirmation
 
@@ -55,14 +55,14 @@ from .agent_utils import (
     format_tool_entry,
     resolve_obs_budget,
     SUPERSEDABLE_TOOL_ACTIONS,
+    extract_self_extension_fields,
 )
+from ..infrastructure.utils import try_parse_json_with_repair_flag
 from .agent_prompts import (
     AGENT_SYSTEM_PROMPT,
     COMPACT_CONVERSATION_PROMPT,
-    PROGRESS_WATCHER_PROMPT,
     get_platform_context,
 )
-from .coding_hint import HINT_ONLY_PROVIDER_NAMES
 
 # Desktop confirmation helpers — imported eagerly so packaging tools can
 # statically discover the dependency and any breakage surfaces at startup.
@@ -75,27 +75,13 @@ from ..tools.desktop_tool import (
 
 MAX_ITEM_ITERATIONS = 999
 
-# Observation rendering tiers: the LATEST turn keeps full results (LLM hasn't
-# digested it yet). The next FULL_OBS_RECENT_TURNS get compressed observations.
-# Older turns keep only the assistant reasoning (observations dropped).
-FULL_OBS_RECENT_TURNS = 3
-
-# Tier-1 watcher hysteresis gate. The Tier-0 no-progress streak counts turns
-# past its own small (~3-turn) threshold; requiring the streak to reach this
-# value before spending a (cheap, fire-and-forget) watcher LLM call enforces
-# the ">=2 re-checks past Tier-0" hysteresis from the design — so a brief stall
-# never escalates, only a sustained one does.
-WATCHER_STREAK_GATE = 2
-
-PreItemHintProvider = Callable[[CheckListItem], Union[str, Awaitable[str]]]
-
 
 class PersistentAgent:
     """V2 persistent agent — fully self-contained, no RuntimeAgent inheritance.
 
     Session lifecycle:
       - Created once at session start
-      - run_loop() blocks indefinitely, processing items from CheckList
+      - run_loop() blocks indefinitely, processing items from the TaskChannel
       - Between items, blocks on wait_for_current_item()
       - Loop only exits via CancelledError (flow teardown)
     """
@@ -103,17 +89,15 @@ class PersistentAgent:
     def __init__(
         self,
         llm_services: List[LLMService],
-        checklist: SharedCheckList,
+        task_channel: TaskChannel,
         working_directory: Optional[str] = None,
         storage_directory: Optional[str] = None,
         max_item_iterations: int = MAX_ITEM_ITERATIONS,
         config_manager: Optional[ConfigManager] = None,
         execution_recorder: Optional[ExecutionRecorder] = None,
         interaction_manager: InteractionManager = None,  # required, see check below
-        pre_item_hint_provider: Optional[PreItemHintProvider] = None,
         ctx: Optional["SessionContext"] = None,
         expose_session_storage_in_prompt: bool = True,
-        helper_services: Optional[List[LLMService]] = None,
     ):
         if not llm_services:
             raise ValueError("llm_services must contain at least one LLMService")
@@ -138,16 +122,6 @@ class PersistentAgent:
         self._services: List[LLMService] = list(llm_services)
         self._obs_budget_chars: int = resolve_obs_budget(self._services[0].context_window)
 
-        # Cheap auxiliary pool for the Tier-1 progress watcher. Kept SEPARATE
-        # from self._services so the watcher's LLM call shares no stream state
-        # with _think_streaming (independent service objects). Empty/None
-        # disables the watcher; Tier-0 mechanical sense still runs.
-        self._helper_services: List[LLMService] = list(helper_services or [])
-        # Fire-and-forget watcher handle + in-flight guard. Never awaited on the
-        # agent's critical path; cancelled + cleared at each item boundary.
-        self._watcher_task: Optional[asyncio.Task] = None
-        self._watcher_inflight: bool = False
-
         # Conversation state (replaces old _observations/_assistant_messages/_obs_group_sizes).
         # Out-of-band events (background-task completions, context-truncation
         # notices) are persisted into _turns via _persist_event_observations
@@ -161,13 +135,30 @@ class PersistentAgent:
         self.tools: Dict[str, BaseTool] = ToolRegistry.create_all_tool_instances(ctx=ctx)
         self._api_tools: List[Dict[str, Any]] = ToolRegistry.generate_tools_for_api()
 
+        # Wire the spawn_agent / fan_out_agents tools' runtime: both reuse
+        # THIS agent's LLM fallback chain and tool instances to run isolated
+        # sub-loops, so their reads/writes never enter this agent's own
+        # _turns. Bound here (post-construction) because the tools need live
+        # references, not registry metadata.
+        for _sub_name in ("spawn_agent", "fan_out_agents"):
+            _sub = self.tools.get(_sub_name)
+            if _sub is not None and hasattr(_sub, "bind_runtime"):
+                try:
+                    _sub.bind_runtime(self._services, self.tools)
+                except Exception:
+                    pass
+
         # Legacy interrupt-event post-injection — kept ONLY for ctx=None paths.
         # When ctx is supplied the tools already have the event from their
         # own __init__ pulling ctx.interrupt_event.
         if ctx is None:
-            interrupt_event = checklist._interrupt_event
+            interrupt_event = task_channel._interrupt_event
             if interrupt_event is not None:
-                for tool_name in ("shell", "session"):
+                for tool_name in (
+                    "shell",
+                    "live_shell_open", "live_shell_exec", "live_shell_write",
+                    "live_shell_read", "live_shell_list", "live_shell_close",
+                ):
                     tool = self.tools.get(tool_name)
                     if tool is not None:
                         tool.interrupt_event = interrupt_event  # type: ignore[attr-defined]
@@ -185,11 +176,10 @@ class PersistentAgent:
         self._conversation_summary: Optional[str] = None
 
         # Per-item static context — set in _execute_item, consumed by every
-        # _build_messages call until the next item begins. Keeps
-        # expected_outcomes / SSH credentials / LTM hints visible for the whole
-        # multi-iteration item instead of being shown only on the first turn.
+        # _build_messages call until the next item begins. Keeps the task
+        # instruction / LTM hints visible for the whole multi-iteration item
+        # instead of being shown only on the first turn.
         self._current_item_block: Optional[str] = None
-        self._current_item_hint: Optional[str] = None
         self._current_ltm_block: Optional[str] = None
 
         # Safety (stateless — no RiskGuard instance needed)
@@ -208,7 +198,7 @@ class PersistentAgent:
         # Session-wide monotonic turn counter (NOT per-item). Incremented once
         # per LLM turn for the lifetime of the agent. Used for:
         #   - log line disambiguation across items ([42][Act] ...)
-        #   - ExecutionRecorder.write_iteration's iteration field, paired with
+        #   - ExecutionRecorder.write_turn's `turn` field, paired with
         #     step_id so records are unique within a session
         #   - InteractionManager turn IDs visible to UI
         # Per-item iteration count lives in `_item_loop`'s local `iteration`.
@@ -216,28 +206,42 @@ class PersistentAgent:
         self._current_item_turn_count: int = 0
         self.logger = get_logger()
 
-        # Recorder / UI / Checklist
+        # Per-build scratch for the ExecutionRecorder's incremental trace:
+        # `_last_build_retiered` carries the observation-elision events from
+        # this build's _microcompact_old_outputs pass (what got compressed
+        # this turn); `_last_build_totals` carries the total context size.
+        # Both read at the write_turn call site. Reset each build.
+        self._last_build_retiered: List[Dict[str, Any]] = []
+        self._last_build_totals: Dict[str, Any] = {}
+        # Fires once per session: the first turn's full, untruncated message
+        # list (system + skill prelude + turn trace + tools) is snapshotted
+        # to ExecutionRecorder before any content could have been elided or
+        # prefix-cached away — the one moment the "complete picture" the
+        # incremental per-turn `appended` records don't carry on their own.
+        self._first_request_logged: bool = False
+
+        # Recorder / UI / TaskChannel
         self.execution_recorder: Optional[ExecutionRecorder] = execution_recorder
         self._interaction_manager: InteractionManager = interaction_manager
 
-        self._checklist = checklist
+        self._task_channel = task_channel
         self._max_item_iterations = max_item_iterations
         # Item counters split by outcome so logs/metrics distinguish
         # "we ran N items" from "M of them succeeded".
         self._total_items_processed = 0
         self._total_items_succeeded = 0
         self._total_items_failed = 0
-        self._total_token_usage = TokenUsage()
 
-        # Pre-item hint provider
-        self._pre_item_hint_provider: Optional[PreItemHintProvider] = pre_item_hint_provider
 
         # Skills / tools injection tracking
         self._loaded_tools: Set[str] = set()
         # Tools the agent has explicitly released for visibility purposes.
         # Loaded resources stay warm — see _apply_self_extension /
-        # _regenerate_api_tools. Re-claiming a hidden tool removes it from
-        # this set in the same turn (0 ms — no bootstrap).
+        # _regenerate_api_tools. Re-claiming a hidden tool clears it from
+        # this set immediately when the claim is processed (right after the
+        # turn that issued it finishes) — no re-instantiation needed, just a
+        # set removal — but the tool only reappears in self._api_tools, and
+        # so becomes callable, starting the NEXT turn's request.
         self._hidden_tools: Set[str] = set()
 
         # Skills follow the progressive-disclosure model (mirrors Claude Code):
@@ -247,9 +251,9 @@ class PersistentAgent:
         # _render_skill_prelude), so panel toggles take effect immediately and
         # the agent pulls non-standing skill bodies on demand via read_skill.
 
-        # Subscribe to checklist state changes (tools only — skills are no
+        # Subscribe to task-channel state changes (tools only — skills are no
         # longer pushed; see _render_skill_prelude).
-        self._checklist.on_tools_changed(self._handle_tools_added)
+        self._task_channel.on_tools_changed(self._handle_tools_added)
 
         # Build system prompt with environment info (static for session lifetime)
         env_parts = []
@@ -270,7 +274,17 @@ class PersistentAgent:
                 "Discovery Results', which may go to your OS temp directory."
             )
         env_parts.append(get_platform_context())
-        self._system_prompt = AGENT_SYSTEM_PROMPT + "\n\n---\n## Environment\n\n" + "\n".join(env_parts)
+        if self._services:
+            env_parts.append(f"You are powered by the model: {self._services[0].model}")
+        # Sent as TWO separate system blocks (not one concatenated string) so
+        # the send layer (_build_api_kwargs) can cache-anchor the stable
+        # identity/behavior block independently of the Environment block,
+        # which is session-static but changes more often across deployments
+        # than the core prompt does. Mirrors Claude Code's practice of
+        # keeping the system prompt as named, independently-cacheable
+        # sections rather than one opaque string.
+        self._system_prompt_core = AGENT_SYSTEM_PROMPT
+        self._system_prompt_env = "## Environment\n\n" + "\n".join(env_parts)
 
     # ── Public API ───────────────────────────────────────────────────────────
 
@@ -279,7 +293,7 @@ class PersistentAgent:
         self.logger.info("Persistent agent loop started", component="PersistentAgent")
         try:
             while True:
-                item = await self._checklist.wait_for_current_item()
+                item = await self._task_channel.wait_for_current_item()
                 await self._execute_item(item)
         except asyncio.CancelledError:
             self.logger.info(
@@ -296,7 +310,14 @@ class PersistentAgent:
     def _log_observations(self, results: List[ToolResult]) -> None:
         """Log tool results for diagnostics."""
         for obs in results:
-            output_str = str(obs.output)
+            # On failure, .output is normally None and the real diagnostic
+            # text lives in .error — logging str(obs.output) alone renders
+            # every failure as the same uninformative "Output(len=4): None"
+            # regardless of the actual cause. Confirmed to cost real
+            # debugging time (had to be re-derived from ExecutionRecorder
+            # traces instead of these logs) during live E2E benchmarking.
+            payload = obs.output if obs.success else (obs.error or obs.output)
+            output_str = str(payload)
             self.logger.info(
                 f"[{self.current_iteration}][Observe] Tool={obs.tool_name}, "
                 f"Success={obs.success}, Output(len={len(output_str)}): {output_str[:500]}...",
@@ -305,27 +326,31 @@ class PersistentAgent:
 
     # ── Per-item execution ───────────────────────────────────────────────────
 
-    async def _execute_item(self, item: CheckListItem) -> None:
-        """Execute a single CheckList item with full feature parity."""
-        self._advisor.reset_for_item(item.directives)
+    async def _execute_item(self, item: TaskSpec) -> None:
+        """Execute a single task item with full feature parity."""
+        self._advisor.reset_for_item()
         self._current_item_turn_count = 0
 
         # Item-static context — persisted until the next item begins.
         # _build_messages reads these every turn so the agent never loses
-        # expected_outcomes, host credentials, or LTM recall partway through
-        # a multi-iteration item.
+        # its task instruction or LTM recall partway through a multi-iteration item.
         self._current_item_block = item.to_agent_message()
-        self._current_item_hint  = await self._gather_pre_item_hint(item)
-        self._current_ltm_block  = await self._gather_ltm_block(item)
+        # LTM block is precomputed by the Coordinator (PRECISE tier,
+        # rerank=True) concurrently with the INTENT call that queued this
+        # item — see Orchestrator._build_precise_long_term_block /
+        # TaskSpec.ltm_block. The Agent does not run its own recall: the
+        # instruction here is near-identical to what the Coordinator already
+        # reranked against, so a second recall would just repeat that work
+        # on the Agent's own critical path for no new information.
+        self._current_ltm_block = item.ltm_block
+        if self._current_ltm_block:
+            self._emit_recall_summary(self._current_ltm_block)
 
         if self.execution_recorder:
             self.execution_recorder.write_agent_start(
                 step_id=item.item_id,
                 goal=item.instruction,
-                planner_reasoning=item.planner_reasoning,
-                expected_outcomes=item.expected_outcomes,
                 active_tools=sorted(self._loaded_tools),
-                ssh_target=item.ssh_target,
                 skills_required=self._standing_skill_names(),
             )
 
@@ -335,11 +360,9 @@ class PersistentAgent:
             pass
 
         item_result = await self._item_loop(item)
-        # Item boundary: kill any in-flight watcher and drop its verdict so a
-        # stale judgment from THIS item cannot bleed into the next one.
-        self._cancel_progress_watcher()
-        self._checklist.clear_progress_concern()
-        self._total_token_usage += item_result.token_usage or TokenUsage()
+        # Item boundary: drop any stale progress concern so a judgment from THIS
+        # item cannot bleed into the next one.
+        self._task_channel.clear_progress_concern()
         self._total_items_processed += 1
         if item_result.success:
             self._total_items_succeeded += 1
@@ -358,7 +381,7 @@ class PersistentAgent:
                 issues=item_result.issues,
             )
 
-        self._checklist.mark_current_done(item_result)
+        self._task_channel.mark_current_done(item_result)
         self.logger.info(
             f"[PersistentAgent] Item '{item.item_id}' done "
             f"(success={item_result.success}, iters={item_result.iterations})",
@@ -369,11 +392,20 @@ class PersistentAgent:
         # rolling summary instead of letting _turns grow until byte pressure.
         await self._compact_item_boundary()
 
-    async def _item_loop(self, item: CheckListItem) -> ItemResult:
+    async def _item_loop(self, item: TaskSpec) -> TaskResult:
         """Per-item OTA loop."""
         instruction = item.instruction
         iteration = 0
         _tools_used: list = []
+        # Bookkeeping-only tools (planning/reading a recipe) never touch the
+        # world and must not satisfy the speculative-completion guard below —
+        # confirmed live (2026-07-14): an item that called claim_tool + 3x
+        # todo_write, and NOTHING else, was accepted as success=True because
+        # _tools_used counted todo_write as "tool-grounded evidence" for a
+        # task whose entire point was calling live_shell_open/exec/close.
+        # Same root cause behind the schedule_wakeup false-accept finding.
+        _BOOKKEEPING_ONLY_TOOLS = frozenset({"todo_write", "read_skill"})
+        _grounding_tools_used: list = []
         # Absolute paths of files actually written/edited this item, collected
         # from the write/edit tool OUTPUTS (str(path.absolute())) — NOT from the
         # LLM's self-reported `artifacts`, which it tends to fill with bare
@@ -388,17 +420,17 @@ class PersistentAgent:
             self.current_iteration += 1
 
             # ── 0. Interrupt check ───────────────────────────────────────────
-            if self._checklist.check_interrupt():
-                interrupt_reason = self._checklist.acknowledge_interrupt()
+            if self._task_channel.check_interrupt():
+                interrupt_reason = self._task_channel.acknowledge_interrupt()
                 self.logger.info(
-                    f"[{iteration}][Interrupt] Planner interrupt for item={item.item_id}"
+                    f"[{iteration}][Interrupt] Coordinator interrupt for item={item.item_id}"
                     f"{f': {interrupt_reason}' if interrupt_reason else ''}",
                     component="PersistentAgent",
                 )
-                issue_msg = INTERRUPTED_BY_PLANNER
+                issue_msg = INTERRUPTED_BY_COORDINATOR
                 if interrupt_reason:
-                    issue_msg = f"{INTERRUPTED_BY_PLANNER}: {interrupt_reason}"
-                return ItemResult(
+                    issue_msg = f"{INTERRUPTED_BY_COORDINATOR}: {interrupt_reason}"
+                return TaskResult(
                     item_id=item.item_id,
                     success=False,
                     issues=[issue_msg],
@@ -414,23 +446,9 @@ class PersistentAgent:
             # ── 2. Reminders (via IterationAdvisor) ────────────────────────
             reminder = self._advisor.get_reminder()
 
-            # ── 2b. Stagnation-triggered LTM refresh ───────────────────────
-            # When the advisor sees ≥3 consecutive failures (cooldown-gated so
-            # we don't re-query every turn), run a fresh LTM recall whose query
-            # is enriched with the recent failure signatures. Result is shown
-            # as an independent block in the reminder area — _current_ltm_block
-            # is NOT replaced, so the original happy-path recall stays visible
-            # alongside and the per-item prefix-cache anchor is preserved.
-            extra_ltm_block: Optional[str] = None
-            if self._advisor.should_refresh_ltm():
-                signatures = self._advisor.get_recent_failure_signatures()
-                extra_ltm_block = await self._gather_stagnation_ltm_block(
-                    item, signatures
-                )
-
             # ── 3. Think + Act ───────────────────────────────────────────────
             turn_result, tool_results, _iter_token_usage = await self._think_streaming(
-                instruction, reminder, extra_ltm_block
+                instruction, reminder
             )
             _token_usage += _iter_token_usage
 
@@ -485,10 +503,24 @@ class PersistentAgent:
                         if self._drop_current_ltm_block() > 0:
                             continue
 
-                        # Last resort: truncate oldest turn's observations
-                        if self._turns and len(self._turns[0].observations) > 1:
-                            self._turns[0].observations = self._turns[0].observations[-1:]
-                            continue
+                        # Last resort: elide the oldest turn's observations
+                        # in place (never drop list entries — that desyncs
+                        # from assistant_message["tool_calls"] and produces
+                        # mismatched/missing tool_results, a 400 with the
+                        # Anthropic API). Falls through to give up once
+                        # nothing new gets superseded.
+                        turn0 = self._turns[0] if self._turns else None
+                        if turn0 and len(turn0.observations) > 1:
+                            newly_superseded = 0
+                            for obs in turn0.observations[:-1]:
+                                if obs.superseded_note is None:
+                                    obs.superseded_note = (
+                                        "[content dropped — prompt was too "
+                                        "long even after compaction]"
+                                    )
+                                    newly_superseded += 1
+                            if newly_superseded > 0:
+                                continue
 
                         raw_error = raw_error[len("PTL:"):].strip()
 
@@ -496,7 +528,7 @@ class PersistentAgent:
                         f"[{iteration}] LLM API error: {raw_error[:200]}",
                         component="PersistentAgent",
                     )
-                    return ItemResult(
+                    return TaskResult(
                         item_id=item.item_id,
                         success=False,
                         issues=[f"LLM API error: {raw_error[:300]}"],
@@ -509,7 +541,7 @@ class PersistentAgent:
                     component="PersistentAgent",
                 )
                 err_text = turn_result.error or ""
-                return ItemResult(
+                return TaskResult(
                     item_id=item.item_id,
                     success=False,
                     issues=[f"Error: {err_text[:300]}"],
@@ -527,7 +559,7 @@ class PersistentAgent:
                         f"[{iteration}] Stream error masked as completion: {error_summary}",
                         component="PersistentAgent",
                     )
-                    return ItemResult(
+                    return TaskResult(
                         item_id=item.item_id,
                         success=False,
                         issues=[f"Stream error: {error_summary[:300]}"],
@@ -578,13 +610,20 @@ class PersistentAgent:
                     continue
 
                 # Speculative-completion guard: an item that claims success
-                # without ever dispatching a tool is almost always the LLM
-                # composing prose in lieu of action. Real "no work needed"
-                # items do not have expected_outcomes or ssh_target.
-                if not _tools_used and (item.expected_outcomes or item.ssh_target):
+                # without ever dispatching a WORLD-TOUCHING tool is almost
+                # always the LLM composing prose in lieu of action — the
+                # Coordinator only queues genuine world-work, so a completion
+                # backed by nothing but planning/reading (todo_write,
+                # read_skill) needs the same rejection as zero tool calls.
+                # This also catches "claimed a tool, never called it" — the
+                # exact failure confirmed live for schedule_wakeup and
+                # live_shell_open/exec/close (claim_tool + todo_write only,
+                # then a completion claiming the claimed tool's job was done).
+                if not _grounding_tools_used:
                     self.logger.warning(
-                        f"[{iteration}] Speculative completion rejected: 0 tool calls "
-                        f"for item with expected_outcomes/ssh_target. Forcing retry.",
+                        f"[{iteration}] Speculative completion rejected: "
+                        f"{len(_tools_used)} tool call(s), none world-touching. "
+                        f"Forcing retry.",
                         component="PersistentAgent",
                     )
                     self._persist_event_observations(
@@ -592,18 +631,21 @@ class PersistentAgent:
                             success=False, output=None,
                             tool_name="completion_guard", tool_parameters={},
                             error=(
-                                "Item declared complete without any tool execution. "
-                                "Items with expected_outcomes or ssh_target require "
-                                "tool-grounded evidence. If a required tool is "
-                                "unavailable in your tool list, return an error JSON "
-                                "naming the missing tool — do not synthesise a "
-                                "free-form factual_outcome."
+                                "Item declared complete without calling any tool "
+                                "that actually does the task's work — claim_tool / "
+                                "todo_write / read_skill alone are not evidence. "
+                                "If you claimed a tool, this is the turn to actually "
+                                "call it. Completion requires tool-grounded evidence. "
+                                "If a required tool is unavailable in your tool list, "
+                                "return an error JSON naming the missing tool — do "
+                                "not synthesise a free-form factual_outcome."
                             ),
                         )],
                         note=(
-                            "(I declared the item complete with no tool calls. The "
-                            "completion-guard rejected this — call the appropriate "
-                            "tool or return error JSON.)"
+                            "(I declared the item complete without calling any "
+                            "tool that does real work — the completion-guard "
+                            "rejected this. If I claimed a tool, I must call it "
+                            "now, not just report having claimed it.)"
                         ),
                     )
                     continue
@@ -620,7 +662,7 @@ class PersistentAgent:
                         component="PersistentAgent",
                     )
                     _issues.append(turn_result.truncation_note)
-                return ItemResult(
+                return TaskResult(
                     item_id=item.item_id,
                     success=True,
                     factual_outcome=list(turn_result.factual_outcome or []),
@@ -659,6 +701,8 @@ class PersistentAgent:
                     else:
                         primary_input = next(iter(params.values()), None) if params else None
                     _tools_used.append(format_tool_entry(tool_nm, primary_input))
+                    if tool_nm not in _BOOKKEEPING_ONLY_TOOLS:
+                        _grounding_tools_used.append(tool_nm)
 
                     # Capture the authoritative absolute path from successful
                     # write/edit outputs (str(path.absolute())) for the artifact
@@ -674,27 +718,57 @@ class PersistentAgent:
                             _produced_seen.add(abs_path)
 
             if self.execution_recorder and tool_results:
-                is_parallel = len(tool_results) > 1
-                for idx, tr in enumerate(tool_results):
-                    self.execution_recorder.write_iteration(
-                        tool_result=tr,
-                        decision=turn_result,
-                        iteration=self.current_iteration,
-                        step_id=item.item_id,
-                        parallel_index=idx if is_parallel else None,
-                        token_usage=_iter_token_usage,
-                    )
+                # One incremental record per turn (not per tool_result): the
+                # assistant message + all observations of this turn, rendered
+                # as sent to the LLM, plus the tier changes and context totals
+                # captured during this turn's _build_messages.
+                self.execution_recorder.write_turn(
+                    turn=self.current_iteration,
+                    step_id=item.item_id,
+                    decision=turn_result,
+                    tool_results=tool_results,
+                    token_usage=_iter_token_usage,
+                    retiered=self._last_build_retiered,
+                    totals=self._last_build_totals,
+                )
 
             # ── 7. USER_NEW_INSTRUCTION propagation ──────────────────────────
             for tr in tool_results:
                 if tr.error == "USER_NEW_INSTRUCTION":
-                    return ItemResult(
+                    return TaskResult(
                         item_id=item.item_id,
                         success=False,
                         issues=["User new instruction"],
                         iterations=iteration,
                         token_usage=_token_usage,
                     )
+
+            # ── 7b. Tool-call format violation (blank reasoning) ─────────────
+            # Structural mirror of the completion format_violation guard above.
+            # Tools already executed (their results are real facts, kept as-is
+            # — discarding them would hide genuine environment feedback), but a
+            # blank `reasoning` on a tool-call turn breaks the response-format
+            # contract, so it's flagged the same way: log + a corrective note
+            # for the model's next turn. No content requirement — the model
+            # picks what to say.
+            if turn_result.format_violation and turn_result.tool_calls:
+                self.logger.warning(
+                    f"[{iteration}] Tool-call format violation: blank "
+                    f"reasoning. Corrective note injected.",
+                    component="PersistentAgent",
+                )
+                self._persist_event_observations(
+                    [ToolResult(
+                        success=False, output=None,
+                        tool_name="completion_guard", tool_parameters={},
+                        error=(
+                            "Format violation: the previous turn called tool(s) "
+                            "with no reasoning text. Every turn must state why "
+                            "before or alongside its tool call(s)."
+                        ),
+                    )],
+                    note="(My last turn called tools with blank reasoning — noted for next turn.)",
+                )
 
             # ── 8. Update advisor + per-turn progress signal ─────────────────
             has_wait_interval = False
@@ -706,32 +780,31 @@ class PersistentAgent:
                 has_wait_interval=has_wait_interval,
             )
 
-            # Mechanical planner wake (the incident fix): when either mechanical
-            # signal crosses its HARD threshold, flip the planner trigger
-            # DIRECTLY via the checklist bus — no LLM in the path, no dependency
-            # on a helper pool. hard_stall() is cooldown-gated so this fires at
-            # most once per stall episode. Guarded by the item_id staleness
-            # check for parity with the watcher path.
+            # Mechanical progress-concern recording (the incident fix): when
+            # either mechanical signal crosses its HARD threshold, record a
+            # concern DIRECTLY on the task-channel bus — no LLM in the path,
+            # no dependency on a helper pool. hard_stall() is cooldown-gated
+            # so this fires at most once per stall episode. Guarded by the
+            # item_id staleness check for parity with the watcher path.
             if self._advisor.hard_stall():
-                current = self._checklist.get_current_item()
+                current = self._task_channel.get_current_item()
                 if current is not None and current.item_id == item.item_id:
-                    self._checklist.set_progress_concern(ProgressConcern(
+                    self._task_channel.set_progress_concern(ProgressConcern(
                         item_id=item.item_id,
                         verdict="stalled",
                         rationale=(
                             "mechanical hard stall — crossed the no-progress / "
-                            "consecutive-failure threshold without adding new "
-                            "information; approach likely needs re-planning"
+                            "consecutive-failure / redundant-repeat threshold "
+                            "without adding new information; approach likely "
+                            "needs re-planning or the item is already done"
                         ),
                         suggest_replan=True,
                     ))
 
-            # ── 9. Mechanical digest + Tier-1 watcher (fire-and-forget) ──────
-            # Write one bus digest per turn (cheap, synchronous) so the planner
-            # has an in-flight view of this running item. Then, only after the
-            # no-info-gain streak has persisted (hysteresis), launch the cheap
-            # LLM watcher — never awaited on this critical path.
-            self._checklist.append_turn_digest(TurnDigest(
+            # ── 9. Mechanical digest ────────────────────────────────────────
+            # Write one bus digest per turn (cheap, synchronous) so the
+            # coordinator has an in-flight view of this running item.
+            self._task_channel.append_turn_digest(TurnDigest(
                 item_id=item.item_id,
                 iteration=iteration,
                 tool_names=[tr.tool_name for tr in tool_results if tr.tool_name],
@@ -741,7 +814,6 @@ class PersistentAgent:
                 info_gain=info_gain,
                 no_progress_streak=self._advisor.no_info_gain_streak,
             ))
-            self._maybe_launch_progress_watcher(item)
 
         advisor_summary = self._advisor.get_summary()
         self.logger.warning(
@@ -749,138 +821,12 @@ class PersistentAgent:
             f"Success rate: {advisor_summary['success_rate']:.1%}",
             component="PersistentAgent",
         )
-        return ItemResult(
+        return TaskResult(
             item_id=item.item_id,
             success=False,
             issues=[f"Reached per-item iteration cap ({self._max_item_iterations})"],
             iterations=iteration,
             token_usage=_token_usage,
-        )
-
-    # ── Tier-1 progress watcher (fire-and-forget) ────────────────────────────
-
-    def _maybe_launch_progress_watcher(self, item: CheckListItem) -> None:
-        """Launch the cheap LLM watcher iff the hysteresis gate is satisfied.
-
-        Gate (all must hold):
-          - a helper pool is configured (else Tier-1 is disabled),
-          - no watcher is already in flight (one at a time),
-          - the Tier-0 no-progress streak has persisted >= WATCHER_STREAK_GATE
-            turns past the small Tier-0 threshold (the >=2-recheck hysteresis
-            from the design — only escalate when Tier-0 keeps re-firing).
-
-        Never awaits: spawns a task and returns immediately so the agent's
-        per-turn wall-clock is unaffected (latency is the only enemy).
-        """
-        if not self._helper_services:
-            return
-        if self._watcher_inflight:
-            return
-        if self._advisor.no_info_gain_streak < WATCHER_STREAK_GATE:
-            return
-        self._watcher_inflight = True
-        self._watcher_task = asyncio.create_task(
-            self._run_progress_watcher(item),
-            name=f"progress_watcher_{item.item_id}",
-        )
-        self._watcher_task.add_done_callback(self._on_watcher_done)
-
-    def _on_watcher_done(self, task: "asyncio.Task") -> None:
-        """Clear the in-flight guard when the watcher task settles."""
-        self._watcher_inflight = False
-        try:
-            task.result()
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            self.logger.warning(
-                f"[ProgressWatcher] task failed: {e}",
-                component="PersistentAgent",
-            )
-
-    def _cancel_progress_watcher(self) -> None:
-        """Cancel any in-flight watcher and reset state (item boundary)."""
-        task = self._watcher_task
-        if task is not None and not task.done():
-            task.cancel()
-        self._watcher_task = None
-        self._watcher_inflight = False
-
-    async def _run_progress_watcher(self, item: CheckListItem) -> None:
-        """Cheap, fire-and-forget divergence check on the in-flight item.
-
-        Snapshots the mechanical digests BEFORE the first await (so it never
-        iterates a deque that the agent coroutine mutates mid-call), builds a
-        small prompt from the item's expected_outcomes + digests, and asks the
-        helper pool for a verdict. Only "diverging"/"false_progress" verdicts
-        are written to the bus; "ok" leaves the slot untouched. A stale result
-        arriving after the item advanced is dropped (item_id guard).
-        """
-        digests = [
-            d for d in self._checklist.get_turn_digests()
-            if d.item_id == item.item_id
-        ]
-        if not digests:
-            return
-
-        expected = "\n".join(f"- {o}" for o in item.expected_outcomes) \
-            or "(no explicit expected outcomes provided)"
-        digest_lines = []
-        for d in digests[-12:]:
-            tools = ",".join(d.tool_names) if d.tool_names else "none"
-            digest_lines.append(
-                f"iter {d.iteration}: tools={tools} ok={d.success_count} "
-                f"fail={d.fail_count} new_artifact={d.produced_new_artifact} "
-                f"info_gain={d.info_gain} "
-                f"no_progress_streak={d.no_progress_streak}"
-            )
-        prompt = PROGRESS_WATCHER_PROMPT.format(
-            expected_outcomes=expected,
-            digests="\n".join(digest_lines),
-        )
-
-        try:
-            result = await call_with_fallback(
-                self._helper_services,
-                dict(
-                    messages=[{"role": "user", "content": prompt}],
-                    json_mode=True,
-                    max_tokens=400,
-                ),
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            self.logger.warning(
-                f"[ProgressWatcher] LLM call failed: {e}",
-                component="PersistentAgent",
-            )
-            return
-
-        parsed = try_parse_json(result.content or "")
-        if not isinstance(parsed, dict):
-            return
-        verdict = str(parsed.get("verdict", "ok")).strip().lower()
-        if verdict not in ("diverging", "false_progress"):
-            return
-
-        # Drop a verdict that arrived after the item already advanced.
-        current = self._checklist.get_current_item()
-        if current is None or current.item_id != item.item_id:
-            return
-
-        self._checklist.set_progress_concern(ProgressConcern(
-            item_id=item.item_id,
-            verdict=verdict,
-            rationale=str(parsed.get("rationale", ""))[:500],
-            suggest_replan=bool(parsed.get("suggest_replan", False)),
-            suggest_interrupt=bool(parsed.get("suggest_interrupt", False)),
-        ))
-        self.logger.info(
-            f"[ProgressWatcher] item={item.item_id} verdict={verdict} "
-            f"replan={bool(parsed.get('suggest_replan', False))} "
-            f"interrupt={bool(parsed.get('suggest_interrupt', False))}",
-            component="PersistentAgent",
         )
 
     # ── LLM interaction ──────────────────────────────────────────────────────
@@ -889,17 +835,40 @@ class PersistentAgent:
         self,
         instruction: str,
         reminder: Optional[str],
-        extra_ltm_block: Optional[str] = None,
     ) -> tuple[TurnOutcome, List[ToolResult], TokenUsage]:
         """Streaming Think+Act: open stream, dispatch tools as they arrive."""
-        messages = self._build_messages(instruction, reminder, extra_ltm_block)
+        messages = self._build_messages(instruction, reminder)
+
+        if not self._first_request_logged and self.execution_recorder:
+            self._first_request_logged = True
+            self.execution_recorder.write_first_request_snapshot(
+                messages=messages, tools=self._api_tools,
+            )
 
         try:
             self._interaction_manager.notify_state_changed("thinking")
         except Exception:
             pass
 
-        chat_kwargs = dict(messages=messages, tools=self._api_tools, json_mode=False)
+        chat_kwargs = dict(
+            messages=messages, tools=self._api_tools, json_mode=False,
+            effort="xhigh",
+            # Pair effort with an explicit thinking budget: without this, the
+            # QGenie/Bedrock gateway silently suppresses thinking_delta events
+            # in streaming mode (verified 2026-07-16 — same request returns a
+            # thinking block non-streaming but 0 thinking_deltas via
+            # chat_stream). Effect: agent loop cannot see its own reasoning
+            # from turn to turn, producing "blank rounds". Both
+            # {"type":"enabled", "budget_tokens":N} and {"type":"adaptive"}
+            # fix this and stream thinking equally well on this gateway; we
+            # use budget_tokens=N here because chat_stream already exposes
+            # that parameter and _build_api_kwargs already maps it to
+            # {"type":"enabled", "budget_tokens":N} — one-line change with no
+            # new plumbing. Coordinator (orchestrator.py) intentionally does
+            # NOT set this — its one-shot JSON classifications don't consume
+            # inter-turn reasoning, so the extra token cost is pure waste.
+            thinking_budget_tokens=4096,
+        )
 
         async def _run_after(tc: ToolCall, prereqs: List[asyncio.Task]) -> ToolResult:
             if prereqs:
@@ -969,6 +938,7 @@ class PersistentAgent:
                     elif isinstance(event, StreamDoneEvent):
                         llm_result = event.result
                         reasoning = llm_result.content or ""
+                        _thinking_blocks = llm_result.thinking_blocks or []
 
                         if stream_tool_calls:
                             _asst_msg = {
@@ -976,10 +946,49 @@ class PersistentAgent:
                                 "content": reasoning,
                                 "tool_calls": api_tool_calls_for_msg,
                             }
-                            turn_outcome = TurnOutcome(reasoning=reasoning, tool_calls=stream_tool_calls)
+                            if _thinking_blocks:
+                                _asst_msg["thinking_blocks"] = _thinking_blocks
+                            # A tool-call turn's `reasoning` is free-form text, not
+                            # the completion JSON schema — but the prompt promises
+                            # claim_tool/release_tool can appear "in one response"
+                            # alongside a tool call. Best-effort scan: if the model
+                            # embedded a JSON object in its reasoning, pull the
+                            # fields out; absent/unparseable is the normal case and
+                            # yields empty lists.
+                            _claim, _release = [], []
+                            if reasoning:
+                                _parsed, _ = try_parse_json_with_repair_flag(reasoning)
+                                if isinstance(_parsed, dict):
+                                    _claim, _release = extract_self_extension_fields(_parsed)
+                            turn_outcome = TurnOutcome(
+                                reasoning=reasoning, tool_calls=stream_tool_calls,
+                                claim_tool=_claim, release_tool=_release,
+                                # Structural check, not a content requirement: the
+                                # model must reason SOMEWHERE before acting — either
+                                # in the visible `reasoning` text OR in an extended
+                                # thinking block. What it says is entirely its own
+                                # judgment; this only catches a truly blank turn
+                                # (no text AND no thinking), mirroring the completion
+                                # format_violation guard below. Post 2026-07-17 when
+                                # PersistentAgent enabled `thinking_budget_tokens`,
+                                # the model routinely puts full reasoning into a
+                                # thinking block and leaves visible content empty —
+                                # that's not a violation, it's the streamed thinking
+                                # channel doing its job.
+                                format_violation=(
+                                    not reasoning.strip()
+                                    and not _thinking_blocks
+                                ),
+                                thinking_text=llm_result.reasoning_content,
+                                stop_reason=getattr(llm_result, "stop_reason", None),
+                            )
                         else:
                             _asst_msg = {"role": "assistant", "content": reasoning}
+                            if _thinking_blocks:
+                                _asst_msg["thinking_blocks"] = _thinking_blocks
                             turn_outcome = TurnOutcome.from_completion_text(reasoning)
+                            turn_outcome.thinking_text = llm_result.reasoning_content
+                            turn_outcome.stop_reason = getattr(llm_result, "stop_reason", None)
                             # Truncation diagnostics: log stop_reason + output tokens on
                             # every completion turn, and stamp a truncation_note when
                             # stop_reason=max_tokens so ITEM_END surfaces the partial.
@@ -990,6 +999,17 @@ class PersistentAgent:
                                 f"raw_len={len(reasoning)}",
                                 component="PersistentAgent",
                             )
+                            # json_repair salvage is a benign format signal, NOT
+                            # truncation — keep it as a DEBUG breadcrumb only, never
+                            # in truncation_note/issues (that mislabeled every clean
+                            # completion as "truncated mid-stream").
+                            if turn_outcome.completion_needed_repair:
+                                self.logger.debug(
+                                    f"[{self.current_iteration}][ThinkStream] Completion "
+                                    f"JSON needed json_repair salvage (non-strict but "
+                                    f"complete); stop_reason={_sr} raw_len={len(reasoning)}",
+                                    component="PersistentAgent",
+                                )
                             if _sr == "max_tokens":
                                 _mt_note = (
                                     f"LLM stopped at max_tokens after "
@@ -1072,6 +1092,25 @@ class PersistentAgent:
                 result = ToolResult(success=False, output=None, error=f"Tool execution error: {exc}", tool_name=tc.tool_name, tool_parameters=tc.parameters)
             tool_results.append(result)
 
+        # Drain claim_tool/release_tool intent recorded by the real
+        # ClaimToolTool/ReleaseToolTool (self_extension_tool.py) via
+        # ctx.pending_claim_tool/pending_release_tool, merging it into this
+        # turn's TurnOutcome alongside whatever the legacy reasoning-JSON
+        # scan above already found. This keeps _item_loop's existing,
+        # unchanged call — `self._apply_self_extension(turn_result.claim_tool,
+        # turn_result.release_tool)` — as the single application point; only
+        # how intent gets INTO turn_outcome changed. Draining (not peeking)
+        # means a name is consumed exactly once even if ctx is reused.
+        if self._ctx is not None and turn_outcome is not None:
+            _pc = getattr(self._ctx, "pending_claim_tool", None)
+            if _pc:
+                turn_outcome.claim_tool = list(dict.fromkeys(turn_outcome.claim_tool + _pc))
+                _pc.clear()
+            _pr = getattr(self._ctx, "pending_release_tool", None)
+            if _pr:
+                turn_outcome.release_tool = list(dict.fromkeys(turn_outcome.release_tool + _pr))
+                _pr.clear()
+
         # Store turn in conversation history.
         # Skip obs-less completion turns: a turn with no tool_calls and no
         # observations contributes only a bare assistant message, which both
@@ -1095,7 +1134,6 @@ class PersistentAgent:
         self,
         instruction: str,
         reminder: Optional[str] = None,
-        extra_ltm_block: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Build the LLM message list from ConversationTurns.
 
@@ -1113,7 +1151,8 @@ class PersistentAgent:
         of being pushed below an instruction block that changes every item.
         """
         messages: List[Dict[str, Any]] = [
-            {"role": "system", "content": self._system_prompt},
+            {"role": "system", "content": self._system_prompt_core},
+            {"role": "system", "content": self._system_prompt_env},
         ]
 
         # Skill prelude — rendered LIVE from the SkillRegistry every turn
@@ -1135,6 +1174,12 @@ class PersistentAgent:
         # trace will actually be emitted.
         turns = self._budget_enforced_turns()
         self._supersede_stale(turns)
+        # Sole observation-elision layer (CC-aligned microcompact): under
+        # budget pressure, replace old re-derivable tool RESULTS with a
+        # one-line re-read hint via `superseded_note`. tool_use blocks are
+        # never touched. Returns the elision events for this build so the
+        # execution trace can record what was compressed this turn.
+        self._last_build_retiered = self._microcompact_old_outputs(turns)
 
         # Top session-context message — earlier-session summary + cross-item
         # boundary history. Both change slowly (summary on compaction, boundary
@@ -1152,7 +1197,7 @@ class PersistentAgent:
             top_parts.append(
                 f"---\n[Earlier session progress]\n{self._conversation_summary}\n---"
             )
-        boundary = self._checklist.get_recent_results_for_agent(limit=10)
+        boundary = self._task_channel.get_recent_results_for_agent(limit=10)
         if boundary:
             top_parts.append(boundary)
         # Anthropic requires a user message before the first turn in the trace.
@@ -1161,53 +1206,51 @@ class PersistentAgent:
         if turns and not top_parts:
             top_parts.append(self._current_item_block or f"[Current Task]\n{instruction}")
         if top_parts:
-            messages.append({"role": "user", "content": "\n\n".join(top_parts)})
+            content = "\n\n".join(top_parts)
+            # Cache breakpoint #4 (of Anthropic's 4-per-request max — the
+            # other 3 are system[-2], tools[-1], and the skill-prelude
+            # anchor). This block is stable across every iteration of a
+            # single item (only changes on compaction or at the next item's
+            # boundary), and it sits immediately after the skill-prelude
+            # anchor and before the turn trace — anchoring it extends the
+            # cached prefix through the LAST byte-stable point before the
+            # trace begins, which itself is NOT byte-stable across turns
+            # (see the three-tier rendering below) and so cannot itself be
+            # anchored.
+            messages.append({"role": "user", "content": content, "_cache_anchor": True})
 
-        # Conversation trace — three-tier observation rendering.
-        last_idx = len(turns) - 1
-        compressed_start = max(0, last_idx - FULL_OBS_RECENT_TURNS)
-
-        for idx, turn in enumerate(turns):
-            if idx < compressed_start:
-                # TIER 3 — old: reasoning only, strip tool_calls (no API contract issue)
-                messages.append({
-                    "role": "assistant",
-                    "content": turn.assistant_message.get("content", ""),
-                })
-            elif idx < last_idx:
-                # TIER 2 — recent: compressed observations
-                messages.append(turn.assistant_message)
-                if turn.has_tool_calls:
-                    tc_list = turn.assistant_message.get("tool_calls", [])
-                    for i, obs in enumerate(turn.observations):
-                        call_id = tc_list[i]["id"] if i < len(tc_list) else f"call_{i}"
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": call_id,
-                            "content": self._compress_obs_for_context(obs),
-                        })
-                elif turn.observations:
-                    combined = "\n\n".join(
-                        self._compress_obs_for_context(obs) for obs in turn.observations
-                    )
-                    messages.append({"role": "user", "content": combined})
-            else:
-                # TIER 1 — latest: full uncompressed (LLM hasn't digested yet)
-                messages.append(turn.assistant_message)
-                if turn.has_tool_calls:
-                    tc_list = turn.assistant_message.get("tool_calls", [])
-                    for i, obs in enumerate(turn.observations):
-                        call_id = tc_list[i]["id"] if i < len(tc_list) else f"call_{i}"
-                        messages.append({
-                            "role": "tool",
-                            "tool_call_id": call_id,
-                            "content": obs.to_tool_result_json(),
-                        })
-                elif turn.observations:
-                    combined = "\n\n".join(
-                        obs.to_obs_json(i + 1) for i, obs in enumerate(turn.observations)
-                    )
-                    messages.append({"role": "user", "content": combined})
+        # Conversation trace — uniform rendering, CC-aligned.
+        #
+        # Every turn renders the SAME way regardless of age: the assistant
+        # message in full (tool_calls NEVER stripped — the record of what the
+        # model called, especially edit/write diffs, is irreproducible state)
+        # followed by each observation via ToolResult.to_tool_result_json(),
+        # which already renders `superseded_note` when set. The ONLY thing that
+        # ever shrinks an old turn is `_microcompact_old_outputs` stamping
+        # `superseded_note` on a re-derivable tool RESULT under budget pressure
+        # (mirrors Claude Code microcompact: keep tool_use forever, only clear
+        # old tool_results). superseded_note is one-way, so a settled turn's
+        # bytes never change again → prompt-cache prefix stays stable.
+        #
+        # This replaces the former turn-distance three-tier loop, whose tier-3
+        # stripped tool_calls purely by age (not budget) — live-confirmed to
+        # make a weak model lose its own edit and loop hunting a phantom bug.
+        for turn in turns:
+            messages.append(turn.assistant_message)
+            if turn.has_tool_calls:
+                tc_list = turn.assistant_message.get("tool_calls", [])
+                for i, obs in enumerate(turn.observations):
+                    call_id = tc_list[i]["id"] if i < len(tc_list) else f"call_{i}"
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": obs.to_tool_result_json(),
+                    })
+            elif turn.observations:
+                combined = "\n\n".join(
+                    obs.to_tool_result_json() for obs in turn.observations
+                )
+                messages.append({"role": "user", "content": combined})
 
         # Bottom instruction message — placed last so it is the model's freshest
         # context. On the first turn of an item, include full task block + LTM +
@@ -1220,10 +1263,10 @@ class PersistentAgent:
         # the trace above may have drifted from the user's original intent.
         # `_latest_user_message` is last-write-wins: mid-flight instructions
         # ("also do X", "actually only on gv") overwrite the initial message,
-        # but the initial content is already captured in the planner-generated
-        # item.instruction, so overwriting is safe.
+        # but the initial content is already captured in the mechanically
+        # enqueued item.instruction, so overwriting is safe.
         bottom_parts: List[str] = []
-        user_msg = self._checklist.get_latest_user_message()
+        user_msg = self._task_channel.get_latest_user_message()
         if user_msg:
             bottom_parts.append(
                 "[User Directive — verbatim; honor this over any paraphrased "
@@ -1236,30 +1279,53 @@ class PersistentAgent:
             )
             if self._current_ltm_block:
                 bottom_parts.append(self._current_ltm_block)
-            if self._current_item_hint:
-                bottom_parts.append(f"[Host Context]\n{self._current_item_hint}")
         else:
             bottom_parts.append(f"[Continuing: {instruction[:120]}]")
-            if self._current_item_hint and "ssh" in (self._current_item_hint or "").lower():
-                bottom_parts.append(f"[Host Context]\n{self._current_item_hint}")
-        # Reminder section. extra_ltm_block (when present) is the
-        # stagnation-triggered fresh LTM recall — kept here as an independent
-        # block so it sits next to the advisor reminder that motivated it,
-        # WITHOUT overwriting _current_ltm_block above (the original happy-path
-        # recall stays visible, and the per-item prefix-cache anchor is intact).
+        # Reminder section (advisor reminder + the agent's own todo).
         reminder_section_parts: List[str] = []
-        if extra_ltm_block:
-            reminder_section_parts.append(
-                f"[Stagnation Recall — refreshed LTM for current blockers]\n"
-                f"{extra_ltm_block}"
-            )
+        # Agent-owned todo — the agent's OWN plan written via `todo_write`, fed
+        # back every turn so it can see and update its list. Without this the
+        # agent writes to ctx.agent_todo but never reads it back, defeating the
+        # point of having a todo. Rendered as a compact status block near the
+        # bottom (high-attention region) so it survives conversation growth.
+        todo_block = self._render_agent_todo_block()
+        if todo_block:
+            reminder_section_parts.append(todo_block)
         if reminder:
             reminder_section_parts.append(reminder)
         if reminder_section_parts:
             bottom_parts.append("\n\n".join(reminder_section_parts))
         messages.append({"role": "user", "content": "\n\n".join(bottom_parts)})
 
+        # Record the total context size this build so the ExecutionRecorder's
+        # turn record can track context growth. (`_last_build_retiered` was set
+        # above from _microcompact_old_outputs — the elision events this build.)
+        self._last_build_totals = {
+            "messages": len(messages),
+            "est_chars": sum(len(str(m.get("content", ""))) for m in messages),
+        }
+
         return messages
+
+    def _render_agent_todo_block(self) -> str:
+        """Render the agent's own todo (written via `todo_write`) as a status block.
+
+        Kept small: one line per item with a status glyph, ordered as the agent
+        wrote them. Empty when no todo exists (initial state / task without a
+        multi-step plan). Read from ctx.agent_todo (last-write-wins) — this is
+        the SAME slot the tool writes to, so the agent always sees its latest
+        plan next turn without a separate read.
+        """
+        todos = getattr(self._ctx, "agent_todo", None) if self._ctx else None
+        if not todos:
+            return ""
+        glyph = {"pending": "☐", "in_progress": "▶", "completed": "✓"}
+        lines = ["[Your Todo — your own plan, written via todo_write]"]
+        for t in todos:
+            g = glyph.get(t.get("status", "pending"), "☐")
+            content = str(t.get("content", "")).strip()[:200]
+            lines.append(f"  {g} {content}")
+        return "\n".join(lines)
 
     def _effective_obs_budget(self) -> int:
         """obs budget after subtracting prelude / summary / item-static overhead.
@@ -1276,7 +1342,6 @@ class PersistentAgent:
             sum(len(m.get("content", "")) for m in self._render_skill_prelude())
             + len(self._conversation_summary or "")
             + len(self._current_item_block or "")
-            + len(self._current_item_hint or "")
             + len(self._current_ltm_block or "")
         )
         return max(self._obs_budget_chars - overhead, 100_000)
@@ -1296,12 +1361,114 @@ class PersistentAgent:
             total_chars -= dropped.total_obs_chars()
         return turns
 
+    # Tools whose output is re-derivable on demand: the agent can just call the
+    # tool again to get it back. Microcompact elides these once they are old,
+    # replacing the body with a re-read hint. Write/edit are excluded (their
+    # output is a diff/path, small and not re-derivable the same way); desktop/
+    # browser snapshots are handled by _supersede_stale instead.
+    _MICROCOMPACT_TOOLS: frozenset = frozenset({
+        "read", "grep", "glob", "shell", "bash", "web_search",
+    })
+    # Only elide bodies larger than this (chars) — small results are not worth
+    # the traceability loss.
+    _MICROCOMPACT_MIN_CHARS: int = 600
+    # Keep the most recent N turns fully intact — microcompact never touches
+    # them (the agent is still actively reasoning over recent output).
+    _MICROCOMPACT_KEEP_RECENT_TURNS: int = 4
+    # Budget gate: microcompact only elides when total observation bytes exceed
+    # this fraction of the effective obs budget. Below it, EVERYTHING stays full
+    # — CC-aligned "no pressure → no compression". Kept lower than the
+    # LLM-summary triggers (ITEM_BOUNDARY 0.80 / _compact_conversation 0.95) so
+    # this cheap, lossless-in-capability layer relieves pressure first.
+    _MICROCOMPACT_RATIO: float = 0.60
+
+    def _microcompact_old_outputs(self, turns: List[ConversationTurn]) -> List[Dict[str, Any]]:
+        """Sole observation-elision layer (CC-aligned microcompact).
+
+        Under BUDGET PRESSURE only, replace old, large, re-derivable tool
+        RESULTS (read/grep/glob/shell/web_search) with a one-line re-read hint
+        via ``superseded_note``. tool_use blocks are never touched. The agent
+        can re-run the tool if it needs the content again — lossless in
+        capability, only trading a re-read for tokens. `superseded_note` is
+        one-way (never cleared), so a settled turn's rendered bytes never change
+        again → prompt-cache prefix stays stable.
+
+        Budget-gated (``_MICROCOMPACT_RATIO``): when observation bytes are under
+        the fraction of the effective budget, NOTHING is elided — everything
+        stays full. This is the CC "no pressure → no compression" behaviour, and
+        the fix for the case where a weak model lost its own recent edit to an
+        age-based tier drop while the context was nowhere near full.
+
+        Returns a list of elision events (one per newly-elided obs) for the
+        ExecutionRecorder's per-turn trace. Idempotent: an already-elided obs is
+        skipped, so a settled elision is reported once, not every build.
+        """
+        events: List[Dict[str, Any]] = []
+        if len(turns) <= self._MICROCOMPACT_KEEP_RECENT_TURNS:
+            return events
+        # Budget gate — below the ratio, keep everything full (CC-aligned).
+        total_chars = sum(t.total_obs_chars() for t in turns)
+        if total_chars <= self._effective_obs_budget() * self._MICROCOMPACT_RATIO:
+            return events
+        cutoff = len(turns) - self._MICROCOMPACT_KEEP_RECENT_TURNS
+        for turn in turns[:cutoff]:
+            for obs in turn.observations:
+                if obs.superseded_note is not None:
+                    continue
+                if not obs.success:
+                    continue  # keep errors — they explain failures, small anyway
+                if (obs.tool_name or "") not in self._MICROCOMPACT_TOOLS:
+                    continue
+                out = obs.output if isinstance(obs.output, dict) else {}
+                if (obs.tool_name or "") in ("shell", "bash") and "task_id" in out:
+                    # Background-task launch/status results carry an
+                    # irreproducible task_id — re-running a launch mints a NEW
+                    # task, so "re-run if needed" is actively wrong advice.
+                    # Live-confirmed 2026-07-14: eliding these caused repeated
+                    # relaunches chasing a lost task_id.
+                    continue
+                try:
+                    body_len = len(obs.to_obs_json(1))
+                except Exception:
+                    continue
+                if body_len < self._MICROCOMPACT_MIN_CHARS:
+                    continue
+                params = obs.tool_parameters or {}
+                target = (
+                    params.get("path")
+                    or params.get("pattern")
+                    or params.get("command")
+                    or params.get("query")
+                    or ""
+                )
+                target_hint = f" ({str(target)[:80]})" if target else ""
+                obs.superseded_note = (
+                    f"[old {obs.tool_name} output{target_hint} elided to save "
+                    f"context; re-run the tool if you need it again]"
+                )
+                events.append({
+                    "tool": obs.tool_name or "?",
+                    "decision": "elided",
+                    "chars_saved": body_len,
+                })
+                # DEBUG observability (moved here from the deleted tier-2
+                # compressor): every elide decision is grep-able as
+                # `[Microcompact]` on a session log, reconstructing the
+                # compression history without the full trace file.
+                self.logger.debug(
+                    f"[Microcompact] tool={obs.tool_name or '?'} elided "
+                    f"body_len={body_len}",
+                    component="PersistentAgent",
+                )
+        return events
+
     def _supersede_stale(self, turns: List[ConversationTurn]) -> None:
         """Elide older supersedable snapshots in-place; keep the newest of each.
 
         Screenshot/snapshot-style observations are only useful at their latest
         value — older ones are dead weight. Walk newest→oldest and, for each
-        (tool, action) in SUPERSEDABLE_TOOL_ACTIONS, keep the first (newest)
+        atomic tool in SUPERSEDABLE_TOOL_ACTIONS (post-2.1: keyed on tool_name
+        alone since each atomic tool IS one action), keep the first (newest)
         occurrence intact while stamping every earlier one with a
         `superseded_note`. The stamp mutates the shared ToolResult objects, so
         it survives into every future _build_messages call and also shrinks
@@ -1315,8 +1482,7 @@ class PersistentAgent:
         seen_signatures: set = set()
         for turn in reversed(turns):
             for obs in reversed(turn.observations):
-                action = (obs.tool_parameters or {}).get("action")
-                sig = (obs.tool_name, action)
+                sig = obs.tool_name
                 if sig not in SUPERSEDABLE_TOOL_ACTIONS:
                     continue
                 if obs.superseded_note is not None:
@@ -1326,224 +1492,32 @@ class PersistentAgent:
                     seen_signatures.add(sig)  # newest occurrence — keep intact
                     continue
                 obs.superseded_note = (
-                    f"[superseded by newer {obs.tool_name}.{action}; "
+                    f"[superseded by newer {obs.tool_name}; "
                     f"result elided to save tokens]"
                 )
 
-    def _compress_obs_for_context(self, obs: ToolResult) -> str:
-        """Compress a ToolResult for tier-2 (recent but digested) rendering."""
-        tool = obs.tool_name or ""
-        params = obs.tool_parameters or {}
-
-        if not obs.success:
-            err = obs.error or str(obs.output) or ""
-            return json.dumps({"ok": False, "err": err[:500]}, ensure_ascii=False)
-
-        if tool == "read":
-            path = params.get("path", "?")
-            out = obs.output
-            if isinstance(out, dict):
-                lines = out.get("lines_returned") or out.get("total_lines") or "?"
-                return json.dumps({"ok": True, "out": f"Read {path} ({lines} lines)"}, ensure_ascii=False)
-            return json.dumps({"ok": True, "out": f"Read {path}"}, ensure_ascii=False)
-
-        if tool in ("bash", "shell", "ssh"):
-            out = obs.output
-            exit_code = obs.exit_code
-            if isinstance(out, dict):
-                stdout = str(out.get("stdout", ""))
-                exit_code = out.get("exit_code", exit_code)
-            else:
-                stdout = str(out or "")
-            lines = stdout.split("\n")
-            if len(lines) <= 10:
-                compressed = stdout
-            else:
-                head = "\n".join(lines[:5])
-                tail = "\n".join(lines[-5:])
-                compressed = f"{head}\n... ({len(lines) - 10} lines omitted) ...\n{tail}"
-            return json.dumps({"ok": True, "exit_code": exit_code, "out": compressed}, ensure_ascii=False)
-
-        if tool == "write":
-            path = params.get("path", "?")
-            lw = obs.lines_written or "?"
-            return json.dumps({"ok": True, "out": f"Wrote {path} ({lw} lines)"}, ensure_ascii=False)
-
-        if tool == "edit":
-            path = params.get("path", "?")
-            diff = obs.diff_output or ""
-            if len(diff) > 1000:
-                diff = diff[:1000] + "\n... (diff truncated)"
-            return json.dumps({"ok": True, "out": f"Edited {path}", "diff": diff}, ensure_ascii=False)
-
-        if tool == "desktop":
-            return self._compress_desktop_obs(obs)
-
-        if tool == "browser":
-            return self._compress_browser_obs(obs)
-
-        return obs.to_tool_result_json()
-
-    def _compress_desktop_obs(self, obs: ToolResult) -> str:
-        """Compress desktop tool observation for tier-2 rendering."""
-        params = obs.tool_parameters or {}
-        out = obs.output if isinstance(obs.output, dict) else {}
-        action = params.get("action", "")
-
-        def _state_summary(sa: dict) -> str:
-            parts: list[str] = []
-            if sa.get("foreground_changed"):
-                parts.append(f"fg→'{sa.get('foreground_title', '?')[:60]}'")
-            elif sa.get("title_changed"):
-                parts.append(f"title→'{sa.get('foreground_title', '?')[:60]}'")
-            new_wins = sa.get("new_windows", [])
-            if new_wins:
-                names = [w.get("title", "?")[:40] for w in new_wins[:2]]
-                parts.append(f"new_win: {names}")
-            return "; ".join(parts) if parts else "no change"
-
-        state = out.get("state_after", {})
-        state_str = _state_summary(state) if state else ""
-
-        if action == "screenshot":
-            path = out.get("path", "?")
-            return json.dumps({"ok": True, "out": f"Screenshot: {path}"}, ensure_ascii=False)
-
-        if action == "snapshot":
-            title = out.get("window_title", "?")
-            count = out.get("element_count", "?")
-            source = out.get("source", "?")
-            return json.dumps({"ok": True, "out": f"Snapshot: '{title}' ({count} elements, source={source})"}, ensure_ascii=False)
-
-        if action == "list_windows":
-            count = out.get("count", len(out.get("windows", [])))
-            fg = next((w["title"] for w in out.get("windows", []) if w.get("foreground")), "?")
-            return json.dumps({"ok": True, "out": f"Windows: {count} visible, fg='{fg[:60]}'"}, ensure_ascii=False)
-
-        if action == "find_element":
-            x, y = out.get("x", "?"), out.get("y", "?")
-            conf = out.get("confidence", "?")
-            src = out.get("source", "?")
-            matched = out.get("matched_text", "?")
-            return json.dumps({"ok": True, "out": f"Found '{matched}' at ({x},{y}), conf={conf}, source={src}"}, ensure_ascii=False)
-
-        if action == "find_and_click":
-            x, y = out.get("x", "?"), out.get("y", "?")
-            matched = out.get("matched_text", "?")
-            return json.dumps({"ok": True, "out": f"Clicked '{matched}' at ({x},{y})", "state": state_str}, ensure_ascii=False)
-
-        if action == "hover_at":
-            x, y = out.get("x", "?"), out.get("y", "?")
-            nearby = out.get("nearby_text", [])
-            tip = nearby[0]["text"][:100] if nearby else ""
-            return json.dumps({"ok": True, "out": f"Hover at ({x},{y})", "tooltip": tip}, ensure_ascii=False)
-
-        if action in ("click_at", "type_text", "drag", "scroll", "hotkey", "key_press"):
-            if action == "click_at":
-                label = f"Clicked ({out.get('x', '?')},{out.get('y', '?')})"
-            elif action == "type_text":
-                label = f"Typed {out.get('chars', '?')} chars"
-            elif action == "drag":
-                label = f"Dragged {out.get('from', '?')}->{out.get('to', '?')}"
-            elif action == "scroll":
-                label = f"Scrolled dy={out.get('dy', '?')} at ({out.get('x', '?')},{out.get('y', '?')})"
-            elif action == "hotkey":
-                label = f"Hotkey {out.get('keys', '?')}"
-            else:
-                label = f"Key {out.get('key', '?')}"
-            return json.dumps({"ok": True, "out": label, "state": state_str}, ensure_ascii=False)
-
-        return obs.to_tool_result_json()
-
-    def _compress_browser_obs(self, obs: ToolResult) -> str:
-        """Compress browser tool observation for tier-2 rendering."""
-        params = obs.tool_parameters or {}
-        out = obs.output if isinstance(obs.output, dict) else {}
-        action = params.get("action", "")
-
-        if action == "navigate":
-            url = out.get("url", "?")
-            status = out.get("status", "?")
-            ps = out.get("page_state")
-            result: dict = {"ok": True, "out": f"Navigated to {url} (status={status})"}
-            if ps and (ps.get("dialogs") or ps.get("notifications")):
-                result["page_state"] = ps
-            return json.dumps(result, ensure_ascii=False)
-
-        if action == "extract":
-            mode = out.get("mode", "?")
-            content = out.get("content", "")
-            trunc = " [truncated]" if out.get("truncated") else ""
-            head = content[:800].replace("\n", " ") if content else ""
-            result = {"ok": True, "out": f"Extracted {mode}: {len(content)} chars{trunc}"}
-            if head:
-                result["head"] = head
-            return json.dumps(result, ensure_ascii=False)
-
-        if action == "snapshot":
-            title = out.get("title", "?")
-            count = out.get("element_count", "?")
-            trunc = " [truncated]" if out.get("truncated") else ""
-            result = {"ok": True, "out": f"Snapshot: '{title}' ({count} elements{trunc})"}
-            dialogs = out.get("dialogs")
-            if dialogs:
-                result["dialogs"] = dialogs
-            notifs = out.get("notifications")
-            if notifs:
-                result["notifications"] = notifs
-            return json.dumps(result, ensure_ascii=False)
-
-        if action in ("click", "type"):
-            selector = params.get("selector", "?")
-            nav = " → navigated" if out.get("navigated") else ""
-            url = out.get("url_after", "")
-            result = {"ok": True, "out": f"{'Clicked' if action == 'click' else 'Typed into'} {selector}{nav}"}
-            if nav and url:
-                result["url"] = url
-            ps = out.get("page_state")
-            if ps and (ps.get("dialogs") or ps.get("notifications")):
-                result["page_state"] = ps
-            return json.dumps(result, ensure_ascii=False)
-
-        if action == "wait_for":
-            selector = out.get("selector")
-            if selector:
-                state = out.get("state", "?")
-                return json.dumps({"ok": True, "out": f"Wait complete: {selector} {state}"}, ensure_ascii=False)
-            url = out.get("url", "")
-            return json.dumps({"ok": True, "out": f"URL matched: {url}"}, ensure_ascii=False)
-
-        if action == "screenshot":
-            path = out.get("path", "?")
-            return json.dumps({"ok": True, "out": f"Screenshot: {path}"}, ensure_ascii=False)
-
-        if action == "vision_query":
-            answer = out.get("answer", "")
-            if isinstance(answer, dict):
-                answer = json.dumps(answer, ensure_ascii=False)
-            if len(str(answer)) > 500:
-                answer = str(answer)[:500] + "..."
-            return json.dumps({"ok": True, "out": answer}, ensure_ascii=False)
-
-        if action == "video_context":
-            video = out.get("video", {})
-            dur = video.get("duration_s", "?")
-            captions = video.get("captions", [])
-            trunc = " [truncated]" if video.get("captions_truncated") else ""
-            return json.dumps({"ok": True, "out": f"Video: {dur}s, {len(captions)} captions{trunc}"}, ensure_ascii=False)
-
-        if action == "fetch_json":
-            status = out.get("status", "?")
-            body = out.get("body", "")
-            head = body[:800] if body else ""
-            result = {"ok": True, "out": f"HTTP {status}"}
-            if head:
-                result["body_head"] = head
-            return json.dumps(result, ensure_ascii=False)
-
-        return obs.to_tool_result_json()
-
     # ── Tool execution ───────────────────────────────────────────────────────
+
+    async def _execute_tool_with_write_lock(
+        self, tool: BaseTool, tool_name: str, parameters: Dict[str, Any],
+    ) -> ToolResult:
+        """Run ``tool.execute(**parameters)``, serializing writes to the same
+        path across EVERY concurrent writer in this session — not just the
+        parent agent's own in-flight tool calls (that narrower dedup is
+        ``dispatched_write_paths`` in ``_think_streaming``), but also any
+        ``fan_out_agents``/``spawn_agent`` sub-task writing under the same
+        ``SessionContext`` (``_run_one_tool`` in spawn_agent_tool.py takes the
+        same lock via ``ctx.write_lock_for``). Two writers to DIFFERENT paths
+        never contend — only same-path writers serialize. No-op for
+        non-write/edit tools or when ctx is unavailable (test fixtures).
+        """
+        if tool_name not in ("write", "edit") or self._ctx is None:
+            return await tool.execute(**parameters)
+        path = parameters.get("path", "")
+        if not path:
+            return await tool.execute(**parameters)
+        async with self._ctx.write_lock_for(path):
+            return await tool.execute(**parameters)
 
     async def _execute_one(self, tc: ToolCall) -> ToolResult:
         """Execute a single ToolCall: check → validate → run → notify UI."""
@@ -1572,10 +1546,33 @@ class PersistentAgent:
                 return ToolResult(success=False, output=confirmation.message, error="USER_NEW_INSTRUCTION", tool_name=tool_name, tool_parameters=parameters)
 
         if not tool_name or tool_name not in self.tools:
-            available = sorted(self.tools.keys())
-            error_msg = f"Unknown tool: '{tool_name}'. Available tools: {available}"
-            self.logger.error(f"[{self.current_iteration}][Act] {error_msg}", component="PersistentAgent")
-            return ToolResult(success=False, output=None, error=error_msg, tool_name=tool_name or "unknown", tool_parameters=parameters)
+            # Defensive auto-load, NOT "same-turn activation" of a claim: the
+            # model can only emit a tool_use for a name it received a schema
+            # for THIS turn (self._api_tools, frozen before the request was
+            # sent — see _think_streaming), so a genuinely brand-new claim
+            # can never be called in the response that claims it. This branch
+            # exists for dispatch-layer callers that bypass that constraint
+            # (e.g. a ToolCall constructed directly, not from a real
+            # streamed tool_use) — it loads the instance on demand instead of
+            # erroring "Unknown tool" when self.tools doesn't have it yet.
+            if tool_name and tool_name in ToolRegistry.get_tool_names():
+                try:
+                    new_tools = ToolRegistry.create_all_tool_instances(
+                        ctx=self._ctx, extra_tool_names=[tool_name],
+                    )
+                    if tool_name in new_tools:
+                        self.tools[tool_name] = new_tools[tool_name]
+                        self._loaded_tools.add(tool_name)
+                        self._task_channel.activate_tools([tool_name])
+                        self._regenerate_api_tools()
+                except Exception:
+                    pass  # fall through to error below
+
+            if tool_name not in self.tools:
+                available = sorted(self.tools.keys())
+                error_msg = f"Unknown tool: '{tool_name}'. Available tools: {available}"
+                self.logger.error(f"[{self.current_iteration}][Act] {error_msg}", component="PersistentAgent")
+                return ToolResult(success=False, output=None, error=error_msg, tool_name=tool_name or "unknown", tool_parameters=parameters)
 
         param_error = self._validate_tool_parameters(tool_name, parameters)
         if param_error:
@@ -1593,7 +1590,7 @@ class PersistentAgent:
         except Exception:
             pass
 
-        result: ToolResult = await tool.execute(**parameters)
+        result: ToolResult = await self._execute_tool_with_write_lock(tool, tool_name, parameters)
 
         if not result.tool_name:
             result.tool_name = tool_name
@@ -1651,7 +1648,10 @@ class PersistentAgent:
         # Desktop task-scoped approval — pull through SessionContext when
         # supplied (per-session DesktopState); fall back to module-level
         # helpers for ctx=None paths (test fixtures).
-        if tool_name == "desktop":
+        # Post-2.1: matches every atomic ``desktop_*`` tool (family prefix);
+        # approving ONE desktop_* action approves the whole family for that
+        # task (DesktopState is session-wide, not per-tool).
+        if tool_name.startswith("desktop_"):
             ds = self._ctx.desktop_state if self._ctx is not None else None
             is_approved = ds.is_task_approved() if ds is not None else _desktop_is_task_approved()
             was_rescinded = ds.was_user_rescinded() if ds is not None else _desktop_was_user_rescinded()
@@ -1723,7 +1723,16 @@ class PersistentAgent:
         if tool is None:
             return False
         if tc.tool_name in ("bash", "shell"):
-            return bool(tc.parameters.get("concurrent_safe", False))
+            declared = tc.parameters.get("concurrent_safe")
+            if declared is not None:
+                # Explicit declaration (true or false) always wins over the
+                # heuristic — the model gets the final say either way.
+                return bool(declared)
+            # Model didn't declare — fall back to a conservative server-side
+            # heuristic so an obviously read-only command (ls, git status,
+            # --version probes, ...) doesn't get needlessly serialized just
+            # because the model forgot to set the flag.
+            return looks_read_only(tc.parameters.get("command", ""))
         return bool(getattr(tool, "is_concurrency_safe", False))
 
     # ── Context management ───────────────────────────────────────────────────
@@ -1818,17 +1827,34 @@ class PersistentAgent:
     # it grows unbounded across a long multi-item session. Keep the most recent
     # chars — older narrative is the least relevant.
     MAX_SUMMARY_CHARS = 16_000
+    # Item-boundary compaction only fires once obs pressure crosses this fraction
+    # of the effective budget. Unconditional per-item compaction (the old
+    # behavior) was a skeleton-first violation: it replaced verified raw tool
+    # output with LLM prose on every item even when there was zero context
+    # pressure, introducing one hallucination surface per item for no benefit.
+    # Compaction is now purely budget-driven, decoupled from item structure.
+    ITEM_BOUNDARY_COMPACT_RATIO = 0.80
 
     async def _compact_item_boundary(self) -> None:
-        """Fold turns beyond KEEP_RECENT into the summary at each item boundary.
+        """Compress old turns at an item boundary ONLY under obs-budget pressure.
 
-        ``_turns`` is a single rolling buffer that never resets across items and
-        is only trimmed under byte pressure. Once an item completes its raw
-        turns are dead weight — the ``ItemResult`` is the cross-item carrier —
-        so unlike :meth:`_compact_conversation` (which only fires when the obs
-        budget is strained) this compresses unconditionally whenever there are
-        more than ``KEEP_RECENT_TURNS`` turns, regardless of budget.
+        ``_turns`` is a single rolling buffer that never resets across items.
+        A completed item's raw turns are cheap to keep while the buffer fits the
+        budget, and keeping them preserves verified tool output (paths, exit
+        codes, stdout) that the next item may reference far more reliably than a
+        re-summarized narrative. So this fires on the SAME budget signal as
+        :meth:`_compact_conversation`, just at a lower ratio (0.80 vs 0.95) so an
+        item boundary is a natural early checkpoint to relieve pressure — never
+        an unconditional summarize step.
         """
+        if len(self._turns) <= self.KEEP_RECENT_TURNS:
+            return
+
+        budget = self._effective_obs_budget()
+        total_chars = sum(t.total_obs_chars() for t in self._turns)
+        if total_chars <= budget * self.ITEM_BOUNDARY_COMPACT_RATIO:
+            return
+
         compress_count = len(self._turns) - self.KEEP_RECENT_TURNS
         if compress_count <= 0:
             return
@@ -1840,17 +1866,78 @@ class PersistentAgent:
                 f"[New turns]\n{trace_text}"
             )
 
+        # Extract verified structured facts BEFORE the turns are trimmed, so
+        # they can be pinned after the prose summary (skeleton-first).
+        verified = self._extract_verified_facts(compress_count)
         new_summary = await self._llm_compress(trace_text, compress_count)
+        if verified:
+            new_summary = f"{new_summary}\n\n{verified}"
 
         self._turns = self._turns[-self.KEEP_RECENT_TURNS:]
         self._conversation_summary = new_summary[-self.MAX_SUMMARY_CHARS:]
 
         self.logger.info(
-            f"[{self.current_iteration}][Compact] Item boundary: {compress_count} "
+            f"[{self.current_iteration}][Compact] Item boundary at "
+            f"{total_chars / budget:.0%} budget: {compress_count} "
             f"turns -> summary ({len(self._conversation_summary)} chars), "
             f"{len(self._turns)} turns kept.",
             component="PersistentAgent",
         )
+
+    def _extract_verified_facts(self, compress_count: int) -> str:
+        """Deterministic structured-fact block from the turns being compacted.
+
+        Post-compact restoration (skeleton-first): the LLM summary is prose and
+        may drop or reword the exact paths/commands the agent will need later.
+        This walks the turns about to be folded away and pulls VERIFIED facts
+        straight from tool outputs — files written/edited (authoritative
+        ``output['path']``), skills read, and remote hosts touched — and returns
+        them as a compact block appended AFTER the prose summary. Every line
+        traces to a real tool result, never to the summarizer's narration, so
+        an artifact path can't be hallucinated or lost here.
+
+        Returns "" when there is nothing worth pinning.
+        """
+        files: List[str] = []
+        seen_files = set()
+        skills: List[str] = []
+        seen_skills = set()
+        hosts: List[str] = []
+        seen_hosts = set()
+
+        for turn in self._turns[:compress_count]:
+            for obs in turn.observations:
+                if not obs.success:
+                    continue
+                tool = obs.tool_name or ""
+                out = obs.output if isinstance(obs.output, dict) else {}
+                params = obs.tool_parameters or {}
+                if tool in ("write", "edit"):
+                    p = out.get("path")
+                    if p and p not in seen_files:
+                        seen_files.add(p)
+                        files.append(p)
+                elif tool == "read_skill":
+                    nm = out.get("name") or params.get("name")
+                    if nm and nm not in seen_skills:
+                        seen_skills.add(nm)
+                        skills.append(nm)
+                elif tool in ("ssh", "remote_handq"):
+                    host = params.get("ssh_target") or params.get("host") or ""
+                    if host and host not in seen_hosts:
+                        seen_hosts.add(host)
+                        hosts.append(host)
+
+        if not (files or skills or hosts):
+            return ""
+        lines = ["[Verified facts carried past compaction]"]
+        if files:
+            lines.append("Files written/edited: " + "; ".join(files[:20]))
+        if skills:
+            lines.append("Skills read: " + ", ".join(skills[:10]))
+        if hosts:
+            lines.append("Remote hosts touched: " + ", ".join(hosts[:10]))
+        return "\n".join(lines)
 
     async def _compact_conversation(self, budget_ratio: float = 0.95) -> None:
         """Compress old conversation turns into a narrative summary."""
@@ -1882,12 +1969,15 @@ class PersistentAgent:
             )
 
         # LLM compression with fallback
+        verified = self._extract_verified_facts(compress_count)
         new_summary = await self._llm_compress(trace_text, compress_count)
+        if verified:
+            new_summary = f"{new_summary}\n\n{verified}"
 
         # Update state — keep only recent turns; replace summary entirely
         # (old summary was already folded into trace_text above).
         self._turns = self._turns[-self.KEEP_RECENT_TURNS:]
-        self._conversation_summary = new_summary
+        self._conversation_summary = new_summary[-self.MAX_SUMMARY_CHARS:]
 
         self.logger.info(
             f"[{self.current_iteration}][Compact] Done: {compress_count} turns -> summary "
@@ -2143,97 +2233,6 @@ class PersistentAgent:
             return list(produced_paths)
         return list(llm_artifacts or [])
 
-    async def _gather_pre_item_hint(self, item: CheckListItem) -> Optional[str]:
-        """Invoke the FlowController's per-item hint provider for host context.
-
-        Returns the hint string (stripped, non-empty) or None. Persisted by
-        _execute_item into self._current_item_hint so it remains visible for
-        the entire item lifetime, not just the first iteration.
-        """
-        if self._pre_item_hint_provider is None:
-            return None
-        try:
-            result = self._pre_item_hint_provider(item)
-            hint: str = result if isinstance(result, str) else await result
-        except Exception as exc:
-            self.logger.warning(
-                f"[PersistentAgent] pre_item_hint_provider failed: {exc}",
-                component="PersistentAgent",
-            )
-            return None
-        return hint.strip() if hint and hint.strip() else None
-
-    @staticmethod
-    def _resolve_current_frame(item: CheckListItem) -> dict:
-        """Map ``item.ssh_target`` to a frame dict for LTM recall.
-
-        Empty ``ssh_target``  → ``{os:'windows', host:'local',  confidence:0.95}``
-        ``user@host`` value   → ``{os:'linux',   host:<host>,   confidence:0.85}``
-
-        Why ``confidence=0.85`` for SSH (not 0.95): the hostname overwhelmingly
-        indicates a Linux remote, but a user could SSH to a Windows server or
-        a non-Linux Unix. 0.85 stays above the 0.6 floor in
-        :func:`recall._frame_compatible` so filtering is active, but a
-        low-confidence wrong guess does NOT fully suppress signal — the
-        permissive-on-uncertainty bias still applies.
-        """
-        target = (item.ssh_target or "").strip()
-        if not target:
-            return {"os": "windows", "host": "local", "confidence": 0.95}
-        host = target.split("@", 1)[1] if "@" in target else target
-        return {"os": "linux", "host": host or "unknown", "confidence": 0.85}
-
-    async def _gather_ltm_block(self, item: CheckListItem) -> Optional[str]:
-        """Recall LTM context for this item's deliverable intent.
-
-        Uses the same LongTermMemory.get() singleton + format_context_block
-        API as Orchestrator. The recall query is built from the item's
-        ``expected_outcomes`` (the deliverable contract) rather than the full
-        ``instruction``: the instruction is laden with proper nouns (paths,
-        product/version names) that spuriously match passive-observation
-        activity snapshots about those same screens, inflating their recall
-        score. Anchoring on the deliverable keeps recall relevant to WHAT must
-        be produced. Falls back to ``instruction`` only when the item carries
-        no expected_outcomes.
-        """
-        try:
-            from ..infrastructure.long_term_memory import LongTermMemory
-            ltm = LongTermMemory.get()
-        except Exception:
-            return None
-        # LTM 2.0 frame: derive from item.ssh_target — local items get
-        # ``windows/local``; remote items get ``linux/<host>`` so SSH-captured
-        # insights surface and Windows-only insights are filtered out. See
-        # _resolve_current_frame for the confidence rationale.
-        current_frame = self._resolve_current_frame(item)
-        recall_query = " ".join(item.expected_outcomes).strip() or item.instruction
-        try:
-            self._interaction_manager.notify_recall_started()
-            from ..infrastructure.long_term_memory._constants import (
-                RECALL_MIN_SCORE_FAST,
-                RERANK_PERSISTENT_AGENT_ITEM,
-            )
-            # Per-item runs 5-20× per session at fast-tier (rerank off). Without
-            # rerank as the final relevance gate, the RECALL_MIN_SCORE_FAST
-            # dense-branch floor is what stops activity-snapshot noise from
-            # padding into the agent's per-item context. See _constants.py §4.
-            block = await ltm.format_context_block(
-                query=recall_query,
-                rerank=RERANK_PERSISTENT_AGENT_ITEM,
-                min_score=RECALL_MIN_SCORE_FAST,
-                current_frame=current_frame,
-            )
-            if not (block and block.strip()):
-                return None
-            self._emit_recall_summary(block)
-            return block
-        except Exception as exc:
-            self.logger.warning(
-                f"[PersistentAgent] LTM recall failed: {exc}",
-                component="PersistentAgent",
-            )
-            return None
-
     # Pull the memory/knowledge sections out of a rendered LTM block, then
     # the per-entry summary text inside them. The block is XML-tagged
     # (see recall.format_memory_block / format_knowledge_block): the two
@@ -2277,76 +2276,10 @@ class PersistentAgent:
         except Exception:
             pass
 
-    async def _gather_stagnation_ltm_block(
-        self, item: CheckListItem, failure_signatures: List[str]
-    ) -> Optional[str]:
-        """Mid-item LTM recall focused on failure-recovery patterns.
-
-        Triggered by IterationAdvisor.should_refresh_ltm() when the agent
-        has stagnated (≥3 consecutive failures, cooldown-gated). This is a
-        REMINDER injected on top of ``_current_ltm_block`` (which already
-        carries IDENTITY + AGENTIC + instruction-aligned recall from
-        item-start), so:
-          - query: ``failure_signatures``-only — the instruction is
-            already in ``_current_item_block`` and re-including it dilutes
-            BM25 / dense focus on the actual blocker.
-          - memory dimension = AGENTIC — user patterns and environment
-            facts relevant to unblocking.
-          - include_identity=False — IDENTITY is in ``_current_ltm_block``;
-            re-rendering it on every stagnation refresh wastes tokens.
-          - k=3/3 — focused reminder, not full re-discovery.
-        Returns None on empty/error so the caller's injection path becomes
-        a no-op.
-        """
-        try:
-            from ..infrastructure.long_term_memory import (
-                LongTermMemory, MemoryDimension,
-            )
-            ltm = LongTermMemory.get()
-        except Exception:
-            return None
-        if failure_signatures:
-            sigs = "; ".join(failure_signatures)
-            query = f"Recovery strategies for: {sigs}"
-        else:
-            # No signatures yet — advisor's should_refresh_ltm() only
-            # fires after ≥3 consecutive failures, so this branch is
-            # uncommon. Fall back to the instruction so we still issue a
-            # sensible recall instead of an empty query.
-            query = item.instruction
-        try:
-            self._interaction_manager.notify_recall_started()
-            from ..infrastructure.long_term_memory._constants import (
-                RERANK_PERSISTENT_AGENT_STAGNATION,
-            )
-            block = await ltm.format_context_block(
-                query=query,
-                memory_dimension=MemoryDimension.AGENTIC,
-                memory_k=3,
-                knowledge_k=3,
-                include_identity=False,
-                rerank=RERANK_PERSISTENT_AGENT_STAGNATION,
-                current_frame=self._resolve_current_frame(item),
-            )
-        except Exception as exc:
-            self.logger.warning(
-                f"[PersistentAgent] Stagnation LTM recall failed: {exc}",
-                component="PersistentAgent",
-            )
-            return None
-        if not (block and block.strip()):
-            return None
-        self.logger.info(
-            f"[{self.current_iteration}][LTM] Stagnation refresh issued "
-            f"({len(failure_signatures)} signatures, {len(block):,} chars)",
-            component="PersistentAgent",
-        )
-        return block
-
-    # ── Checklist callbacks ──────────────────────────────────────────────────
+    # ── TaskChannel callbacks ────────────────────────────────────────────────
 
     def _handle_tools_added(self, names: List[str]) -> None:
-        """Callback: planner activated new tools — load implementations."""
+        """Callback: tools activated on the task channel — load implementations."""
         delta = [n for n in names if n and n not in self._loaded_tools]
         if not delta:
             return
@@ -2361,47 +2294,11 @@ class PersistentAgent:
             if name not in self.tools:
                 self.tools[name] = tool
         # Mark only names that actually resolved to a tool instance. An unknown
-        # name (planner typo / not-yet-registered) is silently absent from
-        # new_tools — create_all_tool_instances does not raise — so updating
-        # _loaded_tools with the raw delta would permanently swallow a later
-        # genuine activation of that name.
+        # name (typo / not-yet-registered) is silently absent from new_tools —
+        # create_all_tool_instances does not raise — so updating _loaded_tools
+        # with the raw delta would permanently swallow a later genuine
+        # activation of that name.
         loaded = [n for n in delta if n in new_tools]
-        # Names known to be hint-only providers (e.g. "coding") have no entry
-        # in ToolRegistry by design — their CapabilityProvider injects a hint
-        # via flow_controller._gather_pre_item_hints. Filtering them out here
-        # prevents a misleading "not registered" warning surfacing in the
-        # agent's conversation.
-        unresolved = [
-            n for n in delta
-            if n not in new_tools
-            and n not in HINT_ONLY_PROVIDER_NAMES
-        ]
-        if unresolved:
-            # Surface the unresolved names to the agent's conversation so the
-            # LLM can name them in error JSON when applicable. Without this,
-            # an item that needs a missing tool produces "0 tool calls →
-            # speculative completion" with no obvious cause from the agent's
-            # perspective. The synthetic ToolResult is a sentinel — it never
-            # gets executed; tool_name="tool_activation_notice" makes the
-            # source visible in logs and conversation traces.
-            self._persist_event_observations(
-                [ToolResult(
-                    success=False, output=None,
-                    tool_name="tool_activation_notice", tool_parameters={},
-                    error=(
-                        f"Planner requested tool(s) {unresolved} but they are "
-                        f"not registered in this build. They will NOT be "
-                        f"available. If the current item requires one of these, "
-                        f"return an error JSON naming the missing tool — do not "
-                        f"attempt to invoke it and do not fabricate a "
-                        f"factual_outcome."
-                    ),
-                )],
-                note=(
-                    f"(Tool activation: planner requested {sorted(delta)}; "
-                    f"loaded {sorted(loaded)}; unresolved {sorted(unresolved)}.)"
-                ),
-            )
         if not loaded:
             self.logger.warning(
                 f"[PersistentAgent] No tools resolved from activation request "
@@ -2416,8 +2313,8 @@ class PersistentAgent:
     def _regenerate_api_tools(self) -> None:
         """Rebuild self._api_tools from currently-loaded, non-hidden tools.
 
-        Called after planner activation (via _handle_tools_added) and after
-        agent self-extension (via _apply_self_extension). Hidden tools are
+        Called after task-channel activation (via _handle_tools_added) and
+        after agent self-extension (via _apply_self_extension). Hidden tools are
         excluded from the LLM's visible tool list but their instances stay
         loaded — re-claiming is 0 ms.
         """
@@ -2434,8 +2331,8 @@ class PersistentAgent:
     def _apply_self_extension(self, claim: List[str], release: List[str]) -> None:
         """Apply agent-driven claim_tool / release_tool fields from a turn.
 
-        - claim: append to checklist active tools (loads via the same callback
-          chain the planner uses) and remove from hidden if present.
+        - claim: append to task-channel active tools (loads via the same callback
+          chain skill activation uses) and remove from hidden if present.
         - release: add to hidden set; resource stays loaded for fast re-claim.
 
         Unknown names are silently dropped — operators see them at debug
@@ -2451,7 +2348,7 @@ class PersistentAgent:
                 # activate_tools is idempotent; the on_tools_changed callback
                 # fires only for genuinely-new names.
                 self._hidden_tools.difference_update(valid)
-                self._checklist.activate_tools(valid)
+                self._task_channel.activate_tools(valid)
             dropped = [n for n in claim if n not in valid]
             if dropped:
                 self.logger.debug(

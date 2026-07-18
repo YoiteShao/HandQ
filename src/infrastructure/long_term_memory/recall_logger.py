@@ -2,7 +2,7 @@
 
 Why a separate module
 ---------------------
-Recall is a hot-path call (every receptionist message + every planner
+Recall is a hot-path call (every INTENT message + every per-item agent
 observe). Writing a row to ``recall_log`` synchronously on every hit
 would push SQLite write contention into the user-visible latency
 budget. Instead we buffer hits in memory and flush in batches piggybacked

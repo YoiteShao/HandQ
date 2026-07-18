@@ -1,15 +1,24 @@
-// HandQ Liquid Glass — Edge Refraction (liquidGL-style bevel).
-// desktopCapturer stream + WebGL2 fragment shader focused on the edge band:
-// broad refraction + sharp spike at boundary + multi-wavelength dispersion.
-// The dispersion is a soft spectral halo (each wavelength refracts by a
-// slightly different amount along the same direction), NOT a static tint or
-// a wide per-channel fringe — that keeps it reading as real glass color
-// dispersion rather than a rainbow stripe or a printed decal.
+// HandQ Liquid Glass — unified edge-to-core refraction.
+// desktopCapturer stream + WebGL2 fragment shader covering the WHOLE window:
+// one continuous "bend" falloff (1 at the rounded-rect boundary, decaying to
+// 0 over EDGE_THICKNESS px inward) drives displacement, chromatic dispersion,
+// glow AND alpha together. Earlier revisions split the rim (crisp per-channel
+// displacement via gl.SCISSOR_TEST strips) from the interior (fully
+// transparent, undrawn) as two separate code paths — even with a smooth
+// alpha ramp between them, switching what the shader DOES at the seam read
+// as "edge is edge, center is center" rather than one continuous piece of
+// glass. Validated in an isolated demo (see project chat) before porting
+// here; a single sampling function whose inputs simply decay toward the
+// center removes the seam entirely, at the cost of drawing the full quad
+// instead of 4 edge strips (acceptable — render is still event-driven, not
+// a fixed-rate loop, and the window is a few hundred px across).
 //
-// Rasterization is limited to a 4-strip "picture frame" via gl.SCISSOR_TEST —
-// interior pixels aren't visited at all, since the shader would discard them
-// anyway. Window bounds are pushed from main.js on move/resize instead of
-// polled per frame; this removes the IPC roundtrip that made drag feel laggy.
+// Displacement direction is the outward normal of the rounded-rect SDF,
+// taken via screen-space derivatives (dFdx/dFdy of the signed distance
+// itself) rather than a vector from the shape's center — a radial-from-
+// center vector is only correct at the corners; along a flat edge the true
+// outward direction is perpendicular to that edge. The derivative trick
+// gives the right normal everywhere with no per-region case analysis.
 
 'use strict';
 
@@ -23,143 +32,153 @@ void main() {
     gl_Position = vec4(a_pos, 0.0, 1.0);
 }`;
 
-// liquidGL-inspired fragment shader:
-// - axis-split edgeFactor (LR + TB bands combined via max)
-// - two-part refraction: edge*refraction + pow(edge,10)*bevelDepth
-// - centreBlend suppression (no refraction near center)
-// - clean rounded-rect masking (sdRoundBox used for inShape only)
 const FRAG = `#version 300 es
-precision mediump float;
+precision highp float;
 
 uniform sampler2D u_tex;
-uniform vec2 u_res;        // canvas resolution
-uniform vec4 u_crop;       // xy=offset, zw=size (normalized screen coords)
-uniform float u_radius;    // corner radius in pixels
-uniform float u_refraction;   // broad refraction strength
-uniform float u_bevelDepth;   // sharp bevel spike strength
-uniform float u_dispersion;   // per-wavelength refraction spread (fraction of displacement)
-uniform float u_bevelWidthLR;     // bevel band width for left/right edges (fraction of min dimension)
-uniform float u_bevelWidthTop;    // bevel band width for the top edge (fraction of min dimension)
-uniform float u_bevelWidthBottom; // bevel band width for the bottom edge (fraction of min dimension)
+uniform vec2 u_res;
+uniform vec4 u_crop;            // xy=offset, zw=size (normalized screen coords)
+uniform float u_radius;         // corner radius, px
+
+uniform float u_edgeThickness;  // px — width of the bend band inward from the rim
+uniform float u_refraction;     // px, peak displacement at the rim
+uniform float u_dispersion;     // px, peak per-channel spectral spread at the rim
+uniform float u_glowStrength;   // additive, color-tinted glow intensity at rim
+uniform float u_edgeOpacity;    // white-tint mix strength at the rim (0 = clear glass)
+uniform float u_coreOpacity;    // white-tint mix strength at the interior (frosted body)
+uniform float u_glassAlpha;     // extra flat tint mix added on top (material color)
+uniform vec3  u_tintColor;
+uniform float u_frostiness;     // blur radius, px (0 = off)
 
 in vec2 v_uv;
 out vec4 o;
 
-// Correct SIGNED distance to rounded box (negative inside, positive outside)
 float sdRoundBox(vec2 p, vec2 b, float r) {
     vec2 q = abs(p) - b + r;
     return min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - r;
 }
 
-float edgeFactor(vec2 uv) {
-    vec2 p_px = (uv - 0.5) * u_res;
-    // Inward distance from each edge (positive inside). WebGL clip space is
-    // bottom-origin, so p_px.y > 0 corresponds to the upper half of the canvas
-    // — distTop shrinks as we approach uv.y = 1, distBottom as uv.y = 0.
-    float distLR = 0.5 * u_res.x - abs(p_px.x);
-    float distTop = 0.5 * u_res.y - p_px.y;
-    float distBottom = 0.5 * u_res.y + p_px.y;
-    float minDim = min(u_res.x, u_res.y);
-    float bevelLRpx = u_bevelWidthLR * minDim;
-    float bevelTopPx = u_bevelWidthTop * minDim;
-    float bevelBottomPx = u_bevelWidthBottom * minDim;
-    // 1.0 at the corresponding edge, 0.0 beyond the bevel band.
-    float edgeLR = 1.0 - smoothstep(0.0, bevelLRpx, distLR);
-    float edgeTop = 1.0 - smoothstep(0.0, bevelTopPx, distTop);
-    float edgeBottom = 1.0 - smoothstep(0.0, bevelBottomPx, distBottom);
-    return max(edgeLR, max(edgeTop, edgeBottom));
+vec3 sampleBg(vec2 uv) {
+    return texture(u_tex, u_crop.xy + uv * u_crop.zw).rgb;
+}
+
+vec3 sampleBgAA(vec2 uv, float radiusPx) {
+    if (radiusPx < 0.4) return sampleBg(uv);
+    vec2 texel = u_crop.zw / u_res;
+    vec3 sum = vec3(0.0);
+    float n = 0.0;
+    for (int x = -2; x <= 2; x++) {
+        for (int y = -2; y <= 2; y++) {
+            vec2 off = vec2(float(x), float(y)) * texel * (radiusPx * 0.5);
+            sum += sampleBg(uv + off);
+            n += 1.0;
+        }
+    }
+    return sum / n;
 }
 
 void main() {
-    // Inside/outside mask
     vec2 p_px = (v_uv - 0.5) * u_res;
     vec2 b_px = 0.5 * u_res;
     float sd = sdRoundBox(p_px, b_px, u_radius);
     float inShape = 1.0 - smoothstep(-1.0, 1.0, sd);
     if (inShape < 0.01) { o = vec4(0.0); return; }
 
-    // Edge factor (0 at center, 1 at boundary)
-    float edge = edgeFactor(v_uv);
+    // Outward normal of the SDF field via screen-space derivatives — correct
+    // along flat edges AND around the rounded corners alike.
+    vec2 gradSd = vec2(dFdx(sd), dFdy(sd));
+    vec2 normalDir = length(gradSd) > 1e-5 ? normalize(gradSd) : vec2(0.0);
 
-    // Early out for fully-interior pixels (no refraction needed)
-    if (edge < 0.001) { o = vec4(0.0); return; }
+    // Single continuous falloff: 1 at the boundary, eased down to 0 over
+    // u_edgeThickness px moving inward. Everything below reads from "bend",
+    // never branches into a separate interior code path.
+    float distIn = -sd;
+    float shape = 1.0 - smoothstep(0.0, u_edgeThickness, distIn);
+    float bend = pow(shape, 1.4);
 
-    // Centre blend: suppress refraction near absolute center
-    vec2 p = v_uv - 0.5;
-    p.x *= u_res.x / u_res.y;
-    float centreBlend = smoothstep(0.12, 0.42, length(p));
+    vec2 baseUV = vec2(v_uv.x, 1.0 - v_uv.y);
+    vec2 dispUV = normalDir * (bend * u_refraction) / u_res;
+    // Dispersion is an INDEPENDENT pixel-scale offset (u_dispersion is now a
+    // px quantity, not a fraction of the refraction displacement). Earlier
+    // revision multiplied the already-small bend*refraction displacement by
+    // (1 ± disp) — with disp capped at 0.4, the resulting per-channel
+    // separation was a small fraction of an already-small number, which read
+    // as "faint" no matter how the sliders were set. Reference art (Apple's
+    // liquid glass) shows a wide, clearly-separated spectral fringe at the
+    // rim — decoupling dispersion from refraction lets it reach that
+    // magnitude independently.
+    vec2 dispersionOffsetUV = normalDir * (bend * u_dispersion) / u_res;
+    float blurPx = u_frostiness * mix(1.0, 0.4, bend);
 
-    // liquidGL dual refraction formula:
-    // broad linear + sharp exponential spike at the very edge
-    float offsetAmt = edge * u_refraction + pow(edge, 6.0) * u_bevelDepth;
-    offsetAmt *= centreBlend;
+    // Single shared tap when dispersion is off (the common case — confirmed
+    // default is 0). u_dispersion is a uniform, so this branch is the same
+    // for every pixel in the draw call (no per-pixel divergence cost) — it
+    // just skips doing 3x the texture fetches across the WHOLE window body
+    // for a per-channel offset that would evaluate to zero anyway.
+    vec3 color;
+    if (u_dispersion < 0.001) {
+        color = sampleBgAA(baseUV + dispUV, blurPx);
+    } else {
+        color.r = sampleBgAA(baseUV + dispUV + dispersionOffsetUV, blurPx).r;
+        color.g = sampleBgAA(baseUV + dispUV, blurPx).g;
+        color.b = sampleBgAA(baseUV + dispUV - dispersionOffsetUV, blurPx).b;
+    }
 
-    // Displacement direction: outward from center. The rim samples the
-    // desktop behind the window edge and pulls it further out, so straight
-    // features behind the window visibly bow/shift as they cross the band —
-    // the "bending light through a thick glass edge" cue.
-    vec2 dir = normalize(p + 0.001);
-    vec2 offset = dir * offsetAmt;
-
-    // Map to texture UV space
-    vec2 baseUV = u_crop.xy + vec2(v_uv.x, 1.0 - v_uv.y) * u_crop.zw;
-
-    // Multi-wavelength dispersion done the physically-correct way: instead of
-    // sampling one bent point and then adding a separate sideways per-channel
-    // fringe (which reads as three discrete rainbow stripes once it's wide
-    // enough to see), each wavelength REFRACTS BY A SLIGHTLY DIFFERENT AMOUNT
-    // along the SAME direction — exactly how a real glass edge's refractive
-    // index varies with wavelength. The spread is a small fraction (~±9%) of
-    // the displacement itself, so the colored copies stay overlapped into a
-    // soft spectral halo whose width scales WITH the bend (never separating
-    // into bands), and it's gated by u_dispersion * a smooth edge ramp so the
-    // color only blooms in the peak of the bevel, not across the whole band.
-    float disp = u_dispersion * smoothstep(0.15, 1.0, edge);
-    vec2 offR = offset * (1.0 + disp);
-    vec2 offG = offset;
-    vec2 offB = offset * (1.0 - disp);
-    // Crisp single-tap per channel — the whole point of edge refraction is
-    // seeing the desktop behind the window bent sharply and split into a
-    // spectral halo. An earlier revision box-blurred these samples to stop a
-    // row of small text under the band from tearing into colored lines, but
-    // blurring the samples destroys exactly the sharpness that reads as
-    // "glass" — the bend and the dispersion both smear into a dull haze. Keep
-    // the taps crisp; the text-tearing case is handled instead by keeping the
-    // band from reaching too far in (BEVEL_WIDTH_TOP) rather than by blurring.
-    float r = texture(u_tex, baseUV + offR * u_crop.zw).r;
-    float g = texture(u_tex, baseUV + offG * u_crop.zw).g;
-    float b = texture(u_tex, baseUV + offB * u_crop.zw).b;
-    vec3 color = vec3(r, g, b);
-
-    // Gentle saturation lift in the peak so the spectral separation reads as
-    // a luminous glass halo rather than a faint tint. Small — the dispersion
-    // above already provides the hue; this just keeps it from washing out.
+    // Saturation lift so the dispersion reads as a spectral halo, not a wash.
     float luma = dot(color, vec3(0.299, 0.587, 0.114));
-    color = mix(vec3(luma), color, 1.0 + smoothstep(0.15, 1.0, edge) * 0.45);
+    color = mix(vec3(luma), color, 1.0 + bend * 0.7);
 
-    // Alpha: linear-ish falloff with a high edge peak so the refracted rim
-    // clearly overrides the un-refracted desktop showing through the
-    // transparent window — a low peak made the displaced copy blend back
-    // into the real content behind and the bend became invisible.
-    float alpha = pow(edge, 1.1) * 0.95 * inShape;
+    // Tint/frost — NOT alpha. This is the actual "transparent at the rim,
+    // less transparent toward the center" cue the design calls for. Earlier
+    // revision implemented that gradient by lowering the COMPOSITING alpha
+    // itself (edgeOpacity down to ~0.05) — but this canvas sits over an
+    // OS-transparent window showing the SAME real desktop underneath, so a
+    // faint-alpha copy of a slightly-shifted image blends almost invisibly
+    // back into its own undisplaced twin: the refraction/dispersion shift
+    // was real but diluted into imperceptibility. Fix: composite at
+    // near-full alpha everywhere inside the shape (so the bend actually
+    // replaces what's there instead of faintly blending into it), and do
+    // the transparent-to-frosted gradient via how much white tint gets
+    // mixed in — near 0 at the rim (clear glass, dispersion fully visible),
+    // higher toward center (frosted body).
+    float tintMix = clamp(mix(u_coreOpacity, u_edgeOpacity, bend) + u_glassAlpha, 0.0, 1.0);
+    color = mix(color, u_tintColor, tintMix);
+
+    // Additive glow at the rim, tinted by the already-dispersed color so the
+    // highlight itself carries a hint of the spectral fringe rather than
+    // reading as a flat white line. Multiplicative-only (no flat vec3(...)
+    // additive term) — an earlier revision added a flat brightening on top,
+    // which pushes R/G/B up by an equal amount regardless of the underlying
+    // hue, i.e. it desaturates toward literal white and reads as a solid
+    // white outline rather than a soft colored highlight. pow(bend, 4.5)
+    // (was 3.0) narrows the highlight to a thin rim line instead of a wide
+    // band, per the same complaint (outer edge looked like a thick white
+    // border, not a refined highlight).
+    float glow = pow(bend, 4.5) * u_glowStrength;
+    color += color * glow;
+
+    // Compositing alpha: near-1 through the body of the shape, falling only
+    // in the outer antialiasing ring (inShape) — this is what makes the bend
+    // itself visible instead of alpha-diluted. inShape already handles the
+    // true shape boundary independently of u_edgeThickness (the refraction
+    // band width), so corners/edges still antialias cleanly.
+    float alpha = inShape;
 
     o = vec4(color * alpha, alpha);
 }`;
 
 // --- Constants ---
-// Capture the desktop at LOW resolution on purpose. First-principles: a
-// frosted-glass edge refracts a BLURRED (low-frequency) copy of what's behind
-// it, and a low-frequency image loses nothing when stored at low resolution
-// (Nyquist). So instead of capturing 1280px and then spending GPU to blur it,
-// we capture small and let the sampler's built-in bilinear upscale BE the
-// blur — free. Three wins at once from this single number:
-//   1. Upload cost (texImage2D, the per-frame bottleneck) drops ~11x vs 1280.
-//   2. The refraction can no longer tear fine text into colored lines, because
-//      there's no high-frequency detail left in the source to tear.
-//   3. The soft, low-detail look is what real frosted glass should show.
-// 384 keeps just enough structure that the bent content still reads as "the
-// window/colors behind, bending" rather than a flat color smear.
-const CAPTURE_MAX_DIM = 384;
+// Capture resolution. The old design only ever showed this capture in thin
+// edge strips (gl.SCISSOR_TEST bands) — at that scale a deliberately LOW-res
+// capture (384px, relying on bilinear upscale as free blur) was invisible as
+// blur and saved a lot of upload cost. Now the shader paints the ENTIRE
+// window body with this same texture (STATE.coreOpacity blends it under a
+// tint, not a discard), so a 384px source stretched ~2-3x across the full
+// card reads as visibly mushy — text/icons behind the window turn to soup
+// everywhere, not just at the rim. Raised to 1024 so the interior stays
+// legible; frostiness (STATE.frostiness, default 0) is the correct knob for
+// an intentional soft-frost look now, not an under-resolved capture.
+const CAPTURE_MAX_DIM = 1024;
 // Event-driven rendering (see the render section below): we no longer spin a
 // fixed-rate rAF loop. The only clock left is a throttle on how often a
 // *changing* desktop is allowed to trigger a redraw — a blurred edge doesn't
@@ -168,40 +187,28 @@ const CAPTURE_MAX_DIM = 384;
 // When the desktop is static and the window is still, nothing ticks at all.
 const DESKTOP_REFRESH_MS = 200;     // max ~5fps desktop-content refresh when busy
 
-// Shader parameters (tuned for window-level glass).
-// LR / Top / Bottom bevel bands are independent — the top is widened so the
-// title bar's blank strip carries a more prominent bend, while the bottom
-// stays narrower to keep the content-hugging edge tight. Corners take
-// max(LR, Top/Bottom), so the wider band dominates the corner arc.
-//
-// CRITICAL relationship: peak displacement must stay a fraction OF the bevel
-// band width, not exceed it. Displacement in screen px ≈ (REFRACTION +
-// BEVEL_DEPTH) × window_width; band width in px ≈ BEVEL_WIDTH_* × min(window
-// dimensions). The previous 0.055/0.070 (sum 0.125 ≈ 105px on an 840px
-// window) dwarfed the ~50px band, so the rim sampled desktop content far
-// outside the edge — visually uncorrelated with the boundary, which read as
-// "no bend / random smear" rather than refraction. Keeping the peak at
-// ~70% of the band width makes the displaced content come from just past
-// the window edge, so straight features behind the window smoothly bow as
-// they cross the band — a real, legible bend.
-const REFRACTION = 0.020;        // broad displacement (linear across the band)
-const BEVEL_DEPTH = 0.028;       // extra displacement concentrated near the edge
-const DISPERSION = 0.11;         // per-wavelength refraction spread (±11% of the
-                                  // displacement). Small enough that the R/G/B
-                                  // copies stay overlapped into a soft spectral
-                                  // halo that scales with the bend, instead of
-                                  // separating into discrete rainbow bands.
-const BEVEL_WIDTH_LR = 0.10;     // left/right edges
-const BEVEL_WIDTH_TOP = 0.06;    // top edge — a middle ground: 0.08 reached far
-                                  // enough in to sit over dense nav-bar text and
-                                  // tear it; 0.05 barely refracted at all. 0.06
-                                  // keeps a clearly-visible refracting top rim
-                                  // while pulling the deepest refraction back
-                                  // toward the very edge where less text sits.
-const BEVEL_WIDTH_BOTTOM = 0.04; // bottom edge — narrow band
+// Shader parameters — validated against an isolated demo app before porting
+// here (see project chat for the layer-1/layer-2 validation walkthrough).
+// Kept as a mutable object (not const numbers) so the Ctrl+Shift+G tuning
+// panel below can adjust them live without touching shader/render code.
+// Corner radius intentionally stays at HandQ's existing 30px (matches
+// `.app { border-radius: 30px }` in styles.css) rather than the demo's own
+// 14px default, which was only sized for its own smaller demo window.
+const STATE = {
+    edgeThickness: 45,   // px — width of the bend band inward from the rim
+    refraction: 34,      // peak displacement magnitude at the rim
+    dispersion: 0,       // px — peak per-channel spectral spread at the rim
+                          // (independent of refraction — see shader comment)
+    glowStrength: 0.5,   // additive, color-tinted glow intensity at the rim
+    edgeOpacity: 0,      // white-tint mix strength at the rim (near-clear glass)
+    coreOpacity: 0,      // white-tint mix strength at the interior (frosted body)
+    glassAlpha: 0.0,     // tint mix strength (material color)
+    frostiness: 8,     // extra blur radius, px (0 = off)
+    radius: 30,          // corner radius, px — matches .app's CSS radius
+};
 
 async function initGlass() {
-    if (!window.glassCapture) return;
+    if (!window.glassCapture) { _logToFile('WARN', 'window.glassCapture missing, aborting'); return; }
 
     const canvas = document.createElement('canvas');
     canvas.id = 'glass-canvas';
@@ -209,15 +216,17 @@ async function initGlass() {
         'position:fixed;inset:0;width:100%;height:100%;z-index:-1;pointer-events:none;border-radius:30px;';
     document.body.prepend(canvas);
 
-    const gl = canvas.getContext('webgl2', { alpha: true, premultipliedAlpha: true });
-    if (!gl) { canvas.remove(); return; }
+    const gl = canvas.getContext('webgl2', { alpha: true, premultipliedAlpha: false, preserveDrawingBuffer: true });
+    if (!gl) { _logToFile('WARN', 'no webgl2 context, aborting'); canvas.remove(); return; }
 
     function makeShader(type, src) {
         const s = gl.createShader(type);
         gl.shaderSource(s, src);
         gl.compileShader(s);
         if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
-            console.error('[glass]', gl.getShaderInfoLog(s));
+            const log = gl.getShaderInfoLog(s);
+            console.error('[glass]', log);
+            _logToFile('ERROR', 'shader compile failed', { log });
             return null;
         }
         return s;
@@ -231,7 +240,9 @@ async function initGlass() {
     gl.attachShader(prog, fs);
     gl.linkProgram(prog);
     if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
-        console.error('[glass]', gl.getProgramInfoLog(prog));
+        const log = gl.getProgramInfoLog(prog);
+        console.error('[glass]', log);
+        _logToFile('ERROR', 'program link failed', { log });
         canvas.remove();
         return;
     }
@@ -249,12 +260,15 @@ async function initGlass() {
         res: gl.getUniformLocation(prog, 'u_res'),
         crop: gl.getUniformLocation(prog, 'u_crop'),
         radius: gl.getUniformLocation(prog, 'u_radius'),
+        edgeThickness: gl.getUniformLocation(prog, 'u_edgeThickness'),
         refraction: gl.getUniformLocation(prog, 'u_refraction'),
-        bevelDepth: gl.getUniformLocation(prog, 'u_bevelDepth'),
         dispersion: gl.getUniformLocation(prog, 'u_dispersion'),
-        bevelWidthLR: gl.getUniformLocation(prog, 'u_bevelWidthLR'),
-        bevelWidthTop: gl.getUniformLocation(prog, 'u_bevelWidthTop'),
-        bevelWidthBottom: gl.getUniformLocation(prog, 'u_bevelWidthBottom'),
+        glowStrength: gl.getUniformLocation(prog, 'u_glowStrength'),
+        edgeOpacity: gl.getUniformLocation(prog, 'u_edgeOpacity'),
+        coreOpacity: gl.getUniformLocation(prog, 'u_coreOpacity'),
+        glassAlpha: gl.getUniformLocation(prog, 'u_glassAlpha'),
+        tintColor: gl.getUniformLocation(prog, 'u_tintColor'),
+        frostiness: gl.getUniformLocation(prog, 'u_frostiness'),
     };
 
     const tex = gl.createTexture();
@@ -265,11 +279,20 @@ async function initGlass() {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
 
     gl.enable(gl.BLEND);
-    gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+    gl.blendFuncSeparate(gl.ONE, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
 
     // --- Capture ---
     const screenInfo = await window.glassCapture.getScreenSource();
-    if (!screenInfo || !screenInfo.sourceId) { canvas.remove(); return; }
+    if (!screenInfo || !screenInfo.sourceId) {
+        _logToFile('WARN', 'getScreenSource returned no sourceId, aborting', { screenInfo });
+        canvas.remove();
+        return;
+    }
+    _logToFile('INFO', 'screen source acquired', {
+        displayId: screenInfo.displayId,
+        displayWidth: screenInfo.displayWidth,
+        displayHeight: screenInfo.displayHeight,
+    });
 
     const scale = screenInfo.scaleFactor || 1;
     const rawW = screenInfo.displayWidth * scale;
@@ -293,7 +316,7 @@ async function initGlass() {
                 },
             },
         });
-    } catch (_) {
+    } catch (errA) {
         try {
             stream = await navigator.mediaDevices.getUserMedia({
                 audio: false,
@@ -309,15 +332,24 @@ async function initGlass() {
             });
         } catch (err) {
             console.warn('[glass] capture failed:', err.message);
+            _logToFile('ERROR', 'getUserMedia failed (both attempts)', {
+                firstError: errA && errA.message,
+                secondError: err && err.message,
+            });
             canvas.remove();
             return;
         }
     }
+    _logToFile('INFO', 'getUserMedia stream acquired', { capW, capH });
 
     const video = document.createElement('video');
     video.srcObject = stream;
     video.muted = true;
     await video.play();
+    _logToFile('INFO', 'video playing', {
+        videoWidth: video.videoWidth,
+        videoHeight: video.videoHeight,
+    });
 
     // Initial bounds via one-shot fetch; from here on we listen for main-push
     // updates instead of polling. No per-frame IPC.
@@ -384,6 +416,7 @@ async function initGlass() {
     // No fixed-rate loop. We draw a frame only when an INPUT changes:
     //   • the window moved/resized  → onBoundsChanged → requestRender(false)
     //   • the desktop behind us changed → refresh timer → requestRender(true)
+    //   • a tuning-panel slider moved → requestRender(false)
     // When both are static the GPU does almost nothing — the previous frame is
     // already correct, so re-drawing it would be identical work for no visible
     // change. This is the whole point of the optimization: near-zero cost while
@@ -392,10 +425,6 @@ async function initGlass() {
     function renderOnce(uploadTexture) {
         if (!bounds) return;
 
-        // Clear the whole canvas (needed so the interior stays transparent).
-        // Scissor is off here so clear covers all pixels — the 4 strip draws
-        // below only touch the edge band.
-        gl.disable(gl.SCISSOR_TEST);
         gl.clearColor(0, 0, 0, 0);
         gl.clear(gl.COLOR_BUFFER_BIT);
 
@@ -407,6 +436,7 @@ async function initGlass() {
             gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
         }
 
+        const dpr = window.devicePixelRatio || 1;
         gl.uniform1i(loc.tex, 0);
         gl.uniform2f(loc.res, canvas.width, canvas.height);
         gl.uniform4f(loc.crop,
@@ -414,36 +444,21 @@ async function initGlass() {
             bounds.y / bounds.displayHeight,
             bounds.width / bounds.displayWidth,
             bounds.height / bounds.displayHeight);
-        gl.uniform1f(loc.radius, 30.0 * (window.devicePixelRatio || 1));
-        gl.uniform1f(loc.refraction, REFRACTION);
-        gl.uniform1f(loc.bevelDepth, BEVEL_DEPTH);
-        gl.uniform1f(loc.dispersion, DISPERSION);
-        gl.uniform1f(loc.bevelWidthLR, BEVEL_WIDTH_LR);
-        gl.uniform1f(loc.bevelWidthTop, BEVEL_WIDTH_TOP);
-        gl.uniform1f(loc.bevelWidthBottom, BEVEL_WIDTH_BOTTOM);
+        gl.uniform1f(loc.radius, STATE.radius * dpr);
+        gl.uniform1f(loc.edgeThickness, STATE.edgeThickness * dpr);
+        gl.uniform1f(loc.refraction, STATE.refraction * dpr * 0.6);
+        gl.uniform1f(loc.dispersion, STATE.dispersion * dpr);
+        gl.uniform1f(loc.glowStrength, STATE.glowStrength);
+        gl.uniform1f(loc.edgeOpacity, STATE.edgeOpacity);
+        gl.uniform1f(loc.coreOpacity, STATE.coreOpacity);
+        gl.uniform1f(loc.glassAlpha, STATE.glassAlpha);
+        gl.uniform3f(loc.tintColor, 0.98, 0.98, 1.0);
+        gl.uniform1f(loc.frostiness, STATE.frostiness * dpr);
 
-        // Rasterize only the 4 edge strips. The shader would discard interior
-        // pixels via `edge < 0.001` anyway, but the rasterizer still visits
-        // every one — SCISSOR_TEST prevents that. `+ 4` gives a tiny margin so
-        // the shader's alpha fade never gets clipped mid-transition.
-        // gl.scissor uses bottom-left origin.
-        const minDim = Math.min(canvas.width, canvas.height);
-        const bevelTopPx = Math.ceil(BEVEL_WIDTH_TOP * minDim) + 4;
-        const bevelBottomPx = Math.ceil(BEVEL_WIDTH_BOTTOM * minDim) + 4;
-        const bevelLRpx = Math.ceil(BEVEL_WIDTH_LR * minDim) + 4;
-        const midH = Math.max(0, canvas.height - bevelTopPx - bevelBottomPx);
-        gl.enable(gl.SCISSOR_TEST);
-
-        gl.scissor(0, canvas.height - bevelTopPx, canvas.width, bevelTopPx); // top
+        // Full-quad draw — the shader now does real work across the whole
+        // window (the interior composites a tinted/frosted backdrop, not a
+        // discard), so there's no strip to scissor down to anymore.
         gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-        gl.scissor(0, 0, canvas.width, bevelBottomPx);                       // bottom
-        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-        gl.scissor(0, bevelBottomPx, bevelLRpx, midH);                       // left (mid section only)
-        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-        gl.scissor(canvas.width - bevelLRpx, bevelBottomPx, bevelLRpx, midH);// right (mid section only)
-        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
-
-        gl.disable(gl.SCISSOR_TEST);
     }
 
     // Coalesce any number of requests within one frame into a single draw. If
@@ -477,16 +492,125 @@ async function initGlass() {
     requestRender(true);
     setTimeout(() => requestRender(true), 60);
     setTimeout(() => requestRender(true), 150);
-    console.log('[glass] active (event-driven + ' + DESKTOP_REFRESH_MS + 'ms refresh), cap:', capW + 'x' + capH);
+    console.log('[glass] active (unified edge-to-core, event-driven + ' + DESKTOP_REFRESH_MS + 'ms refresh), cap:', capW + 'x' + capH);
+
+    installTuningPanel(() => requestRender(false));
+
+    // Exposed for the Playwright screenshot driver (and any future scripted
+    // testing) to programmatically set params and force a redraw without
+    // going through the slider DOM. __glassRedrawSync bypasses
+    // requestAnimationFrame entirely — rAF can be throttled/skipped when the
+    // window lacks OS focus (as happens when Playwright drives it headlessly),
+    // which would otherwise make automated before/after comparisons silently
+    // no-op.
+    window.__glassState = STATE;
+    window.__glassRedraw = () => requestRender(false);
+    window.__glassRedrawSync = () => renderOnce(true);
+}
+
+// --- Ctrl+Shift+G tuning panel ---
+// Dev-only live control over STATE (see above), mirroring the existing
+// Ctrl+Shift+L debug-log-panel pattern in renderer.js. Sliders write directly
+// into the same STATE object renderOnce() reads every frame, then trigger an
+// immediate (non-uploading) redraw so changes are visible instantly against
+// the real window instead of round-tripping through the standalone demo app.
+function installTuningPanel(requestRedraw) {
+    const FIELDS = [
+        { key: 'edgeThickness', label: 'Edge thickness (px)', min: 4, max: 100, step: 1 },
+        { key: 'refraction',    label: 'Refraction strength', min: 0, max: 100, step: 1 },
+        { key: 'dispersion',    label: 'Dispersion (px)',       min: 0, max: 40,  step: 0.5 },
+        { key: 'glowStrength',  label: 'Glow strength',        min: 0, max: 0.5, step: 0.01 },
+        { key: 'edgeOpacity',   label: 'Edge opacity',         min: 0, max: 1,   step: 0.01 },
+        { key: 'coreOpacity',   label: 'Core opacity',         min: 0, max: 1,   step: 0.01 },
+        { key: 'glassAlpha',    label: 'Glass alpha (tint)',   min: 0, max: 1,   step: 0.01 },
+        { key: 'frostiness',    label: 'Frostiness (blur px)', min: 0, max: 20,  step: 0.5 },
+        { key: 'radius',        label: 'Corner radius (px)',   min: 0, max: 60,  step: 1 },
+    ];
+
+    let panelEl = null;
+    let panelVisible = false;
+
+    function buildPanel() {
+        if (panelEl) return panelEl;
+        panelEl = document.createElement('div');
+        panelEl.id = 'glass-tuning-panel';
+        panelEl.style.cssText =
+            'position:fixed;top:12px;right:12px;width:260px;z-index:99999;' +
+            'background:rgba(20,20,24,0.90);color:#fff;border-radius:10px;' +
+            'padding:12px;font:11px/1.4 -apple-system,Segoe UI,sans-serif;' +
+            'box-shadow:0 8px 32px rgba(0,0,0,0.4);display:none;';
+
+        const title = document.createElement('div');
+        title.textContent = 'Liquid glass tuning (Ctrl+Shift+G to hide)';
+        title.style.cssText = 'font-weight:600;margin-bottom:8px;';
+        panelEl.appendChild(title);
+
+        FIELDS.forEach((f) => {
+            const row = document.createElement('label');
+            row.style.cssText = 'display:block;margin-top:8px;';
+            const valueSpan = document.createElement('span');
+            valueSpan.textContent = String(STATE[f.key]);
+            row.appendChild(document.createTextNode(f.label + ' '));
+            row.appendChild(valueSpan);
+
+            const input = document.createElement('input');
+            input.type = 'range';
+            input.min = String(f.min);
+            input.max = String(f.max);
+            input.step = String(f.step);
+            input.value = String(STATE[f.key]);
+            input.style.cssText = 'display:block;width:100%;';
+            input.addEventListener('input', () => {
+                const v = parseFloat(input.value);
+                STATE[f.key] = v;
+                valueSpan.textContent = String(v);
+                requestRedraw();
+            });
+
+            row.appendChild(input);
+            panelEl.appendChild(row);
+        });
+
+        document.body.appendChild(panelEl);
+        return panelEl;
+    }
+
+    window.addEventListener('keydown', (e) => {
+        if (e.ctrlKey && e.shiftKey && (e.key === 'G' || e.key === 'g')) {
+            e.preventDefault();
+            buildPanel();
+            panelVisible = !panelVisible;
+            panelEl.style.display = panelVisible ? 'block' : 'none';
+        }
+    });
 }
 
 // --- Boot ---
+function _logToFile(level, msg, extra) {
+    // glass-effect.js runs before renderer.js's window.__handqLog wiring is
+    // guaranteed ready in all load orders, so guard defensively. This routes
+    // through the same forwarder renderer.js installs, landing in
+    // handq-frontend.log — console.* alone is invisible once DevTools isn't
+    // attached (packaged builds, or when nobody popped devtools this launch).
+    try {
+        if (typeof window.__handqLog === 'function') {
+            window.__handqLog(level, '[glass] ' + msg, extra);
+            return;
+        }
+    } catch (_) { /* ignore */ }
+    try { console.log('[glass]', msg, extra); } catch (_) { /* ignore */ }
+}
+
 function init() {
     // Log the full error (with stack), not just .message — a silent init
     // failure here means the whole effect never renders, and the stack is what
     // pinpoints where. (A temporal-dead-zone ReferenceError from mis-ordered
     // `let`s vs. an early call site is exactly the kind of bug that hid here.)
-    initGlass().catch((e) => console.warn('[glass] init failed:', e));
+    _logToFile('INFO', 'init starting');
+    initGlass().catch((e) => {
+        console.warn('[glass] init failed:', e);
+        _logToFile('ERROR', 'init failed', { message: e && e.message, stack: e && e.stack });
+    });
 }
 
 if (document.readyState === 'loading') {

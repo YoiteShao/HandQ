@@ -117,15 +117,13 @@ async def recall_memory_impl(
     k: int = 5,
     min_score: float = 0.0,
     rerank: bool = True,
-    dynamic_k: bool = False,
     current_frame: Optional[dict] = None,
 ) -> List[Entry]:
-    effective_k = C.RECALL_PLANNER_OVERFETCH_K if dynamic_k else k
     rows = await _hybrid_recall(
         store, embedder, query,
         kind=EntryKind.MEMORY.value,
         facet_value=dimension.value if dimension else None,
-        k=effective_k,
+        k=k,
         min_score=min_score,
         current_frame=current_frame,
     )
@@ -159,16 +157,7 @@ async def recall_memory_impl(
         if not rows:
             return []
         rows = _recency_reorder(rows)
-    entries = [_row_to_memory_entry(r) for r in rows[:effective_k]]
-    if dynamic_k:
-        entries = _score_gap_trim(
-            entries,
-            min_k=C.RECALL_PLANNER_MIN_K,
-            max_k=C.RECALL_PLANNER_MAX_K,
-            gap=C.RECALL_SCORE_GAP_THRESHOLD,
-        )
-    else:
-        entries = entries[:k]
+    entries = [_row_to_memory_entry(r) for r in rows[:k]]
     RecallLogger.get().record(
         [e.id for e in entries], kind=EntryKind.MEMORY.value,
     )
@@ -185,15 +174,13 @@ async def recall_knowledge_impl(
     k: int = 5,
     min_score: float = 0.0,
     rerank: bool = True,
-    dynamic_k: bool = False,
     current_frame: Optional[dict] = None,
 ) -> List[Entry]:
-    effective_k = C.RECALL_PLANNER_OVERFETCH_K if dynamic_k else k
     rows = await _hybrid_recall(
         store, embedder, query,
         kind=EntryKind.KNOWLEDGE.value,
         facet_value=category.value if category else None,
-        k=effective_k,
+        k=k,
         min_score=min_score,
         current_frame=current_frame,
     )
@@ -217,16 +204,7 @@ async def recall_knowledge_impl(
         if not rows:
             return []
         rows = _recency_reorder(rows)
-    entries = [_row_to_knowledge_entry(r) for r in rows[:effective_k]]
-    if dynamic_k:
-        entries = _score_gap_trim(
-            entries,
-            min_k=C.RECALL_PLANNER_MIN_K,
-            max_k=C.RECALL_PLANNER_MAX_K,
-            gap=C.RECALL_SCORE_GAP_THRESHOLD,
-        )
-    else:
-        entries = entries[:k]
+    entries = [_row_to_knowledge_entry(r) for r in rows[:k]]
     RecallLogger.get().record(
         [e.id for e in entries], kind=EntryKind.KNOWLEDGE.value,
     )
@@ -340,25 +318,6 @@ def _recency_reorder(rows: List[tuple]) -> List[tuple]:
         return float(score) * (0.5 ** (age_days / halflife))
 
     return sorted(rows, key=_key, reverse=True)
-
-
-def _score_gap_trim(
-    entries: List[Entry], *, min_k: int, max_k: int, gap: float,
-) -> List[Entry]:
-    """Trim entries at the first score gap exceeding *gap*.
-
-    Respects *min_k* floor and *max_k* ceiling. Returns the original list
-    unchanged when scores are unavailable or the list is too short.
-    """
-    if len(entries) <= min_k:
-        return entries
-    entries = entries[:max_k]
-    for i in range(min_k - 1, len(entries) - 1):
-        curr = entries[i].score
-        nxt = entries[i + 1].score
-        if curr is not None and nxt is not None and (curr - nxt) > gap:
-            return entries[: i + 1]
-    return entries
 
 
 # ── Hybrid stage 1 ──────────────────────────────────────────────────────────

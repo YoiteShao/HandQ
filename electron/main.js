@@ -1148,6 +1148,14 @@ function createWindow() {
     // No native menu bar (Alt won't reveal it either).
     mainWindow.setMenuBarVisibility(false);
 
+    if (process.platform === 'win32') {
+        // Excludes this window from ANY screen capture (own-process
+        // desktopCapturer included) via SetWindowDisplayAffinity
+        // (WDA_EXCLUDEFROMCAPTURE) — fixes the glass effect sampling its own
+        // rendered pixels instead of the real desktop behind it.
+        try { mainWindow.setContentProtection(true); } catch (_) { /* ignore */ }
+    }
+
     mainWindow.loadFile(path.join(__dirname, 'renderer', 'index.html'));
 
     // Close behavior: hide to tray instead of quitting, unless the user picked

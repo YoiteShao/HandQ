@@ -43,6 +43,15 @@ _BINARY_EXTENSIONS = frozenset([
     ".xlsx", ".ppt", ".pptx", ".db", ".sqlite", ".wasm",
 ])
 
+# Image extensions get a more specific error pointing back at the desktop
+# tool's own OCR output — repeatedly seen in live traces: the model calls
+# desktop_screenshot, gets a path back, then calls read() on that path
+# expecting to "look at" the image instead of re-checking the screenshot
+# call's own text_regions/summary field it already has.
+_IMAGE_EXTENSIONS = frozenset([
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".ico", ".tiff",
+])
+
 
 def _add_line_numbers(lines: list, start: int = 1) -> str:
     """Prefix each line with its 1-based line number, right-aligned to 4 digits."""
@@ -231,10 +240,31 @@ class ReadTool(BaseTool):
         path_obj = Path(path)
 
         if not path_obj.exists():
+            # Actionable recovery: suggest similarly-named files (same helper
+            # edit_tool uses) so a wrong path doesn't dead-end the agent — it
+            # gets "Did you mean …?" candidates to retry against.
+            error_msg = f"Path does not exist: {path}"
+            try:
+                from .edit_tool import _walk_for_suggestions
+                target_name = path_obj.name
+                search_root = str(path_obj.parent) if str(path_obj.parent) else "."
+                workspace_root = (
+                    self.ctx.working_directory
+                    if (self.ctx and self.ctx.working_directory) else None
+                )
+                suggestions = _walk_for_suggestions(
+                    target_name, search_root, workspace_root
+                )
+                if suggestions:
+                    error_msg += "\nDid you mean one of these?\n" + "\n".join(
+                        f"  {s}" for s in suggestions
+                    )
+            except Exception:
+                pass
             return {
                 "success": False,
                 "path": path,
-                "error": f"Path does not exist: {path}"
+                "error": error_msg,
             }
 
         # --- Directory ---
@@ -288,13 +318,22 @@ class ReadTool(BaseTool):
 
         # Binary detection (extension + null bytes)
         if _is_binary(path_obj):
+            is_image = path_obj.suffix.lower() in _IMAGE_EXTENSIONS
+            message = f"Binary file detected ({file_size} bytes). Cannot display as text."
+            if is_image:
+                message += (
+                    " This tool cannot render images. If this is a screenshot "
+                    "from desktop_screenshot/desktop_snapshot, that call's own "
+                    "tool result already contains the OCR text_regions/summary "
+                    "for it — re-check that result instead of reading this path."
+                )
             return {
                 "success": True,
                 "output": {
                     "type": "binary_file",
                     "path": str(path_obj.absolute()),
                     "size": file_size,
-                    "message": f"Binary file detected ({file_size} bytes). Cannot display as text.",
+                    "message": message,
                 }
             }
 

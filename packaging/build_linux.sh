@@ -166,10 +166,6 @@ NOFOLLOW_COMMON=(
 INCLUDE_COMMON=(
     "--include-package=src"
     "--include-package=yaml"
-    # rich is kept although handq_linux.py has no TUI: --include-package=src
-    # still compiles src/ui/status_tui.py (the only rich consumer), so dropping
-    # rich would break the build for no meaningful size win.
-    "--include-package=rich"
     "--include-package=json_repair"
     # QGenie SDK temporarily disabled — uncomment when re-enabling qgenie support
     # "--include-module=qgenie_service"
@@ -262,6 +258,15 @@ build_linux() {
         rm -rf "../${BUILD_CACHE_DIR}"
     else
         print_info "Incremental build (set CLEAN_BUILD=1 to force a full rebuild)"
+    fi
+
+    # Always wipe the previous dist package first.  Unlike BUILD_CACHE_DIR above
+    # (an incremental-compile cache), DIST_DIR is just the final assembled output,
+    # so stale contents buy nothing — and if a prior handq_linux.dist/ is left in
+    # place, `cp -r` below copies the new one *into* it instead of replacing it.
+    if [ -d "../${DIST_DIR}" ]; then
+        print_info "Removing previous dist package: ${DIST_DIR}"
+        rm -rf "../${DIST_DIR}"
     fi
     mkdir -p "../${BUILD_CACHE_DIR}" "../${DIST_DIR}"
     print_info "Build cache  : ${BUILD_CACHE_DIR}  (intermediate Nuitka files)"

@@ -156,6 +156,10 @@ class SshConnectionPool:
         # OS detection cache
         self._os_cache: Dict[str, Tuple[str, str]] = {}
         self._os_cache_lock = threading.Lock()
+        # Job base-dir cache (which candidate — ~/handq_jobs, /tmp/..., etc. —
+        # actually accepted a real write on this host, see _resolve_job_base_dir)
+        self._job_dir_cache: Dict[str, str] = {}
+        self._job_dir_cache_lock = threading.Lock()
 
     # ── Connection pool API ──────────────────────────────────────────────
 
@@ -226,6 +230,16 @@ class SshConnectionPool:
         with self._os_cache_lock:
             self._os_cache[host_key] = info
 
+    # ── Job base-dir cache API ───────────────────────────────────────────
+
+    def get_job_dir(self, host_key: str) -> Optional[str]:
+        with self._job_dir_cache_lock:
+            return self._job_dir_cache.get(host_key)
+
+    def set_job_dir(self, host_key: str, base_dir: str) -> None:
+        with self._job_dir_cache_lock:
+            self._job_dir_cache[host_key] = base_dir
+
     # ── Lifecycle ────────────────────────────────────────────────────────
 
     def close(self) -> int:
@@ -247,6 +261,8 @@ class SshConnectionPool:
             self._connect_timestamps.clear()
         with self._os_cache_lock:
             self._os_cache.clear()
+        with self._job_dir_cache_lock:
+            self._job_dir_cache.clear()
         return closed
 
 
@@ -377,6 +393,83 @@ def _detect_os(client: Any) -> str:
 def _detect_os_cached(client: Any, host_key: str, pool: "SshConnectionPool") -> str:
     """Cached wrapper — returns just the OS name."""
     return _detect_os_and_shell_cached(client, host_key, pool)[0]
+
+
+def _expand_sftp_home(sftp: Any, path: str) -> str:
+    """Expand a leading ``~`` in *path* for SFTP use.
+
+    Unlike ``client.exec_command()`` (which runs through the remote login
+    shell and expands ``~`` itself), the SFTP subsystem has no shell in the
+    loop — ``~/foo`` is a literal, meaningless relative path to it and
+    ``sftp.open()``/``sftp.stat()`` raise ``FileNotFoundError``. Resolve the
+    real home directory once via ``sftp.normalize('.')`` (SFTP's own
+    "current directory", which is the login home) and substitute it in.
+    No-op for paths that don't start with ``~``.
+    """
+    if not path.startswith("~"):
+        return path
+    home = sftp.normalize(".")
+    if path == "~":
+        return home
+    if path.startswith("~/"):
+        return f"{home}/{path[2:]}"
+    return path  # ~otheruser/... — not supported, pass through unchanged
+
+
+# Candidate base directories for run_script/exec_bg job artifacts, tried in
+# order on Linux/macOS/Cygwin remotes. ~/handq_jobs is the default (naturally
+# per-user under home), but some hosts have a small per-user home quota
+# (e.g. NetApp NFS mounts) that's unrelated to the filesystem's total free
+# space — /tmp and /local/mnt/workspace are common quota-free scratch areas
+# on such hosts. {user} is substituted with the connecting username so
+# shared scratch paths don't collide across users.
+_JOB_BASE_DIR_CANDIDATES: Tuple[str, ...] = (
+    "~/handq_jobs",
+    "/tmp/{user}_handq_jobs",
+    "/local/mnt/workspace/{user}_handq_jobs",
+)
+
+
+def _resolve_job_base_dir(
+    client: Any,
+    creds: Dict[str, Any],
+    host_key: str,
+    pool: "SshConnectionPool",
+    timeout: float = 15.0,
+) -> str:
+    """Find a writable job base-dir on a non-Windows remote, preferring
+    ~/handq_jobs but falling back to scratch paths when the home directory's
+    quota is exhausted. Cached per host for the life of the pool.
+
+    A plain `mkdir -p` is not a real probe: the top-level directory usually
+    already exists, so mkdir -p on it is a no-op that consumes no quota and
+    can't detect "can I actually create files under here". Each candidate
+    is probed with mkdir -p + a real file write + delete, which is what
+    surfaces a quota failure.
+    """
+    cached = pool.get_job_dir(host_key)
+    if cached is not None:
+        return cached
+
+    username = creds.get("username", "")
+    errors: List[str] = []
+    for template in _JOB_BASE_DIR_CANDIDATES:
+        candidate = template.format(user=username) if "{user}" in template else template
+        probe = (
+            f"mkdir -p {shlex.quote(candidate)} && "
+            f"touch {shlex.quote(candidate)}/.handq_probe && "
+            f"rm -f {shlex.quote(candidate)}/.handq_probe"
+        )
+        _, stderr, rc = _exec_command(client, f"bash -c {shlex.quote(probe)}", timeout=timeout)
+        if rc == 0:
+            pool.set_job_dir(host_key, candidate)
+            return candidate
+        errors.append(f"{candidate}: {stderr.strip() or f'exit {rc}'}")
+
+    raise OSError(
+        "No writable job base-dir found on remote host — all candidates failed: "
+        + "; ".join(errors)
+    )
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -561,7 +654,7 @@ def _new_client(
             f"SSH connection failed for {username}@{hostname}:{port} "
             f"(tried {min(_attempt + 1, _MAX_RETRIES + 1)} time(s), "
             f"with up to {_MAX_RETRIES} retries). "
-            f"Last error: {last_error}"
+            f"Last error ({type(last_error).__name__}): {last_error}"
         )
 
     # SSH-level keepalive: sends MSG_IGNORE every 30 s to prevent NAT/firewall
@@ -903,9 +996,16 @@ class StatelessSSHTool(BaseTool):
     Every action opens a fresh SSH connection, executes the operation, and
     closes the connection immediately.  No session state is kept between calls.
 
-    SECURITY: The LLM only passes ``credentials_file`` (a local file path).
-    hostname, username, password, and key_path are read from that file inside
-    the tool and never appear in LLM context.
+    SECURITY: The LLM only ever passes ``credentials_file`` (a local file path)
+    or ``ssh_target`` (a "user@host" string). hostname, username, password, and
+    key_path are read from the resolved credentials file inside the tool and
+    never appear in LLM context.
+
+    First call to a host: pass ``ssh_target`` (no ``credentials_file``). The
+    tool establishes credentials on the fly (key auth → OS keyring → one-time
+    password prompt via the interaction manager, cached for future sessions)
+    and returns the resolved ``credentials_file`` path in the result — reuse
+    that path on subsequent calls instead of ``ssh_target``.
 
     Actions
     -------
@@ -1019,7 +1119,20 @@ class StatelessSSHTool(BaseTool):
                     "Path to a local YAML or JSON file containing SSH credentials "
                     "(hostname, username, and optionally key_path / password / port). "
                     "The actual credential values are read by the tool at runtime and "
-                    "never passed through the LLM."
+                    "never passed through the LLM. Omit this on your FIRST call to a "
+                    "host and pass ssh_target instead — the tool establishes credentials "
+                    "on the fly and returns the resolved path for you to reuse."
+                ),
+            },
+            "ssh_target": {
+                "type": "string",
+                "description": (
+                    "'user@host' or bare host/IP. Use this INSTEAD of credentials_file "
+                    "on your first call to a host you haven't connected to yet — the tool "
+                    "establishes SSH credentials (key / OS keyring / one-time password "
+                    "prompt) and returns 'credentials_file' in the result. Pass that "
+                    "resolved path on subsequent calls to the same host instead of "
+                    "ssh_target again."
                 ),
             },
             # exec / exec_bg / run_script
@@ -1059,11 +1172,22 @@ class StatelessSSHTool(BaseTool):
             },
             "log_path": {
                 "type": "string",
-                "description": "[exec_bg / job_status / tail_log / fetch_log] Remote path for the job log file.",
+                "description": (
+                    "[exec_bg / job_status / tail_log / fetch_log / wait_done] "
+                    "Remote path for the job log file. For a job started by "
+                    "run_script/exec_bg, use the EXACT value that action's "
+                    "result returned — do not guess or reconstruct this path."
+                ),
             },
             "pid_file": {
                 "type": "string",
-                "description": "[exec_bg / job_status] Remote path to the PID file.",
+                "description": (
+                    "[exec_bg / job_status / wait_done] Remote path to the PID "
+                    "file. REQUIRED for wait_done, and easy to miss since it's "
+                    "not in wait_done's obvious \"next step\" framing — for a job "
+                    "started by run_script/exec_bg, use the EXACT pid_file value "
+                    "that action's result returned, do not guess or reconstruct it."
+                ),
             },
             # job_status
             "exit_file": {
@@ -1118,8 +1242,17 @@ class StatelessSSHTool(BaseTool):
                 "type": "integer",
                 "description": "[run_script] Advisory timeout hint in seconds (informational only).",
             },
+            "job_base_dir": {
+                "type": "string",
+                "description": (
+                    "[run_script] Override the remote base directory for job "
+                    "artifacts (default: auto-probe ~/handq_jobs, falling back "
+                    "to /tmp or /local/mnt/workspace if the home directory's "
+                    "quota is exhausted). Usually leave unset."
+                ),
+            },
         },
-        "required": ["action", "credentials_file"],
+        "required": ["action"],
         "additionalProperties": False,
     }
 
@@ -1137,7 +1270,8 @@ class StatelessSSHTool(BaseTool):
     async def execute(
         self,
         action: str,
-        credentials_file: str,
+        credentials_file: str = "",
+        ssh_target: str = "",
         **kwargs: Any,
     ) -> ToolResult:
         start_time = time.time()
@@ -1172,11 +1306,43 @@ class StatelessSSHTool(BaseTool):
                 execution_time=time.time() - start_time,
             )
 
+        # Lazy credential establishment: no credentials_file yet, but the
+        # caller told us which host to reach. Establish key/keyring/password
+        # auth now (Round 5 — this replaces the old pre-turn ContextProvider
+        # hook) and use the resulting creds file for this call.
+        newly_established = False
+        if not credentials_file and ssh_target:
+            from ..infrastructure.ssh_setup import (
+                ensure_ssh_credentials_lazy, SSHSetupError,
+            )
+            im = self.ctx.interaction_manager if self.ctx is not None else None
+            try:
+                credentials_file = await ensure_ssh_credentials_lazy(ssh_target, im)
+                newly_established = True
+            except SSHSetupError as exc:
+                return ToolResult(
+                    success=False, output=None,
+                    error=f"Failed to establish SSH credentials for '{ssh_target}': {exc}",
+                    tool_name=self.name,
+                    tool_parameters=params,
+                    execution_time=time.time() - start_time,
+                )
+        elif not credentials_file:
+            return ToolResult(
+                success=False, output=None,
+                error="Either 'credentials_file' (existing) or 'ssh_target' (to establish new) is required.",
+                tool_name=self.name,
+                tool_parameters=params,
+                execution_time=time.time() - start_time,
+            )
+
         # Anchor a relative credentials_file path to the per-session workspace
         # rather than the process cwd (no longer mutated via os.chdir — see
         # concurrency work). _load_credentials only does os.path.expanduser, so
         # a bare "creds.yaml" would otherwise be looked up under the install
         # dir; with this resolve it lands in the agent's working directory.
+        # A freshly-established path is already absolute (ssh_setup writes to
+        # ~/.ssh/) so resolve_in_workspace is a no-op for it.
         resolved_creds_file = self.resolve_in_workspace(credentials_file)
         try:
             creds = _load_credentials(resolved_creds_file)
@@ -1226,10 +1392,16 @@ class StatelessSSHTool(BaseTool):
         except Exception as exc:
             result = ToolResult(
                 success=False, output=None,
-                error=f"SSH action '{action}' raised an exception: {exc}",
+                error=f"SSH action '{action}' raised {type(exc).__name__}: {exc}",
                 tool_name=self.name,
                 tool_parameters=params,
                 execution_time=time.time() - start_time,
+            )
+        if newly_established and isinstance(result.output, dict):
+            result.output["credentials_file"] = credentials_file
+            result.output["credentials_file_note"] = (
+                "Newly established — pass this exact path as credentials_file "
+                "on subsequent calls to the same host."
             )
         return result
 
@@ -1279,7 +1451,7 @@ class StatelessSSHTool(BaseTool):
         except Exception as exc:
             return ToolResult(
                 success=False, output=None,
-                error=str(exc),
+                error=f"{type(exc).__name__}: {exc}",
                 tool_name=self.name, tool_parameters=params,
                 execution_time=time.time() - start_time,
             )
@@ -1344,15 +1516,23 @@ class StatelessSSHTool(BaseTool):
             )
 
         job_id: str = kwargs.get("job_id") or f"job_{int(time.time())}"
-        log_path: str = kwargs.get("log_path") or f"~/handq_jobs/{job_id}.log"
-        pid_file: str = kwargs.get("pid_file") or f"{log_path}.pid"
-        exit_file: str = f"{log_path}.exit"
+        log_path_override: Optional[str] = kwargs.get("log_path")
+        pid_file_override: Optional[str] = kwargs.get("pid_file")
         workdir: Optional[str] = kwargs.get("workdir")
         timeout: float = float(kwargs.get("timeout", 30.0))
 
         try:
             with _connect(creds, self.pool) as (client, host_key):
                 remote_os = _detect_os_cached(client, host_key, self.pool)
+                if log_path_override:
+                    log_path = log_path_override
+                elif remote_os in ("windows",):
+                    log_path = f"~/handq_jobs/{job_id}.log"
+                else:
+                    base_dir = _resolve_job_base_dir(client, creds, host_key, self.pool)
+                    log_path = f"{base_dir}/{job_id}.log"
+                pid_file: str = pid_file_override or f"{log_path}.pid"
+                exit_file: str = f"{log_path}.exit"
                 if remote_os == "windows":
                     stdout, stderr, exit_code = _exec_bg_windows(
                         client, command, job_id, log_path, pid_file, exit_file,
@@ -1371,7 +1551,7 @@ class StatelessSSHTool(BaseTool):
         except Exception as exc:
             return ToolResult(
                 success=False, output=None,
-                error=str(exc),
+                error=f"{type(exc).__name__}: {exc}",
                 tool_name=self.name, tool_parameters=params,
                 execution_time=time.time() - start_time,
             )
@@ -1452,7 +1632,7 @@ class StatelessSSHTool(BaseTool):
         except Exception as exc:
             return ToolResult(
                 success=False, output=None,
-                error=str(exc),
+                error=f"{type(exc).__name__}: {exc}",
                 tool_name=self.name, tool_parameters=params,
                 execution_time=time.time() - start_time,
             )
@@ -1564,11 +1744,17 @@ class StatelessSSHTool(BaseTool):
                             f"tail -n {lines} {log_path} 2>/dev/null || echo ''; "
                             f"echo '---WC---'; wc -l < {log_path} 2>/dev/null || echo 0"
                         )
+                    # Wrap in bash -c so quoting/redirection behave under a
+                    # non-bash login shell (tcsh/csh) — same fix as
+                    # _action_exec / _exec_bg_linux; a raw multi-statement
+                    # command with quoted regex args gets mis-tokenized by
+                    # tcsh otherwise.
+                    cmd = f"bash -c {shlex.quote(cmd)}"
                 stdout, _, _ = _exec_command(client, cmd, timeout=timeout)
         except Exception as exc:
             return ToolResult(
                 success=False, output=None,
-                error=str(exc),
+                error=f"{type(exc).__name__}: {exc}",
                 tool_name=self.name, tool_parameters=params,
                 execution_time=time.time() - start_time,
             )
@@ -1583,15 +1769,24 @@ class StatelessSSHTool(BaseTool):
                 total_lines = int(token.strip())
                 break
 
+        # Parity with exec's output cap — an unbounded tail_log could
+        # otherwise return an arbitrarily large payload (e.g. a caller
+        # passing lines=100000 against a chatty log).
+        content, content_truncated = _truncate_ssh_output(content)
+
+        out: Dict[str, Any] = {
+            "log_path":    log_path,
+            "lines":       lines,
+            "pattern":     pattern,
+            "total_lines": total_lines,
+            "content":     content,
+        }
+        if content_truncated:
+            out["truncated"] = True
+
         return ToolResult(
             success=True,
-            output={
-                "log_path":    log_path,
-                "lines":       lines,
-                "pattern":     pattern,
-                "total_lines": total_lines,
-                "content":     content,
-            },
+            output=out,
             tool_name=self.name,
             tool_parameters=params,
             execution_time=time.time() - start_time,
@@ -1632,11 +1827,15 @@ class StatelessSSHTool(BaseTool):
                     )
                 else:
                     cmd = f"sed -n '{start_line},{end_line}p' {log_path} 2>/dev/null || echo ''"
+                    # bash -c wrap — see _action_tail_log's comment; a raw
+                    # quoted sed range argument is mis-tokenized under a
+                    # tcsh/csh login shell.
+                    cmd = f"bash -c {shlex.quote(cmd)}"
                 stdout, _, _ = _exec_command(client, cmd, timeout=timeout)
         except Exception as exc:
             return ToolResult(
                 success=False, output=None,
-                error=str(exc),
+                error=f"{type(exc).__name__}: {exc}",
                 tool_name=self.name, tool_parameters=params,
                 execution_time=time.time() - start_time,
             )
@@ -1691,21 +1890,29 @@ class StatelessSSHTool(BaseTool):
                     remote_dir = remote_path.rsplit("/", 1)[0] if "/" in remote_path else "."
                     if remote_dir and remote_dir not in (".", "~"):
                         if remote_os == "windows":
-                            _exec_command(
+                            _, mkdir_err, mkdir_rc = _exec_command(
                                 client,
                                 f"powershell -Command \"New-Item -ItemType Directory -Force -Path '{remote_dir}' | Out-Null\"",
                                 timeout=15.0,
                             )
                         else:
-                            _exec_command(client, f"mkdir -p {shlex.quote(remote_dir)}", timeout=15.0)
-                    with sftp.open(remote_path, "wb") as rf:
+                            _, mkdir_err, mkdir_rc = _exec_command(
+                                client, f"bash -c {shlex.quote(f'mkdir -p {remote_dir}')}", timeout=15.0
+                            )
+                        if mkdir_rc != 0:
+                            raise OSError(
+                                f"Failed to create remote directory {remote_dir!r} "
+                                f"(exit {mkdir_rc}): {mkdir_err.strip() or '(no stderr)'}"
+                            )
+                    sftp_path = _expand_sftp_home(sftp, remote_path)
+                    with sftp.open(sftp_path, "wb") as rf:
                         rf.write(data)
                 finally:
                     sftp.close()
         except Exception as exc:
             return ToolResult(
                 success=False, output=None,
-                error=str(exc),
+                error=f"{type(exc).__name__}: {exc}",
                 tool_name=self.name, tool_parameters=params,
                 execution_time=time.time() - start_time,
             )
@@ -1743,6 +1950,7 @@ class StatelessSSHTool(BaseTool):
         job_id: str = kwargs.get("job_id") or f"job_{int(time.time())}"
         workdir: Optional[str] = kwargs.get("workdir")
         timeout_hint: Optional[int] = kwargs.get("timeout_hint_seconds")
+        job_base_dir_override: Optional[str] = kwargs.get("job_base_dir")
 
         data: bytes = script_content.encode("utf-8")
 
@@ -1763,15 +1971,21 @@ class StatelessSSHTool(BaseTool):
                     exit_file = f"{log_path}.exit"
 
                     # (a) mkdir
-                    _exec_command(
+                    _, mkdir_err, mkdir_rc = _exec_command(
                         client,
                         f"powershell -Command \"New-Item -ItemType Directory -Force -Path '{job_dir}' | Out-Null\"",
                         timeout=15.0,
                     )
+                    if mkdir_rc != 0:
+                        raise OSError(
+                            f"Failed to create remote directory {job_dir!r} "
+                            f"(exit {mkdir_rc}): {mkdir_err.strip() or '(no stderr)'}"
+                        )
                     # (b) upload script via SFTP
                     sftp = client.open_sftp()
                     try:
-                        with sftp.open(script_remote_path, "wb") as rf:
+                        sftp_path = _expand_sftp_home(sftp, script_remote_path)
+                        with sftp.open(sftp_path, "wb") as rf:
                             rf.write(data)
                     finally:
                         sftp.close()
@@ -1787,22 +2001,34 @@ class StatelessSSHTool(BaseTool):
                     # Linux or Cygwin: both support bash/nohup/mkdir natively.
                     # Cygwin must NOT use Start-Process — it cannot inherit Cygwin
                     # POSIX file descriptors, causing empty log files.
-                    script_remote_path = f"~/handq_jobs/{job_id}/{script_name}"
-                    log_path = f"~/handq_jobs/{job_id}/{job_id}.log"
+                    job_dir = job_base_dir_override or _resolve_job_base_dir(
+                        client, creds, host_key, self.pool,
+                    )
+                    job_dir = f"{job_dir}/{job_id}"
+                    script_remote_path = f"{job_dir}/{script_name}"
+                    log_path = f"{job_dir}/{job_id}.log"
                     pid_file = f"{log_path}.pid"
                     exit_file = f"{log_path}.exit"
 
                     # (a) mkdir + upload
-                    _exec_command(client, f"mkdir -p ~/handq_jobs/{job_id}", timeout=15.0)
+                    _, mkdir_err, mkdir_rc = _exec_command(
+                        client, f"bash -c {shlex.quote(f'mkdir -p {job_dir}')}", timeout=15.0
+                    )
+                    if mkdir_rc != 0:
+                        raise OSError(
+                            f"Failed to create remote directory {job_dir!r} "
+                            f"(exit {mkdir_rc}): {mkdir_err.strip() or '(no stderr)'}"
+                        )
                     sftp = client.open_sftp()
                     try:
-                        with sftp.open(script_remote_path, "wb") as rf:
+                        sftp_path = _expand_sftp_home(sftp, script_remote_path)
+                        with sftp.open(sftp_path, "wb") as rf:
                             rf.write(data)
                     finally:
                         sftp.close()
 
                     # (b) chmod +x
-                    _exec_command(client, f"chmod +x {script_remote_path}", timeout=15.0)
+                    _exec_command(client, f"bash -c {shlex.quote(f'chmod +x {script_remote_path}')}", timeout=15.0)
 
                     # (c) exec_bg
                     stdout, _, _ = _exec_bg_linux(
@@ -1814,12 +2040,32 @@ class StatelessSSHTool(BaseTool):
         except Exception as exc:
             return ToolResult(
                 success=False, output=None,
-                error=str(exc),
+                error=f"{type(exc).__name__}: {exc}",
                 tool_name=self.name, tool_parameters=params,
                 execution_time=time.time() - start_time,
             )
 
         pid = stdout.strip().split()[-1] if stdout.strip() else ""
+
+        # Same validation as exec_bg: if bash is not in $PATH on the remote,
+        # the nohup wrapper still exits 0 but writes nothing to the pid
+        # file, leaving pid empty or non-numeric. run_script previously
+        # skipped this check and reported success with an empty pid.
+        if not pid.isdigit():
+            return ToolResult(
+                success=False, output=None,
+                error=(
+                    f"run_script: script uploaded and launched but PID capture "
+                    f"failed (stdout={stdout!r:.200}). "
+                    "Likely cause: 'bash' is not in $PATH on the remote host, or "
+                    "nohup is unavailable. "
+                    "Fallback: use action='exec' with "
+                    f"command='nohup bash {script_remote_path} > {log_path} "
+                    "2>&1 & echo $!' to capture the PID manually."
+                ),
+                tool_name=self.name, tool_parameters=params,
+                execution_time=time.time() - start_time,
+            )
 
         return ToolResult(
             success=True,
@@ -1871,8 +2117,35 @@ class StatelessSSHTool(BaseTool):
                         "\""
                     )
                 else:
+                    # Scan every candidate base-dir, not just whichever one this
+                    # session happened to resolve to — jobs from earlier runs may
+                    # sit under a different candidate (e.g. quota exhaustion
+                    # forced /tmp last time, then freed up and ~/handq_jobs is
+                    # used again). find on a non-existent dir fails silently
+                    # (2>/dev/null), so looping over all candidates is safe even
+                    # when most of them were never created on this host.
+                    #
+                    # Double-quoted (not shlex.quote'd) so $HOME expands inside
+                    # bash — shlex.quote would single-quote the literal '~',
+                    # which bash does NOT tilde-expand, silently breaking the
+                    # ~/handq_jobs candidate. Only the username fragment is
+                    # externally-influenced, so it alone is escaped for safe
+                    # embedding inside these double quotes.
+                    def _dq_escape(s: str) -> str:
+                        return (
+                            s.replace("\\", "\\\\").replace('"', '\\"')
+                            .replace("$", "\\$").replace("`", "\\`")
+                        )
+                    username_safe = _dq_escape(creds.get("username", ""))
+                    base_dirs = []
+                    for template in _JOB_BASE_DIR_CANDIDATES:
+                        path = template.replace("~/", "$HOME/", 1) if template.startswith("~/") else template
+                        path = path.format(user=username_safe) if "{user}" in path else path
+                        base_dirs.append(f'"{path}"')
+                    dirs_list = " ".join(base_dirs)
                     kill_body = (
-                        "find ~/handq_jobs -name '*.pid' 2>/dev/null "
+                        f"for base in {dirs_list}; do "
+                        "find \"$base\" -name '*.pid' 2>/dev/null "
                         "| while read pf; do "
                         "  _PID=$(cat \"$pf\" 2>/dev/null); "
                         "  if [ -n \"$_PID\" ] && kill -0 \"$_PID\" 2>/dev/null; then "
@@ -1880,7 +2153,13 @@ class StatelessSSHTool(BaseTool):
                         "  fi; "
                         "  rm -f \"$pf\"; "
                         "done; "
-                        "find ~/handq_jobs -name '*.pid' 2>/dev/null | wc -l"
+                        "done; "
+                        "_TOTAL=0; "
+                        f"for base in {dirs_list}; do "
+                        "  _N=$(find \"$base\" -name '*.pid' 2>/dev/null | wc -l); "
+                        "  _TOTAL=$((_TOTAL + _N)); "
+                        "done; "
+                        "echo $_TOTAL"
                     )
                     # Wrap in bash to bypass tcsh/csh login shells.
                     kill_all = f"bash -c {shlex.quote(kill_body)}"
@@ -1888,7 +2167,7 @@ class StatelessSSHTool(BaseTool):
         except Exception as exc:
             return ToolResult(
                 success=False, output=None,
-                error=str(exc),
+                error=f"{type(exc).__name__}: {exc}",
                 tool_name=self.name, tool_parameters=params,
                 execution_time=time.time() - start_time,
             )
@@ -2003,7 +2282,7 @@ class StatelessSSHTool(BaseTool):
         except Exception as exc:
             return ToolResult(
                 success=False, output=None,
-                error=str(exc),
+                error=f"{type(exc).__name__}: {exc}",
                 tool_name=self.name, tool_parameters=params,
                 execution_time=time.time() - start_time,
             )
@@ -2032,15 +2311,22 @@ class StatelessSSHTool(BaseTool):
                 total_lines = int(token.strip())
                 break
 
+        status = "timeout" if timed_out else "done"
+
+        # Error summary: only when the process has genuinely finished with a
+        # non-zero code — gated on status=="done" for parity with
+        # job_status's equivalent check. Without this, a job that's still
+        # running when wait_done's own timeout fires could have a stale
+        # nonzero exit_code left over from swallowed shell noise, or (as this
+        # gate now prevents) surface error lines that belong to a job that
+        # hasn't actually settled yet.
         import re as _re
         _ERROR_RE = _re.compile(r'\b(ERROR|FAILED|Traceback|Exception)\b', _re.IGNORECASE)
         error_summary: List[str] = []
-        if exit_code is not None and exit_code != 0 and tail_out:
+        if status == "done" and exit_code is not None and exit_code != 0 and tail_out:
             for line in tail_out.splitlines():
                 if _ERROR_RE.search(line):
                     error_summary.append(line)
-
-        status = "timeout" if timed_out else "done"
 
         return ToolResult(
             success=not timed_out,

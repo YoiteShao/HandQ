@@ -10,9 +10,10 @@ correctly:
   YES            — user approves; continue execution.
   NO             — user rejects; do not execute.
   MESSAGE        — user provides a new instruction (tool-confirmation path);
-                   propagated up to FlowControllerV2 so the planner can replan.
+                   surfaced back to the calling tool as an error string so
+                   the agent can decide how to proceed.
   RISK_GUIDANCE  — user provides guidance for a risk dialog; handled within
-                   the current agent step rather than escalating to the planner.
+                   the current agent step, injected as an observation.
 """
 from dataclasses import dataclass
 from enum import Enum
@@ -45,8 +46,9 @@ class UserConfirmation:
     def with_message(cls, user_message: str) -> "UserConfirmation":
         """Tool-confirmation path: user typed a free-form instruction.
 
-        The message propagates up to FlowControllerV2 as a new user instruction
-        so the planner can replan the entire task.
+        The message is surfaced back to the calling tool as a cancellation
+        reason; the agent reads it as an observation and decides how to
+        proceed on its own.
         """
         return cls(confirmation_type=ConfirmationType.MESSAGE, message=user_message)
 
@@ -56,7 +58,7 @@ class UserConfirmation:
 
         Unlike ``with_message``, this is handled entirely inside the current
         PersistentAgent iteration — the guidance is injected as an observation
-        so the agent can re-think without escalating to the planner.
+        so the agent can re-think without any escalation.
         """
         return cls(confirmation_type=ConfirmationType.RISK_GUIDANCE, message=user_message)
 

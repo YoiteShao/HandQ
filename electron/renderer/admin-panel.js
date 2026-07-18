@@ -78,6 +78,87 @@
     const panes = Array.from(document.querySelectorAll('.admin-pane'));
     const toast = document.getElementById('admin-toast');
 
+    // ── In-app confirm dialog ─────────────────────────────────────
+    // Replaces window.confirm(). The native dialog is a synchronous OS-level
+    // modal that steals focus from the Chromium renderer; on Windows the
+    // renderer's text-input focus/IME state doesn't always get restored
+    // cleanly when it closes, leaving textareas/inputs elsewhere in the app
+    // unclickable (no cursor) until an unrelated focus change nudges it back.
+    // This dialog stays entirely inside the renderer's own DOM/focus world,
+    // so there's no cross-process focus handoff to get wrong.
+    let confirmDialogEl = null;
+    let confirmResolve = null;
+
+    function _buildConfirmDialog() {
+        if (confirmDialogEl) return confirmDialogEl;
+        const wrap = document.createElement('div');
+        wrap.className = 'overlay hidden';
+        wrap.id = 'overlay-confirm-dialog';
+        wrap.style.zIndex = '2000'; // above admin/sched/skill form overlays (1500)
+
+        const card = document.createElement('div');
+        card.className = 'overlay-card confirm-dialog-card';
+        card.setAttribute('role', 'alertdialog');
+        card.setAttribute('aria-modal', 'true');
+
+        const body = document.createElement('div');
+        body.className = 'confirm-dialog-body';
+        card.appendChild(body);
+
+        const actions = document.createElement('div');
+        actions.className = 'scc-actions confirm-dialog-actions';
+        const cancelBtn = document.createElement('button');
+        cancelBtn.type = 'button';
+        cancelBtn.textContent = 'Cancel';
+        const okBtn = document.createElement('button');
+        okBtn.type = 'button';
+        okBtn.className = 'primary';
+        okBtn.textContent = 'Confirm';
+        actions.appendChild(cancelBtn);
+        actions.appendChild(okBtn);
+        card.appendChild(actions);
+
+        wrap.appendChild(card);
+        document.body.appendChild(wrap);
+
+        function settle(result) {
+            wrap.classList.add('hidden');
+            const resolve = confirmResolve;
+            confirmResolve = null;
+            if (resolve) resolve(result);
+        }
+        cancelBtn.addEventListener('click', () => settle(false));
+        okBtn.addEventListener('click', () => settle(true));
+        wrap.addEventListener('mousedown', (ev) => {
+            if (ev.target === wrap) settle(false);
+        });
+
+        confirmDialogEl = { wrap, body, okBtn };
+        return confirmDialogEl;
+    }
+
+    // confirmDialog(message) — Promise<boolean>, drop-in replacement for
+    // window.confirm(message) but non-blocking and renderer-local.
+    function confirmDialog(message) {
+        const dlg = _buildConfirmDialog();
+        dlg.body.textContent = message;
+        dlg.wrap.classList.remove('hidden');
+        return new Promise((resolve) => {
+            confirmResolve = resolve;
+            try { dlg.okBtn.focus(); } catch (_) { /* ignore */ }
+        });
+    }
+    document.addEventListener('keydown', (e) => {
+        if (!confirmDialogEl || confirmDialogEl.wrap.classList.contains('hidden')) return;
+        if (e.key === 'Escape') {
+            e.preventDefault();
+            confirmDialogEl.wrap.classList.add('hidden');
+            const resolve = confirmResolve;
+            confirmResolve = null;
+            if (resolve) resolve(false);
+        }
+    });
+
     function showToast(msg, kind) {
         toast.textContent = msg;
         toast.classList.remove('hidden', 'error');
@@ -211,9 +292,8 @@
     }
 
     async function archiveEntry(entryId, kind) {
-        if (!confirm(`Archive this ${kind} entry?\nIt will stop being injected; version history is kept.`)) {
-            return;
-        }
+        const ok = await confirmDialog(`Archive this ${kind} entry? It will stop being injected; version history is kept.`);
+        if (!ok) return;
         try {
             await rpc('ltm_archive', { entry_id: entryId, kind: kind, reason: 'user_request' });
             showToast('Archived.');
@@ -353,8 +433,15 @@
 
     function fmtTime(epochSec) {
         if (!epochSec) return '—';
-        return new Date(epochSec * 1000)
-            .toISOString().slice(0, 19).replace('T', ' ');
+        // Render in the user's LOCAL timezone. next_run_at / last_run_at are
+        // computed from local-time schedules, so displaying them as UTC (the
+        // old toISOString() path) showed a whole-timezone offset — e.g. a
+        // 09:00 task read as 01:00 for a UTC+8 user. Use the locale formatter
+        // and pad to a stable "YYYY-MM-DD HH:MM:SS" shape.
+        const d = new Date(epochSec * 1000);
+        const p = (n) => String(n).padStart(2, '0');
+        return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} `
+            + `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
     }
 
     // Schedule strings starting with "once" are one-shot. After they
@@ -531,7 +618,8 @@
         }
     }
     async function deleteSched(id) {
-        if (!confirm('Delete this scheduled task?')) return;
+        const ok = await confirmDialog('Delete this scheduled task?');
+        if (!ok) return;
         setSchedActionsBusy(true);
         // Optimistic remove. If the RPC fails, refreshSchedules below
         // re-pulls and the row reappears.
@@ -592,7 +680,19 @@
             if (r.ok) {
                 closeSchedForm();
                 const sched = (r.task && r.task.schedule) || '?';
-                showSchedToast(`Created with schedule: ${sched}`);
+                if (r.inference_failed) {
+                    // The schedule string could NOT be inferred from the prompt
+                    // (e.g. a transient LLM failure) and fell back to a default.
+                    // Warn loudly so the user doesn't silently get "tomorrow 9am"
+                    // when they asked for "in 1 minute" — they should edit it.
+                    showSchedToast(
+                        `⚠ Couldn't parse the time — defaulted to "${sched}". `
+                        + `Edit the task to fix the schedule.`,
+                        'error',
+                    );
+                } else {
+                    showSchedToast(`Created with schedule: ${sched}`);
+                }
                 if (r.task && r.task.id) selectedTaskId = r.task.id;
                 refreshSchedules();
             } else {
@@ -868,9 +968,8 @@
     }
 
     async function deleteSkillEntry(name) {
-        if (!confirm(`Delete skill "${name}"?\nIts SKILL.md directory is removed from disk.`)) {
-            return;
-        }
+        const ok = await confirmDialog(`Delete skill "${name}"? Its SKILL.md directory is removed from disk.`);
+        if (!ok) return;
         try {
             const r = await rpc('skill_delete', { name });
             if (!r || !r.ok) throw new Error((r && (r.reason || r.error)) || 'unknown');

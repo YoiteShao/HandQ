@@ -13,9 +13,9 @@ from ..infrastructure.utils import try_parse_json_with_repair_flag
 from ..tools.base_tool import ToolResult
 
 if TYPE_CHECKING:
-    # Annotation-only: shared_checklist imports this module, so importing
-    # ItemResult at runtime would create a cycle.
-    from .shared_checklist import ItemResult
+    # Annotation-only: task_channel imports this module, so importing
+    # TaskResult at runtime would create a cycle.
+    from .task_channel import TaskResult
 
 
 # ── ToolCall ────────────────────────────────────────────────────────────────
@@ -46,13 +46,15 @@ TOOL_NAME_ALIASES: Dict[str, str] = {
 }
 
 SUPERSEDABLE_TOOL_ACTIONS: frozenset = frozenset({
-    ("desktop", "screenshot"),
-    ("desktop", "snapshot"),
-    ("desktop", "hover_at"),
-    ("desktop", "find_element"),
-    ("desktop", "find_and_click"),
-    ("browser", "screenshot"),
-    ("browser", "snapshot"),
+    # Post-2.1 split: each atomic tool has its own name; supersession keys on
+    # tool_name alone (no more action-dispatch composites).
+    "desktop_screenshot",
+    "desktop_snapshot",
+    "desktop_hover_at",
+    "desktop_find_element",
+    "desktop_find_and_click",
+    "browser_screenshot",
+    "browser_snapshot",
 })
 
 
@@ -78,8 +80,8 @@ class TurnDigest:
 
     NOT a self-report — every field is computed from the turn's tool results
     and the IterationAdvisor's counters, so it cannot be gamed by an agent that
-    claims progress it did not make. Read by the planner (in-flight item view)
-    and by the Tier-1 progress watcher.
+    claims progress it did not make. Read by the Coordinator (in-flight item
+    view) and by the Tier-1 progress watcher.
 
     ``info_gain`` is the unified per-turn novelty signal (a novel content
     artifact, a previously-unseen tool observation, a newly-learned failure
@@ -98,7 +100,7 @@ class TurnDigest:
 
 @dataclass
 class ProgressConcern:
-    """Tier-1 watcher verdict — planner-facing only, never shown to agent.
+    """Tier-1 watcher verdict — Coordinator-facing only, never shown to agent.
 
     last-write-wins single slot on the bus. ``verdict`` is one of
     "diverging" | "false_progress" | "stalled" | "ok". "diverging" and
@@ -189,61 +191,73 @@ def failed_approach_signature(tr: ToolResult) -> Optional[str]:
     return None
 
 
-# ── Acceptance-loop cross-round info delta ────────────────────────────────────
-#
-# Pure, ungameable pre-gate for the acceptance loop — the mechanical "hard-coded
-# sense" tier, analogous to IterationAdvisor.no_info_gain_streak for the in-item
-# loop. Measures the information a freshly-completed acceptance round added over
-# the UNION of all prior acceptance rounds. total_new == 0 ⇒ the candidate is
-# spinning in place (re-attempting with zero new information per round).
+# ── Tools whose repetition is bookkeeping/orientation, not task progress ─────
+# A repeat of these is never a "redundant-work" stall: todo_write is the agent
+# updating its own plan, read_skill re-reads a recipe. Excluded from the
+# repeated-SUCCESS detector below so normal orientation isn't flagged.
+_REPEAT_EXEMPT_TOOLS: frozenset = frozenset({
+    "todo_write", "read_skill", "wait_interval",
+})
 
-_WS_RE = re.compile(r'\s+')
-_PUNCT_RE = re.compile(r'[^\w\s]')
+# Observation-only tools (screenshot/snapshot/list_windows): their OUTPUT
+# legitimately differs every call (fresh pixels, live window list), so the
+# output-novelty stall detector never trips on a re-observe loop. Keyed on
+# tool_name ALONE here so N repeats of the same observation count as a repeat
+# regardless of the ever-changing bytes — this is what catches the Alma
+# cold-start "43 screenshots, zero clicks" loop.
+_OBSERVE_ONLY_TOOLS: frozenset = frozenset({
+    "desktop_screenshot", "desktop_snapshot", "desktop_list_windows",
+    "browser_screenshot", "browser_snapshot",
+})
 
 
-def _normalize(s: str) -> str:
-    """Lowercase, strip punctuation, collapse whitespace.
+def repeated_call_signature(tr: ToolResult) -> Optional[str]:
+    """Stable signature for a SUCCESSFUL tool call, for redundant-repeat detection.
 
-    Collapses reworded-identical findings/issues so a blocker restated with
-    different surface text does not read as genuinely new information.
+    Mirrors ``failed_approach_signature`` but for successes, and keyed on the
+    CALL (tool + normalized params) rather than the output — so a repeat is
+    caught even when the output looks superficially novel every time
+    (``schedule_create`` returns a fresh UUID, ``desktop_screenshot`` returns
+    fresh pixels). This is the hole the output-novelty stall detector cannot
+    see: re-running an already-succeeded, non-idempotent-looking call forever.
+
+    Returns None for calls that should not be tracked (bookkeeping tools, or
+    calls with no substantive key).
     """
-    s = _PUNCT_RE.sub(' ', s.lower())
-    return _WS_RE.sub(' ', s).strip()
-
-
-def acceptance_info_delta(
-    latest: "ItemResult",
-    prior: List["ItemResult"],
-) -> Dict[str, Any]:
-    """Set-difference of the latest acceptance round vs the UNION of prior rounds.
-
-    Each of artifacts / key_findings / issues / factual_outcome is normalized and
-    diffed against the pooled prior rounds. factual_outcome is the primary novelty
-    channel for artifact-free tasks (e.g. SSH status reads). ``total_new`` == 0
-    means the latest round surfaced nothing the candidate had not already
-    produced — the ungameable signal that the loop is spinning.
-    """
-    fields = ("artifacts", "key_findings", "issues", "factual_outcome")
-
-    def _norm_set(result: "ItemResult", field_name: str) -> Set[str]:
-        out: Set[str] = set()
-        for v in getattr(result, field_name, None) or []:
-            n = _normalize(str(v))
-            if n:
-                out.add(n)
-        return out
-
-    delta: Dict[str, Any] = {}
-    total_new = 0
-    for f in fields:
-        pooled: Set[str] = set()
-        for r in prior:
-            pooled |= _norm_set(r, f)
-        new = sorted(_norm_set(latest, f) - pooled)
-        delta[f] = new
-        total_new += len(new)
-    delta["total_new"] = total_new
-    return delta
+    name = tr.tool_name or ""
+    if name in _REPEAT_EXEMPT_TOOLS or name in INFRA_TOOL_NAMES:
+        return None
+    if name in _OBSERVE_ONLY_TOOLS:
+        return name  # re-observing the same surface — key on tool alone
+    params = tr.tool_parameters or {}
+    if name in ("bash", "shell"):
+        cmd = _normalize_numeric(params.get("command", "").strip())
+        return f"bash:{_smart_truncate(cmd)}" if cmd else None
+    if name == "ssh":
+        action = params.get("action", "")
+        key = _normalize_numeric(
+            (params.get("command", "") or params.get("script_content", "")).strip()
+        )
+        sig = _smart_truncate(key, 120)
+        return f"ssh:{action}:{sig}" if sig else (f"ssh:{action}" if action else None)
+    if name in ("write", "edit"):
+        # Key on content (like _info_payload), NOT the destination path — a
+        # rename with identical body is still a repeat.
+        content = params.get("content")
+        if content is None:
+            return None
+        body = _smart_truncate(_normalize_numeric(str(content)), 120)
+        return f"{name}:{body}"
+    if name == "read":
+        path = params.get("path", "")
+        return f"read:{path}" if path else None
+    if name in ("glob", "grep"):
+        pattern = _normalize_numeric(params.get("pattern", ""))
+        return f"{name}:{_smart_truncate(pattern)}" if pattern else None
+    # Generic fallback for multi-action tools (schedule_*, remote_handq, etc.):
+    # key on tool + action so re-issuing the same action counts as a repeat.
+    action = params.get("action", "")
+    return f"{name}:{action}" if action else name
 
 
 # ── Stale-snapshot supersession ──────────────────────────────────────────────
@@ -255,21 +269,36 @@ def acceptance_info_delta(
 
 # ── IterationAdvisor ────────────────────────────────────────────────────────
 
-_LTM_REFRESH_THRESHOLD = 3
-_LTM_REFRESH_COOLDOWN = 5
-
 # Stall detection (unified mechanical progress-sense). A "stall" is N consecutive
 # turns that added zero new information (no_info_gain_streak) OR N consecutive
 # tool failures. Two tiers:
 #   - SOFT: surface a single bail-out reminder to the agent (cooldown-gated).
-#   - HARD: flip the planner trigger mechanically (no LLM in the path) via the
-#     checklist bus — the incident fix. Higher threshold than SOFT so the agent
-#     gets a chance to self-correct before the planner is woken.
+#   - HARD: mechanically record a progress concern on the task channel (no LLM
+#     in the path) — the incident fix. Higher threshold than SOFT so the agent
+#     gets a chance to self-correct before the concern is recorded.
 # _STALL_COOLDOWN gates both so neither fires every turn while stuck.
 _SOFT_STALL_STREAK = 3
 _HARD_STALL_STREAK = 5
 _HARD_FAIL_STREAK = 6
 _STALL_COOLDOWN = 5
+# Redundant-repeat detection: the SAME successful call (tool + normalized
+# params, see repeated_call_signature) repeated this many times is a redundant
+# loop even when its OUTPUT looks novel every call — the exact hole the
+# output-novelty streak cannot see (Pattern A: re-running an already-succeeded
+# schedule_create/desktop_screenshot forever). Folded into hard_stall so the
+# loop surfaces as a mechanical ProgressConcern to the coordinator; the
+# model-facing fix is the standing prompt ("stop when done, don't repeat a
+# succeeded call"), CC-aligned — no per-turn mechanical reminder.
+_REDUNDANT_REPEAT_HARD = 3
+
+# todo_write reminder (CC-aligned — mirrors Claude Code's
+# getTodoReminderAttachments in attachments.ts: a pure turn-count nudge, no
+# semantic stall judgment). Fires when neither threshold is a judgment call —
+# just "N turns since the tool was last used" and "N turns since we last said
+# so" — so it can't misfire on a task that's genuinely progressing without
+# a todo list. Values match Claude Code's TODO_REMINDER_CONFIG verbatim.
+_TODO_REMINDER_TURNS_SINCE_WRITE = 10
+_TODO_REMINDER_TURNS_BETWEEN = 10
 
 _WRITE_PARAM_ERROR_REMINDER: str = (
     "Write Tool Parameter Error — your previous write call failed "
@@ -290,17 +319,15 @@ _WRITE_PARAM_ERROR_REMINDER: str = (
 class IterationAdvisor:
     """Unified iteration health tracker for PersistentAgent.
 
-    Two output channels:
-      A. get_reminder() — text reminder injected into the agent's per-turn
-         instruction message. At most three blocks (down from six):
-           0. Directives (planner's advisory constraints, always visible)
-           1. Anti-repeat guard (specific dead-path signatures)
-           2. One stall block — the specific write_param_error fix OR the
-              generic soft-stall bail-out (mutually exclusive).
-      B. should_refresh_ltm() — boolean signal that drives a fresh LTM
-         recall in PersistentAgent (cooldown-gated). Result is shown as an
-         independent block alongside (A); see get_recent_failure_signatures()
-         for the query-enrichment helper.
+    Primary output channel:
+      get_reminder() — text reminder injected into the agent's per-turn
+      instruction message. At most three blocks:
+        1. Anti-repeat guard (specific dead-path signatures)
+        2. One stall block — the specific write_param_error fix OR the
+           generic soft-stall bail-out (mutually exclusive).
+        3. todo_write reminder (CC-aligned turn-count nudge, independent of
+           the other two — a pure "haven't seen this tool in a while" check,
+           no stall judgment).
 
     Progress is measured by a single mechanical primitive, info_gain, recorded
     per turn. A turn shows info gain iff it wrote a novel content artifact, a
@@ -308,17 +335,14 @@ class IterationAdvisor:
     new failure signature appeared, or it contained an intentional
     wait_interval. N consecutive turns without info gain (no_info_gain_streak)
     — or N consecutive tool failures — constitute a stall. hard_stall() reports
-    when a HARD threshold is crossed so PersistentAgent can wake the planner
-    mechanically (no LLM in the trigger path — the incident fix).
+    when a HARD threshold is crossed so PersistentAgent can record a progress
+    concern mechanically (no LLM in the trigger path — the incident fix).
     """
 
     def __init__(self) -> None:
         self._success_history: List[bool] = []
         self._last_error_hint: Optional[str] = None
         self._failed_approaches: Dict[str, int] = {}
-        # Cooldown for stagnation-triggered LTM refresh, decremented per turn
-        # so the agent doesn't re-query LTM on every turn while stuck.
-        self._ltm_refresh_cooldown: int = 0
 
         # Unified progress-sense (replaces the keyword goal-proxy). Every turn
         # is classified as info-gaining or not; _no_info_gain_streak counts
@@ -330,34 +354,51 @@ class IterationAdvisor:
         self._no_info_gain_streak: int = 0
         self._turn_saw_info_gain: bool = False
 
-        # Stall-block cooldowns (soft agent reminder + hard mechanical planner
-        # wake), so neither fires every turn while stuck. Decremented once per
-        # turn in record_progress_signal, and reset when info gain ends an
+        # Redundant-repeat ledger: per-item count of each SUCCESSFUL call
+        # signature (repeated_call_signature). Distinct from _failed_approaches
+        # (tracks failures) and _seen_obs_hashes (tracks output novelty) — this
+        # catches re-running an already-succeeded call whose output looks novel
+        # every time, so the loop shows up as a real no-info-gain stall.
+        # Coordinator-facing (feeds hard_stall → ProgressConcern); NOT a
+        # per-turn model reminder — the standing prompt's "stop when done, don't
+        # repeat a succeeded call" guidance is the model-facing fix (CC-aligned:
+        # trust the model + faithful history + prompt, not a mechanical nag).
+        self._successful_call_counts: Dict[str, int] = {}
+
+        # Stall-block cooldowns (soft agent reminder + hard mechanical concern
+        # recording), so neither fires every turn while stuck. Decremented once
+        # per turn in record_progress_signal, and reset when info gain ends an
         # episode so a fresh stall can fire cleanly.
         self._soft_stall_cooldown: int = 0
         self._hard_stall_cooldown: int = 0
 
-        # Directives (Q4): advisory constraints from the planner shown to the
-        # agent each turn via get_reminder(). Weak — agent may violate but is
-        # expected to bail out via plan_feedback rather than silently push
-        # through. Populated on reset_for_item, cleared at item boundary.
-        self._directives: List[str] = []
+        # todo_write reminder counters (CC-aligned, see _TODO_REMINDER_* above).
+        # _turns_since_todo_write resets on a successful todo_write call;
+        # _turns_since_todo_reminder resets only when the reminder itself is
+        # actually emitted (get_reminder) — two independent clocks, mirroring
+        # Claude Code's turnsSinceLastTodoWrite / turnsSinceLastReminder.
+        # _turn_saw_todo_write is set by record_tool_result and consumed by
+        # record_progress_signal, so the turn that calls todo_write ends at
+        # count 0 rather than being reset then immediately incremented back
+        # to 1 (the same flag-then-consume pattern as _turn_saw_info_gain).
+        self._turns_since_todo_write: int = 0
+        self._turns_since_todo_reminder: int = 0
+        self._turn_saw_todo_write: bool = False
 
-    def reset_for_item(
-        self,
-        directives: Optional[List[str]] = None,
-    ) -> None:
+    def reset_for_item(self) -> None:
         """Call at the start of each item."""
         self._success_history.clear()
         self._last_error_hint = None
         self._failed_approaches.clear()
-        self._ltm_refresh_cooldown = 0
         self._seen_obs_hashes.clear()
         self._no_info_gain_streak = 0
         self._turn_saw_info_gain = False
+        self._successful_call_counts.clear()
+        self._turns_since_todo_write = 0
+        self._turns_since_todo_reminder = 0
+        self._turn_saw_todo_write = False
         self._soft_stall_cooldown = 0
         self._hard_stall_cooldown = 0
-        self._directives = list(directives) if directives else []
 
     def record_tool_result(self, tr: ToolResult) -> None:
         """Record outcome of a tool execution.
@@ -382,6 +423,9 @@ class IterationAdvisor:
         waits are never flagged as retried failures. Its info-gain contribution
         is handled in record_progress_signal (has_wait_interval).
         """
+        if tr.tool_name == "todo_write" and tr.success:
+            self._turn_saw_todo_write = True
+
         if tr.tool_name == "wait_interval":
             return
 
@@ -403,6 +447,21 @@ class IterationAdvisor:
         self._last_error_hint = None
         if tr.tool_name in INFRA_TOOL_NAMES:
             return
+
+        # Redundant-repeat tracking (keyed on the CALL, not the output). If
+        # this exact successful call was already made this item, it is NOT
+        # progress no matter how novel its output looks — suppress the
+        # output-novelty info-gain below so the stall streak can build. This
+        # is the fix for the "re-run an already-succeeded schedule_create /
+        # desktop_screenshot forever" loop the output hash alone can't see.
+        repeat_sig = repeated_call_signature(tr)
+        is_redundant_repeat = False
+        if repeat_sig is not None:
+            prev = self._successful_call_counts.get(repeat_sig, 0)
+            self._successful_call_counts[repeat_sig] = prev + 1
+            if prev >= 1:
+                is_redundant_repeat = True
+
         payload = self._info_payload(tr)
         if not payload:
             return
@@ -412,7 +471,8 @@ class IterationAdvisor:
         ).hexdigest()
         if h not in self._seen_obs_hashes:
             self._seen_obs_hashes.add(h)
-            self._turn_saw_info_gain = True
+            if not is_redundant_repeat:
+                self._turn_saw_info_gain = True
 
     @staticmethod
     def _info_payload(tr: ToolResult) -> str:
@@ -447,12 +507,17 @@ class IterationAdvisor:
         an info-gaining turn ends the episode (streak → 0) and clears the stall
         cooldowns so a subsequent stall can fire cleanly.
         """
-        if self._ltm_refresh_cooldown > 0:
-            self._ltm_refresh_cooldown -= 1
         if self._soft_stall_cooldown > 0:
             self._soft_stall_cooldown -= 1
         if self._hard_stall_cooldown > 0:
             self._hard_stall_cooldown -= 1
+
+        if self._turn_saw_todo_write:
+            self._turns_since_todo_write = 0
+        else:
+            self._turns_since_todo_write += 1
+        self._turns_since_todo_reminder += 1
+        self._turn_saw_todo_write = False
 
         info_gain = self._turn_saw_info_gain or has_wait_interval
         if info_gain:
@@ -470,20 +535,27 @@ class IterationAdvisor:
         """Consecutive turns that added zero new information."""
         return self._no_info_gain_streak
 
+    def _max_repeat_count(self) -> int:
+        """Highest repeat count among successful call signatures this item."""
+        return max(self._successful_call_counts.values(), default=0)
+
     def hard_stall(self) -> bool:
         """True once per stall episode when a HARD threshold is crossed.
 
-        Crossed when no_info_gain_streak >= _HARD_STALL_STREAK OR consecutive
-        tool failures >= _HARD_FAIL_STREAK. Cooldown-gated (_STALL_COOLDOWN) so
-        a persistent stall re-wakes the planner periodically rather than every
+        Crossed when no_info_gain_streak >= _HARD_STALL_STREAK, consecutive
+        tool failures >= _HARD_FAIL_STREAK, OR the same successful call was
+        repeated >= _REDUNDANT_REPEAT_HARD times (the redundant-repeat loop the
+        output-novelty streak can't see). Cooldown-gated (_STALL_COOLDOWN) so a
+        persistent stall re-records the concern periodically rather than every
         turn. PersistentAgent calls this after record_progress_signal and, when
-        True, flips the planner trigger mechanically via set_progress_concern —
+        True, records a progress concern mechanically via set_progress_concern —
         NO LLM in the path (the incident fix).
         """
         if self._hard_stall_cooldown > 0:
             return False
         if (self._no_info_gain_streak >= _HARD_STALL_STREAK
-                or self._count_consecutive_failures() >= _HARD_FAIL_STREAK):
+                or self._count_consecutive_failures() >= _HARD_FAIL_STREAK
+                or self._max_repeat_count() >= _REDUNDANT_REPEAT_HARD):
             self._hard_stall_cooldown = _STALL_COOLDOWN
             return True
         return False
@@ -491,15 +563,6 @@ class IterationAdvisor:
     def get_reminder(self) -> Optional[str]:
         """Generate combined reminder string, or None if nothing to say."""
         parts: List[str] = []
-
-        # 0. Directives — planner's advisory constraints, always visible while
-        # active ("警钟长鸣"). Placed first so the agent re-reads them every
-        # turn. Weak constraint: agent may violate but is expected to bail out
-        # via plan_feedback rather than silently push through — see the
-        # "Directive Conflicts" section of the agent system prompt.
-        directives_msg = self._format_directives()
-        if directives_msg:
-            parts.append(directives_msg)
 
         # 1. Anti-repeat guard (highest priority — specific dead paths)
         repeat_offenders = sorted(
@@ -539,14 +602,29 @@ class IterationAdvisor:
                 parts.append(
                     f"STALL CHECK — {fact}. If the current approach is "
                     f"structurally wrong (wrong assumption, tool, or target), stop "
-                    f"tweaking and bail out to the planner: emit completion or "
-                    f"error JSON with `plan_feedback` describing what you tried, "
-                    f"what kept failing, and what you now suspect the real blocker "
-                    f"is. If the expected outcomes are already met, complete the "
-                    f"item. Bailing out when the approach is structurally wrong is "
-                    f"the correct action — not a failure."
+                    f"tweaking and bail out: emit completion or error JSON with "
+                    f"`plan_feedback` describing what you tried, what kept failing, "
+                    f"and what you now suspect the real blocker is. If the "
+                    f"instruction is already satisfied, complete the item. Bailing "
+                    f"out when the approach is structurally wrong is the correct "
+                    f"action — not a failure."
                 )
                 self._soft_stall_cooldown = _STALL_COOLDOWN
+
+        # 3. todo_write reminder (CC-aligned) — pure turn-count nudge, no
+        #    semantic judgment of whether a stall is happening. Fires once
+        #    both counters clear their threshold, then resets the
+        #    between-reminders clock so it doesn't repeat every turn.
+        if (self._turns_since_todo_write >= _TODO_REMINDER_TURNS_SINCE_WRITE
+                and self._turns_since_todo_reminder >= _TODO_REMINDER_TURNS_BETWEEN):
+            parts.append(
+                "The todo_write tool hasn't been used recently. If this task "
+                "has multiple distinct steps, consider calling todo_write to "
+                "list them and track which are done — this also lets the "
+                "user watch your progress. Ignore if the task is a single "
+                "step or todo_write wouldn't add value."
+            )
+            self._turns_since_todo_reminder = 0
 
         if not parts:
             return None
@@ -558,42 +636,8 @@ class IterationAdvisor:
             "success_rate": self._get_success_rate(),
             "consecutive_failures": self._count_consecutive_failures(),
             "failed_approaches_count": len(self._failed_approaches),
+            "max_redundant_repeat": self._max_repeat_count(),
         }
-
-    def should_refresh_ltm(self) -> bool:
-        """Return True when a run of failures justifies a fresh LTM recall.
-
-        Fires once per failure episode (cooldown applied) so a stuck agent
-        gets one LTM refresh, not one per turn. Threshold is
-        _LTM_REFRESH_THRESHOLD (3) consecutive failures: the per-item LTM was
-        chosen for the happy-path query at item start, so once the agent has
-        failed three times the original recall is likely the wrong angle.
-
-        Caller is expected to query LTM with a query enriched by
-        get_recent_failure_signatures(). The returned block goes into the
-        bottom instruction area as an independent reminder, NOT replacing the
-        per-item static block (preserves the prefix-cache anchor and lets the
-        original LTM stay visible too).
-        """
-        if self._ltm_refresh_cooldown > 0:
-            return False
-        if self._count_consecutive_failures() >= _LTM_REFRESH_THRESHOLD:
-            self._ltm_refresh_cooldown = _LTM_REFRESH_COOLDOWN
-            return True
-        return False
-
-    def get_recent_failure_signatures(self, limit: int = 3) -> List[str]:
-        """Return the top-N most-frequent failed-approach signatures.
-
-        Used to enrich the LTM refresh query so recall favors entries about
-        overcoming the actual blocker, not the item's happy-path approach.
-        """
-        return [
-            sig for sig, _ in sorted(
-                self._failed_approaches.items(),
-                key=lambda x: -x[1],
-            )[:limit]
-        ]
 
     # ── Internal ────────────────────────────────────────────────────────────
 
@@ -611,26 +655,6 @@ class IterationAdvisor:
             return 1.0
         window = self._success_history[-10:]
         return sum(window) / len(window)
-
-    def _format_directives(self) -> Optional[str]:
-        """Render the current item's directives as a per-turn reminder block.
-
-        Called by get_reminder(). Directives are the planner's advisory
-        constraints — derived from user directives, prior lessons, and skill
-        non-negotiables. They stay visible every turn ("警钟长鸣") until the
-        item boundary; agent may violate but is expected to bail out via
-        plan_feedback rather than silently push through.
-        """
-        if not self._directives:
-            return None
-        lines = [
-            "🔔 [Directives — planner guidance; follow by default. "
-            "If a directive contradicts observed reality, bail out with "
-            "plan_feedback rather than silently violate — see \"Directive "
-            "Conflicts\" in your system prompt.]"
-        ]
-        lines.extend(f"  • {d}" for d in self._directives)
-        return "\n".join(lines)
 
 
 # ── TurnOutcome ────────────────────────────────────────────────────────────
@@ -653,13 +677,14 @@ class TurnOutcome:
     key_findings: Optional[List[str]] = None
     claim_tool: List[str] = field(default_factory=list)
     release_tool: List[str] = field(default_factory=list)
-    # Optional agent→planner advisory. Set by the agent (on a completion OR an
-    # error turn) when something it learned this item — most often a skill body
-    # read via read_skill, or a discovered fact — means the planner's REMAINING
-    # items should change. Carried onto ItemResult and rendered into the
-    # planner's checklist context at the item boundary; the planner may then
-    # replace_post_current the pending tail. Distinct from key_findings (facts)
-    # and from the watcher's ProgressConcern (watcher→planner only).
+    # Optional agent→coordinator advisory. Set by the agent (on a completion OR
+    # an error turn) when something it learned this item — most often a skill
+    # body read via read_skill, or a discovered fact — means the coordinator's
+    # REMAINING items should change. Carried onto ItemResult and rendered into
+    # the coordinator's task-plan context at the item boundary; the coordinator
+    # may then replace_post_current the pending tail. Distinct from
+    # key_findings (facts) and from the watcher's ProgressConcern
+    # (watcher→coordinator only).
     plan_feedback: Optional[str] = None
     # Non-fatal note attached when a completion turn has evidence of
     # truncation (stop_reason=max_tokens, or JSON that only parsed after
@@ -668,6 +693,16 @@ class TurnOutcome:
     # required repair. Surfaced to the log's ITEM_END `issues` field so a
     # partial-completion never looks like a clean pass.
     truncation_note: Optional[str] = None
+    # True when the completion JSON only parsed after json_repair salvage
+    # (stdlib json.loads failed on the de-fenced content). This is NOT a
+    # truncation signal — it fires for benign, complete-but-non-strict output
+    # (trailing comma, single quotes, a raw newline inside a string, or a
+    # closing pleasantry after the JSON object), all of which json_repair
+    # fixes cleanly. Kept purely as a diagnostic the caller can DEBUG-log to
+    # notice "this model's completion format routinely needs repair"; it must
+    # NOT feed truncation_note / issues (that conflated it with real
+    # truncation and mislabeled every clean completion as "truncated").
+    completion_needed_repair: bool = False
     # True when the LLM emitted a completion that violated the JSON schema
     # entirely — i.e. no dict with a `reasoning` key. This is a stronger
     # signal than truncation_note: the item_loop uses it to REJECT the
@@ -676,6 +711,21 @@ class TurnOutcome:
     # LLM so subsequent turns can produce a properly-structured completion
     # with long output routed into artifacts / files.
     format_violation: bool = False
+    # Plain-text extended-thinking content for this turn (Claude's internal
+    # reasoning before the visible reply), when the model/service enabled
+    # it. DEBUG-only — written to the execution log by ExecutionRecorder so
+    # a human can inspect what the model was "thinking" on a given turn;
+    # never re-sent to the model (the structured, verbatim thinking_blocks
+    # on the assistant message are what gets round-tripped — see
+    # PersistentAgent._think_streaming / _convert_messages_to_anthropic).
+    thinking_text: Optional[str] = None
+    # Anthropic's stop_reason for this turn's raw response (end_turn /
+    # max_tokens / tool_use / stop_sequence / None). Populated by
+    # _think_streaming from LLMChatResult.stop_reason on every turn
+    # (tool-call and completion alike) and surfaced by
+    # ExecutionRecorder.write_turn so a truncated/odd stop is visible in
+    # the trace without cross-referencing the separate DEBUG log stream.
+    stop_reason: Optional[str] = None
 
     @property
     def is_completion(self) -> bool:
@@ -706,11 +756,6 @@ class TurnOutcome:
 
         if isinstance(parsed, dict) and "reasoning" in parsed:
             claim, release = extract_self_extension_fields(parsed)
-            note = (
-                f"Completion JSON was salvaged by json_repair (likely truncated "
-                f"mid-stream); raw_len={len(raw_content)}"
-                if repaired else None
-            )
             _pf = parsed.get("plan_feedback")
             return cls(
                 reasoning=parsed.get("reasoning", ""),
@@ -720,7 +765,11 @@ class TurnOutcome:
                 key_findings=_coerce_str_list(parsed.get("key_findings")),
                 claim_tool=claim,
                 release_tool=release,
-                truncation_note=note,
+                # repaired means json_repair salvaged a non-strict-but-complete
+                # payload — a diagnostic, NOT truncation (see field docstring).
+                # Real truncation is stamped from stop_reason==max_tokens by the
+                # caller, independently of this.
+                completion_needed_repair=repaired,
                 plan_feedback=(str(_pf).strip() or None) if _pf is not None else None,
             )
 

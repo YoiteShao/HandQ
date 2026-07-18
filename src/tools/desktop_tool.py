@@ -87,6 +87,7 @@ if _IS_WINDOWS:
     import win32gui                 # type: ignore[import-not-found]
     import win32process             # type: ignore[import-not-found]
     import win32con                 # type: ignore[import-not-found]
+    import win32clipboard           # type: ignore[import-not-found]
     from PIL import Image           # type: ignore[import-not-found]
     import pywinauto                # type: ignore[import-not-found]
     from pywinauto import Desktop   # type: ignore[import-not-found]
@@ -106,6 +107,7 @@ else:
     win32gui: Any = None
     win32process: Any = None
     win32con: Any = None
+    win32clipboard: Any = None
     Image: Any = None
     pywinauto: Any = None
     Desktop: Any = None
@@ -150,6 +152,15 @@ def _ensure_dpi_aware() -> None:
 
 _desktop_lock = asyncio.Lock()
 
+# Read-only actions never move the mouse/keyboard or change window focus, so
+# they don't need to serialize behind _desktop_lock (which exists to keep
+# physical input actions from interleaving). They still share a bounded
+# semaphore rather than running fully unbounded: pywinauto/UIA concurrent-
+# safety under real parallel access hasn't been verified, so this caps
+# concurrent UIA tree walks / OCR passes instead of trusting them blindly.
+_DESKTOP_READONLY_MAX_CONCURRENCY = 4
+_desktop_readonly_semaphore = asyncio.Semaphore(_DESKTOP_READONLY_MAX_CONCURRENCY)
+
 # Process-wide desktop ownership lock for multi-session concurrency.
 # Distinct from ``_desktop_lock`` above: that one serialises individual input
 # *actions* (release between each click / keystroke). This one is held for the
@@ -161,14 +172,22 @@ _GLOBAL_DESKTOP_OWNERSHIP_LOCK = asyncio.Lock()
 _GLOBAL_DESKTOP_OWNER: Optional["DesktopState"] = None
 
 # Actions that drive real mouse / keyboard input and therefore must claim the
-# cross-session ownership lock. Read-only actions (screenshot / snapshot /
-# list_windows / find_element) are absent on purpose — they never take
-# ownership and stay freely concurrent across sessions. Kept in sync with the
-# handlers that call ``_input_action_guard`` (which itself remains the single
-# place that flips takeover state and re-checks the sensitive-window gate).
+# cross-session ownership lock AND serialize on _desktop_lock. NOTE: hover_at
+# moves the physical cursor (pyautogui.moveTo) even though it doesn't click,
+# so it belongs here, not in _READONLY_ACTIONS below — two sessions hovering
+# concurrently would fight over cursor position.
 _INPUT_ACTIONS = frozenset({
     "hover_at", "find_and_click", "click_at", "type_text",
     "drag", "scroll", "hotkey", "key_press",
+})
+
+# Actions that only observe current desktop/window state — no mouse/keyboard
+# movement, no focus change. Dispatched through _desktop_readonly_semaphore
+# instead of _desktop_lock so a burst of screenshots/snapshots from multiple
+# sessions doesn't queue behind each other (or behind an in-flight input
+# action). Never touch the ownership lock either — see _INPUT_ACTIONS.
+_READONLY_ACTIONS = frozenset({
+    "screenshot", "snapshot", "list_windows", "find_element",
 })
 
 
@@ -189,13 +208,6 @@ def is_any_session_holding_desktop() -> bool:
 
 
 _desktop_store_instance: Optional[Any] = None
-
-# RapidOCR cold-start (~600ms) is paid on the first find_element. To
-# hide it, the first call to DesktopTool.execute fires a background
-# task that loads the engine while the agent is still doing whatever
-# else (likely list_windows / screenshot before find_element). One-shot
-# guard so we never queue more than one warm-up.
-_ocr_prewarm_started: bool = False
 
 
 # ── Snapshot result cache ────────────────────────────────────────────────────
@@ -247,29 +259,6 @@ def _snapshot_sig(state: Dict[str, Any]) -> Tuple[int, str, int]:
         len(state.get("visible_hwnds") or ()),
     )
 
-
-def _prewarm_local_ocr_async() -> None:
-    """Kick off a background task that loads the RapidOCR engine.
-
-    Safe no-op when no event loop is running yet (e.g. import-time use
-    in tests). Errors are swallowed because find_element will surface
-    its own clear message if OCR is genuinely unavailable.
-    """
-    global _ocr_prewarm_started
-    if _ocr_prewarm_started:
-        return
-    _ocr_prewarm_started = True
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        return  # no loop — nothing to do, skip
-    def _load() -> None:
-        try:
-            from ..infrastructure.vision import get_local_ocr
-            get_local_ocr()._ensure_engine()
-        except Exception:
-            pass
-    loop.run_in_executor(None, _load)
 
 
 def _desktop_store():
@@ -495,8 +484,8 @@ def reset_takeover_state() -> None:
 # ``_start_takeover`` / ``_end_takeover`` / ``mark_task_approved`` /
 # ``is_task_approved`` / ``revoke_takeover`` / ``was_user_rescinded`` /
 # ``reset_takeover_state`` and the corresponding ``_snapshot_cache`` /
-# ``_desktop_store_instance`` / ``_ocr_prewarm_started`` globals stay
-# alongside this class for callers still routing through the module path.
+# ``_desktop_store_instance`` globals stay alongside this class for callers
+# still routing through the module path.
 
 
 class DesktopState:
@@ -603,7 +592,7 @@ class DesktopState:
     async def acquire_global_takeover(self) -> None:
         """Acquire the process-wide desktop ownership lock for the current
         task. Idempotent — re-entrant calls on the same DesktopState return
-        immediately. Released by ``reset_takeover_state`` when the planner
+        immediately. Released by ``reset_takeover_state`` when the coordinator
         signals task settled, or by ``close`` when the session is destroyed.
 
         While this DesktopState owns the lock, other sessions' input-driving
@@ -746,7 +735,6 @@ class DesktopState:
 # ── Per-action tunables ──────────────────────────────────────────────────────
 
 _DEFAULT_MOUSE_DURATION = 0.0      # 0 = teleport; non-zero = animated drag
-_DEFAULT_TYPE_INTERVAL = 0.02      # seconds between keystrokes
 _DEFAULT_FUZZY_THRESHOLD = 70      # rapidfuzz token_set_ratio threshold
 _DEFAULT_SENSITIVE_PATTERNS: Tuple[str, ...] = (
     r"(?i)bitwarden|1password|keepass|lastpass|dashlane",
@@ -756,8 +744,8 @@ _DEFAULT_SENSITIVE_PATTERNS: Tuple[str, ...] = (
 # Safety net on list_windows so we never flood the LLM context.
 _LIST_WINDOWS_CAP = 50
 
-# Hard cap on type_text payload — long pastes should go through clipboard,
-# not synthetic keystrokes (slow + leaks visible state).
+# Hard cap on type_text payload — keeps a single call's blast radius bounded
+# (target control limits, accidental giant-paste mistakes).
 _TYPE_TEXT_MAX_CHARS = 4000
 
 
@@ -1450,6 +1438,53 @@ def _uia_invoke_at_point(x: int, y: int) -> Optional[str]:
     return f"UIA patterns exhausted for {ctrl_type!r}: {'; '.join(errors)}"
 
 
+def _has_focused_control(retries: int = 5, delay: float = 0.1) -> bool:
+    """True once some control in the foreground window's thread genuinely
+    holds keyboard focus (Win32 ``GUITHREADINFO.hwndFocus`` — cross-process,
+    unlike ``GetFocus()`` which only sees the calling thread's own windows).
+
+    A window that has JUST launched (cold-start app, e.g. right after
+    ``shell(run_in_background=true)`` + a short wait) can already be the
+    foreground window while its first control hasn't finished claiming
+    focus yet — a real race confirmed live: ``desktop_type_text`` pasted
+    into a Notepad window that WAS foreground but had no focused control
+    yet, so Ctrl+V had nothing to deliver to and silently typed nothing,
+    while the tool still reported success. Retrying briefly here (a few
+    hundred ms total, well within one tool call) lets that one-time
+    startup race resolve itself before we commit to typing — the caller
+    (a human or an LLM) should never have to know or reason about this
+    timing detail themselves.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    class GUITHREADINFO(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", wintypes.DWORD),
+            ("flags", wintypes.DWORD),
+            ("hwndActive", wintypes.HWND),
+            ("hwndFocus", wintypes.HWND),
+            ("hwndCapture", wintypes.HWND),
+            ("hwndMenuOwner", wintypes.HWND),
+            ("hwndMoveSize", wintypes.HWND),
+            ("hwndCaret", wintypes.HWND),
+            ("rcCaret", wintypes.RECT),
+        ]
+
+    user32 = ctypes.windll.user32
+    for attempt in range(retries):
+        hwnd = user32.GetForegroundWindow()
+        if hwnd:
+            info = GUITHREADINFO()
+            info.cbSize = ctypes.sizeof(GUITHREADINFO)
+            thread_id = user32.GetWindowThreadProcessId(hwnd, None)
+            if user32.GetGUIThreadInfo(thread_id, ctypes.byref(info)) and info.hwndFocus:
+                return True
+        if attempt < retries - 1:
+            time.sleep(delay)
+    return False
+
+
 def _uia_set_focused_value(text: str) -> Optional[str]:
     """Set the focused edit control's value via ValuePattern.SetValue.
 
@@ -1465,6 +1500,83 @@ def _uia_set_focused_value(text: str) -> Optional[str]:
         return None
     except Exception as exc:
         return f"UIA set_edit_text: {exc}"
+
+
+def _clipboard_paste_text(text: str) -> Optional[str]:
+    """Type *text* by writing it to the clipboard and sending Ctrl+V.
+
+    pyautogui.typewrite() sends one simulated keystroke per character,
+    which the OS runs through the ACTIVE INPUT METHOD (IME) exactly like a
+    real keypress — on a machine with a CJK (or any composing) IME enabled,
+    this silently corrupts the typed text into composed characters instead
+    of the literal ASCII/Unicode requested, with no error raised (confirmed
+    live: 'handq desktop skill check' became garbled CJK text). Clipboard
+    paste hands the OS the exact Unicode string directly; the target
+    control receives it via WM_PASTE, never passing through per-keystroke
+    IME composition. This makes type_text's behavior independent of
+    whatever input method is currently active — no prompt guidance can
+    reliably get a model to check/switch IME state before every call, so
+    the fix has to make the tool itself immune.
+
+    Preserves whatever was on the clipboard before the call (best-effort;
+    a failure to restore is not reported as an error since the type
+    itself already succeeded by that point).
+    """
+    if not _has_focused_control():
+        return (
+            "no control in the foreground window holds keyboard focus — "
+            "Ctrl+V would have nothing to deliver to. This usually means "
+            "the target window just launched and hasn't finished claiming "
+            "focus yet; wait_interval briefly and retry, or click into the "
+            "target field first."
+        )
+
+    prior: Optional[str] = None
+    had_prior = False
+    try:
+        win32clipboard.OpenClipboard()
+        try:
+            had_prior = win32clipboard.IsClipboardFormatAvailable(win32clipboard.CF_UNICODETEXT)
+            if had_prior:
+                prior = win32clipboard.GetClipboardData(win32clipboard.CF_UNICODETEXT)
+        finally:
+            win32clipboard.CloseClipboard()
+    except Exception:
+        pass  # no prior clipboard content to restore, or nothing was on it
+
+    try:
+        win32clipboard.OpenClipboard()
+        try:
+            win32clipboard.EmptyClipboard()
+            win32clipboard.SetClipboardData(win32clipboard.CF_UNICODETEXT, text)
+        finally:
+            win32clipboard.CloseClipboard()
+    except Exception as exc:
+        return f"clipboard write failed: {exc}"
+
+    try:
+        pyautogui.hotkey("ctrl", "v")
+    except Exception as exc:
+        return f"paste hotkey failed: {exc}"
+
+    # pyautogui.hotkey() returns once the keyup events are sent, not once
+    # the target app has actually processed WM_PASTE off its message queue
+    # — restoring the clipboard immediately risks a race where the paste
+    # reads back the ORIGINAL content instead of ours. This runs inside a
+    # thread-pool executor call, so a short blocking sleep here is fine.
+    time.sleep(0.15)
+
+    if had_prior:
+        try:
+            win32clipboard.OpenClipboard()
+            try:
+                win32clipboard.EmptyClipboard()
+                win32clipboard.SetClipboardData(win32clipboard.CF_UNICODETEXT, prior)
+            finally:
+                win32clipboard.CloseClipboard()
+        except Exception:
+            pass  # best-effort restore; the paste itself already succeeded
+    return None
 
 
 # ── DesktopTool ──────────────────────────────────────────────────────────────
@@ -1646,14 +1758,6 @@ class DesktopTool(BaseTool):
                     "the sensitive patterns (password managers / banking)."
                 ),
             },
-            "interval": {
-                "type": "number",
-                "description": (
-                    "[type_text] Seconds between keystrokes. Default 0.02. "
-                    "Increase to ~0.05 for sites that throttle / drop fast "
-                    "input."
-                ),
-            },
             "dy": {
                 "type": "integer",
                 "description": (
@@ -1693,8 +1797,12 @@ class DesktopTool(BaseTool):
         "additionalProperties": False,
     }
 
-    def __init__(self, ctx=None) -> None:
-        super().__init__("desktop", ctx=ctx)
+    def __init__(self, ctx=None, *, name: str = "desktop") -> None:
+        # ``name`` lets the atomic ``desktop_*`` subclasses register under their
+        # own identifiers while inheriting this backend's shared init. After
+        # Phase 2.1 the registry only exposes the atomic subclasses; the
+        # ``desktop`` name is not a live tool anymore.
+        super().__init__(name, ctx=ctx)
         # Per-session desktop state — takeover machine + IM + snapshot cache +
         # OCR prewarm guard + lazy ScreenshotStore. When ctx is supplied the
         # state lives on the SessionContext (dies with the session); when
@@ -1771,9 +1879,7 @@ class DesktopTool(BaseTool):
                 return self._error(params, start, refusal)
             await self.state.acquire_global_takeover()
 
-        # Mouse and keyboard are global — actions across agents and steps
-        # all queue here.
-        async with _desktop_lock:
+        async def _run_handler() -> ToolResult:
             try:
                 return await handler(params, start, **kwargs)
             except Exception as exc:
@@ -1783,8 +1889,20 @@ class DesktopTool(BaseTool):
                 )
                 return self._error(
                     params, start,
-                    f"desktop action {action!r} failed: {exc}",
+                    f"desktop action {action!r} failed ({type(exc).__name__}): {exc}",
                 )
+
+        if action in _READONLY_ACTIONS:
+            # No mouse/keyboard involved — don't queue behind in-flight input
+            # actions or other sessions' reads. Bounded by a semaphore rather
+            # than run fully unbounded (see _DESKTOP_READONLY_MAX_CONCURRENCY).
+            async with _desktop_readonly_semaphore:
+                return await _run_handler()
+
+        # Mouse and keyboard are global — actions across agents and steps
+        # all queue here.
+        async with _desktop_lock:
+            return await _run_handler()
 
     # ── screenshot ────────────────────────────────────────────────────────────
 
@@ -2301,11 +2419,15 @@ class DesktopTool(BaseTool):
 
         vision_hit = await self._match_via_vision(out_path, description)
         if vision_hit is None:
+            _vision_note = (
+                f" Vision fallback itself failed: {self._last_vision_unavailable_reason}."
+                if getattr(self, "_last_vision_unavailable_reason", None) else ""
+            )
             return self._error(
                 params, start,
                 f"find_element: neither OCR nor vision could locate "
                 f"{description!r}. Inspect the screenshot at {out_path} "
-                "to verify the target is actually visible.",
+                f"to verify the target is actually visible.{_vision_note}",
             )
         vx, vy, vconf, vreason = vision_hit
         return ToolResult(
@@ -2361,13 +2483,23 @@ class DesktopTool(BaseTool):
     async def _match_via_vision(
         self, image_path: str, description: str,
     ) -> Optional[Tuple[int, int, float, str]]:
-        """Fall back to LLM vision: ask for {x, y, confidence, reason}."""
+        """Fall back to LLM vision: ask for {x, y, confidence, reason}.
+
+        Sets ``self._last_vision_unavailable_reason`` when returning None due
+        to the vision client itself being unavailable (config/network), as
+        opposed to a genuine "not found" — desktop actions are already
+        serialized by ``_desktop_lock`` in the dispatcher, so this instance
+        attribute is safe without its own lock. The caller (find_element)
+        surfaces it instead of a bare "neither OCR nor vision could locate".
+        """
         from ..infrastructure.config_manager import ConfigManager
         from ..infrastructure.vision import get_vision_client
 
+        self._last_vision_unavailable_reason = None
         try:
             client = get_vision_client(ConfigManager())
         except Exception as exc:
+            self._last_vision_unavailable_reason = f"{type(exc).__name__}: {exc}"
             self.logger.warning(
                 f"find_element vision fallback unavailable: {exc}",
                 component="DesktopTool",
@@ -2394,6 +2526,10 @@ class DesktopTool(BaseTool):
         )
         result = await client.query(image_path, instruction, output_schema=schema)
         if not result.ok or not result.parsed_json:
+            self._last_vision_unavailable_reason = (
+                f"vision query failed: {result.error}" if not result.ok
+                else "vision query returned no parsable JSON"
+            )
             return None
         d = result.parsed_json
         if d.get("found") is False:
@@ -2437,6 +2573,18 @@ class DesktopTool(BaseTool):
         double = bool(kwargs.get("double", False))
         use_uia = bool(kwargs.get("use_uia_pattern", True))
 
+        # Acquire the ownership guard BEFORE the find phase, not just before
+        # the click. find_element's OCR/vision probe used to run unguarded —
+        # two concurrent sessions could both probe the screen at once, and
+        # whichever won the guard afterward would click coordinates that may
+        # already be stale (the other session's actions, or the screen
+        # itself, could have changed between probe and click). Wrapping both
+        # phases in one guard acquisition matches click_at/drag, which only
+        # ever had a single phase to guard.
+        guard = await self._input_action_guard()
+        if guard:
+            return self._error(params, start, guard)
+
         # Delegate the find half to the existing handler so OCR pre-warm,
         # vision fallback, threshold handling, and the screenshot lifecycle
         # (ephemeral tier + retention sweep) all stay in one place.
@@ -2454,13 +2602,6 @@ class DesktopTool(BaseTool):
                 "find_and_click: find_element succeeded but returned no "
                 "(x, y) — internal error.",
             )
-
-        # Now drive the click. The input guard (sensitive-window check +
-        # _start_takeover) runs here as well — find_element never goes
-        # through it because read-only.
-        guard = await self._input_action_guard()
-        if guard:
-            return self._error(params, start, guard)
 
         _ensure_dpi_aware()
         state_before = _capture_state_before()
@@ -2622,18 +2763,13 @@ class DesktopTool(BaseTool):
             return self._error(
                 params, start,
                 f"type_text: payload {len(text)} chars exceeds cap "
-                f"({_TYPE_TEXT_MAX_CHARS}). For long pastes use clipboard "
-                "via shell tool instead.",
+                f"({_TYPE_TEXT_MAX_CHARS}).",
             )
-        try:
-            interval = float(kwargs.get("interval") or _DEFAULT_TYPE_INTERVAL)
-        except (TypeError, ValueError):
-            interval = _DEFAULT_TYPE_INTERVAL
         use_uia = bool(kwargs.get("use_uia_pattern", True))
 
         _ensure_dpi_aware()
         state_before = _capture_state_before()
-        output: Dict[str, Any] = {"chars": len(text), "interval": interval}
+        output: Dict[str, Any] = {"chars": len(text)}
 
         if use_uia:
             uia_err = await asyncio.get_event_loop().run_in_executor(
@@ -2644,23 +2780,19 @@ class DesktopTool(BaseTool):
                 output["input_source"] = "uia_value_pattern"
             else:
                 output["uia_fallback_reason"] = uia_err
-                try:
-                    await asyncio.get_event_loop().run_in_executor(
-                        None,
-                        lambda: pyautogui.typewrite(text, interval=interval),
-                    )
-                except Exception as exc:
-                    return self._error(params, start, f"type_text: {exc}")
-                output["input_source"] = "keyboard"
-        else:
-            try:
-                await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda: pyautogui.typewrite(text, interval=interval),
+                paste_err = await asyncio.get_event_loop().run_in_executor(
+                    None, _clipboard_paste_text, text,
                 )
-            except Exception as exc:
-                return self._error(params, start, f"type_text: {exc}")
-            output["input_source"] = "keyboard"
+                if paste_err is not None:
+                    return self._error(params, start, f"type_text: {paste_err}")
+                output["input_source"] = "clipboard_paste"
+        else:
+            paste_err = await asyncio.get_event_loop().run_in_executor(
+                None, _clipboard_paste_text, text,
+            )
+            if paste_err is not None:
+                return self._error(params, start, f"type_text: {paste_err}")
+            output["input_source"] = "clipboard_paste"
 
         await asyncio.sleep(0.1)
         state_after = _capture_state_after(state_before)
@@ -2753,8 +2885,14 @@ class DesktopTool(BaseTool):
                 None,
                 lambda: pyautogui.scroll(dy, x=x, y=y),
             )
+        except pyautogui.FailSafeException:
+            return self._error(
+                params, start,
+                "scroll: PyAutoGUI failsafe triggered (mouse hit corner). "
+                "Move the mouse away from screen corners and retry.",
+            )
         except Exception as exc:
-            return self._error(params, start, f"scroll: {exc}")
+            return self._error(params, start, f"scroll: {type(exc).__name__}: {exc}")
         await asyncio.sleep(0.1)
         state_after = _capture_state_after(state_before)
         self.state.invalidate_on_state_change(state_after)
@@ -2791,8 +2929,14 @@ class DesktopTool(BaseTool):
                 None,
                 lambda: pyautogui.hotkey(*keys),
             )
+        except pyautogui.FailSafeException:
+            return self._error(
+                params, start,
+                "hotkey: PyAutoGUI failsafe triggered (mouse hit corner). "
+                "Move the mouse away from screen corners and retry.",
+            )
         except Exception as exc:
-            return self._error(params, start, f"hotkey: {exc}")
+            return self._error(params, start, f"hotkey: {type(exc).__name__}: {exc}")
         await asyncio.sleep(0.1)
         state_after = _capture_state_after(state_before)
         self.state.invalidate_on_state_change(state_after)
@@ -2825,8 +2969,14 @@ class DesktopTool(BaseTool):
                 None,
                 lambda: pyautogui.press(key),
             )
+        except pyautogui.FailSafeException:
+            return self._error(
+                params, start,
+                "key_press: PyAutoGUI failsafe triggered (mouse hit corner). "
+                "Move the mouse away from screen corners and retry.",
+            )
         except Exception as exc:
-            return self._error(params, start, f"key_press: {exc}")
+            return self._error(params, start, f"key_press: {type(exc).__name__}: {exc}")
         await asyncio.sleep(0.1)
         state_after = _capture_state_after(state_before)
         self.state.invalidate_on_state_change(state_after)
@@ -2912,3 +3062,107 @@ def _pyautogui_install_msg() -> str:
         "the import result at startup, so a mid-session pip install will "
         "not take effect until restart."
     )
+
+
+# ── Atomic desktop_* tools (Phase 2.1 split) ─────────────────────────────────
+#
+# The old composite ``desktop`` tool with a 12-value ``action`` enum is gone —
+# each atomic tool below subclasses DesktopTool, inherits the shared state /
+# IM / logger, and delegates ``execute`` to ``super().execute(action=X)``.
+# Same pattern as the browser split. The ``DesktopState`` per-ctx object is
+# shared across ALL atomic desktop_* tools so takeover state / snapshot cache
+# etc. remain coherent regardless of which atomic member the model calls.
+
+class _DesktopAtomic(DesktopTool):
+    """Common base for the atomic desktop_* tools. Each subclass sets
+    ``_action`` (the composite's action name) and its own registered name."""
+
+    _action: str = ""
+
+    def __init__(self, ctx=None, *, name: str) -> None:
+        DesktopTool.__init__(self, ctx=ctx, name=name)
+
+    async def execute(self, **kwargs: Any) -> ToolResult:
+        # Reuse the composite's dispatch + confirmation + exception handling.
+        # See browser_tool._BrowserAtomic.execute for why 'action' must be
+        # dropped from caller kwargs before re-adding it explicitly: the
+        # shared parameter_schema still exposes 'action' as a valid property.
+        kwargs.pop("action", None)
+        return await DesktopTool.execute(self, action=self._action, **kwargs)
+
+
+class DesktopScreenshotTool(_DesktopAtomic):
+    _action = "screenshot"
+    is_read_only = True
+    def __init__(self, ctx=None) -> None:
+        super().__init__(ctx=ctx, name="desktop_screenshot")
+
+
+class DesktopListWindowsTool(_DesktopAtomic):
+    _action = "list_windows"
+    is_read_only = True
+    def __init__(self, ctx=None) -> None:
+        super().__init__(ctx=ctx, name="desktop_list_windows")
+
+
+class DesktopSnapshotTool(_DesktopAtomic):
+    _action = "snapshot"
+    is_read_only = True
+    def __init__(self, ctx=None) -> None:
+        super().__init__(ctx=ctx, name="desktop_snapshot")
+
+
+class DesktopHoverAtTool(_DesktopAtomic):
+    _action = "hover_at"
+    is_read_only = True  # move + read tooltip
+    def __init__(self, ctx=None) -> None:
+        super().__init__(ctx=ctx, name="desktop_hover_at")
+
+
+class DesktopFindElementTool(_DesktopAtomic):
+    _action = "find_element"
+    is_read_only = True
+    def __init__(self, ctx=None) -> None:
+        super().__init__(ctx=ctx, name="desktop_find_element")
+
+
+class DesktopFindAndClickTool(_DesktopAtomic):
+    _action = "find_and_click"
+    def __init__(self, ctx=None) -> None:
+        super().__init__(ctx=ctx, name="desktop_find_and_click")
+
+
+class DesktopClickAtTool(_DesktopAtomic):
+    _action = "click_at"
+    def __init__(self, ctx=None) -> None:
+        super().__init__(ctx=ctx, name="desktop_click_at")
+
+
+class DesktopTypeTextTool(_DesktopAtomic):
+    _action = "type_text"
+    def __init__(self, ctx=None) -> None:
+        super().__init__(ctx=ctx, name="desktop_type_text")
+
+
+class DesktopDragTool(_DesktopAtomic):
+    _action = "drag"
+    def __init__(self, ctx=None) -> None:
+        super().__init__(ctx=ctx, name="desktop_drag")
+
+
+class DesktopScrollTool(_DesktopAtomic):
+    _action = "scroll"
+    def __init__(self, ctx=None) -> None:
+        super().__init__(ctx=ctx, name="desktop_scroll")
+
+
+class DesktopHotkeyTool(_DesktopAtomic):
+    _action = "hotkey"
+    def __init__(self, ctx=None) -> None:
+        super().__init__(ctx=ctx, name="desktop_hotkey")
+
+
+class DesktopKeyPressTool(_DesktopAtomic):
+    _action = "key_press"
+    def __init__(self, ctx=None) -> None:
+        super().__init__(ctx=ctx, name="desktop_key_press")

@@ -32,10 +32,8 @@ them into three files added cross-imports without separating any real
 ownership boundary. They're deployed together, evolve together, and
 fail together; one file is easier to navigate.
 
-The only Teams-related modules that stay separate:
+The only Teams-related module that stays separate:
 
-  * ``teams_setup.py`` — ContextProvider + agent hint (each tool
-    has one of these; pattern-match with ``email_setup`` etc.).
   * ``teams_web_bridge.py`` — Playwright-based bootstrap. It is the
     only Teams module that depends on Playwright; keeping it separate
     lets ``teams_api`` stay import-cheap.

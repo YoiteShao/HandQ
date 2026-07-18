@@ -39,7 +39,7 @@ session and ``status`` inspects the current one without leaving. This is how a
 Linux user tells "same session as before, keep going" from "start over".
 
 File IPC layout (``~/.handq/<user>@<host>/``):
-  state.json            daemon writes coarse status + latest_tool + checklist
+  state.json            daemon writes coarse status + latest_tool
                         (includes session_id + working_dir)
   messages/<id>.txt     inbound goal / follow-up (console AND Windows write here)
   commands/<id>.json    inbound new_session / interrupt
@@ -124,10 +124,10 @@ LAST_SEEN_SESSION_FILE = HANDQ_DIR / ".last_seen_session"
 # The msgid whose on_user_message() call is currently on this asyncio Task's
 # call stack — set for the duration of _drain_messages' await, unset outside
 # it. _on_agent_reply reads this to tell a DIRECT synchronous reply (chat, or
-# a synchronous planner-failure fallback — same Task, sees the var) apart from
-# an ASYNC task-completion summary arriving from the daemon's independent
-# agent/planner background Tasks, which snapshot their context at creation
-# time (in ``start()``, before any message exists) and so never observe a
+# a synchronous completion-reply fallback — same Task, sees the var) apart
+# from an ASYNC task-completion summary arriving from the daemon's
+# independent agent background task, which snapshots its context at creation
+# time (in ``start()``, before any message exists) and so never observes a
 # later ``.set()`` from _drain_messages, regardless of lock/await interleaving.
 _current_msgid: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar(
     "_current_msgid", default=None
@@ -216,21 +216,21 @@ class StateMirror:
 
     Only the methods the daemon cares about are implemented; the
     InteractionManager silently skips any delegate method that is absent, so
-    this class deliberately omits the receptionist-streaming hooks.
+    this class deliberately omits the coordinator-reply-streaming hooks.
     """
 
     def __init__(self, session_id: str, working_dir: str = "") -> None:
         self._session_id = session_id
         self._working_dir = working_dir
-        self._checklist: Any = None
+        self._task_channel: Any = None
         self._status = "idle"
         # "" = no task yet, "running" = task in flight, "idle" = settled.
         self._task_status = ""
         self._latest_tool: Optional[Dict[str, Any]] = None
 
     # ── wiring ────────────────────────────────────────────────────────────
-    def attach_checklist(self, checklist: Any) -> None:
-        self._checklist = checklist
+    def attach_task_channel(self, task_channel: Any) -> None:
+        self._task_channel = task_channel
 
     def set_working_dir(self, working_dir: str) -> None:
         self._working_dir = working_dir
@@ -245,6 +245,20 @@ class StateMirror:
     def set_task_status(self, status: str) -> None:
         self._task_status = status
 
+    def mark_task_starting(self) -> None:
+        """Call the instant a message is drained, before on_user_message runs.
+
+        Closes a race where a fast poller's get_status call could otherwise
+        observe task_status='running' (set eagerly here) alongside a stale
+        status_text='idle' left over from the PREVIOUS task — self-
+        contradictory, since show_state_changed only ever moves status_text
+        off 'idle' once the agent's own loop actually starts (which happens
+        moments later, asynchronously). Setting both fields together here
+        keeps the snapshot internally consistent for that gap.
+        """
+        self._status = "starting"
+        self._task_status = "running"
+
     # ── state-mirroring delegate hooks ───────────────────────────────────
     def show_state_changed(self, state: str) -> None:
         self._status = state
@@ -254,7 +268,7 @@ class StateMirror:
 
     def show_inline_event(self, icon: str, desc: str) -> None:
         # Coarse one-liner; folded into status_text so Windows sees the latest
-        # planner banner without a separate field.
+        # activity banner without a separate field.
         self._status = f"{icon} {desc}".strip()
         self.snapshot()
 
@@ -280,18 +294,6 @@ class StateMirror:
 
     # ── state.json snapshot ──────────────────────────────────────────────
     def snapshot(self) -> None:
-        checklist_text = ""
-        completed = total = 0
-        if self._checklist is not None:
-            try:
-                total = int(self._checklist.total_items)
-                completed = int(self._checklist.completed_count)
-                if total > 0:
-                    checklist_text = (
-                        self._checklist.get_checklist_context_for_planner()
-                    )
-            except Exception:
-                pass
         state = {
             "pid": os.getpid(),
             "handq_active": True,
@@ -300,9 +302,6 @@ class StateMirror:
             "task_status": self._task_status,
             "status_text": self._status,
             "latest_tool": self._latest_tool,
-            "checklist": checklist_text,
-            "completed": completed,
-            "total": total,
             "last_updated": datetime.now(timezone.utc).isoformat(),
         }
         try:
@@ -495,13 +494,13 @@ class _LinuxDaemon:
         assert self._mirror is not None
         if self._flow.interaction_manager is not None:
             self._flow.interaction_manager.set_delegate(self._mirror)
-        self._mirror.attach_checklist(self._flow._checklist)
+        self._mirror.attach_task_channel(self._flow._task_channel)
 
     def _on_agent_reply(self, reply: str) -> None:
         """Sink for ``FlowControllerV2.on_reply_to_user`` — the authoritative reply.
 
         V2 runs task execution in a background task: ``on_user_message`` returns
-        only the initial plan ack, and the real completion summary is emitted
+        only the initial ack, and the real completion summary is emitted
         later via ``Orchestrator._emit_completion_reply`` (unconditional, full
         text). This callback carries no per-task correlation id, and more than
         one msgid can be pending at once (a follow-up submitted via
@@ -510,13 +509,13 @@ class _LinuxDaemon:
 
           * DIRECT — fires synchronously inside _drain_messages' own
             ``await on_user_message(...)`` (the chat path, or a synchronous
-            planner-failure fallback). ``_current_msgid.get()`` is non-None
+            error fallback). ``_current_msgid.get()`` is non-None
             here, naming exactly the message this reply belongs to.
-          * ASYNC — fires later from the daemon's independent agent/planner
-            background Tasks (the real task-completion summary).
-            ``_current_msgid.get()`` is None here — those Tasks' contexts were
-            snapshotted at ``start()``, before any message existed, so they
-            never observe _drain_messages' ``.set()``. With no correlation id
+          * ASYNC — fires later from the daemon's independent agent
+            background task (the real task-completion summary).
+            ``_current_msgid.get()`` is None here — that task's context was
+            snapshotted at ``start()``, before any message existed, so it
+            never observes _drain_messages' ``.set()``. With no correlation id
             to target, broadcast to every msgid still awaiting its reply.
         """
         direct = _current_msgid.get()
@@ -529,10 +528,10 @@ class _LinuxDaemon:
                 self._final_reply_msgids.add(msgid)
             except Exception:
                 pass
-        # Once the checklist has genuinely settled, every id this broadcast
+        # Once the task channel has genuinely settled, every id this broadcast
         # covered is done — drop them so a later, unrelated task's completion
         # doesn't get broadcast to them too.
-        cl = self._flow._checklist if self._flow is not None else None
+        cl = self._flow._task_channel if self._flow is not None else None
         if direct is None and cl is not None and cl.get_current_item() is None and not cl.has_pending:
             self._pending_msgids.clear()
         if self._mirror is not None:
@@ -606,13 +605,13 @@ class _LinuxDaemon:
     async def _handle_command(self, cmd: Dict[str, Any]) -> None:
         action = cmd.get("action", "")
         if action == "interrupt":
-            cl = self._flow._checklist if self._flow is not None else None
+            cl = self._flow._task_channel if self._flow is not None else None
             if cl is not None:
                 try:
                     if cl.get_current_item() is not None:
                         # A task is in flight: clear the pending tail first,
                         # then abort the in-flight item (order per
-                        # SharedCheckList.replace_post_current). The agent acks
+                        # TaskChannel.replace_post_current). The agent acks
                         # the interrupt inside its item loop, releasing
                         # interrupt_agent's wait on _interrupt_acked.
                         await cl.replace_post_current([])
@@ -652,7 +651,7 @@ class _LinuxDaemon:
                 continue
             # Mark this message the DIRECT target for any reply produced
             # synchronously within the upcoming await (chat, or a synchronous
-            # planner-failure fallback) — see _on_agent_reply / _current_msgid.
+            # error fallback) — see _on_agent_reply / _current_msgid.
             # Deliberately NOT added to _pending_msgids yet: that set is what
             # an unrelated task's ASYNC completion broadcasts to, and until
             # on_user_message returns we don't yet know whether this message
@@ -661,7 +660,7 @@ class _LinuxDaemon:
             # completion fires (and broadcasts) while this await is still
             # in flight, clobbering this message's reply before it starts.
             if self._mirror is not None:
-                self._mirror.set_task_status("running")
+                self._mirror.mark_task_starting()
                 self._mirror.snapshot()
             token = _current_msgid.set(stem)
             try:
@@ -670,12 +669,12 @@ class _LinuxDaemon:
                 reply = f"[handq_linux] error: {exc}"
             finally:
                 _current_msgid.reset(token)
-            # on_user_message has returned; the planner (if any) has already
-            # applied its items synchronously. Only now can we tell whether
+            # on_user_message has returned; the coordinator has already
+            # applied its item synchronously. Only now can we tell whether
             # this message left real work in flight — if so, register it so
-            # the eventual ASYNC completion (background planner_task) knows
+            # the eventual ASYNC completion (background agent task) knows
             # to broadcast to it too.
-            cl = self._flow._checklist if self._flow is not None else None
+            cl = self._flow._task_channel if self._flow is not None else None
             still_in_flight = cl is not None and (
                 cl.get_current_item() is not None or cl.has_pending
             )
@@ -685,7 +684,7 @@ class _LinuxDaemon:
             # the authoritative reply for this id. Chat → the return IS the
             # reply (the sink already wrote it as the DIRECT target above, so
             # this is normally a no-op guarded by _final_reply_msgids). Task →
-            # the return is the plan ack; it serves as an immediate
+            # the return is the initial ack; it serves as an immediate
             # placeholder, and the async sink overwrites it with the full
             # completion summary once the task settles (which, for a very fast
             # task, may have already happened — hence the guard).
@@ -693,13 +692,13 @@ class _LinuxDaemon:
                 _atomic_write_text(REPLY_DIR / f"{stem}.txt", reply or "")
             if self._mirror is not None:
                 # Settle to idle when nothing is in flight. A freshly-submitted
-                # task leaves its first item current here (the planner applies
-                # items before on_user_message returns), so this never settles a
-                # running task — show_state_changed drives that to idle at
-                # completion. But the pure-chat path runs no agent/planner and so
-                # never emits an "idle" state change; without this the optimistic
-                # "running" set above would strand and get_status would report a
-                # finished chat reply as a perpetually running task.
+                # task leaves its first item current here (the coordinator
+                # applies it before on_user_message returns), so this never
+                # settles a running task — show_state_changed drives that to
+                # idle at completion. But the pure-chat path runs no agent and
+                # so never emits an "idle" state change; without this the
+                # optimistic "running" set above would strand and get_status
+                # would report a finished chat reply as a perpetually running task.
                 if not still_in_flight:
                     self._mirror.set_task_status("idle")
                 self._mirror.snapshot()
@@ -723,8 +722,10 @@ def _build_llm_services(config_path: Optional[str]) -> Tuple[List[Any], List[Any
 
     Mirrors stdio_bridge's construction: one AnthropicStreamingService per
     model in priority order (the fallback chain), plus a distinct helper pool
-    (llm.helper_models, falling back to the main models) for the Tier-1
-    progress watcher.
+    (llm.helper_models, falling back to the main models). The helper pool is
+    threaded through to FlowControllerV2/Orchestrator for constructor
+    compatibility but currently has no live consumer on this (LTM-less) Linux
+    path — kept for pool-lifecycle symmetry with stdio_bridge's shutdown.
     """
     from src.infrastructure.anthropic_streaming_service import AnthropicStreamingService
     from src.infrastructure.config_manager import ConfigManager

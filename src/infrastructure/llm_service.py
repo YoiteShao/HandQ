@@ -59,8 +59,17 @@ class LLMChatResult:
         Text content from ``message.content``.  ``None`` when the model
         issued a tool call without any accompanying text.
     reasoning_content:
-        Thinking / reasoning content (e.g. Claude extended thinking).
-        ``None`` when the model does not emit a separate reasoning field.
+        Thinking / reasoning content (e.g. Claude extended thinking), as
+        plain concatenated text — for logging/debugging only.
+    thinking_blocks:
+        Structured extended-thinking content blocks exactly as the API
+        returned them (``{"type": "thinking", "thinking": ..., "signature":
+        ...}`` or ``{"type": "redacted_thinking", "data": ...}``), in
+        original order. Anthropic's protocol requires these be carried back
+        UNMODIFIED in a later assistant turn's content — see
+        ``PersistentAgent._think_streaming`` / ``_convert_messages_to_anthropic``
+        for the round-trip. Empty when extended thinking wasn't enabled for
+        this call.
     tool_name / tool_arguments:
         Populated from the FIRST tool call when the model issues tool calls;
         both are ``None`` when the model replies with plain text.
@@ -84,8 +93,10 @@ class LLMChatResult:
     """
     # Text content from message.content
     content: Optional[str] = None
-    # Thinking/reasoning content (e.g. Claude extended thinking)
+    # Thinking/reasoning content (e.g. Claude extended thinking) — plain text
     reasoning_content: Optional[str] = None
+    # Structured thinking/redacted_thinking blocks, original order, unmodified
+    thinking_blocks: "list[dict]" = field(default_factory=list)
     # Tool call fields — both present or both None (mirrors tool_calls[0] when present)
     tool_name: Optional[str] = None
     tool_arguments: Optional[str] = None   # raw JSON string from function.arguments
@@ -157,8 +168,8 @@ class LLMService(ABC):
         How many times a transient failure should be retried before
         propagating the exception.
     context_window:
-        Maximum number of input tokens this model accepts.  Used by the
-        Planner to decide when to compress step history.  Defaults to
+        Maximum number of input tokens this model accepts.  Used by
+        PersistentAgent to size its observation budget.  Defaults to
         200 000 (conservative — safe for all current Anthropic models).
     """
 
@@ -206,6 +217,7 @@ class LLMService(ABC):
         top_p: Optional[float] = None,
         reasoning_effort: Optional[Literal["low", "medium", "high"]] = None,
         thinking_budget_tokens: Optional[int] = None,
+        effort: Optional[Literal["low", "medium", "high", "xhigh", "max"]] = None,
         tools: Optional[list[dict[str, Any]]] = None,
         tool_choice: Optional[Any] = None,
         response_format: Optional[Any] = None,
@@ -255,9 +267,60 @@ class LLMService(ABC):
         top_p:
             Top-P (nucleus) sampling.
         reasoning_effort:
-            ``"low"`` | ``"medium"`` | ``"high"``.
+            ``"low"`` | ``"medium"`` | ``"high"``.  Legacy knob — maps to
+            Anthropic's ``thinking.budget_tokens`` (fixed token counts).
+            Not deprecated on the QGenie/Bedrock gateway HandQ ships against:
+            verified 2026-07-17 that ``budget_tokens=4096`` returns 200 and
+            activates extended thinking on Opus 4.7/4.8 and Sonnet 5. Note
+            this contradicts the native Anthropic API, where Opus 4.7+ and
+            Sonnet 5 reject ``budget_tokens`` with a 400 (adaptive-only).
+            When porting HandQ to a native Anthropic endpoint, expect this
+            path to break and re-verify before shipping.
         thinking_budget_tokens:
-            Explicit token budget for Anthropic extended thinking.
+            Explicit token budget for Anthropic extended thinking. Same
+            gateway/native discrepancy as ``reasoning_effort`` above. This
+            is the path PersistentAgent's ``_think_streaming`` uses to
+            enable streaming reasoning (``budget_tokens=4096``) — without
+            it, the gateway silently suppresses ``thinking_delta`` events
+            in streaming mode even though the model is thinking.
+        effort:
+            ``"low"`` | ``"medium"`` | ``"high"`` | ``"xhigh"`` | ``"max"``.
+            Maps to Anthropic's ``output_config.effort`` — the current
+            (non-deprecated) mechanism for controlling reasoning depth and
+            overall token spend. Independent of ``reasoning_effort`` /
+            ``thinking_budget_tokens`` above; adapters that support it
+            should clamp per-model to what that model's backend actually
+            accepts (e.g. Sonnet 4.6 rejects ``"xhigh"`` with a 400 — see
+            ``anthropic_streaming_service._resolve_effort``).
+
+            Call-site convention in ``controller_v2`` (verified live
+            against the QGenie/Bedrock gateway 2026-07-16 — see the
+            per-model acceptance notes in
+            ``anthropic_streaming_service._MODEL_EFFORT_VALUES``):
+
+              * Orchestrator (coordinator role — INTENT, goal-judge, etc.)
+                always requests ``"high"``. Confirmed accepted by every
+                model in the pool, old or new, including both Opus
+                4.7/4.8 and Sonnet 4.6 — ``"high"`` never 400s regardless
+                of which model the user has selected or which model a
+                fallback lands on.
+              * PersistentAgent's think/act loop always requests
+                ``"xhigh"``. Only a whitelisted subset of models (Opus
+                4.7/4.8, Sonnet 5 at the time this was written) actually
+                accept and act on ``"xhigh"``; every other model —
+                Sonnet 4.6, older/haiku models, and any model not yet in
+                the whitelist — is silently downgraded to ``"high"``
+                rather than sent a value that risks a 400. This applies
+                per fallback hop too: ``call_with_fallback*`` passes the
+                same ``chat_kwargs`` (including ``effort="xhigh"``)
+                unchanged to every service in the pool, but each
+                adapter's ``chat_stream`` re-resolves ``effort`` against
+                *that service's own* ``model`` — so a fallback chain
+                that starts on a whitelisted model (e.g. Opus) and ends
+                up serving from a non-whitelisted one (e.g. Haiku) still
+                downgrades correctly on the hop that actually serves the
+                request. Verified live: Opus-with-``xhigh`` falling back
+                to Haiku completes without a 400.
         tools:
             Tool / function-calling definitions.
         tool_choice:

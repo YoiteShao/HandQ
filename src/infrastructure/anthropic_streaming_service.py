@@ -160,7 +160,11 @@ _MODEL_CONTEXT_WINDOW: list[tuple[str, int]] = [
 _DEFAULT_CONTEXT_WINDOW = 200_000  # conservative default for unknown models
 
 
-def _resolve_max_tokens(model: str, requested: Optional[int]) -> int:
+def _resolve_max_tokens(
+    model: str,
+    requested: Optional[int],
+    thinking_budget_tokens: Optional[int] = None,
+) -> int:
     """Return the effective max_tokens for an Anthropic API call.
 
     Resolution rules:
@@ -174,6 +178,12 @@ def _resolve_max_tokens(model: str, requested: Optional[int]) -> int:
         API never receives a value the model cannot satisfy (would be a
         400) while still letting callers (vision, reranker, triage, etc.)
         deliberately throttle output for short-response use cases.
+      * Anthropic requires ``max_tokens`` to strictly exceed
+        ``thinking.budget_tokens``. If a caller combines a small explicit
+        *requested* with a thinking budget that would violate this (latent
+        today — no current caller passes both — but reachable via the
+        public ``chat_stream`` interface), the result is raised to clear
+        the budget with headroom, still capped at the model's ceiling.
     """
     model_lower = model.lower()
     ceiling = _DEFAULT_MAX_OUTPUT_TOKENS
@@ -181,9 +191,10 @@ def _resolve_max_tokens(model: str, requested: Optional[int]) -> int:
         if substring in model_lower:
             ceiling = c
             break
-    if requested is None or requested <= 0:
-        return ceiling
-    return min(requested, ceiling)
+    resolved = ceiling if requested is None or requested <= 0 else min(requested, ceiling)
+    if thinking_budget_tokens and resolved <= thinking_budget_tokens:
+        resolved = min(ceiling, thinking_budget_tokens + 1024)
+    return resolved
 
 
 def _resolve_context_window(model: str, override: Optional[int]) -> int:
@@ -201,6 +212,145 @@ def _resolve_context_window(model: str, override: Optional[int]) -> int:
         if substring in model_lower:
             return size
     return _DEFAULT_CONTEXT_WINDOW
+
+
+_DEFAULT_THINKING_BUDGET_TOKENS = 4096
+
+
+def _model_supports_extended_thinking(model: str) -> bool:
+    """True when *model*'s configured name opts into extended thinking.
+
+    Mirrors the existing ``:1m``-suffix convention (a model-name marker the
+    Settings UI lets the user pick per entry) — a model isn't assumed to
+    support the ``thinking`` API param unless its name carries ``:thinking``.
+    The model string itself is never mutated; this is a local capability
+    signal only, resolved before the raw model id is sent to the API.
+    """
+    return ":thinking" in model.lower()
+
+
+# ---------------------------------------------------------------------------
+# output_config.effort — per-model accepted values
+#
+# The gateway itself does NOT validate `output_config.effort` (a garbage
+# value like "banana" is silently forwarded and returns 200). The real
+# enforcement lives in Bedrock's model-parameter validation downstream,
+# and that layer has been observed to flip its position:
+#
+#   * 2026-07-16 — claude-4-6-sonnet (both plain and ":1M") REJECTED
+#     "xhigh" with a hard 400:
+#       ValidationException: output_config.effort: Input should be
+#       'low', 'medium', 'high' or 'max'
+#     — matching Anthropic's public docs (xhigh introduced with Opus 4.7;
+#     Sonnet 4.6 and earlier only ever had low/medium/high/max).
+#   * 2026-07-17 — same request, 3× per variant, both streaming and
+#     non-streaming: all 12 returned 200 end_turn. Something in the
+#     gateway or Bedrock backend loosened validation in the intervening
+#     day. Cause unknown.
+#
+# The clamping table below is KEPT DESPITE the current 200s: it downgrades
+# unsupported effort→high, which is free of side effects (high is a
+# universally-accepted value), and it defends against the next flip back
+# — a bare "xhigh" against Sonnet 4.6 that gets a 400 in production is
+# painful to debug and re-fix. The cost of keeping the clamp during
+# permissive windows is zero; the cost of losing it during a strict
+# window is a production incident. So: keep the clamp, and treat the
+# comment above as documenting a real observed flap, not a currently-live
+# rejection.
+#
+# claude-4-7-opus/4-8-opus/5-sonnet were confirmed to both accept "xhigh"
+# AND show a measurable behavioral difference (output_tokens step-changes
+# up at xhigh/max; thinking_chars varies but not strictly monotonically)
+# vs "high" on the same prompt — a real effect, not a no-op. Older/haiku
+# models returned 200 for "xhigh" but showed no reliably distinguishable
+# effect from "high" in that same probe, so they are treated as
+# unverified and clamped down rather than assumed to work — the gateway's
+# own lack of validation means a 200 response is not proof the field did
+# anything.
+#
+# "high" itself was confirmed live to be accepted by EVERY model tested
+# (Opus 4.7/4.8, Sonnet 5, Sonnet 4.6, Sonnet 4.5, Haiku) — it is the
+# universally-safe value every accepted-set below includes, which is why
+# orchestrator.py's coordinator calls request "high" unconditionally with
+# no per-model clamping needed, while persistent_agent.py's agent loop
+# requests "xhigh" and relies on the clamping in _resolve_effort below.
+#
+# Each entry is the model's full accepted-value set. Keys are substrings
+# matched against the model name (case-insensitive), same convention as
+# _MODEL_MAX_OUTPUT_TOKENS above. First match wins.
+# ---------------------------------------------------------------------------
+_EFFORT_XHIGH_CAPABLE = frozenset({"low", "medium", "high", "xhigh", "max"})
+_EFFORT_NO_XHIGH = frozenset({"low", "medium", "high", "max"})
+
+_MODEL_EFFORT_VALUES: list[tuple[str, frozenset]] = [
+    # Confirmed to accept + act on "xhigh".
+    ("claude-5-sonnet",  _EFFORT_XHIGH_CAPABLE),
+    ("claude-4-8-opus",  _EFFORT_XHIGH_CAPABLE),
+    ("claude-4-7-opus",  _EFFORT_XHIGH_CAPABLE),
+    # Confirmed 400 on "xhigh" — not in this model's Bedrock-enforced enum.
+    ("claude-4-6-sonnet", _EFFORT_NO_XHIGH),
+]
+# Everything else (4-5-sonnet, haiku, unknown future names): "xhigh"
+# returned 200 but with no confirmed distinguishable effect — treat as
+# unverified and restrict to the safe, universally-supported set rather
+# than trust an unvalidated 200.
+_DEFAULT_EFFORT_VALUES = _EFFORT_NO_XHIGH
+
+# Downgrade path when a requested value isn't in the model's accepted set.
+# "xhigh" is the only value observed to be rejected outright; per explicit
+# product decision, fall back to "high" (not "max") on models that don't
+# support it — "high" is universally supported and is the safe baseline
+# every model in _DEFAULT_EFFORT_VALUES / _EFFORT_NO_XHIGH accepts.
+_EFFORT_DOWNGRADE = {"xhigh": "high"}
+
+
+def _resolve_effort(model: str, requested: Optional[str]) -> Optional[str]:
+    """Clamp *requested* effort to a value *model*'s backend actually accepts.
+
+    Returns ``None`` when *requested* is ``None`` (no ``output_config`` is
+    sent at all — callers that never opt in see the same implicit-default
+    behavior as before this parameter existed). Otherwise returns
+    *requested* unchanged if it's in the model's confirmed accepted set, or
+    the downgraded equivalent if not (e.g. "xhigh" on a claude-4-6-sonnet
+    model becomes "high" instead of a value that 400s).
+
+    Call-site convention (see llm_service.LLMService.chat_stream's
+    ``effort`` docstring for the full rationale):
+
+      * orchestrator.py's coordinator calls (_call_and_parse /
+        _call_and_parse_streaming) always request "high" — confirmed live
+        to be accepted by every model in the pool (old and new, including
+        both whitelisted and non-whitelisted entries below), so it never
+        needs downgrading and never 400s regardless of which model the
+        user has selected.
+      * persistent_agent.py's PersistentAgent._think_streaming always
+        requests "xhigh" — only accepted by the whitelist below; every
+        other model is downgraded here.
+
+    Fallback safety: ``model`` is always the model actually about to serve
+    THIS call, not necessarily the model the caller originally intended.
+    call_with_fallback / call_with_fallback_stream (llm_pool.py) pass the
+    same chat_kwargs dict — including whatever `effort` was requested —
+    unchanged to every service in the fallback list, but each service's
+    own chat_stream calls this function with ITS OWN self.model. So a
+    fallback chain that starts on a whitelisted model (e.g. Opus, which
+    accepts "xhigh") and ends up being served by a non-whitelisted one
+    (e.g. Haiku, after Opus failed) still gets correctly downgraded on the
+    hop that actually serves the request — verified live 2026-07-16:
+    requesting "xhigh" against Opus, forcing a fallback to Haiku, Haiku
+    completes with no 400.
+    """
+    if requested is None:
+        return None
+    model_lower = model.lower()
+    accepted = _DEFAULT_EFFORT_VALUES
+    for substring, values in _MODEL_EFFORT_VALUES:
+        if substring in model_lower:
+            accepted = values
+            break
+    if requested in accepted:
+        return requested
+    return _EFFORT_DOWNGRADE.get(requested, "high")
 
 
 # ---------------------------------------------------------------------------
@@ -288,8 +438,14 @@ class AnthropicStreamingService(LLMService):
         """
         # In-progress tool-call blocks keyed by block index
         pending: dict[int, dict] = {}
+        # In-progress thinking blocks keyed by block index — tracks both the
+        # accumulated text and its signature so the finished block can be
+        # replayed VERBATIM in a later assistant turn (Anthropic forbids any
+        # modification of thinking/redacted_thinking content once issued).
+        pending_thinking: dict[int, dict] = {}
+        thinking_blocks: list[dict] = []  # completed, in original order
         text_parts: list[str] = []
-        thinking_parts: list[str] = []  # extended thinking content
+        thinking_parts: list[str] = []  # extended thinking content (flat text, for logging)
         all_tool_calls: list[ToolCallInfo] = []
         input_tokens: int = 0
         output_tokens: int = 0
@@ -320,7 +476,17 @@ class AnthropicStreamingService(LLMService):
                         "name": blk.name,
                         "input_json": "",
                     }
-                # text and thinking blocks are handled via delta events
+                elif blk.type == "thinking":
+                    pending_thinking[event.index] = {"thinking": "", "signature": ""}
+                elif blk.type == "redacted_thinking":
+                    # Arrives fully-formed (no delta events) — the server
+                    # withheld the reasoning; `data` is opaque and must be
+                    # replayed verbatim, same as a normal thinking block.
+                    thinking_blocks.append({
+                        "type": "redacted_thinking",
+                        "data": getattr(blk, "data", ""),
+                    })
+                # text blocks are handled via delta events
 
             elif etype == "content_block_delta":
                 delta = event.delta
@@ -334,6 +500,15 @@ class AnthropicStreamingService(LLMService):
                 elif delta.type == "thinking_delta":
                     # Extended thinking content — accumulate but don't yield
                     thinking_parts.append(delta.thinking)
+                    tblk = pending_thinking.get(event.index)
+                    if tblk is not None:
+                        tblk["thinking"] += delta.thinking
+                elif delta.type == "signature_delta":
+                    # Server-issued signature over the thinking block's
+                    # content — opaque, never regenerated or edited locally.
+                    tblk = pending_thinking.get(event.index)
+                    if tblk is not None:
+                        tblk["signature"] += delta.signature
 
             elif etype == "content_block_stop":
                 blk = pending.pop(event.index, None)
@@ -354,6 +529,13 @@ class AnthropicStreamingService(LLMService):
                         args=args,
                         block_index=event.index,
                     )
+                tblk = pending_thinking.pop(event.index, None)
+                if tblk is not None:
+                    thinking_blocks.append({
+                        "type": "thinking",
+                        "thinking": tblk["thinking"],
+                        "signature": tblk["signature"],
+                    })
             elif etype == "message_delta":
                 # message_delta carries the real input+output token counts for
                 # streaming AND the cache_creation / cache_read fields. The
@@ -406,6 +588,7 @@ class AnthropicStreamingService(LLMService):
         result = LLMChatResult(
             content=text_content,
             reasoning_content=reasoning_content,
+            thinking_blocks=thinking_blocks,
             tool_name=tool_name_val,
             tool_arguments=tool_args_val,
             tool_calls=all_tool_calls,
@@ -447,6 +630,7 @@ class AnthropicStreamingService(LLMService):
         tools: Optional[list[dict[str, Any]]],
         tool_choice: Optional[Any],
         thinking_budget_tokens: Optional[int],
+        effort: Optional[str] = None,
     ) -> dict[str, Any]:
         """Separate system messages, convert OpenAI→Anthropic format, build kwargs.
 
@@ -468,6 +652,13 @@ class AnthropicStreamingService(LLMService):
         When ``thinking_budget_tokens`` is set, the ``thinking`` parameter is
         added with ``{"type": "enabled", "budget_tokens": N}``.  Temperature
         must be 1.0 when thinking is enabled (Anthropic requirement).
+
+        Effort
+        ------
+        When ``effort`` is set, ``output_config.effort`` is added. Already
+        clamped to the model's confirmed ceiling by ``_resolve_effort`` in
+        ``chat_stream`` before reaching here — this method sends whatever
+        value it's given unchanged.
         """
         system_msgs = [m for m in messages if m.get("role") == "system"]
         other_msgs = [m for m in messages if m.get("role") != "system"]
@@ -481,18 +672,38 @@ class AnthropicStreamingService(LLMService):
             "model": model,
             "messages": converted,
             "temperature": effective_temp,
-            "max_tokens": _resolve_max_tokens(model, max_tokens),
+            "max_tokens": _resolve_max_tokens(model, max_tokens, thinking_budget_tokens),
         }
 
-        system_content = "\n\n".join(m.get("content", "") for m in system_msgs)
-        if system_content:
-            api_kwargs["system"] = [
-                {
-                    "type": "text",
-                    "text": system_content,
-                    "cache_control": {"type": "ephemeral"},
-                }
+        # Anthropic's `system` param accepts an array of independently
+        # cacheable text blocks (not just one opaque string) — mirrors Claude
+        # Code's practice of sending the system prompt as named sections so
+        # a stable prefix (identity/behavior rules) can be cached separately
+        # from a more volatile suffix (Environment: cwd/platform/etc). Every
+        # system message we receive here becomes its own array element; a
+        # cache breakpoint is placed on the LAST block that precedes the
+        # final one (treated as the volatile "Environment" tail), so the
+        # stable prefix is served from prefix cache even when the tail
+        # changes. A single system message (e.g. the Coordinator's INTENT
+        # call) degenerates to one block with no breakpoint, unchanged from
+        # before.
+        if len(system_msgs) >= 2:
+            system_blocks: list[dict[str, Any]] = [
+                {"type": "text", "text": m.get("content", "") or ""}
+                for m in system_msgs
             ]
+            system_blocks[-2]["cache_control"] = {"type": "ephemeral"}
+            api_kwargs["system"] = system_blocks
+        else:
+            system_content = "\n\n".join(m.get("content", "") for m in system_msgs)
+            if system_content:
+                api_kwargs["system"] = [
+                    {
+                        "type": "text",
+                        "text": system_content,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ]
         if stop:
             api_kwargs["stop_sequences"] = stop
         if top_k is not None:
@@ -511,6 +722,8 @@ class AnthropicStreamingService(LLMService):
                 "type": "enabled",
                 "budget_tokens": thinking_budget_tokens,
             }
+        if effort is not None:
+            api_kwargs["output_config"] = {"effort": effort}
 
         return api_kwargs
 
@@ -535,6 +748,13 @@ class AnthropicStreamingService(LLMService):
             # ── assistant with tool_calls → Anthropic tool_use blocks ─────────
             if role == "assistant" and msg.get("tool_calls"):
                 content_blocks: list[dict] = []
+                # Thinking/redacted_thinking blocks MUST lead the content
+                # array and MUST be replayed byte-for-byte as the API issued
+                # them — Anthropic rejects (or silently degrades quality of)
+                # a modified thinking block. `thinking_blocks` was captured
+                # verbatim in _consume_stream and stored untouched since.
+                for tb in (msg.get("thinking_blocks") or []):
+                    content_blocks.append(tb)
                 text = msg.get("content") or ""
                 if text:
                     content_blocks.append({"type": "text", "text": text})
@@ -550,6 +770,17 @@ class AnthropicStreamingService(LLMService):
                         "name": fn.get("name", ""),
                         "input": input_dict,
                     })
+                result.append({"role": "assistant", "content": content_blocks})
+                i += 1
+                continue
+
+            # ── assistant with thinking_blocks but no tool_calls (a
+            # completion turn) → same verbatim-leading-block treatment ─────
+            if role == "assistant" and msg.get("thinking_blocks"):
+                content_blocks = list(msg["thinking_blocks"])
+                text = msg.get("content") or ""
+                if text:
+                    content_blocks.append({"type": "text", "text": text})
                 result.append({"role": "assistant", "content": content_blocks})
                 i += 1
                 continue
@@ -621,7 +852,19 @@ class AnthropicStreamingService(LLMService):
         for msg in messages:
             if merged and merged[-1].get("role") == msg.get("role"):
                 prev = merged[-1]
-                prev["content"] = _as_blocks(prev.get("content")) + _as_blocks(msg.get("content"))
+                combined = _as_blocks(prev.get("content")) + _as_blocks(msg.get("content"))
+                if prev.get("role") == "assistant":
+                    # Anthropic requires thinking/redacted_thinking blocks to
+                    # lead an assistant turn's content. Merging two adjacent
+                    # assistant messages (see docstring) can otherwise strand
+                    # the second message's thinking block mid-array — hoist
+                    # ALL thinking blocks to the front, preserving their
+                    # relative order and leaving each block's own content
+                    # untouched (only array position changes).
+                    thinking = [b for b in combined if b.get("type") in ("thinking", "redacted_thinking")]
+                    rest = [b for b in combined if b.get("type") not in ("thinking", "redacted_thinking")]
+                    combined = thinking + rest
+                prev["content"] = combined
             else:
                 merged.append(dict(msg))
         return merged
@@ -676,6 +919,7 @@ class AnthropicStreamingService(LLMService):
         top_p: Optional[float] = None,
         reasoning_effort: Optional[Literal["low", "medium", "high"]] = None,
         thinking_budget_tokens: Optional[int] = None,
+        effort: Optional[Literal["low", "medium", "high", "xhigh", "max"]] = None,
         tools: Optional[list[dict[str, Any]]] = None,
         tool_choice: Optional[Any] = None,
         response_format: Optional[Any] = None,       # ignored — Anthropic only
@@ -694,10 +938,22 @@ class AnthropicStreamingService(LLMService):
         temp = temperature if temperature is not None else self.temperature
         max_tok = max_tokens if max_tokens is not None else self.max_tokens
 
-        # Resolve thinking budget: explicit > reasoning_effort mapping
+        # Resolve thinking budget: explicit request > reasoning_effort mapping
+        # > model-name default (":thinking" marker, mirrors ":1m"). A model
+        # whose configured name doesn't opt in never gets the "thinking" API
+        # param, so unsupported providers/models take the unchanged path.
         budget: Optional[int] = thinking_budget_tokens
         if budget is None and reasoning_effort is not None:
             budget = {"low": 1024, "medium": 4096, "high": 10000}.get(reasoning_effort)
+        if budget is None and _model_supports_extended_thinking(model_name):
+            budget = _DEFAULT_THINKING_BUDGET_TOKENS
+
+        # Clamp requested effort to what this model's backend actually
+        # accepts. Historical context: "xhigh" on claude-4-6-sonnet was
+        # observed to 400 on 2026-07-16 but return 200 on 2026-07-17 —
+        # see the extended note above _MODEL_EFFORT_VALUES for the flap
+        # and the rationale for keeping the clamp as a safety net.
+        resolved_effort = _resolve_effort(model_name, effort)
 
         api_kwargs = self._build_api_kwargs(
             messages=messages,
@@ -710,13 +966,15 @@ class AnthropicStreamingService(LLMService):
             tools=tools,
             tool_choice=tool_choice,
             thinking_budget_tokens=budget,
+            effort=resolved_effort,
         )
 
         self.logger.debug(
             f"AnthropicStreaming request: model={model_name}, "
             f"messages={len(messages)}, "
             f"tools={len(tools) if tools else 0}"
-            + (f", thinking_budget={budget}" if budget else ""),
+            + (f", thinking_budget={budget}" if budget else "")
+            + (f", effort={resolved_effort}" if resolved_effort else ""),
             component="AnthropicStreamingService",
         )
 

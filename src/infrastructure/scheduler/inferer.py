@@ -60,9 +60,15 @@ class InferResult(NamedTuple):
                     stripped. Empty string is allowed and means "fall
                     back to the original prompt at dispatch time" — the
                     bridge's :meth:`accept_scheduled_task` honours that.
+    - ``ok``      : True when the schedule was genuinely inferred from the
+                    prompt; False when inference failed and we fell back to
+                    ``daily 09:00``. The bridge surfaces this to the UI so a
+                    silent fallback (e.g. a transient LLM blip that turns
+                    "1分钟后…" into "daily 09:00") is VISIBLE, not buried.
     """
     schedule: str
     prompt: str
+    ok: bool = True
 
 
 _INFERENCE_MAX_TOKENS = 256
@@ -166,8 +172,12 @@ def _build_llm_services(config: dict) -> List[Any]:
 
 
 def _fallback(prompt: str) -> InferResult:
-    """Fallback shape — daily 9am with the original prompt verbatim."""
-    return InferResult(schedule=_FALLBACK_SCHEDULE, prompt=prompt or "")
+    """Fallback shape — daily 9am with the original prompt verbatim.
+
+    ``ok=False`` marks this as a NON-inferred result so the bridge/UI can warn
+    the user that the requested timing wasn't understood.
+    """
+    return InferResult(schedule=_FALLBACK_SCHEDULE, prompt=prompt or "", ok=False)
 
 
 async def infer_schedule(prompt: str, config: dict) -> InferResult:
@@ -232,8 +242,8 @@ async def infer_schedule(prompt: str, config: dict) -> InferResult:
             )
             return _fallback(prompt)
 
-        # Same JSON-parse pipeline used by planner / receptionist /
-        # decision: handles fenced blocks, prose wrappers, json_repair
+        # Same JSON-parse pipeline used by INTENT / agent decision calls:
+        # handles fenced blocks, prose wrappers, json_repair
         # tricks. Returns dict on success, original str on failure.
         from src.infrastructure.utils import try_parse_json
         parsed = try_parse_json(result.content or "")

@@ -47,14 +47,12 @@ def is_high_risk(
     config_manager: ConfigManager,
 ) -> bool:
     """Determine if a tool call is high-risk and requires user confirmation."""
-    if tool_name == "browser":
-        if parameters.get("action") == "attach_browser":
-            _logger.warning(
-                "browser attach_browser action detected (confirmation required)",
-                component="RiskCheck",
-            )
-            return True
-        return False
+    if tool_name == "browser_attach":
+        _logger.warning(
+            "browser_attach detected (confirmation required)",
+            component="RiskCheck",
+        )
+        return True
 
     if tool_name not in ("bash", "shell"):
         return False
@@ -134,22 +132,21 @@ def get_risk_description(
     config_manager: ConfigManager,
 ) -> str:
     """Build a human-readable description of why a call was flagged."""
-    if tool_name == "browser":
-        if parameters.get("action") == "attach_browser":
-            creds_file = parameters.get("browser_credentials_file") or "(none — using config defaults)"
-            return (
-                "Agent wants to ATTACH to your running Chrome / Edge browser.\n"
-                "\n"
-                "What this means:\n"
-                "  - HandQ will see ALL your currently open tabs and their content.\n"
-                "  - HandQ can open new tabs and operate on existing tabs.\n"
-                "  - HandQ uses your real cookies / login state.\n"
-                "\n"
-                f"Credentials file: {creds_file}\n"
-                "\n"
-                "Approve only if you started Chrome with --remote-debugging-port=9222\n"
-                "and intend to share its tabs with the agent for THIS task."
-            )
+    if tool_name == "browser_attach":
+        creds_file = parameters.get("browser_credentials_file") or "(none — using config defaults)"
+        return (
+            "Agent wants to ATTACH to your running Chrome / Edge browser.\n"
+            "\n"
+            "What this means:\n"
+            "  - HandQ will see ALL your currently open tabs and their content.\n"
+            "  - HandQ can open new tabs and operate on existing tabs.\n"
+            "  - HandQ uses your real cookies / login state.\n"
+            "\n"
+            f"Credentials file: {creds_file}\n"
+            "\n"
+            "Approve only if you started Chrome with --remote-debugging-port=9222\n"
+            "and intend to share its tabs with the agent for THIS task."
+        )
 
     command: str = parameters.get("command", "")
     command_lower = command.lower()

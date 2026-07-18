@@ -9,7 +9,7 @@ that daemon's file-IPC protocol so the agent only deals in high-level actions �
 submit a goal, read status, fetch the reply, interrupt, start a fresh session.
 
 File IPC layout (mirrors ``handq_linux.py``), under ``~/.handq/<user>@<host>/``:
-  state.json            daemon writes coarse status + latest_tool + checklist
+  state.json            daemon writes coarse status + latest_tool
   messages/<id>.txt     inbound goal / follow-up (we write here)
   commands/<id>.json    inbound new_session / interrupt (we write here)
   reply/<id>.txt        outbound reply, keyed by the message id we chose
@@ -46,19 +46,21 @@ Reuses the SSH connection pool + credential infrastructure from ssh_tool.py.
 
 from __future__ import annotations
 
-import asyncio
 import base64
 import json
 import os
 import posixpath
 import re
+import threading
 import time
 import uuid
 from datetime import datetime
 from typing import Any, Dict, Optional, Tuple
 
 from .base_tool import BaseTool, ToolResult
+from .cancellation import interruptible_sleep, run_with_abort
 from .ssh_tool import (
+    SshConnectionPool,
     _connect,
     _default_pool,
     _exec_command,
@@ -72,6 +74,24 @@ _discovery_cache: Dict[str, Dict[str, str]] = {}
 
 POLL_INTERVAL = 1.0  # seconds between reply/state polls when waiting
 
+# The module-level helper functions below (_exec, _remote_bash, _discover,
+# _wake_daemon, _deploy_linux_package, ...) are called many layers deep from
+# RemoteHandQTool._execute_sync, which runs the WHOLE action synchronously on
+# one dedicated executor thread (via asyncio.to_thread). Threading a `pool`
+# parameter through every one of those functions would be a much larger,
+# invasive diff for no behavioral difference — a thread-local set once at the
+# top of _execute_sync is visible to all of them on that same thread, exactly
+# mirroring cancellation.py's existing current_interrupt()/current_abort()
+# thread-local pattern used elsewhere in this tool family.
+_pool_threadlocal = threading.local()
+
+
+def _current_pool() -> "SshConnectionPool":
+    """Return the pool installed for this executor thread, or the
+    test-only default (see ``_default_pool``'s own docstring — the live
+    flow always installs ``ctx.ssh_pool`` before this is ever read)."""
+    return getattr(_pool_threadlocal, "pool", None) or _default_pool
+
 
 def _host_key(creds: Dict[str, Any]) -> str:
     return f"{creds['hostname']}:{creds.get('port', 22)}"
@@ -83,7 +103,7 @@ def _exec(creds: Dict[str, Any], command: str, timeout: float = 15.0) -> Tuple[s
     Prefer ``_remote_bash`` for anything using POSIX shell syntax — see its
     docstring for why the bash wrapper is not optional.
     """
-    with _connect(creds, _default_pool) as (client, _):
+    with _connect(creds, _current_pool()) as (client, _):
         return _exec_command(client, command, timeout=timeout)
 
 
@@ -285,7 +305,7 @@ def _sftp_put_file(creds: Dict[str, Any], local_path: str, remote_path: str) -> 
     SFTP's own framing.
     """
     d = posixpath.dirname(remote_path)
-    with _connect(creds, _default_pool) as (client, _):
+    with _connect(creds, _current_pool()) as (client, _):
         if d:
             _exec_command(client, f"mkdir -p {_shq(d)}", timeout=15.0)
         sftp = client.open_sftp()
@@ -316,7 +336,16 @@ def _daemon_alive(creds: Dict[str, Any], handq_dir: str) -> bool:
 
 
 def _wake_daemon(creds: Dict[str, Any], info: Dict[str, str], config_path: str = "") -> bool:
-    """Launch the daemon detached and wait for its pid file. Returns aliveness."""
+    """Launch the daemon detached and wait for its pid file. Returns aliveness.
+
+    Raises InterruptedError if the wait is aborted by the engine's stop
+    signal — distinct from a genuine deadline timeout (returns False),
+    matching ssh_tool.py's convention (rate_limit / _new_client's retry
+    backoff) of raising rather than folding "interrupted" and "timed out"
+    into the same return value. _ensure_daemon lets this propagate instead
+    of wrapping it in a "failed to wake daemon" RuntimeError, since an
+    interrupt means the user asked to stop, not that the daemon is broken.
+    """
     handq_dir = info["handq_dir"]
     launch = info["launch"]
     cfg = f" --config {_shq(config_path)}" if config_path else ""
@@ -328,7 +357,8 @@ def _wake_daemon(creds: Dict[str, Any], info: Dict[str, str], config_path: str =
     while time.time() < deadline:
         if _daemon_alive(creds, handq_dir):
             return True
-        time.sleep(POLL_INTERVAL)
+        if interruptible_sleep(POLL_INTERVAL):
+            raise InterruptedError("remote_handq: wake-daemon wait aborted")
     return False
 
 
@@ -597,17 +627,23 @@ def _ensure_installed(creds: Dict[str, Any]) -> Dict[str, str]:
 class RemoteHandQTool(BaseTool):
     """Drive a remote Linux HandQ daemon over SSH.
 
+    First call to a host: pass ``ssh_target`` (no ``credentials_file``). The
+    tool establishes SSH credentials on the fly (key auth → OS keyring →
+    one-time password prompt, cached for future sessions) and returns the
+    resolved ``credentials_file`` path in the result — reuse that path on
+    subsequent calls instead of ``ssh_target``.
+
     Actions:
       discover      Locate handq_linux + report daemon state
       ensure_installed  Deploy/upgrade handq_linux from update.linux_share_path if configured
       submit_goal   Wake daemon if needed + queue a goal (optionally wait for reply)
       send_message  Queue a follow-up message into the running task
-      get_status    Read state.json (task_status, status_text, latest_tool, checklist)
+      get_status    Read state.json (task_status, status_text, latest_tool)
       get_result    Fetch reply/<message_id>.txt for a previously submitted goal
       get_confirmation    Read a pending risk/tool/secret/ask_human request, if any
       answer_confirmation Answer a pending confirmation so the remote task resumes
       new_session   Tell the daemon to start a fresh session
-      interrupt     Abort the in-flight task (clears the pending checklist tail)
+      interrupt     Abort the in-flight task (clears any queued follow-ups)
       exit_handq    Stop the remote daemon
     """
 
@@ -628,7 +664,22 @@ class RemoteHandQTool(BaseTool):
             },
             "credentials_file": {
                 "type": "string",
-                "description": "Path to SSH credentials YAML file (provided by setup).",
+                "description": (
+                    "Path to a local SSH credentials YAML file. Omit this on your "
+                    "FIRST call to a host and pass ssh_target instead — the tool "
+                    "establishes credentials on the fly and returns the resolved "
+                    "path for you to reuse."
+                ),
+            },
+            "ssh_target": {
+                "type": "string",
+                "description": (
+                    "'user@host' or bare host/IP. Use this INSTEAD of credentials_file "
+                    "on your first call to a host you haven't connected to yet — the "
+                    "tool establishes SSH credentials (key / OS keyring / one-time "
+                    "password prompt) and returns 'credentials_file' in the result. "
+                    "Pass that resolved path on subsequent calls instead of ssh_target."
+                ),
             },
             "goal": {
                 "type": "string",
@@ -672,28 +723,86 @@ class RemoteHandQTool(BaseTool):
                 "description": "[submit_goal/send_message/get_status/get_result] Max seconds to wait (0=return immediately). Default: 0.",
             },
         },
-        "required": ["action", "credentials_file"],
+        "required": ["action"],
         "additionalProperties": False,
     }
 
     def __init__(self, ctx=None):
         super().__init__("remote_handq", ctx=ctx)
+        # Per-session connection pool from the SessionContext, same as
+        # ssh_tool.py's StatelessSSHTool — ctx=None test fixtures fall back to
+        # the module-level default so connections/close() lifecycle stay
+        # isolated per session instead of leaking across them.
+        self.pool: SshConnectionPool = (
+            ctx.ssh_pool if ctx is not None else _default_pool
+        )
+        self.interrupt_event = ctx.interrupt_event if ctx is not None else None
 
     async def execute(self, **params) -> ToolResult:
+        creds_file = params.get("credentials_file", "")
+        ssh_target = params.get("ssh_target", "")
+        newly_established = False
+
+        if not creds_file and ssh_target:
+            from ..infrastructure.ssh_setup import (
+                ensure_ssh_credentials_lazy, SSHSetupError,
+            )
+            im = self.ctx.interaction_manager if self.ctx is not None else None
+            try:
+                creds_file = await ensure_ssh_credentials_lazy(ssh_target, im)
+                newly_established = True
+                params = {**params, "credentials_file": creds_file}
+            except SSHSetupError as exc:
+                return self._fail(
+                    params,
+                    f"Failed to establish SSH credentials for '{ssh_target}': {exc}",
+                )
+        elif not creds_file:
+            return self._fail(
+                params,
+                "Either 'credentials_file' (existing) or 'ssh_target' (to establish new) is required.",
+            )
+
+        def _run() -> ToolResult:
+            # Installs this session's pool on the executor thread so every
+            # module-level helper (_exec, _remote_bash, _discover, ...) that
+            # opens a connection several call-frames down reaches THIS
+            # session's pool via _current_pool(), not the shared test-only
+            # default. Mirrors cancellation.py's own thread-local pattern.
+            _pool_threadlocal.pool = self.pool
+            try:
+                return self._execute_sync(**params)
+            finally:
+                _pool_threadlocal.pool = None
+
         # Inner handlers are blocking paramiko I/O — run off the event loop.
-        return await asyncio.to_thread(self._execute_sync, **params)
+        # run_with_abort mirrors self.interrupt_event into a thread-safe
+        # token so the polling loops in _wake_daemon/_poll_reply (via
+        # interruptible_sleep) can self-abort at their next check point
+        # instead of riding out the full poll timeout after a stop signal.
+        result = await run_with_abort(
+            _run,
+            interrupt_event=self.interrupt_event,
+            shutdown_deadline=self.shutdown_deadline,
+        )
+        if newly_established and isinstance(result.output, dict):
+            result.output["credentials_file"] = creds_file
+            result.output["credentials_file_note"] = (
+                "Newly established — pass this exact path as credentials_file "
+                "on subsequent calls to the same host."
+            )
+        return result
 
     def _execute_sync(self, **params) -> ToolResult:
         action = params.get("action", "")
         creds_file = params.get("credentials_file", "")
 
-        if not creds_file:
-            return self._fail(params, "credentials_file is required.")
         # Anchor a relative credentials_file path to the per-session workspace
         # rather than the process cwd. _load_credentials only does
         # os.path.expanduser; without this resolve a bare "creds.yaml" would
         # be looked up under the install dir (process cwd is no longer the
-        # session workspace — see concurrency work).
+        # session workspace — see concurrency work). A freshly-established
+        # path is already absolute so this resolve is a no-op for it.
         resolved_creds_file = self.resolve_in_workspace(creds_file)
         try:
             creds = _load_credentials(resolved_creds_file)
@@ -726,7 +835,7 @@ class RemoteHandQTool(BaseTool):
                 tool_name=self.name, tool_parameters=params,
             )
         except Exception as e:
-            return self._fail(params, str(e))
+            return self._fail(params, f"{type(e).__name__}: {e}")
 
     def _fail(self, params: Dict[str, Any], error: str) -> ToolResult:
         return ToolResult(
@@ -886,7 +995,8 @@ class RemoteHandQTool(BaseTool):
                 if wait > 0 and status["task_status"] == "running":
                     status["note"] = f"Timed out after {int(wait)}s — task still running."
                 return status
-            time.sleep(max(POLL_INTERVAL, 2.0))
+            if interruptible_sleep(max(POLL_INTERVAL, 2.0)):
+                return status
 
     def _action_get_result(self, creds: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, Any]:
         msgid = params.get("message_id", "")
@@ -1091,11 +1201,12 @@ class RemoteHandQTool(BaseTool):
                 return reply
             if time.time() >= deadline:
                 return None
-            time.sleep(max(POLL_INTERVAL, 2.0))
+            if interruptible_sleep(max(POLL_INTERVAL, 2.0)):
+                return reply
 
     @staticmethod
     def _format_status(state: Dict[str, Any]) -> Dict[str, Any]:
-        """Shape state.json into the host-facing status (latest_tool + checklist)."""
+        """Shape state.json into the host-facing status (latest_tool + status_text)."""
         return {
             "handq_active": state.get("handq_active", False),
             "task_status": state.get("task_status", ""),
@@ -1103,8 +1214,5 @@ class RemoteHandQTool(BaseTool):
             "session_id": state.get("session_id", ""),
             "working_dir": state.get("working_dir", ""),
             "latest_tool": state.get("latest_tool"),
-            "checklist": state.get("checklist", ""),
-            "completed": state.get("completed", 0),
-            "total": state.get("total", 0),
             "last_updated": state.get("last_updated", ""),
         }

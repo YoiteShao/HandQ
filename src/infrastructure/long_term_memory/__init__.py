@@ -128,9 +128,9 @@ class LongTermMemory:
         self._dream_task: Optional[asyncio.Task] = None
         self._retriage_task: Optional[asyncio.Task] = None
         # Flipped True at the very start of shutdown() so any in-flight
-        # submit_candidate / archive call returning from receptionist
-        # can detect the closed state and skip the write rather than
-        # hitting "database is closed" on the SQLite handle.
+        # submit_candidate / archive call returning from the coordinator's
+        # per-message capture can detect the closed state and skip the write
+        # rather than hitting "database is closed" on the SQLite handle.
         self._shutting_down: bool = False
         # IDENTITY block is recomputed on every recall today. The dream
         # worker can't write a new IDENTITY entry faster than once per
@@ -512,14 +512,13 @@ class LongTermMemory:
         k: int = C.RECALL_MEMORY_K,
         min_score: float = C.RECALL_MIN_SCORE,
         rerank: bool = True,
-        dynamic_k: bool = False,
         current_frame: Optional[dict] = None,
     ) -> List[Entry]:
         try:
             return await recall_memory_impl(
                 self._store, self._embedder, self._reranker, query,
                 dimension=dimension, k=k, min_score=min_score, rerank=rerank,
-                dynamic_k=dynamic_k, current_frame=current_frame,
+                current_frame=current_frame,
             )
         except Exception:
             _logger.exception("recall_memory failed")
@@ -533,14 +532,13 @@ class LongTermMemory:
         k: int = C.RECALL_KNOWLEDGE_K,
         min_score: float = C.RECALL_MIN_SCORE,
         rerank: bool = True,
-        dynamic_k: bool = False,
         current_frame: Optional[dict] = None,
     ) -> List[Entry]:
         try:
             return await recall_knowledge_impl(
                 self._store, self._embedder, self._reranker, query,
                 category=category, k=k, min_score=min_score, rerank=rerank,
-                dynamic_k=dynamic_k, current_frame=current_frame,
+                current_frame=current_frame,
             )
         except Exception:
             _logger.exception("recall_knowledge failed")
@@ -627,7 +625,6 @@ class LongTermMemory:
         knowledge_category: Optional[KnowledgeCategory] = None,
         min_score: float = C.RECALL_MIN_SCORE,
         rerank: bool = True,
-        dynamic_k: bool = False,
         include_identity: bool = True,
         include_known_entities: bool = True,
         include_header: bool = True,
@@ -637,14 +634,12 @@ class LongTermMemory:
 
         One-shot helper for callers that just want "the long-term context
         string for this query" — keeps the memory/knowledge split inside
-        LongTermMemory rather than leaking the two tracks into Planner /
-        Receptionist signatures.
+        LongTermMemory rather than leaking the two tracks into caller
+        signatures.
 
         ``rerank`` default True (full quality, ~3s LLM-rerank cost). Set
-        False on hot per-message paths (receptionist) where precision
-        matters less than latency.
-
-        ``dynamic_k`` enables score-gap trimming (planner path only).
+        False on hot per-message paths (INTENT) where precision matters
+        less than latency.
 
         ``include_identity`` defaults True so the IDENTITY directive block is
         injected alongside the memory + knowledge recall. Set False when
@@ -660,10 +655,7 @@ class LongTermMemory:
 
         ``include_header`` defaults True (adds the ``[Long-Term Context]``
         wrapper + description prefix). Set False when the caller is going to
-        concatenate multiple recall blocks under a single shared header
-        (dual-recall path in Orchestrator: primary block carries the header,
-        the "extra" block does not, so the planner sees one coherent LTM
-        section instead of two duplicated headers).
+        concatenate multiple recall blocks under a single shared header.
 
         ``current_frame`` (LTM 2.0): dict of {os, host, confidence, ...}
         describing the caller's execution environment. When set, recall
@@ -679,18 +671,18 @@ class LongTermMemory:
         else:
             id_block, id_ids = "", frozenset()
         # Run the two tracks concurrently. Each track's rerank=True path makes
-        # its own LLM rerank call; awaiting them sequentially stacked two LLM
-        # round-trips on the planner's critical path. gather collapses that to
-        # one round-trip of wall-clock.
+        # its own LLM rerank call; awaiting them sequentially would stack two
+        # LLM round-trips on the caller's critical path. gather collapses
+        # that to one round-trip of wall-clock.
         mem_entries, kn_entries = await asyncio.gather(
             self.recall_memory(
                 query, dimension=memory_dimension, k=memory_k,
-                min_score=min_score, rerank=rerank, dynamic_k=dynamic_k,
+                min_score=min_score, rerank=rerank,
                 current_frame=current_frame,
             ),
             self.recall_knowledge(
                 query, category=knowledge_category, k=knowledge_k,
-                min_score=min_score, rerank=rerank, dynamic_k=dynamic_k,
+                min_score=min_score, rerank=rerank,
                 current_frame=current_frame,
             ),
         )

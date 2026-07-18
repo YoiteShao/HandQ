@@ -298,7 +298,9 @@ class TeamsTool(BaseTool):
                 "type": "string",
                 "description": (
                     "[send_chat / send_channel] Message body in HTML. "
-                    "Plain text accepted (Graph wraps it). 32 KB cap."
+                    "Plain text accepted (Graph wraps it). 32 KB cap. "
+                    "[create_meeting] Also accepted as a fallback for the "
+                    "meeting body if `body` is omitted."
                 ),
             },
             # ── Tasks ──────────────────────────────────────────────
@@ -311,7 +313,9 @@ class TeamsTool(BaseTool):
             "body": {
                 "type": "string",
                 "description": (
-                    "[create_task] Optional task body / notes (plain text)."
+                    "[create_task] Optional task body / notes (plain text). "
+                    "[create_meeting] Meeting body (HTML or plain text). "
+                    "Falls back to `message_html` if omitted."
                 ),
             },
             "due_date": {
@@ -389,7 +393,18 @@ class TeamsTool(BaseTool):
                     f"teams action {action!r} failed: {exc}",
                     component="TeamsTool", exc_info=True,
                 )
-                return self._fail(params, _t0, f"teams {action!r}: {exc}")
+                # chat_id/team_id/channel_id are already in `kwargs` (merged
+                # into `params` above) but were previously dropped from the
+                # error text — surfacing them here costs nothing and saves a
+                # round-trip of "which target did that actually fail against?"
+                _target = ", ".join(
+                    f"{k}={v!r}" for k in ("chat_id", "team_id", "channel_id") if (v := kwargs.get(k))
+                )
+                _target_note = f" [{_target}]" if _target else ""
+                return self._fail(
+                    params, _t0,
+                    f"teams {action!r}{_target_note}: {type(exc).__name__}: {exc}",
+                )
 
     # ── Action handlers ─────────────────────────────────────────────────
     async def _list_chats(

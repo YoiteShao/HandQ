@@ -345,10 +345,6 @@ if (-not $ElectronOnly) {
         '--nofollow-import-to=playwright.sync_api',
 
         # ── Exclude dev / test / profiling tooling ────────────────────────────
-        # src.ui contains dev-only TUI helpers (status_tui.py uses rich).
-        # Nothing in the prod code path imports src.ui; excluding it keeps rich
-        # out of the bundle and avoids any import-follow issues.
-        '--nofollow-import-to=src.ui',
         '--nofollow-import-to=pytest',
         '--nofollow-import-to=_pytest',
         '--nofollow-import-to=tests',

@@ -78,13 +78,36 @@ class ReadSkillTool(BaseTool):
                 tool_parameters=params,
             )
 
+        # Skill-driven tool activation: a skill is a recipe PLUS the on-demand
+        # tools that recipe needs. Reading the skill activates those tools in one
+        # step (mirrors Claude Code's `allowed-tools`), so the agent does not
+        # have to separately reason about which tools to claim. Activation goes
+        # through the task channel's append-only bus. Fire-and-forget: a
+        # failure here must not block returning the body (the agent can still
+        # claim_tool manually).
+        activated: list = []
+        if entry.allowed_tools:
+            task_channel = getattr(self.ctx, "_task_channel", None) if self.ctx else None
+            if task_channel is not None:
+                try:
+                    activated = list(task_channel.activate_tools(entry.allowed_tools))
+                except Exception:
+                    activated = []
+
+        output = {
+            "name": entry.name,
+            "description": entry.description,
+            "body": entry.body.rstrip(),
+        }
+        if entry.allowed_tools:
+            # Report what the skill grants so the agent knows these tools are
+            # (or will be, next turn) available without a claim_tool round-trip.
+            output["tools_activated"] = activated
+            output["allowed_tools"] = list(entry.allowed_tools)
+
         return ToolResult(
             success=True,
-            output={
-                "name": entry.name,
-                "description": entry.description,
-                "body": entry.body.rstrip(),
-            },
+            output=output,
             execution_time=time.time() - start,
             tool_name=self.name,
             tool_parameters=params,

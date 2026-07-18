@@ -74,11 +74,11 @@ class UIDelegate(Protocol):
     async def request_secret_input(self, prompt: str) -> str: ...
     async def request_user_text(self, prompt: str) -> str: ...
 
-    # ── Receptionist reply streaming ──────────────────────────────────────
-    def show_receptionist_thinking(self) -> None: ...
-    def clear_receptionist_thinking(self) -> None: ...
-    def stream_receptionist_reply_chunk(self, text: str) -> None: ...
-    def seal_receptionist_reply(self) -> None: ...
+    # ── Coordinator reply streaming ─────────────────────────────────────────
+    def show_coordinator_thinking(self) -> None: ...
+    def clear_coordinator_thinking(self) -> None: ...
+    def stream_coordinator_reply_chunk(self, text: str) -> None: ...
+    def seal_coordinator_reply(self) -> None: ...
 
 
 # ── InteractionManager ───────────────────────────────────────────────────────
@@ -100,10 +100,10 @@ class InteractionManager:
       Async input     : ``request_risk_confirmation``,
                         ``request_tool_confirmation``,
                         ``request_secret_input``, ``request_user_text``
-      Reply streaming : ``notify_receptionist_thinking``,
-                        ``clear_receptionist_thinking``,
-                        ``stream_receptionist_reply_chunk``,
-                        ``seal_receptionist_reply``
+      Reply streaming : ``notify_coordinator_thinking``,
+                        ``clear_coordinator_thinking``,
+                        ``stream_coordinator_reply_chunk``,
+                        ``seal_coordinator_reply``
     """
 
     def __init__(self, delegate: Optional[UIDelegate] = None) -> None:
@@ -195,14 +195,23 @@ class InteractionManager:
         opt in by exposing a same-named method."""
         self._ui_call("notify_session_event", str(event_name), data if isinstance(data, dict) else {})
 
-    def notify_checklist_changed(self, items: list) -> None:
-        """Live checklist snapshot for the UI task panel. ``items`` is the list
+    def notify_task_plan_changed(self, items: list) -> None:
+        """Live task-plan snapshot for the UI task panel. ``items`` is the list
         of ``{item_id, instruction, status}`` dicts from
-        ``SharedCheckList.get_ui_snapshot``. Fired on every checklist mutation
+        ``TaskChannel.get_ui_snapshot``. Fired on every task-plan mutation
         (item completed / pending tail replaced). Fire-and-forget; kept out of
         the UIDelegate Protocol — delegates opt in by exposing a same-named
         method, so unit tests with no delegate silently drop it."""
-        self._ui_call("notify_checklist_changed", items if isinstance(items, list) else [])
+        self._ui_call("notify_task_plan_changed", items if isinstance(items, list) else [])
+
+    def notify_agent_todo_changed(self, todos: list) -> None:
+        """Live snapshot of the AGENT's own todo (its private plan for the
+        current item), for the UI. ``todos`` is a list of {content, status}
+        dicts written by the agent via the `todo_write` tool. Distinct from
+        ``notify_task_plan_changed`` (which shows the Coordinator↔Agent IPC
+        task plan). Fire-and-forget; delegates opt in by exposing a same-named
+        method, so tests with no delegate silently drop it."""
+        self._ui_call("notify_agent_todo_changed", todos if isinstance(todos, list) else [])
 
     # ── Async confirmation / input flows ──────────────────────────────────
 
@@ -292,25 +301,25 @@ class InteractionManager:
             str(prompt),
         )
 
-    # ── Receptionist reply streaming (fire-and-forget) ────────────────────
+    # ── Coordinator reply streaming (fire-and-forget) ──────────────────────
 
-    def notify_receptionist_thinking(self) -> None:
-        """Receptionist/planner started composing a reply but hasn't streamed
+    def notify_coordinator_thinking(self) -> None:
+        """Coordinator started composing a reply but hasn't streamed
         any text yet. Renderer shows a transient "thinking…" bubble; cleared
-        by the first ``reply_delta`` or by ``clear_receptionist_thinking``."""
-        self._ui_call("show_receptionist_thinking")
+        by the first ``reply_delta`` or by ``clear_coordinator_thinking``."""
+        self._ui_call("show_coordinator_thinking")
 
-    def clear_receptionist_thinking(self) -> None:
-        """Counterpart of ``notify_receptionist_thinking``. Safety net for the
+    def clear_coordinator_thinking(self) -> None:
+        """Counterpart of ``notify_coordinator_thinking``. Safety net for the
         silent path where no reply chunk ever streams (empty ``response_to_user``)
         so the thinking bubble doesn't linger. Idempotent on the renderer."""
-        self._ui_call("clear_receptionist_thinking")
+        self._ui_call("clear_coordinator_thinking")
 
-    def stream_receptionist_reply_chunk(self, text: str) -> None:
-        """Push one streamed fragment of the receptionist/planner reply to
+    def stream_coordinator_reply_chunk(self, text: str) -> None:
+        """Push one streamed fragment of the coordinator's reply to
         the UI (renderer appends it to the live assistant bubble)."""
-        self._ui_call("stream_receptionist_reply_chunk", str(text))
+        self._ui_call("stream_coordinator_reply_chunk", str(text))
 
-    def seal_receptionist_reply(self) -> None:
+    def seal_coordinator_reply(self) -> None:
         """Finalize the current streamed reply bubble (renderer seals it)."""
-        self._ui_call("seal_receptionist_reply")
+        self._ui_call("seal_coordinator_reply")

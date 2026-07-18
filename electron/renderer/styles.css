@@ -90,7 +90,7 @@ html[data-vt-scope="session"]::view-transition-new(*) {
     -webkit-backdrop-filter: blur(20px) saturate(115%);
     border: none;
     border-radius: 20px;
-    box-shadow: var(--shadow-floating), var(--bevel-strong);
+    box-shadow: var(--shadow-floating);
     position: relative;
     overflow: hidden;
     animation: liquid-entrance 500ms var(--spring-soft) both;
@@ -149,7 +149,7 @@ html[data-vt-scope="session"]::view-transition-new(*) {
     max-width: 360px;
     backdrop-filter: blur(14px) saturate(115%);
     -webkit-backdrop-filter: blur(14px) saturate(115%);
-    box-shadow: var(--bevel);
+    position: relative;
 }
 .boot-hint.hidden { display: none; }
 .boot-error {
@@ -201,19 +201,36 @@ html[data-vt-scope="session"]::view-transition-new(*) {
                        0 4px 16px rgba(122, 114, 133, 0.08),
                        0 1px 0 rgba(255, 255, 255, 0.65) inset;
 
-    /* Liquid glass BEVEL — the defining feature.
-       Top/left = bright highlight (light entering glass edge)
-       Bottom/right = darker refraction shadow
-       This gives the thick glass depth illusion */
-    --bevel: inset 0 1.5px 0 rgba(255, 255, 255, 0.85),
-             inset 0 -1.5px 0 rgba(0, 0, 0, 0.08),
-             inset 1.5px 0 0 rgba(255, 255, 255, 0.50),
-             inset -1.5px 0 0 rgba(0, 0, 0, 0.04);
+    /* Liquid glass RING — the defining feature, v3.
+       A straight inset box-shadow line (the old --bevel) reads as a flat
+       highlight painted across the top of the shape — it doesn't follow a
+       curve, which is exactly what makes a rounded pill/circle look like
+       molded plastic instead of glass. Real light on a curved glass rim is
+       brightest where the surface tilts toward the light (top-left) and
+       darkest at the opposite arc — a conic-gradient sweeps continuously
+       around the actual contour instead. Applied via the shared `::before`
+       ring rule below, masked down to a stroke that follows whatever
+       border-radius the host element has.
+       v3 widens the stroke (1.25px -> 2px) and deepens both ends of the
+       contrast (white 0.85->1.0, dark 0.10->0.22) — at normal window scale
+       the v2 ring was only legible zoomed in 5x+; this pushes it back into
+       range at 1x. */
+    --glass-ring: conic-gradient(from -45deg,
+        rgba(255, 255, 255, 1.0) 0deg,
+        rgba(255, 255, 255, 0.32) 95deg,
+        rgba(0, 0, 0, 0.22) 180deg,
+        rgba(255, 255, 255, 0.32) 265deg,
+        rgba(255, 255, 255, 1.0) 360deg);
 
-    --bevel-strong: inset 0 2px 0 rgba(255, 255, 255, 0.90),
-                    inset 0 -2px 0 rgba(0, 0, 0, 0.12),
-                    inset 2px 0 0 rgba(255, 255, 255, 0.60),
-                    inset -2px 0 0 rgba(0, 0, 0, 0.06);
+    /* Punchier variant for small Tier-1 controls (titlebar buttons, the
+       island pill, the composer send button) — at ~20-28px the subtler
+       --glass-ring above still under-reads, so contrast is boosted further. */
+    --glass-ring-strong: conic-gradient(from -45deg,
+        rgba(255, 255, 255, 1.0) 0deg,
+        rgba(255, 255, 255, 0.48) 95deg,
+        rgba(0, 0, 0, 0.32) 180deg,
+        rgba(255, 255, 255, 0.48) 265deg,
+        rgba(255, 255, 255, 1.0) 360deg);
 
     /* Spring easing for liquid-like motion */
     --spring: cubic-bezier(0.34, 1.56, 0.64, 1);
@@ -225,6 +242,67 @@ html[data-vt-scope="session"]::view-transition-new(*) {
             "Segoe UI", system-ui, "Inter", Roboto, sans-serif;
     --mono: "SF Mono", ui-monospace, Menlo, Monaco, "Cascadia Mono",
             Consolas, "Liberation Mono", monospace;
+}
+
+/* ============================================================ */
+/* Liquid Glass — shared contour-following ring helper.         */
+/* A ::before painted as a conic-gradient, masked down to a     */
+/* thin stroke via mask-composite:exclude (the standard          */
+/* "gradient border" trick: subtract an inset copy of the shape  */
+/* from itself, leaving only the ring). border-radius: inherit   */
+/* means the ring exactly follows whatever radius the host       */
+/* already has — circle, pill, or rounded rect — so one rule     */
+/* works for every shape without per-selector tuning.            */
+/* Selector groups (not marker classes) so JS-created elements    */
+/* (composer buttons, session cards, bubbles, …) pick this up     */
+/* automatically with no change to renderer.js.                   */
+/* ============================================================ */
+.boot-card::before,
+.boot-hint::before,
+.bubble::before,
+.overlay-card::before,
+.tool-card::before,
+.task-plan-items::before,
+.agent-todo-items::before,
+.session-card::before,
+.activity-group::before,
+.floating-composer::before,
+.mention-dropdown::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    padding: 2px;
+    background: var(--glass-ring);
+    -webkit-mask:
+        linear-gradient(#000 0 0) content-box,
+        linear-gradient(#000 0 0);
+    -webkit-mask-composite: xor;
+    mask:
+        linear-gradient(#000 0 0) content-box,
+        linear-gradient(#000 0 0);
+    mask-composite: exclude;
+    pointer-events: none;
+}
+.tb-btn::before,
+.titlebar-new-btn::before,
+.titlebar-island::before,
+.composer-input-wrap > button::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;
+    padding: 2px;
+    background: var(--glass-ring-strong);
+    -webkit-mask:
+        linear-gradient(#000 0 0) content-box,
+        linear-gradient(#000 0 0);
+    -webkit-mask-composite: xor;
+    mask:
+        linear-gradient(#000 0 0) content-box,
+        linear-gradient(#000 0 0);
+    mask-composite: exclude;
+    pointer-events: none;
 }
 
 * { box-sizing: border-box; }
@@ -435,18 +513,30 @@ html, body {
     justify-content: center;
     cursor: pointer;
     color: var(--fg-soft);
-    /* Persistent soft-frost background so the three window controls
-       are visible on any wallpaper (was transparent — invisible on
-       flat-colour desktops). Hover / active intensify. Carries its own
-       blur so it reads as a frosted puck rather than a flat plastic dot. */
-    background: rgba(255, 255, 255, 0.24);
-    backdrop-filter: blur(10px) saturate(130%);
-    -webkit-backdrop-filter: blur(10px) saturate(130%);
+    position: relative;
+    /* Lower fill than the old flat frost (was 0.24) — now that the
+       contour ring + real edge refraction (backdrop-filter's SVG
+       url()) carry the glass identity, a lighter fill lets more of
+       the bent backdrop show through, closer to the reference's
+       actual transparency. */
+    background: rgba(255, 255, 255, 0.16);
+    backdrop-filter: blur(8px) saturate(130%) url(#lg-distort-circle);
+    -webkit-backdrop-filter: blur(8px) saturate(130%) url(#lg-distort-circle);
     transition: background 180ms var(--ease-glass),
                 color 180ms var(--ease-glass),
                 transform 120ms var(--spring);
 }
-.tb-btn svg     { width: 12px; height: 12px; display: block; }
+.tb-btn svg     {
+    width: 12px; height: 12px; display: block;
+    /* The puck's own fill is intentionally very low (see above) so the
+       backdrop shows through — but that means a dark/red icon glyph has
+       nothing to contrast against over a dark desktop. Same fix as
+       .titlebar-brand's text-shadow halo, just via drop-shadow since these
+       are SVG strokes, not text: a light halo behind the stroke keeps it
+       legible on any backdrop without raising the puck's own opacity. */
+    filter: drop-shadow(0 0 1.5px rgba(255, 255, 255, 0.95))
+            drop-shadow(0 0 3px rgba(255, 255, 255, 0.55));
+}
 /* Max/restore icon toggle. The .tb-max button carries both SVGs; renderer.js
    flips the `is-maximized` class in response to main-process maximize /
    unmaximize events, and only the matching icon is visible. */
@@ -518,26 +608,33 @@ html, body {
     padding: 0;
     border: none;
     border-radius: 50%;
-    background: rgba(255, 255, 255, 0.85);
-    backdrop-filter: blur(20px) saturate(140%);
-    -webkit-backdrop-filter: blur(20px) saturate(140%);
+    position: relative;
+    /* Lower fill than the old 0.85 flat frost — the contour ring +
+       real edge refraction now carry the glass identity, so the fill
+       can sit much closer to the reference's actual transparency. */
+    background: rgba(255, 255, 255, 0.28);
+    backdrop-filter: blur(14px) saturate(140%) url(#lg-distort-circle);
+    -webkit-backdrop-filter: blur(14px) saturate(140%) url(#lg-distort-circle);
     color: var(--tint-strong);
     line-height: 1;
     cursor: pointer;
     display: flex;
     align-items: center;
     justify-content: center;
-    box-shadow:
-        inset 0 1px 0 rgba(255, 255, 255, 0.65),
-        inset 0 -0.5px 0 rgba(0, 0, 0, 0.06),
-        0 0 0 0.5px rgba(0, 0, 0, 0.08);
+    box-shadow: 0 0 0 0.5px rgba(0, 0, 0, 0.08);
     transition: background 180ms var(--ease-glass),
                 color 180ms var(--ease-glass),
                 transform 120ms var(--spring);
     -webkit-app-region: no-drag;
     app-region: no-drag;
 }
-.titlebar-new-btn svg { width: 14px; height: 14px; display: block; }
+.titlebar-new-btn svg {
+    width: 14px; height: 14px; display: block;
+    /* Same halo fix as .tb-btn svg above — keeps the "+" glyph legible
+       over a dark backdrop without raising the button's own opacity. */
+    filter: drop-shadow(0 0 1.5px rgba(255, 255, 255, 0.95))
+            drop-shadow(0 0 3px rgba(255, 255, 255, 0.55));
+}
 .titlebar-new-btn:hover {
     background: rgba(184, 175, 196, 0.65);
     color: #fff;
@@ -564,14 +661,17 @@ html, body {
     height: 20px;
     overflow: hidden;
     border-radius: 10px;
+    position: relative;
     background: rgba(255, 255, 255, 0.88);
-    backdrop-filter: blur(16px) saturate(115%);
-    -webkit-backdrop-filter: blur(16px) saturate(115%);
+    /* Real edge refraction only while collapsed (a small pill with just
+       logo + brand text) — .expanded below swaps back to blur-only since
+       the open menu is a text-heavy list where distortion would hurt
+       legibility, not sell "glass". */
+    backdrop-filter: blur(16px) saturate(115%) url(#lg-distort-pill);
+    -webkit-backdrop-filter: blur(16px) saturate(115%) url(#lg-distort-pill);
     box-shadow:
         0 4px 20px rgba(0, 0, 0, 0.12),
-        0 1px 4px rgba(0, 0, 0, 0.06),
-        inset 0 1px 0 rgba(255, 255, 255, 0.70),
-        inset 0 -0.5px 0 rgba(0, 0, 0, 0.05);
+        0 1px 4px rgba(0, 0, 0, 0.06);
     -webkit-app-region: no-drag;
     app-region: no-drag;
     transition:
@@ -589,21 +689,19 @@ html, body {
     background: rgba(255, 255, 255, 0.94);
     box-shadow:
         0 6px 24px rgba(0, 0, 0, 0.16),
-        0 1px 4px rgba(0, 0, 0, 0.06),
-        inset 0 1px 0 rgba(255, 255, 255, 0.85),
-        inset 0 -0.5px 0 rgba(0, 0, 0, 0.05);
+        0 1px 4px rgba(0, 0, 0, 0.06);
 }
 
 .titlebar-island.expanded {
-    width: 260px;
+    width: 150px;
     height: 140px;
     border-radius: 18px;
     background: rgba(255, 255, 255, 0.92);
+    backdrop-filter: blur(16px) saturate(115%);
+    -webkit-backdrop-filter: blur(16px) saturate(115%);
     box-shadow:
         0 12px 40px rgba(0, 0, 0, 0.20),
-        0 2px 6px rgba(0, 0, 0, 0.08),
-        inset 0 1px 0 rgba(255, 255, 255, 0.85),
-        inset 0 -0.5px 0 rgba(0, 0, 0, 0.06);
+        0 2px 6px rgba(0, 0, 0, 0.08);
 }
 
 .titlebar-island-trigger {
@@ -681,9 +779,8 @@ html, body {
 }
 
 .island-menu-item .im-icon {
-    width: 20px;
-    text-align: center;
-    font-size: 15px;
+    width: 16px;
+    height: 16px;
     flex: 0 0 auto;
     color: var(--tint-strong);
 }
@@ -763,18 +860,19 @@ html, body {
        treatment stops reading as "glass" and starts reading as a dyed
        plastic sticker — a solid-colored surface with a printed gradient on
        it. The material cue instead comes from a soft elevation shadow plus
-       a single crisp top highlight (light catching a bevelled edge), the
+       a contour-following ring (see the shared glass-ring rule), the
        same recipe real glossy/glass UI chrome uses at high opacity. */
     background: rgba(255, 255, 255, 0.90);
     backdrop-filter: blur(20px) saturate(120%);
     -webkit-backdrop-filter: blur(20px) saturate(120%);
-    box-shadow: 0 2px 6px rgba(20, 20, 30, 0.10), inset 0 1px 0 rgba(255, 255, 255, 0.70);
+    box-shadow: 0 2px 6px rgba(20, 20, 30, 0.10);
     line-height: 1.5;
     word-wrap: break-word;
     overflow-wrap: break-word;
     align-self: flex-start;
     color: var(--fg);
     border-top-left-radius: 6px;
+    position: relative;
     animation: liquid-entrance 320ms var(--spring-soft) both;
     transition: transform 200ms var(--spring),
                 box-shadow 200ms var(--ease-glass);
@@ -798,7 +896,7 @@ html, body {
     color: var(--fg);
     border-top-right-radius: 6px;
     border-top-left-radius: 16px;
-    box-shadow: 0 2px 8px rgba(20, 20, 30, 0.08), inset 0 1px 0 rgba(255, 255, 255, 0.75);
+    box-shadow: 0 2px 8px rgba(20, 20, 30, 0.08);
 }
 
 .bubble.system {
@@ -962,6 +1060,7 @@ html, body {
     font-family: var(--mono);
     font-size: 12px;
     box-shadow: none;
+    position: relative;
     animation: liquid-entrance 280ms var(--spring-soft) both;
 }
 .tool-card > summary {
@@ -1021,6 +1120,8 @@ html, body {
     border: none;
     border-radius: 50%;
     background: rgba(184, 175, 196, 0.15);
+    backdrop-filter: blur(10px) url(#lg-distort-circle);
+    -webkit-backdrop-filter: blur(10px) url(#lg-distort-circle);
     color: var(--tint-strong);
     cursor: pointer;
     box-shadow: none;
@@ -1186,8 +1287,7 @@ html, body {
     border: none;
     border-radius: 18px;
     box-shadow: 0 20px 60px rgba(20, 20, 30, 0.16),
-                0 6px 18px rgba(20, 20, 30, 0.07),
-                inset 0 1px 0 rgba(255, 255, 255, 0.85);
+                0 6px 18px rgba(20, 20, 30, 0.07);
     overflow: hidden;
     animation: liquid-entrance 350ms var(--spring-soft) both;
     position: relative;
@@ -1586,6 +1686,8 @@ code {
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb {
     background: rgba(184, 175, 196, 0.20);
+    backdrop-filter: blur(6px) url(#lg-distort-pill);
+    -webkit-backdrop-filter: blur(6px) url(#lg-distort-pill);
     border: 2px solid transparent;
     background-clip: padding-box;
     border-radius: 999px;
@@ -1758,6 +1860,13 @@ code {
     height: 16px;
     cursor: nwse-resize;
     z-index: 10;
+    border-radius: 6px 0 6px 0;
+    /* Small glass chip so the corner reads as a grabbable glass nub
+       rather than just two floating diagonal lines — gives the edge
+       refraction below an actual translucent surface to bend. */
+    background: rgba(255, 255, 255, 0.06);
+    backdrop-filter: blur(6px) url(#lg-distort-circle);
+    -webkit-backdrop-filter: blur(6px) url(#lg-distort-circle);
 }
 
 .terminal-resize-handle::after {
@@ -1917,6 +2026,24 @@ code {
 
 .admin-pane.hidden { display: none; }
 
+/* In-app confirm dialog — see admin-panel.js:confirmDialog(). Deliberately
+   a plain overlay-card, not a native window.confirm(), so destructive
+   actions (delete task/skill, archive entry) never hand focus off to an
+   OS-level modal. */
+#overlay-confirm-dialog { z-index: 2000; }
+.confirm-dialog-card {
+    width: min(420px, 90vw);
+    padding: 18px 20px;
+}
+.confirm-dialog-body {
+    font-size: 13.5px;
+    line-height: 1.5;
+    color: var(--fg);
+    margin-bottom: 14px;
+    white-space: pre-line;
+}
+.confirm-dialog-actions { justify-content: flex-end; }
+
 .admin-pane-header {
     display: flex;
     gap: 8px;
@@ -2037,19 +2164,19 @@ code {
 .admin-entry-actions button:hover { background: rgba(255, 255, 255, 0.78); }
 .admin-entry-actions button:active { transform: translateY(1px); }
 
-/* ── Live checklist task panel (renderer.renderChecklist) ─────────────── */
+/* ── Live task-plan panel (renderer.renderTaskPlan) ────────────────────── */
 /* Collapsed by default: the panel is just a one-line header pill pinned at the
    top of the conversation. Clicking the header floats the full item list as an
    absolute overlay (it covers the conversation instead of pushing it down), so
    the panel never permanently blocks the chat — same strip ↔ popover idea as
    the activity button. */
-.checklist-panel {
+.task-plan-panel {
     position: sticky;
     top: 0;
     z-index: 12;
     margin: 0 0 10px 0;
 }
-.checklist-header {
+.task-plan-header {
     display: flex;
     align-items: center;
     gap: 8px;
@@ -2067,15 +2194,15 @@ code {
     cursor: pointer;
     transition: background 180ms var(--ease-glass);
 }
-.checklist-header:hover {
+.task-plan-header:hover {
     background: rgba(255, 255, 255, 0.98);
 }
-.checklist-header .cl-chevron {
+.task-plan-header .tp-chevron {
     font-family: var(--mono);
     color: var(--fg-mute);
     flex: 0 0 auto;
 }
-.checklist-header .cl-summary {
+.task-plan-header .tp-summary {
     flex: 1 1 auto;
     min-width: 0;
     white-space: nowrap;
@@ -2084,7 +2211,7 @@ code {
     font-weight: 600;
 }
 
-.checklist-items {
+.task-plan-items {
     position: absolute;
     top: calc(100% + 4px);
     left: 0;
@@ -2100,11 +2227,11 @@ code {
     background: rgba(255, 255, 255, 0.92);
     backdrop-filter: blur(18px) saturate(115%);
     -webkit-backdrop-filter: blur(18px) saturate(115%);
-    box-shadow: var(--shadow-floating), var(--bevel);
+    box-shadow: var(--shadow-floating);
     z-index: 20;
     animation: liquid-entrance 250ms var(--spring-soft) both;
 }
-.checklist-item {
+.task-plan-item {
     display: grid;
     grid-template-columns: 16px 1fr;
     gap: 8px;
@@ -2113,28 +2240,121 @@ code {
     line-height: 1.45;
     color: var(--fg);
 }
-.checklist-item .cl-glyph {
+.task-plan-item .tp-glyph {
     font-family: var(--mono);
     text-align: center;
     color: var(--fg-mute);
 }
-.checklist-item .cl-text { word-break: break-word; }
+.task-plan-item .tp-text { word-break: break-word; }
 
-.checklist-item.cl-done .cl-glyph     { color: #2e8b57; }
-.checklist-item.cl-done .cl-text      { color: var(--fg-mute); text-decoration: line-through; }
-.checklist-item.cl-running .cl-glyph  { color: rgba(184, 175, 196, 0.95); }
-.checklist-item.cl-running            { font-weight: 600; }
-.checklist-item.cl-failed .cl-glyph   { color: #c0392b; }
-.checklist-item.cl-interrupted .cl-glyph { color: #d08a1e; }
-.checklist-item.cl-skipped .cl-glyph  { color: var(--fg-mute); opacity: 0.7; }
-.checklist-item.cl-skipped .cl-text   {
+.task-plan-item.tp-done .tp-glyph     { color: #2e8b57; }
+.task-plan-item.tp-done .tp-text      { color: var(--fg-mute); text-decoration: line-through; }
+.task-plan-item.tp-running .tp-glyph  { color: rgba(184, 175, 196, 0.95); }
+.task-plan-item.tp-running            { font-weight: 600; }
+.task-plan-item.tp-failed .tp-glyph   { color: #c0392b; }
+.task-plan-item.tp-interrupted .tp-glyph { color: #d08a1e; }
+.task-plan-item.tp-skipped .tp-glyph  { color: var(--fg-mute); opacity: 0.7; }
+.task-plan-item.tp-skipped .tp-text   {
     color: var(--fg-mute);
     text-decoration: line-through;
     text-decoration-style: dashed;
     opacity: 0.85;
 }
-.checklist-item.cl-pending .cl-glyph,
-.checklist-item.cl-pending .cl-text   { color: var(--fg-mute); }
+.task-plan-item.tp-pending .tp-glyph,
+.task-plan-item.tp-pending .tp-text   { color: var(--fg-mute); }
+
+/* ── Live agent-todo panel (renderer.renderAgentTodo) ────────────────────── */
+/* The agent's own private step breakdown of the current task item (written
+   via `todo_write`) — sits below the task-plan panel, same collapsed-pill ↔
+   floating-overlay pattern. Distinct accent (dashed border) so it doesn't
+   read as a duplicate of the task-plan panel above it. */
+.agent-todo-panel {
+    position: relative;
+    z-index: 11;
+    margin: 0 0 10px 0;
+}
+/* When it's the only pinned panel (no task-plan panel above it), pin it too. */
+.agent-todo-panel:first-child {
+    position: sticky;
+    top: 0;
+}
+.agent-todo-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    padding: 6px 12px;
+    font: inherit;
+    font-size: 12px;
+    text-align: left;
+    color: var(--fg);
+    border: 1px dashed rgba(0, 0, 0, 0.12);
+    border-radius: 999px;
+    background: rgba(255, 255, 255, 0.90);
+    backdrop-filter: blur(16px) saturate(115%);
+    -webkit-backdrop-filter: blur(16px) saturate(115%);
+    cursor: pointer;
+    transition: background 180ms var(--ease-glass);
+}
+.agent-todo-header:hover {
+    background: rgba(255, 255, 255, 0.98);
+}
+.agent-todo-header .at-chevron {
+    font-family: var(--mono);
+    color: var(--fg-mute);
+    flex: 0 0 auto;
+}
+.agent-todo-header .at-summary {
+    flex: 1 1 auto;
+    min-width: 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    font-weight: 600;
+}
+
+.agent-todo-items {
+    position: absolute;
+    top: calc(100% + 4px);
+    left: 0;
+    right: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    max-height: 320px;
+    overflow-y: auto;
+    padding: 10px 12px;
+    border: 1px dashed rgba(0, 0, 0, 0.12);
+    border-radius: 12px;
+    background: rgba(255, 255, 255, 0.92);
+    backdrop-filter: blur(18px) saturate(115%);
+    -webkit-backdrop-filter: blur(18px) saturate(115%);
+    box-shadow: var(--shadow-floating);
+    z-index: 20;
+    animation: liquid-entrance 250ms var(--spring-soft) both;
+}
+.agent-todo-item {
+    display: grid;
+    grid-template-columns: 16px 1fr;
+    gap: 8px;
+    align-items: start;
+    font-size: 12px;
+    line-height: 1.45;
+    color: var(--fg);
+}
+.agent-todo-item .at-glyph {
+    font-family: var(--mono);
+    text-align: center;
+    color: var(--fg-mute);
+}
+.agent-todo-item .at-text { word-break: break-word; }
+
+.agent-todo-item.at-completed .at-glyph { color: #2e8b57; }
+.agent-todo-item.at-completed .at-text  { color: var(--fg-mute); text-decoration: line-through; }
+.agent-todo-item.at-in_progress .at-glyph { color: rgba(184, 175, 196, 0.95); }
+.agent-todo-item.at-in_progress          { font-weight: 600; }
+.agent-todo-item.at-pending .at-glyph,
+.agent-todo-item.at-pending .at-text     { color: var(--fg-mute); }
 
 .admin-stats-output {
     font-family: var(--mono);
@@ -2284,26 +2504,27 @@ code {
        coherent vertical stack. */
     border-radius: 20px / 14px 14px 20px 20px;
     /* Whole-page gradient rule: transparency INCREASES toward the outside,
-       DECREASES toward the inside. Fill floor raised to 0.88 at the center
-       (was as low as 0.32) — below that, chat text stops being reliably
-       readable once the card sits over a plain white/light background, not
-       just busy wallpaper. At this opacity the surface is doing almost none
-       of its "glass" work by seeing through to what's behind it, so the
-       material cue moves to elevation: a soft ambient shadow + one crisp
-       top highlight, not a stack of tinted inset bevels (those read as a
-       printed decal on an opaque card, i.e. plastic, once alpha is this
-       high). */
+       DECREASES toward the inside. Floor lowered from 0.88, and the card's
+       own backdrop-filter blur REMOVED — glass-effect.js's canvas now does
+       the actual glass/frosting work for the whole window (its own
+       frostiness/coreOpacity knobs), so a second blur+whiten pass here was
+       compounding: each layer (this gradient, its old backdrop-filter, plus
+       .app's own ::before/::after overlays) stacked on top of the canvas's
+       output and diluted it before it ever reached the screen — the same
+       shader values that looked strong in isolation read as "washed out"
+       once behind this card. Bubbles keep their own opaque
+       --user-bubble/--asst-bubble fill (0.88, unaffected by this), so chat
+       text legibility doesn't depend on this card fill at all; only the
+       card's own chrome (title halo, composer, empty-state text) does, and
+       those already carry text-shadow halos sized for a low-fill card. */
     background:
         radial-gradient(ellipse closest-side at center,
-                        rgba(255, 255, 255, 0.94) 0%,
-                        rgba(255, 255, 255, 0.90) 60%,
-                        rgba(255, 255, 255, 0.82) 100%);
-    backdrop-filter: blur(20px) saturate(115%);
-    -webkit-backdrop-filter: blur(20px) saturate(115%);
+                        rgba(255, 255, 255, 0.42) 0%,
+                        rgba(255, 255, 255, 0.34) 60%,
+                        rgba(255, 255, 255, 0.26) 100%);
     box-shadow:
         0 4px 16px rgba(20, 20, 30, 0.10),
-        0 1px 3px rgba(20, 20, 30, 0.06),
-        inset 0 1px 0 rgba(255, 255, 255, 0.85);
+        0 1px 3px rgba(20, 20, 30, 0.06);
     overflow: hidden;
     /* Isolate paint + layout so window-level repaints (drag) don't re-rasterize
        the card's content. Combined with overflow:hidden the card becomes its
@@ -2317,15 +2538,13 @@ code {
 .session-card:hover {
     box-shadow:
         0 6px 22px rgba(20, 20, 30, 0.14),
-        0 1px 4px rgba(20, 20, 30, 0.07),
-        inset 0 1px 0 rgba(255, 255, 255, 0.95);
+        0 1px 4px rgba(20, 20, 30, 0.07);
 }
 
 .session-card.active {
     box-shadow:
         0 0 0 2px rgba(184, 175, 196, 0.45),
-        0 6px 22px rgba(20, 20, 30, 0.12),
-        inset 0 1px 0 rgba(255, 255, 255, 1);
+        0 6px 22px rgba(20, 20, 30, 0.12);
 }
 
 .session-card-head {
@@ -2590,7 +2809,7 @@ code {
     -webkit-backdrop-filter: blur(14px) saturate(115%);
     font-size: 12px;
     color: #555;
-    box-shadow: var(--bevel);
+    position: relative;
     overflow: hidden;
     animation: liquid-entrance 200ms var(--spring-soft) both;
 }
@@ -3094,8 +3313,7 @@ button.danger:hover:not(:disabled) {
     border: none;
     border-radius: 14px;
     box-shadow: 0 20px 60px rgba(20, 20, 30, 0.16),
-                0 6px 18px rgba(20, 20, 30, 0.08),
-                inset 0 1px 0 rgba(255, 255, 255, 0.85);
+                0 6px 18px rgba(20, 20, 30, 0.08);
     overflow: hidden;
     animation: liquid-entrance 260ms var(--spring-soft) both;
 }
@@ -3184,6 +3402,10 @@ button.danger:hover:not(:disabled) {
     height: 18px;
     cursor: nwse-resize;
     z-index: 2;
+    border-radius: 7px 0 7px 0;
+    background: rgba(255, 255, 255, 0.10);
+    backdrop-filter: blur(6px) url(#lg-distort-circle);
+    -webkit-backdrop-filter: blur(6px) url(#lg-distort-circle);
 }
 .fc-resize::after {
     content: '';
@@ -3216,8 +3438,7 @@ button.danger:hover:not(:disabled) {
     border-radius: 12px;
     box-shadow:
         0 12px 36px rgba(20, 20, 30, 0.16),
-        0 2px 8px rgba(20, 20, 30, 0.08),
-        inset 0 1px 0 rgba(255, 255, 255, 0.80);
+        0 2px 8px rgba(20, 20, 30, 0.08);
     padding: 4px;
     animation: liquid-entrance 200ms var(--spring-soft) both;
     font-size: 13px;
@@ -3241,11 +3462,12 @@ button.danger:hover:not(:disabled) {
 }
 .mention-item-icon {
     flex: 0 0 auto;
-    width: 18px;
-    text-align: center;
-    opacity: 0.75;
-    font-size: 14px;
+    width: 15px;
+    height: 15px;
+    display: inline-flex;
+    opacity: 0.65;
 }
+.mention-item-icon svg { width: 100%; height: 100%; }
 .mention-item-name {
     flex: 1 1 auto;
     font-weight: 500;
@@ -3292,9 +3514,12 @@ button.danger:hover:not(:disabled) {
 }
 .mention-chip-icon {
     flex: 0 0 auto;
-    font-size: 0.9em;
-    opacity: 0.85;
+    width: 12px;
+    height: 12px;
+    display: inline-flex;
+    opacity: 0.75;
 }
+.mention-chip-icon svg { width: 100%; height: 100%; }
 .mention-chip-label {
     flex: 1 1 auto;
     font-weight: 500;

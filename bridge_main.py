@@ -748,12 +748,21 @@ async def _run_with_long_term_memory() -> None:
 
     # ── Skill registry ────────────────────────────────────────────────
     # Built once at boot from %USERPROFILE%\HandQ\Skill\<name>\SKILL.md.
-    # The receptionist sees the L0 menu (name + description) on every user
-    # message; planner sees full bodies of activated skills. Bad files are
-    # skipped with a warning — a single broken skill must not block boot.
+    # INTENT sees the L0 menu (name + description) on every user
+    # message; the agent pulls full bodies on demand via read_skill. Bad
+    # files are skipped with a warning — a single broken skill must not
+    # block boot.
     _emit_boot_progress("skills_init_start")
     _t_skills = time.monotonic()
     try:
+        # Seed product-authored recipe skills (monitor-long-running,
+        # remote-handq-workflow, …) into the user skill root if absent —
+        # never overwriting user edits — then scan.
+        try:
+            from src.infrastructure.skills import seed_bundled_skills
+            seed_bundled_skills()
+        except Exception:
+            _boot_logger.exception("seed_bundled_skills failed; continuing")
         SkillRegistry.init()
     except Exception as exc:
         _boot_logger.exception(

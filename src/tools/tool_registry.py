@@ -24,6 +24,14 @@ from .teams_tool import TeamsTool
 from .ask_human_tool import AskHumanTool
 from .wait_interval_tool import WaitIntervalTool
 from .skill_tool import ReadSkillTool
+from .spawn_agent_tool import SpawnAgentTool
+from .fan_out_tool import FanOutAgentsTool
+from .todo_write_tool import TodoWriteTool
+from .self_extension_tool import ClaimToolTool, ReleaseToolTool
+from .schedule_tool import (
+    ScheduleCreateTool, ScheduleDeleteTool, ScheduleListTool,
+)
+from .schedule_wakeup_tool import ScheduleWakeupTool
 
 if TYPE_CHECKING:
     from ..controller_v2.session_context import SessionContext
@@ -87,15 +95,38 @@ class ToolRegistry:
     NOTEBOOK_EDIT = "notebook_edit"
     SSH  = "ssh"
     REMOTE_HANDQ = "remote_handq"
-    SESSION = "session"
-    BROWSER = "browser"
-    DESKTOP = "desktop"
     WEB_SEARCH = "web_search"
     EMAIL = "email"
     TEAMS = "teams"
     ASK_HUMAN = "ask_human"
     WAIT_INTERVAL = "wait_interval"
     READ_SKILL = "read_skill"
+    SPAWN_AGENT = "spawn_agent"
+    FAN_OUT_AGENTS = "fan_out_agents"
+    TODO_WRITE = "todo_write"
+    # Real structured tool_use for self-extension (replaces the old
+    # embedded-JSON-in-reasoning convention — see self_extension_tool.py).
+    # Always visible, like TODO_WRITE — never itself gated behind claim_tool.
+    CLAIM_TOOL = "claim_tool"
+    RELEASE_TOOL = "release_tool"
+    # Agent-facing scheduling (Claude-Code CronCreate/List/Delete parity) +
+    # dynamic self-paced loop wakeup (ScheduleWakeup parity). All on_demand.
+    SCHEDULE_CREATE = "schedule_create"
+    SCHEDULE_LIST = "schedule_list"
+    SCHEDULE_DELETE = "schedule_delete"
+    SCHEDULE_WAKEUP = "schedule_wakeup"
+    # Live-shell family (Phase 2.1 split — no composite tool remains). Named
+    # "live_shell", not "session", to avoid colliding with the unrelated
+    # session_id/SessionContext/browser-session/bridge-session vocabulary
+    # used throughout the rest of the codebase for a user's HandQ session —
+    # this family is specifically about a long-lived INTERACTIVE SUBPROCESS
+    # (adb shell, a Python REPL, a serial console), not a HandQ session.
+    LIVE_SHELL_OPEN = "live_shell_open"
+    LIVE_SHELL_EXEC = "live_shell_exec"
+    LIVE_SHELL_WRITE = "live_shell_write"
+    LIVE_SHELL_READ = "live_shell_read"
+    LIVE_SHELL_LIST = "live_shell_list"
+    LIVE_SHELL_CLOSE = "live_shell_close"
 
     _tools: Dict[str, ToolMetadata] = {}
     _initialized = False
@@ -448,11 +479,20 @@ Override: shell="cmd" (legacy batch), shell="bash" (Git Bash if installed).
 
 Each call runs in a fresh process at the project root. Shell state (vars,
 functions) does NOT persist between calls — chain with ';' if you need cd.
+This also means PowerShell's OWN background primitives (`&`, `Start-Job`/
+`Get-Job`, a bare `Start-Process` with no tracking) do NOT survive between
+calls — the job object dies with the process that created it, so the next
+call's `Get-Job` reports NotFound even though the real work is still running.
+For anything that must be checked across multiple calls, use run_in_background
+below instead of PowerShell's own job control.
 
 WHEN TO USE
   - Run programs, scripts, tests, builds
   - Quick state checks (Get-ChildItem, Test-Path, Get-Process)
-  - Long-running tasks → run_in_background=true, returns task_id
+  - Long-running or backgrounded work you'll check on later →
+    run_in_background=true (see BACKGROUND EXECUTION below) — NOT
+    PowerShell's own `&`/Start-Job/Start-Process, which won't survive to
+    your next call
 
 WHEN NOT TO USE — use the listed alternative instead
   Read file contents          → 'read' tool (no escaping, no truncation issues)
@@ -506,6 +546,11 @@ BACKGROUND EXECUTION
   run_in_background=true            → returns task_id; no timeout limit
   task_id="bg_X"                    → query status & captured output
   task_id="bg_X", command="kill"    → terminate task tree
+  Use this — not `&`/Start-Job/bare Start-Process — for anything you'll
+  check on in a LATER call; those don't survive past this call's process.
+  A completed background task is also injected into your next turn
+  automatically; you don't have to poll task_id at all if you're doing
+  other work meanwhile.
 
 OUTPUT
   - Truncated at 30,000 chars (10k head + 5k tail). Filter aggressively.
@@ -517,28 +562,25 @@ SCOPE GUARD
   or a subdirectory. Searching drive root or %USERPROFILE% hangs on large
   trees → tool will warn but allow.
 
-ESCALATION (planner-activated, do not request manually)
+ESCALATION — claim the right tool instead of faking it on shell
   - Long-running remote batch (submit script → poll/wait → fetch logs)
-    → 'ssh' tool activates when the step targets a remote host
+    → claim_tool: ["ssh"] when the step targets a remote host
   - Persistent subprocess where EXACTLY ONE of these holds:
       (a) state must survive across commands (cwd, env, REPL, adb shell context)
       (b) watch streaming output AND inject commands concurrently
       (c) tty-bound device (serial console, minicom)
       (d) user explicitly asked to watch the process live
-    → 'session' tool activates when the planner detects the pattern
+    → claim_tool: ["live_shell_open"] when you recognize the pattern
   - Web automation: visit URL, fill form, click, extract page, login flows
-    → 'browser' tool activates when the step references a URL or web action
+    → claim_tool: ["browser_launch"] when the step references a URL or web action
   - Native Windows app automation: Notepad, Excel, File Explorer, Settings,
     Task Manager, Office apps, third-party desktop software
-    → 'desktop' tool activates when the step targets a native app or
+    → claim_tool: ["desktop_screenshot"] when the step targets a native app or
        screen-level interaction
-  If a step matches one of the above but the corresponding tool is not in
-  your list, the planner under-declared `tools_required`. Stop calling
-  shell on the wrong path — set the completion `error` field with a one-
-  line note ("step needs <tool_name>: <why>") and omit `tool_name`. The
-  planner will re-classify on the next observe_and_plan() round and
-  re-issue the step with the right tool. This costs one iteration; far
-  cheaper than thrashing on shell trying to fake the missing capability.
+  If a step matches one of the above, claim the tool yourself (see
+  [Available Tools — claim to activate] in the system prompt) — it
+  activates the same turn you claim it, no extra round-trip needed. Don't
+  thrash on shell trying to fake a capability another tool already has.
 
 EXAMPLES
   GOOD: Get-ChildItem -Recurse -Filter *.py | Select-String 'def main'
@@ -558,11 +600,17 @@ Platform: Linux/macOS. Default shell: /bin/sh. Override with shell="bash"/"zsh".
 
 Each call runs in a fresh process at the project root. Shell state (vars,
 functions) does NOT persist between calls — chain with '&&' if you need cd.
+This also means shell-native backgrounding (`cmd &`, `nohup`, `disown`) does
+NOT survive between calls the way you might expect — the job is tied to the
+shell process that launched it, which exits when this call returns. For
+anything you'll check on in a LATER call, use run_in_background below.
 
 WHEN TO USE
   - Run programs, scripts, tests, builds
   - Quick state checks (ls, ps, df, env, which)
-  - Long-running tasks → run_in_background=true, returns task_id
+  - Long-running or backgrounded work you'll check on later →
+    run_in_background=true (see BACKGROUND EXECUTION below) — NOT `cmd &`/
+    nohup, which won't survive to your next call
 
 WHEN NOT TO USE — use the listed alternative instead
   Read file contents          → 'read' tool (no escaping, no truncation issues)
@@ -580,6 +628,10 @@ BACKGROUND EXECUTION
   run_in_background=true            → returns task_id; no timeout limit
   task_id="bg_X"                    → query status & captured output
   task_id="bg_X", command="kill"    → terminate task tree
+  Use this — not `cmd &`/nohup/disown — for anything you'll check on in a
+  LATER call; those don't survive past this call's process. A completed
+  background task is also injected into your next turn automatically; you
+  don't have to poll task_id at all if you're doing other work meanwhile.
 
 OUTPUT
   - Truncated at 30,000 chars (10k head + 5k tail). Filter aggressively.
@@ -590,9 +642,9 @@ SCOPE GUARD
   Search commands (grep, find, rg) MUST target '.' or a subdirectory.
   Searching / or ~ hangs on large directory trees → tool will warn but allow.
 
-ESCALATION (planner-activated, do not request manually)
+ESCALATION — claim the right tool instead of faking it on shell
   Long-running remote batch (submit script → poll/wait → fetch logs)
-  → 'ssh' tool activates when the step targets a remote host
+  → claim_tool: ["ssh"] when the step targets a remote host
 
 EXAMPLES
   GOOD: grep -rn "def process_batch" src/ | head -20
@@ -634,7 +686,11 @@ EXAMPLES
                         "description": (
                             "If true, launch the command in the background and return "
                             "a task_id immediately. You will be notified when it completes. "
-                            "Use for long-running commands (tests, builds, servers). "
+                            "Use for long-running commands (tests, builds, servers) — this "
+                            "is the ONLY way to track a process across separate tool calls; "
+                            "each call runs in a fresh shell process, so PowerShell's own "
+                            "&/Start-Job or shell '&'/nohup do not survive to your next call "
+                            "even though the underlying process keeps running. "
                             "Default: false."
                         )
                     },
@@ -1005,7 +1061,7 @@ Examples:
             tool_class=NotebookEditTool
         )
 
-        # Register SSH tool (on_demand=True: only activated when a StepContextProvider requests it)
+        # Register SSH tool (on_demand=True: only enters the LLM tool list once the agent claims it)
         # Build the usage_guide as a string variable so we can drop the
         # session advisory line on Linux (session is Windows-only registered).
         _ssh_usage_guide = """\
@@ -1022,43 +1078,12 @@ WHEN NOT TO USE — use the listed alternative instead
   Single short remote cmd (no log/job tracking)   → 'shell' with: ssh host 'cmd'
   Need live UI streaming of remote output         → 'session' tool: open(command='ssh user@host')   (-tt auto-prepended)
 
-WORKFLOW (the recommended pattern — 5 steps)
-  1. exec        Verify env, run < 30s commands. Returns 'login_shell' field.
-  2. run_script  PREFERRED: upload script + launch as nohup background.
-                 The job survives ssh disconnect.
-  3. wait_done   PREFERRED over polling: single SSH connection blocks until
-                 the job finishes. Set timeout = expected duration + buffer.
-                   — OR —
-     job_status  Poll every 30-60s when interleaving local work.
-                 NOTE: log_tail is OMITTED while status="running"; use tail_log
-                 to peek at running output.
-  4. tail_log    Inspect output on success.
-     fetch_log   Page through large logs to debug failures (start_line/end_line).
-  5. safe_exit   ALWAYS call when done — kills tracked jobs, removes pid files.
-
 ACTIONS (full param schemas in tool definition):
   exec | exec_bg | job_status | wait_done | tail_log | fetch_log
   write_file | run_script | safe_exit
 
-CONNECTION MANAGEMENT (transparent)
-  All actions to one host share a single TCP connection (pool). First action
-  pays the handshake; subsequent actions reuse it for free. Auto-reconnects
-  on transport death with exponential backoff. Keepalive every 30s prevents
-  NAT/firewall from dropping the idle pool.
-
-SHELL COMPATIBILITY
-  Built-in actions (exec_bg, job_status, safe_exit) wrap commands in 'bash -c'
-  regardless of remote login shell. For action='exec' on non-bash hosts:
-    command='bash -c "your_command"'
-
-EXAMPLES
-  GOOD: ssh(exec, command="uname -a")                   (probe first)
-  GOOD: ssh(run_script, script_content="...8h job...")  (long batch)
-        → ssh(wait_done, timeout=30000)                 (single conn, blocks)
-        → ssh(tail_log)                                 (read result)
-        → ssh(safe_exit)                                (cleanup)
-  BAD:  ssh(exec, command="...8h job...")               → use run_script
-  BAD:  Loop ssh(job_status) every 5s                   → use wait_done"""
+Read the 'ssh-workflow' skill for the recommended action sequence, connection
+pooling behavior, and shell-compatibility notes."""
 
         if not _IS_WINDOWS:
             # Drop the session advisory: session tool is not registered on Linux.
@@ -1116,25 +1141,11 @@ PREREQUISITES
   the resident daemon (handq_linux --_daemon) if it is not already running, but
   cannot deploy the files.
 
-WORKFLOW
-  1. submit_goal(goal=...)  — wakes the daemon if needed, queues the goal,
-                              returns a message_id.
-  2. get_status(wait_timeout=N)
-                            — task_status is "running" while working, "idle"
-                              when settled; also returns latest_tool + checklist.
-  3. get_result(message_id=...)
-                            — fetch that goal's reply (the daemon writes one
-                              reply per message_id). wait_timeout polls for it.
-  4. exit_handq             — stop the daemon (optional; it is resident and
-                              survives network/power loss, resumable later).
+ACTIONS: submit_goal | get_status | get_result | send_message | new_session |
+  interrupt | exit_handq
 
-CONTROL
-  - send_message(message=...) — inject a follow-up into the running task;
-                                returns its own message_id.
-  - new_session               — abandon the current session, start fresh.
-  - interrupt                 — abort the in-flight task and clear its pending
-                                checklist tail.
-"""
+Read the 'remote-handq-workflow' skill for the recommended submit/poll/fetch
+sequence and how to handle pending confirmations."""
             cls._tools[cls.REMOTE_HANDQ] = ToolMetadata(
                 name=cls.REMOTE_HANDQ,
                 description=(
@@ -1149,15 +1160,15 @@ CONTROL
                 on_demand=True,
             )
 
-        # Register SESSION tool — interactive subprocess sessions (adb shell,
-        # Python REPL, telnet, etc.). Windows-only: the irreplaceable scenarios
-        # (adb dev, serial console, watch-and-inject) are Windows-centric;
-        # Linux equivalents (tmux, expect, screen) are mature enough that
-        # shell + ssh suffice. on_demand=True: activated by
-        # SessionContextProvider when the planner detects the pattern.
+        # Register LIVE_SHELL tool family — interactive subprocess sessions
+        # (adb shell, Python REPL, telnet, etc.). Windows-only: the
+        # irreplaceable scenarios (adb dev, serial console, watch-and-inject)
+        # are Windows-centric; Linux equivalents (tmux, expect, screen) are
+        # mature enough that shell + ssh suffice. on_demand=True: enters the
+        # LLM tool list once the agent claims a live_shell_* tool.
         if _IS_WINDOWS:
             from .session_tool import InteractiveSessionTool
-            _session_usage_guide = """\
+            _live_shell_usage_guide = """\
 WHEN TO USE — exactly ONE of (1)-(4) must hold; STATE WHICH IN REASONING:
   (1) State persistence across commands.
       Subsequent commands depend on accumulated process state that a fresh
@@ -1176,7 +1187,7 @@ WHEN TO USE — exactly ONE of (1)-(4) must hold; STATE WHICH IN REASONING:
       e.g.  open('picocom -b 115200 /dev/ttyUSB0', prompt_pattern='> $')
 
   (4) User explicitly asked to watch / observe / 看着 / monitor live.
-      The UI streams session output in real time; only session can do this.
+      The UI streams live_shell output in real time; only live_shell can do this.
       Trigger words: "看着", "演示", "watch", "observe", "monitor live".
 
 WHEN NOT TO USE
@@ -1221,547 +1232,463 @@ EXAMPLES
   BAD:  open('ssh host') → exec('long_script.sh') → block waiting
         ↑ batch job → ssh tool: run_script + wait_done (survives disconnect)
 """
-            cls._tools[cls.SESSION] = ToolMetadata(
-                name=cls.SESSION,
+            from .session_tool import (
+                SessionOpenTool, SessionExecTool, SessionWriteTool,
+                SessionReadTool, SessionListTool, SessionCloseTool,
+            )
+            # ── live_shell_open ────────────────────────────────────────────
+            # Carries the family's WHEN-TO-USE decision tree in its usage_guide,
+            # since it's the entry point every live_shell workflow calls first.
+            cls._tools[cls.LIVE_SHELL_OPEN] = ToolMetadata(
+                name=cls.LIVE_SHELL_OPEN,
                 description=(
-                    "Interactive session tool — spawn and control long-lived subprocesses "
-                    "(adb shell, Python REPL, serial console, etc.) across multiple tool "
-                    "calls. UI streams stdout in real time. Use ONLY when shell+ssh cannot "
-                    "express the scenario; see WHEN TO USE for the 4 irreplaceable cases."
+                    "Spawn a long-lived interactive subprocess (adb shell, Python "
+                    "REPL, serial console). Returns a session_id used by the other "
+                    "live_shell_* tools. Use ONLY when shell+ssh cannot express the "
+                    "scenario — see usage_guide for the 4 irreplaceable cases."
                 ),
-                usage_guide=_session_usage_guide,
+                usage_guide=_live_shell_usage_guide,
                 parameter_schema={
                     "type": "object",
                     "properties": {
-                        "action": {
-                            "type": "string",
-                            "enum": ["open", "exec", "write", "read", "list", "close"],
-                            "description": "Session action to perform.",
-                        },
-                        "session_id": {
-                            "type": "string",
-                            "description": "[exec/write/read/close] Session ID returned by open.",
-                        },
                         "command": {
                             "type": "string",
                             "description": (
-                                "[open] Program to launch (e.g., 'adb shell', 'python -i'). "
-                                "[exec] Command to send to stdin and wait for completion."
+                                "Program to launch as the session's long-lived "
+                                "process (e.g., 'adb shell', 'python -i'). This "
+                                "does NOT run a command inside an existing "
+                                "session — to do that, call live_shell_exec "
+                                "with the session_id instead. Ignored (the "
+                                "existing session is reused as-is) when alias= "
+                                "matches an already-open session."
                             ),
                         },
                         "alias": {
                             "type": "string",
                             "description": (
-                                "[open] If a live session with this alias exists, reuse it "
-                                "instead of spawning a new one. Useful for re-entering an "
-                                "existing adb/REPL session across planner steps."
+                                "If a live session with this alias exists, reuse "
+                                "it instead of spawning a new one."
                             ),
-                        },
-                        "input": {
-                            "type": "string",
-                            "description": "[write] Raw text sent to stdin without waiting.",
                         },
                         "description": {
                             "type": "string",
-                            "description": "[open] Human-readable label for the session.",
+                            "description": "Human-readable label for the session.",
                         },
                         "prompt_pattern": {
                             "type": "string",
                             "description": (
-                                "[open] Regex matching the REPL's prompt "
-                                "(e.g., '^>>> ' for Python). Used by 'exec' to detect "
-                                "completion. Not needed for shells (delimiter auto-injected)."
+                                "Regex matching the REPL's prompt (e.g., '^>>> ' "
+                                "for Python). Used by live_shell_exec to detect "
+                                "completion. Not needed for shells."
                             ),
                         },
                         "cwd": {
                             "type": "string",
-                            "description": "[open] Working directory for the subprocess.",
+                            "description": "Working directory for the subprocess.",
+                        },
+                        "merge_stderr": {
+                            "type": "boolean",
+                            "description": "Merge stderr into stdout (default true).",
+                        },
+                    },
+                    "required": [],
+                    "anyOf": [
+                        {"required": ["command"]},
+                        {"required": ["alias"]},
+                    ],
+                    "additionalProperties": False,
+                },
+                tool_class=SessionOpenTool,
+                on_demand=True,
+            )
+            # ── live_shell_exec ────────────────────────────────────────────
+            cls._tools[cls.LIVE_SHELL_EXEC] = ToolMetadata(
+                name=cls.LIVE_SHELL_EXEC,
+                description=(
+                    "Send a command to an open session and wait for it to complete. "
+                    "Delimiter is auto-injected for shells; prompt_pattern is matched "
+                    "for REPLs (set at open time). Use for step-by-step interactive "
+                    "workflows where each command's output informs the next."
+                ),
+                usage_guide="",
+                parameter_schema={
+                    "type": "object",
+                    "properties": {
+                        "session_id": {
+                            "type": "string",
+                            "description": "Session ID returned by live_shell_open.",
+                        },
+                        "command": {
+                            "type": "string",
+                            "description": "Command to send to stdin and wait for completion.",
+                        },
+                        "timeout": {
+                            "type": "number",
+                            "description": "Max seconds to wait for completion (default 30, hard ceiling 600).",
+                        },
+                    },
+                    "required": ["session_id", "command"],
+                    "additionalProperties": False,
+                },
+                tool_class=SessionExecTool,
+                on_demand=True,
+            )
+            # ── live_shell_write ───────────────────────────────────────────
+            cls._tools[cls.LIVE_SHELL_WRITE] = ToolMetadata(
+                name=cls.LIVE_SHELL_WRITE,
+                description=(
+                    "Write raw text to a session's stdin without waiting for "
+                    "completion. Use for y/n prompts, ^C, password entry, or "
+                    "streaming commands you'll read with live_shell_read."
+                ),
+                usage_guide="",
+                parameter_schema={
+                    "type": "object",
+                    "properties": {
+                        "session_id": {
+                            "type": "string",
+                            "description": "Session ID returned by live_shell_open.",
+                        },
+                        "input": {
+                            "type": "string",
+                            "description": "Raw text sent to stdin.",
+                        },
+                        "append_newline": {
+                            "type": "boolean",
+                            "description": "Append newline after input (default true).",
+                        },
+                    },
+                    "required": ["session_id", "input"],
+                    "additionalProperties": False,
+                },
+                tool_class=SessionWriteTool,
+                on_demand=True,
+            )
+            # ── live_shell_read ────────────────────────────────────────────
+            cls._tools[cls.LIVE_SHELL_READ] = ToolMetadata(
+                name=cls.LIVE_SHELL_READ,
+                description=(
+                    "Drain buffered output from a session. Returns idle_seconds "
+                    "(time since last output) — use for hang detection when the "
+                    "output stream has fallen quiet."
+                ),
+                usage_guide="",
+                parameter_schema={
+                    "type": "object",
+                    "properties": {
+                        "session_id": {
+                            "type": "string",
+                            "description": "Session ID returned by live_shell_open.",
                         },
                         "timeout": {
                             "type": "number",
                             "description": (
-                                "[exec] Max seconds to wait for completion (default 30). "
-                                "[read] Seconds to wait for new data (default 0 = immediate)."
+                                "Seconds to wait for new data (default 0 = "
+                                "immediate, drain what's already buffered). "
+                                "Hard ceiling 600."
                             ),
                         },
-                        "append_newline": {
-                            "type": "boolean",
-                            "description": "[write] Append newline after input (default true).",
-                        },
-                        "merge_stderr": {
-                            "type": "boolean",
-                            "description": "[open] Merge stderr into stdout (default true).",
-                        },
                     },
-                    "required": ["action"],
+                    "required": ["session_id"],
                     "additionalProperties": False,
                 },
-                tool_class=InteractiveSessionTool,
+                tool_class=SessionReadTool,
                 on_demand=True,
             )
-
-        # Register BROWSER tool. Windows-only — Playwright + Edge channel
-        # gating is tested only on Win11. on_demand=True so it only enters
-        # the LLM tool list when BrowserContextProvider activates it
-        # (Phase 4); without the provider, LLM never sees this tool.
-        if _IS_WINDOWS:
-            cls._tools[cls.BROWSER] = ToolMetadata(
-                name=cls.BROWSER,
+            # ── live_shell_list ────────────────────────────────────────────
+            cls._tools[cls.LIVE_SHELL_LIST] = ToolMetadata(
+                name=cls.LIVE_SHELL_LIST,
                 description=(
-                    "Persistent Chromium browser automation (single shared session "
-                    "with off-screen window position so the user's desktop is not "
-                    "disturbed). Cookies persist across HandQ sessions in "
-                    "%USERPROFILE%\\HandQ\\browser_profile\\."
+                    "List all live sessions with their aliases, commands, and "
+                    "idle_seconds. Pure enumeration — no state mutation."
                 ),
-                usage_guide="""\
-WHEN TO USE
-  - Visit a website, follow links, read page content, fill forms, click buttons
-  - Tasks the user phrases in terms of "open", "go to <url>", "查看 <网站>",
-    "登录"、"点击"、"填写"
-
-WORKFLOW
-  1. action='launch_browser' once per session (idempotent — safe to call
-     repeatedly; reuses the existing session). Returns the first tab_id.
-  2. action='navigate' with url='https://...' to load a page. The result
-     auto-includes a 'page_state' summary (open dialogs + toasts) so you
-     usually do NOT need a follow-up extract just to see what is on screen.
-  3. action='snapshot' to enumerate every visible button / link / form
-     control AND any open dialogs in a single call. Each item carries a
-     suggested selector — pass it straight to click / type. STRONGLY
-     PREFERRED over speculative extract probes when you don't already
-     know the page structure.
-  4. action='extract' for content reads:
-       - mode='text' (default): visible text (filter dropdowns are
-         collapsed to the selected option to keep payloads small).
-       - mode='html': outerHTML of the FIRST match (or whole document).
-       - mode='attr': attributes of one element.
-       - mode='list': outerHTML+text of EVERY match up to 'limit' (default
-         20, max 100) — use when enumerating candidates by selector.
-  5. action='click' / 'type' to interact. Selectors support CSS,
-     text='Login', role='button[name=Submit]', xpath=//.  Both echo a
-     'page_state' field after the action so you see modal/toast changes
-     immediately — do not chase with a screenshot+extract pair.
-  6. action='wait_for' to block until a selector appears (state='visible'
-     default) or the URL matches a regex (url_pattern='/dashboard$').
-  7. action='vision_query' for content the DOM cannot give you — text or
-     visuals rendered inside <canvas>, charts, captcha detection, image
-     classification ("is this a dog?", "is the person male or female?",
-     "is this chart trending up?"). The tool screenshots the viewport
-     (or selector subtree), ships it to a small multimodal model, and
-     returns a TEXT answer plus parsed_json when output_schema is given.
-     The image bytes never enter your context — only the distilled
-     answer. STRICT: read VISION_QUERY DECISION RULE below before
-     calling — most "where is X" / "what does this page say" / "what
-     does this video cover" questions have better tools.
-  8. action='video_context' to read the active <video>'s title,
-     description, duration, and CAPTION text via the textTracks API —
-     no vision involved, no per-frame sampling needed. This is THE
-     answer for "what is this video about" / "is there a part about X"
-     / "summarise the lecture" / "watch this section". Pair with
-     seek_to_s + pause=true to position on a specific frame, then
-     follow with a SINGLE screenshot+vision_query if you need to know
-     what that frame looks like.
-  9. action='list_tabs' if you have multiple tabs.
-  10. action='close_tab' for tabs you no longer need.
-
-KEY INVARIANTS
-  - tab_id is optional everywhere except close_tab; defaults to the first tab.
-  - extract mode='text' (default) returns visible text capped at ~100KB.
-    Filter dropdowns (<select>, <datalist>) are collapsed to their selected
-    option so a 160-row dashboard does not dump 1KB+ of option lists per call.
-  - extract mode='html' returns outerHTML when selector given, full HTML otherwise.
-  - extract mode='attr' requires a selector; returns one attribute or all.
-  - extract mode='list' requires a selector; returns up to 'limit' matches
-    (default 20, hard cap 100) — use this instead of repeating extract with
-    successively narrower selectors.
-  - snapshot has no selector arg; it lists every interactable element on
-    the page plus open dialogs / toast notifications, with a suggested
-    selector for each. Cheap (one page.evaluate call) and bounded.
-  - navigate / click / type / snapshot return a 'page_state' field with
-    the topmost open dialog and visible toasts when present — read it
-    instead of firing a follow-up extract.
-
-PASSWORD GUARD (HARD REFUSAL)
-  type is server-side refused on input[type=password]. If you encounter a
-  login form, do NOT try to fill the password — call request_user_login
-  so the user can log in manually. The resulting cookies persist in the
-  user-data-dir for future sessions.
-
-LOGIN HANDOFF (request_user_login)
-  When a page requires user credentials:
-    1. action='navigate' to the login page (or land there organically).
-    2. action='request_user_login', reason='<short explanation>',
-       success_url_pattern='<regex matching post-login URL>'   (optional but
-       recommended).
-    3. The browser window moves on-screen at the login page; HandQ shows an
-       Approve/Reject modal explaining what's happening. The user enters
-       credentials in Chrome's native UI — agent sees nothing.
-    4. User clicks Approve when finished. The window moves back off-screen
-       and the action returns the post-login URL plus whether
-       success_url_pattern matched.
-    5. If the user clicks Reject, the action fails — re-plan or ask the
-       user for a different approach.
-  Cookies persist across HandQ sessions, so this dance happens at most
-  once per site (until cookies expire on the server side).
-
-STEALTH
-  The browser launches off-screen (window-position=-32000,-32000) so the
-  user's desktop focus is preserved. Do NOT enable headless — sites detect
-  headless via JS fingerprinting; we want a real-user fingerprint while
-  staying invisible.
-
-VISION_QUERY DECISION RULE (read before each call)
-  Before calling vision_query, identify which kind of question you have:
-
-  ✅ vision_query IS THE RIGHT TOOL for IMAGE-LEVEL questions:
-    - Image classification ("Is this a dog or a cat?",
-      "Is the person in this photo male or female?",
-      "Is this chart trending up?")
-    - <canvas> / <svg> / <video> SINGLE-FRAME content that the DOM
-      cannot read (chart screenshot, slide on a paused video frame)
-    - Captcha / verification page DETECTION (recognise that one is
-      present and bail out — never try to solve)
-    - "Click on the dog image" / "find the orange button" — one-shot
-      visual grounding, returns coordinates
-
-  ❌ vision_query IS THE WRONG TOOL for these — use what's listed:
-    - "What is on this page?"            → snapshot
-    - "What does the heading say?"       → extract mode='text'
-    - "Where is the Login link?"         → snapshot (each element gets
-                                            a suggested selector)
-    - "Did the click open a modal?"      → click already returns
-                                            page_state with dialogs
-    - "Is the form submitted?"           → wait_for url_pattern or
-                                            selector
-    - "What's in the search results?"    → extract mode='text' / 'list'
-    - "What is this video about?"        → video_context (reads
-                                            captions + metadata)
-    - "Was section 1 covered?"           → video_context (cues with
-                                            timestamps)
-    - "Watch this until X is mentioned"  → video_context, then check
-                                            captions for X
-
-  ⛔ ANIMATION ANTI-PATTERN:
-    Do NOT call vision_query repeatedly to "watch" a moving canvas or
-    video. Each call is 5-7 seconds — sampling at 1 fps takes longer
-    than the video itself, costs ~1500 input tokens per frame, and
-    misses everything between samples. For VIDEO use video_context.
-    For CANVAS animation, the data driving it almost always lives in
-    a JS variable or network response that DOM extract can reach
-    indirectly (chart libraries expose .data on the canvas instance).
-
-  Penalty for misuse: 5-7s latency, ~1500 input tokens, non-deterministic
-  hallucinations. snapshot is your default for "what is on this page";
-  extract for "give me the content of X"; video_context for any video
-  question. vision_query is for image-level questions only.
-
-EXAMPLES
-  GOOD: action='launch_browser'
-  GOOD: action='navigate', url='https://example.com'
-  GOOD: action='snapshot'        (always do this on a new page before guessing selectors)
-  GOOD: action='click', selector='text=Sign in'
-  GOOD: action='type', selector='input[name=q]', text='hello', press_enter=true
-  GOOD: action='wait_for', selector='.results', state='visible'
-  GOOD: action='wait_for', url_pattern='/dashboard($|/)'
-  GOOD: action='extract', mode='attr', selector='a.next', attribute='href'
-  GOOD: action='extract', mode='list', selector='button.action-btn.book', limit=20
-  GOOD: action='vision_query', selector='canvas#chart', question='What does this chart show? One sentence.'
-  GOOD: action='vision_query', question='Is the person in the photo male or female?',
-        selector='img.profile-pic'
-  GOOD: action='vision_query', question='Where is the Sign In button? Reply with pixel coordinates.',
-        output_schema={"type":"object","properties":{"x":{"type":"number"},"y":{"type":"number"}},"required":["x","y"]}
-  GOOD: action='video_context'                                          (whole-video summary via captions)
-  GOOD: action='video_context', max_cues=2000                           (long lecture)
-  GOOD: action='video_context', seek_to_s=150, pause=true               (jump to 2:30 and stop, ready for screenshot)
-  GOOD: action='screenshot'                                             (default; auto-cleaned shortly after task)
-  GOOD: action='screenshot', path='/abs/path/inside/session/dir/confirm.png'   (long-term keep — write into session working dir)
-  GOOD: action='request_user_login', reason='need GitHub credentials',
-        success_url_pattern='github\\.com/(?!login)'
-  GOOD: action='attach_browser'   (when user said "我刚才打开的" — needs config)
-  GOOD: action='new_tab', url='https://...', background=true   (attach mode)
-  BAD:  action='type', selector='input[type=password]'  — REFUSED
-  BAD:  url='example.com'  — must include scheme
-  BAD:  action='navigate' before launch_browser/attach_browser  — no session
-  BAD:  selector='SA8797P.HGY.5.1.7.0' — '.5' is a CSS numeric literal,
-        use [id='SA8797P.HGY.5.1.7.0'] or text='SA8797P.HGY.5.1.7.0'
-
-LAUNCH vs ATTACH (advanced)
-  Default to launch_browser. Use attach_browser ONLY when the task explicitly
-  needs the user's RUNNING Chrome state (e.g., "刚才/正在/我现在打开的/接着我那个"):
-    - "去 GitHub 看我的 PR review" → launch (just need login state)
-    - "把刚才在 Notion 写的草稿发给团队" → attach (needs current Notion tab)
-  attach is high-risk: it requires user approval each time and
-  browser.attach_enabled: true in handq_config.yaml. New tabs created in
-  attach mode default to background=true so the user's focus is preserved.""",
-                parameter_schema=BrowserTool.parameter_schema,
-                tool_class=BrowserTool,
+                usage_guide="",
+                parameter_schema={
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False,
+                },
+                tool_class=SessionListTool,
                 on_demand=True,
             )
-
-        # Register DESKTOP tool. Windows-only — uses pyautogui + pywin32 +
-        # mss + RapidOCR. on_demand=True so it only enters the LLM tool
-        # list when the planner / a context provider explicitly activates
-        # it (mirrors the BROWSER pattern).
-        if _IS_WINDOWS:
-            cls._tools[cls.DESKTOP] = ToolMetadata(
-                name=cls.DESKTOP,
+            # ── live_shell_close ───────────────────────────────────────────
+            cls._tools[cls.LIVE_SHELL_CLOSE] = ToolMetadata(
+                name=cls.LIVE_SHELL_CLOSE,
                 description=(
-                    "Windows desktop automation: capture the active window or "
-                    "full screen, locate UI elements via local OCR (RapidOCR) "
-                    "with optional LLM-vision fallback, and drive the mouse / "
-                    "keyboard. Sensitive windows (password managers, banking) "
-                    "are refused outright."
+                    "Terminate a session and release its subprocess. Max 4 "
+                    "concurrent sessions — close ones you're done with."
                 ),
-                usage_guide="""\
-TOOL CHOICE HIERARCHY (read before EACH desktop call)
-  desktop drives OS-level mouse / keyboard — every input action looks
-  identical to real human input, steals focus, and is non-deterministic
-  (OCR + vision matching, never as exact as a CSS selector). It is the
-  most powerful tool in the kit and therefore the most disruptive — use
-  it ONLY when no specialised tool fits.
-
-  ✅ desktop is correct when the target is a NATIVE Windows app:
-    - Notepad, Excel, Word, PowerPoint, Outlook, OneNote
-    - File Explorer, Windows Settings, Task Manager, Control Panel
-    - VSCode, Visual Studio, third-party desktop software
-    - Anything that lives OUTSIDE a browser window
-
-  ❌ desktop is the WRONG tool for these — use the named alternative:
-    - Web pages, URLs, anything in browser  → browser   (DOM is exact,
-                                                          ~10x faster than OCR;
-                                                          off-screen, no focus theft)
-    - Read / write / edit files             → read / write / edit
-    - Run commands, scripts, programs       → shell
-    - Search files / find pattern           → glob / grep
-    - Remote machine                        → ssh
-    - Inspect Jupyter notebook cells        → notebook_edit
-
-  ANTI-PATTERN: do NOT use desktop on web pages just because you can see
-  them on screen. Even if the user said "click the OK button on
-  github.com", that's a browser task — open the page in browser_tool
-  and use selectors. Even if the user said "open my Notepad++ at line
-  50", it's still desktop because Notepad++ is a native app, but if the
-  user said "open the GitHub issue at line 50 of foo.py", that's
-  browser. Read the verb-target pair carefully.
-
-  PENALTY for misuse vs the correct tool:
-    - 5-10x slower (OCR ~2.8s + pyautogui PAUSE 50ms vs browser DOM ~50ms)
-    - Non-deterministic (OCR fuzzy match vs CSS selector exact)
-    - Steals user's actual mouse / keyboard
-    - Requires per-task user approval the first time
-    - Triggers a visible 'Agent driving' indicator the user CAN revoke
-      mid-task with Ctrl+C — over-using desktop trains the user to revoke
-
-WHEN TO USE
-  - Tasks that require interacting with NATIVE Windows applications:
-    Notepad, File Explorer, Visual Studio, Excel, Outlook, Settings panel,
-    third-party desktop apps. The browser tool only covers web pages —
-    use desktop for everything outside the browser.
-  - Tasks the user phrases as "open <app>", "click <thing on screen>",
-    "type <text> into the box", "拖动 / 滚动 / 按 Ctrl+S".
-
-PREREQUISITES (the agent must NOT skip these)
-  1. Get the app on screen first: usually a `shell` call to launch it
-     (e.g. `notepad.exe`, `explorer.exe path`). Verify with action='list_windows'
-     or by asking the user.
-  2. Make sure the target window is the FOREGROUND window before any
-     mouse / keyboard action. Sensitive-window guard checks the foreground
-     before each action and refuses on banking / password manager match.
-
-COST HIERARCHY (measured on this platform — internalise before choosing an action)
-  The dominant cost in desktop work is the number of agent decision
-  ROUND-TRIPS (~4s each), not the primitive. Fewer rounds beats a faster
-  primitive every time. Measured per-primitive costs:
-    - snapshot (UIA tree)      ~170 ms   ← nearly free; this is your eyes
-    - input action (click/key) ~100 ms   + a state_after delta, no capture
-    - screenshot capture       ~200 ms
-    - OCR (find_element hit)   ~2.8 s    ← NOT cheap; ~16x a snapshot
-    - vision fallback          ~4 s      (OCR miss only; anthropic::claude-4-5-haiku)
-  Rule of thumb, cheapest-to-most-expensive intent:
-    snapshot  <  pywinauto-batch  <  find_and_click  <  find_element+OCR  <  vision
-
-  A 5-control native-app task costs, by strategy (simulated on measured costs):
-    - screenshot+OCR each, verify after   → ~20 rounds, ~97 s   (AVOID)
-    - snapshot + find_and_click per step   → ~7 rounds,  ~29 s
-    - snapshot once + ONE pywinauto batch  → ~2 rounds,  ~10 s   (PREFER for
-      native apps: collapse a whole click-sequence into a single shell call)
-
-WORKFLOW (typical)
-  1. action='list_windows' — see what is open and which is foregrounded.
-  2. action='snapshot' — STRUCTURED listing of every interactable control
-     in the foreground window via Windows accessibility tree (UIA). Each
-     element comes back with role / text / x / y / selector hint. UIA
-     names work even on iconless buttons (gear / refresh / close X) —
-     PREFER snapshot over screenshot+OCR 90% of the time. Falls back
-     automatically to screenshot+OCR when UIA returns nothing (custom-
-     rendered Electron, games). ~170 ms on the UIA path — treat it as free.
-  3. **PREFERRED for native Windows apps — batch the whole sequence into ONE
-     pywinauto shell call.** Once snapshot gives you the names /
-     automation_ids, do NOT drive click_at one control at a time (that is
-     one ~4s agent round PER control). Instead write a single shell call
-     that resolves and drives them all at once:
-        shell: python -c "
-        import pywinauto
-        app = pywinauto.Application(backend='uia').connect(handle=<HWND>)
-        win = app.window(handle=<HWND>)
-        win.child_window(title='New Notebook', control_type='Button').click()
-        win.child_window(auto_id='NameEdit', control_type='Edit').set_text('X')
-        win.child_window(title='Create', control_type='Button').click()
-        "
-     Deterministic, survives UI shifts, and collapses N click rounds into 1.
-     Simulated ~3x faster than per-step find_and_click, ~10x faster than the
-     screenshot/click/screenshot loop. Reach for desktop.click_at only when
-     pywinauto cannot reach the target (canvas-rendered subregions, custom
-     controls, Electron apps without UIA).
-  4. action='screenshot', region='foreground'[, with_ocr=true] — only
-     when you actually need the PIXELS (vision_query input, sending the
-     image to a vision LLM, debugging). Default to with_ocr=false now
-     that snapshot covers the "what's on screen" question with a much
-     smaller payload.
-  5. action='find_element' / 'find_and_click' — use when pywinauto is
-     overkill (a single click) or snapshot missed the target / you only
-     have a visual descriptor. Note the OCR pass alone is ~2.8s (≈16x a
-     snapshot), so on a control snapshot already named, a direct click_at
-     or pywinauto call is cheaper than round-tripping through find_element.
-  6. action='hover_at', x, y — TOOLTIP READER. Move cursor to (x, y),
-     wait ~800 ms for the Windows tooltip, OCR a 250×120 px region
-     around the cursor, return text in 'nearby_text'. Use for
-     iconless toolbar buttons that snapshot couldn't name AND no
-     visible text label exists. ~1 s.
-  7. action='click_at' / 'type_text' / 'drag' / 'scroll' / 'hotkey' /
-     'key_press' — drive the input once you have the target.
-
-SCREENSHOT EFFICIENCY
-  snapshot is the first move on any new screen — it gives the LLM a
-  bounded, structured listing without the OCR-text-blob bloat.
-  Reserve screenshot for cases where you need the actual pixels (vision
-  LLM input, image debugging). DO NOT screenshot+OCR before every
-  action — it is the most common cause of slowness in desktop
-  workflows. Re-snapshot only when the UI state has actually changed
-  (after a click that opens a menu, after a hotkey, after typing).
-
-DO NOT RE-SCREENSHOT — READ state_after FIRST
-  Every input action returns a `state_after` dict that tells you what
-  changed on screen WITHOUT another capture. Fields:
-    - foreground_title   — current foreground window title
-    - foreground_pid     — its PID
-    - foreground_changed — bool: did focus move to a different window?
-    - title_changed      — bool: same window, but title text changed?
-    - new_windows        — list of window titles that appeared since the
-                           action (dialogs, popups, toasts)
-
-  Decision rule after every input action:
-    1. Read state_after. If foreground_changed=false AND title_changed=
-       false AND new_windows=[] → nothing visible changed. Proceed to
-       the next action. DO NOT screenshot.
-    2. If foreground_changed=true OR new_windows is non-empty → a new
-       dialog/window appeared. You likely need its content, so ONE
-       screenshot (or snapshot) is justified.
-    3. If title_changed=true → the app reacted (e.g. file opened, tab
-       switched). Screenshot only if you need to read new content.
-
-  Anti-pattern: click → screenshot → click → screenshot → click →
-  screenshot. That is a 4× slowdown over click → click → click. Each
-  screenshot is ~200 ms PLUS a full LLM round-trip on the bloated
-  output (~3-5 s) — a screenshot you didn't need costs you ~5 s and a
-  screen of context every time.
-
-  Correct pattern: click → read state_after → click → read state_after
-  → (state says new dialog) → screenshot ONCE → continue.
-
-KEY INVARIANTS
-  - Coordinates are PHYSICAL screen pixels. The tool sets per-monitor v2
-    DPI awareness on first use so scaling > 100% does not shift coords.
-  - find_element returns coords in SCREEN space (already adjusted for
-    region origin) — pass them to click_at / scroll directly.
-  - region='foreground' captures only the active window. Use this by
-    default; region='fullscreen' is needed only for window-switching or
-    multi-window comparisons.
-  - All input actions queue on a single asyncio lock — no two desktop
-    actions run in parallel even if the LLM marks them concurrent_safe.
-
-SENSITIVE WINDOW REFUSAL (HARD)
-  Before screenshot / find_element / any input action, the foreground
-  window title + process name are matched against
-  desktop.sensitive_window_patterns (default covers Bitwarden, 1Password,
-  KeePass, LastPass, Dashlane, banking / wallet keywords). On match the
-  action is refused and the user must switch focus before retrying.
-  This is the desktop analogue of browser_tool's password-field guard.
-
-USER REVOKE (HARD)
-  Once the user presses the global revoke hotkey (Ctrl+C while the
-  on-screen 'Agent driving' indicator is visible), every input action
-  for the rest of this task returns:
-    "REFUSED: user revoked desktop control for this task. ..."
-  Read-only actions (screenshot / list_windows / find_element) still
-  work. Stop using input actions; ask the user whether to continue.
-
-OCR vs VISION FALLBACK
-  find_element first asks RapidOCR for every visible text region in the
-  capture, then fuzzy-matches description with rapidfuzz token_set_ratio
-  (default threshold 70). On match: ~2.8 s, source='ocr'.
-  When OCR misses (visual-only descriptors like "the orange button" /
-  "the icon shaped like a gear"), it falls back to a single LLM-vision
-  call (~4 s, source='vision', anthropic::claude-4-5-haiku). Disable with
-  vision_fallback=false when you know the target is plain text.
-  Note: both paths are far more expensive than a snapshot (~170 ms). If
-  snapshot already named the control, click it directly — don't pay the
-  OCR round-trip to re-find what you can already see.
-
-EXAMPLES
-  GOOD: action='list_windows'
-  GOOD: action='snapshot'              (FIRST move on any new app window —
-                                        UIA tree, no context bloat, names
-                                        every iconless button)
-  GOOD: action='hover_at', x=720, y=24 (read tooltip on a toolbar icon
-                                        when snapshot didn't name it)
-  GOOD: shell: python -c "
-        import pywinauto
-        app = pywinauto.Application(backend='uia').connect(handle=12195718)
-        app.window(handle=12195718).child_window(title='New Notebook',
-            control_type='Button').click()
-        "  (preferred path for native apps once snapshot exposed the name)
-  GOOD: action='screenshot', region='foreground'
-  GOOD: action='screenshot', region='foreground', with_ocr=true
-        — only when you really need pixels + raw OCR; for "what's on
-        screen?" prefer snapshot
-  GOOD: action='find_element', description='OK button'
-  GOOD: action='find_element', description='保存', fuzzy_threshold=80
-  GOOD: action='find_element', description='the gear-shaped settings icon',
-        vision_fallback=true
-  GOOD: action='find_and_click', description='New notebook'
-  GOOD: action='find_and_click', description='保存', double=false
-  GOOD: action='click_at', x=820, y=412
-  GOOD: action='click_at', x=200, y=300, button='right'
-  GOOD: action='type_text', text='hello world'
-  GOOD: action='hotkey', keys=['ctrl','s']
-  GOOD: action='hotkey', keys=['alt','tab']
-  GOOD: action='key_press', key='enter'
-  GOOD: action='drag', from_x=100, from_y=200, to_x=400, to_y=200, duration=0.5
-  GOOD: action='scroll', x=600, y=400, dy=-3   (scroll down 3 clicks)
-  BAD:  action='screenshot' as your first move on a native app — use
-        snapshot instead (same info, no context bloat, handles
-        iconless controls)
-  BAD:  click_at without first finding the element / verifying coordinates
-        — prefer find_and_click which combines the two
-  BAD:  type_text into a window the user hasn't focused (you'll type
-        somewhere unexpected — always verify with snapshot first)
-  BAD:  type_text with a payload >4000 chars (use clipboard via shell)
-  BAD:  using desktop to click a button on a web page — that's a browser
-        task. Open the URL in browser_tool and use action='click' with a
-        selector.
-  BAD:  60-iteration screenshot+click loops. If you're past 15 iterations
-        on one step, STOP — switch to pywinauto via shell, or ask the
-        user for guidance.""",
-                parameter_schema=DesktopTool.parameter_schema,
-                tool_class=DesktopTool,
+                usage_guide="",
+                parameter_schema={
+                    "type": "object",
+                    "properties": {
+                        "session_id": {
+                            "type": "string",
+                            "description": "Session ID returned by live_shell_open.",
+                        },
+                    },
+                    "required": ["session_id"],
+                    "additionalProperties": False,
+                },
+                tool_class=SessionCloseTool,
                 on_demand=True,
             )
+
+        # ── Atomic tool factory (Phase 2.1) ─────────────────────────────────
+        # Register 28 atomic browser_* / desktop_* tools compactly. Each gets
+        # its own name + terse description + narrow required-list; they SHARE
+        # the composite's original ``properties`` dict so runtime param
+        # validation (which is strict on unknown keys) still passes for
+        # every param the underlying handler accepts. The family's full
+        # usage_guide is attached to the family's entry-point tool only
+        # (browser_launch, desktop_snapshot).
+        def _register_atomic(
+            name: str,
+            *,
+            tool_class: type,
+            description: str,
+            shared_properties: Dict[str, Any],
+            usage_guide: str = "",
+            required: Optional[List[str]] = None,
+            optional_params: Optional[List[str]] = None,
+            windows_only: bool = False,
+        ) -> None:
+            if windows_only and not _IS_WINDOWS:
+                return
+            # Confirmed bug (2026-07-14 live trace, recurrence found
+            # 2026-07-16): shared_properties comes from the pre-split
+            # composite tool's own parameter_schema, which lists every
+            # property ANY atomic tool in the family reads. Originally only
+            # 'action' was stripped — but every other property (e.g.
+            # browser_extract's 'mode', browser_navigate's 'url') stayed
+            # exposed on every OTHER atomic tool's schema too. A model
+            # calling browser_launch(url=..., mode="fetch_json") passed
+            # validation (both names are valid registry-wide), then
+            # _action_launch_browser's **kwargs silently ignored them and
+            # returned its normal reused/launched success shape — a
+            # fake-success wrapped around a no-op, indistinguishable from a
+            # working call except that the requested content never came
+            # back. Live-observed 2026-07-16: claude-4-5-haiku burned 12
+            # iterations re-trying browser_launch with different guessed
+            # parameter combinations before giving up and reading the skill.
+            # Fix: each atomic tool's schema is now scoped to exactly the
+            # params ITS OWN handler reads (required ∪ optional_params) —
+            # not the full family superset. A model-supplied parameter that
+            # belongs to a sibling tool now fails _validate_tool_parameters's
+            # "unexpected parameter" check instead of being silently dropped.
+            _allowed = set(required or []) | set(optional_params or [])
+            _properties = {k: v for k, v in shared_properties.items() if k in _allowed}
+            cls._tools[name] = ToolMetadata(
+                name=name,
+                description=description,
+                usage_guide=usage_guide,
+                parameter_schema={
+                    "type": "object",
+                    "properties": _properties,
+                    "required": required or [],
+                },
+                tool_class=tool_class,
+                on_demand=True,
+            )
+
+        # Register BROWSER family — Windows-only. Phase 2.1: composite gone;
+        # 16 atomic browser_* tools each register in their own right, sharing
+        # BrowserTool.parameter_schema.properties so the strict param
+        # validator still accepts every field the underlying handlers use.
+        # The recipe/usage guidance (previously a giant composite usage_guide)
+        # will move to a bundled ``browser-automation`` recipe skill so the
+        # agent pulls it on demand via read_skill rather than paying prompt
+        # bytes for it on every turn. TODO(Skill/browser-automation).
+        if _IS_WINDOWS:
+            from .browser_tool import (
+                BrowserLaunchTool, BrowserAttachTool, BrowserNewTabTool,
+                BrowserListTabsTool, BrowserNavigateTool, BrowserExtractTool,
+                BrowserSnapshotTool, BrowserClickTool, BrowserTypeTool,
+                BrowserWaitForTool, BrowserScreenshotTool,
+                BrowserVisionQueryTool, BrowserVideoContextTool,
+                BrowserFetchJsonTool, BrowserRequestUserLoginTool,
+                BrowserCloseTabTool,
+            )
+            _browser_props = BrowserTool.parameter_schema.get("properties", {})
+            for _name, _cls, _desc, _req, _opt in (
+                ("browser_launch", BrowserLaunchTool,
+                    "Start (or reuse) the persistent Chromium session. "
+                    "Idempotent — safe to call repeatedly. Returns the first tab_id.",
+                    [], []),
+                ("browser_attach", BrowserAttachTool,
+                    "Attach to the user's already-running Chrome (advanced; "
+                    "requires config gate). Use ONLY when the task needs "
+                    "existing browser state ('刚才/正在' in the user's request).",
+                    [], ["browser_credentials_file"]),
+                ("browser_new_tab", BrowserNewTabTool,
+                    "Open a new tab. Optionally set background=true so the "
+                    "user's focus is preserved (default in attach mode).",
+                    [], ["url", "background", "timeout_ms"]),
+                ("browser_list_tabs", BrowserListTabsTool,
+                    "Enumerate every open tab (tab_id, url, title).",
+                    [], []),
+                ("browser_navigate", BrowserNavigateTool,
+                    "Load a URL. Result auto-includes a `page_state` summary "
+                    "of open dialogs + visible toasts.",
+                    ["url"], ["tab_id", "timeout_ms", "wait_until"]),
+                ("browser_extract", BrowserExtractTool,
+                    "Read page content. mode ∈ text/html/attr/list "
+                    "(selector required for attr/list).",
+                    [], ["tab_id", "selector", "mode", "timeout_ms", "limit", "attribute"]),
+                ("browser_snapshot", BrowserSnapshotTool,
+                    "Enumerate every interactable element + open dialog on "
+                    "the current page. Each item gets a suggested selector. "
+                    "PREFERRED over speculative extract when you don't know the page.",
+                    [], ["tab_id"]),
+                ("browser_click", BrowserClickTool,
+                    "Click a selector (CSS / text= / role= / xpath=). "
+                    "Result returns `page_state` post-click so you see modal changes. "
+                    "Don't guess a selector on an unfamiliar page — call "
+                    "browser_snapshot first to get one.",
+                    ["selector"], ["tab_id", "nth", "timeout_ms"]),
+                ("browser_type", BrowserTypeTool,
+                    "Type text into an element. Refused on input[type=password] — "
+                    "use browser_request_user_login for login flows.",
+                    ["selector", "text"], ["tab_id", "nth", "press_enter", "timeout_ms"]),
+                ("browser_wait_for", BrowserWaitForTool,
+                    "Block until a selector reaches a state OR the URL matches "
+                    "a regex. Use after navigate/click when the next step "
+                    "depends on the new page settling.",
+                    [], ["tab_id", "selector", "url_pattern", "state", "timeout_ms"]),
+                ("browser_screenshot", BrowserScreenshotTool,
+                    "Capture the viewport (or a selector subtree) as PNG. "
+                    "Auto-cleaned unless `path` is a session-dir absolute path.",
+                    [], ["tab_id", "path", "selector", "full_page", "timeout_ms"]),
+                ("browser_vision_query", BrowserVisionQueryTool,
+                    "Send a viewport/selector screenshot to a small vision "
+                    "LLM. USE ONLY for image-level questions (chart trend, "
+                    "canvas content, captcha detection). For 'what's on the "
+                    "page' use snapshot; for text content use extract.",
+                    ["question"], ["tab_id", "selector", "full_page", "timeout_ms",
+                                   "output_schema", "max_image_dim", "max_tokens"]),
+                ("browser_video_context", BrowserVideoContextTool,
+                    "Read the active <video>'s title/description/captions "
+                    "via textTracks. THE right tool for 'what is this video "
+                    "about' — no per-frame vision needed.",
+                    [], ["tab_id", "selector", "max_cues", "seek_to_s", "pause"]),
+                ("browser_fetch_json", BrowserFetchJsonTool,
+                    "Fetch a JSON endpoint using the browser's cookies "
+                    "(authenticated API calls without leaving Chromium).",
+                    ["url"], ["method", "headers", "body", "same_origin", "timeout_ms"]),
+                ("browser_request_user_login", BrowserRequestUserLoginTool,
+                    "Hand off to the user for interactive login. The window "
+                    "moves on-screen, user enters credentials in Chrome's "
+                    "native UI, cookies persist across sessions.",
+                    ["reason"], ["tab_id", "success_url_pattern"]),
+                ("browser_close_tab", BrowserCloseTabTool,
+                    "Close one tab by tab_id.",
+                    ["tab_id"], []),
+            ):
+                _register_atomic(
+                    _name, tool_class=_cls, description=_desc,
+                    shared_properties=_browser_props, required=_req,
+                    optional_params=_opt,
+                )
+
+        # Register DESKTOP family — Windows-only. Phase 2.1: composite gone;
+        # 12 atomic desktop_* tools each register in their own right, sharing
+        # DesktopTool.parameter_schema.properties so the strict param
+        # validator still accepts every field the underlying handlers use.
+        # The recipe/usage guidance (previously a giant composite usage_guide)
+        # will move to a bundled ``desktop-automation`` recipe skill the
+        # agent pulls on demand. TODO(Skill/desktop-automation).
+        if _IS_WINDOWS:
+            from .desktop_tool import (
+                DesktopScreenshotTool, DesktopListWindowsTool,
+                DesktopSnapshotTool, DesktopHoverAtTool,
+                DesktopFindElementTool, DesktopFindAndClickTool,
+                DesktopClickAtTool, DesktopTypeTextTool, DesktopDragTool,
+                DesktopScrollTool, DesktopHotkeyTool, DesktopKeyPressTool,
+            )
+            _desktop_props = DesktopTool.parameter_schema.get("properties", {})
+            # Safety facts a caller of these specific actions needs even
+            # without reading Skill/desktop-workflow: they can be refused for
+            # reasons outside the caller's control (hard window-content gate,
+            # user-initiated revocation) — surfacing why avoids the agent
+            # mistaking a safety refusal for a bug and retrying blindly.
+            _desktop_control_safety_note = (
+                "Hard refusal (cannot bypass): refused outright while a "
+                "banking / password-manager / wallet app is foregrounded. "
+                "The user can revoke control anytime with Ctrl+Shift+C — "
+                "after that this action is refused until the user re-approves "
+                "(desktop_screenshot / desktop_list_windows keep working)."
+            )
+            for _name, _cls, _desc, _req, _opt in (
+                ("desktop_snapshot", DesktopSnapshotTool,
+                    "Enumerate every interactable control on the foreground "
+                    "window via Windows accessibility tree (UIA). Each element "
+                    "gets role/text/x/y/selector — PREFERRED over "
+                    "screenshot+OCR (~170 ms vs ~2.8 s).",
+                    [], []),
+                ("desktop_list_windows", DesktopListWindowsTool,
+                    "List all top-level windows currently open + which is "
+                    "foregrounded. Cheap discovery step.",
+                    [], []),
+                ("desktop_screenshot", DesktopScreenshotTool,
+                    "Capture the active window or full screen as PNG. Reserve "
+                    "for cases where you need actual pixels — snapshot covers "
+                    "'what's on screen' faster.",
+                    [], ["region", "monitor", "hwnd", "with_ocr", "path"]),
+                ("desktop_find_element", DesktopFindElementTool,
+                    "Locate a UI element by text or visual descriptor via OCR. "
+                    "Slower than snapshot (~2.8 s) — try snapshot first.",
+                    [], ["description", "region", "vision_fallback", "fuzzy_threshold"]),
+                ("desktop_find_and_click", DesktopFindAndClickTool,
+                    "Find an element by text/descriptor and click it in one "
+                    "shot. When snapshot already gave you coordinates, use "
+                    "desktop_click_at instead.",
+                    [], ["description", "region", "vision_fallback", "fuzzy_threshold",
+                         "button", "double", "use_uia_pattern"]),
+                ("desktop_hover_at", DesktopHoverAtTool,
+                    "Move cursor to (x, y) and OCR the tooltip that appears "
+                    "~800 ms later. Use for iconless toolbar buttons snapshot "
+                    "couldn't name.",
+                    ["x", "y"], ["hover_seconds", "capture_after_hover"]),
+                ("desktop_click_at", DesktopClickAtTool,
+                    "Click at (x, y). Cheapest input action when you already "
+                    "have coordinates from snapshot or find_element.",
+                    ["x", "y"], ["button", "double", "use_uia_pattern"]),
+                ("desktop_type_text", DesktopTypeTextTool,
+                    "Type text into the foreground window's focused field. "
+                    "Refused on sensitive windows (password managers, banking).",
+                    ["text"], ["use_uia_pattern"]),
+                ("desktop_drag", DesktopDragTool,
+                    "Mouse drag from one point to another.",
+                    ["from_x", "from_y", "to_x", "to_y"], ["duration"]),
+                ("desktop_scroll", DesktopScrollTool,
+                    "Scroll the foreground window by a given amount at a "
+                    "given point.",
+                    ["x", "y", "dy"], []),
+                ("desktop_hotkey", DesktopHotkeyTool,
+                    "Send a keyboard hotkey combo (e.g. Ctrl+S, Alt+F4).",
+                    ["keys"], []),
+                ("desktop_key_press", DesktopKeyPressTool,
+                    "Press a single key by name (e.g. 'enter', 'esc', 'tab').",
+                    ["key"], []),
+            ):
+                _register_atomic(
+                    _name, tool_class=_cls, description=_desc,
+                    shared_properties=_desktop_props, required=_req,
+                    optional_params=_opt,
+                    usage_guide=(
+                        _desktop_control_safety_note
+                        if _name in (
+                            "desktop_click_at", "desktop_type_text",
+                            "desktop_find_and_click", "desktop_hotkey",
+                            "desktop_key_press", "desktop_drag", "desktop_scroll",
+                        ) else ""
+                    ),
+                )
+
 
         # Register WEB_SEARCH tool. Windows-only — depends on browser_tool
         # whose Playwright session is Windows-tested. on_demand=True so it
-        # only enters the LLM tool list when WebSearchContextProvider
-        # activates it (mirrors the browser/desktop pattern).
+        # only enters the LLM tool list once the agent claims it.
         if _IS_WINDOWS:
             cls._tools[cls.WEB_SEARCH] = ToolMetadata(
                 name=cls.WEB_SEARCH,
@@ -1787,47 +1714,12 @@ WHEN NOT TO USE
   Read a specific Confluence page / Jira ticket   → browser navigate + extract
   Email / calendar lookup                         → email tool
 
-WORKFLOW
-  1. Ensure browser is launched. browser.launch_browser is idempotent — if
-     in doubt, call it before every web_search.
-  2. action='search', source='confluence' (Phase 2 only fully wires this),
-     query='free-text or CQL/JQL', limit=10. Default limit 10, hard cap 25
-     (clamped from web_search.max_limit in handq_config.yaml).
-  3. Hits arrive snippet-truncated to ~300 chars. The agent CHOOSES which
-     hit to dig into and calls browser.navigate to read the full document.
-     Auto-fetching full bodies here is forbidden — search is for ranking,
-     navigation is for reading.
-  4. LOGIN RECOVERY: if the result error reads
-     '<source> requires login (status=401|403|3xx)':
-       a. browser.navigate url='<source's base_url>'
-       b. browser.request_user_login reason='auth <source>',
-          success_url_pattern='<base_url>'
-       c. After user clicks Approve, retry the same search call.
-     Cookies persist across HandQ sessions, so this dance is at most once
-     per source until cookies expire on the server side.
+Results are ranking hits, not full documents (snippet-truncated to ~300
+chars) — the agent picks which hit to open via browser.navigate. Default
+limit 10, hard cap 25 (clamped from web_search.max_limit in handq_config.yaml).
 
-SOURCES (all four wired)
-  - confluence  : qualcomm-confluence.atlassian.net (Atlassian Cloud REST)
-                  Query supports CQL ('text ~ "..."', 'space=ENG AND ...')
-                  or plain text (auto-wrapped in CQL text~).
-  - jira        : jira-dc.qualcomm.com (Jira Data Center REST)
-                  Query supports JQL ('project = ANDR AND text ~ "..."')
-                  or plain text (auto-wrapped in JQL text~).
-  - sharepoint  : qualcomm.sharepoint.com (SharePoint Online Search REST)
-                  Plain free-text query — KQL keywords (filetype:pdf,
-                  author:"...") work too.
-  - orbit       : intranet portal (DOM-extract fallback — no JSON API).
-                  Tune web_search.sources.orbit.result_selector in
-                  handq_config.yaml when the portal markup shifts.
-
-EXAMPLES
-  GOOD: action='search', source='confluence', query='power management release notes'
-  GOOD: action='search', source='confluence', query='space=ANDROID AND text ~ "boot trace"', limit=20
-  BAD:  action='search', source='confluence', query='everything about X', limit=200
-        (hard cap 25)
-  BAD:  Use web_search to read a known URL → use browser.navigate
-  BAD:  Loop web_search to scrape 100 results → fetch via search once, then
-        navigate the top hits agent picks""",
+Read the 'web-search-workflow' skill for the source list (confluence/jira/
+sharepoint/orbit query syntax) and the login-recovery sequence.""",
                 parameter_schema=WebSearchTool.parameter_schema,
                 tool_class=WebSearchTool,
                 on_demand=True,
@@ -1835,15 +1727,16 @@ EXAMPLES
 
         # Register EMAIL tool. Windows-only — depends on pywin32 (win32com /
         # pythoncom) and a local Outlook MAPI profile. on_demand=True so it
-        # only enters the LLM tool list when EmailContextProvider activates it.
+        # only enters the LLM tool list once the agent claims it.
         if _IS_WINDOWS:
             cls._tools[cls.EMAIL] = ToolMetadata(
                 name=cls.EMAIL,
                 description=(
                     "Read Outlook email via local COM automation. "
                     "Reuses the user's MAPI profile — no extra credentials. "
-                    "Actions: list_folders, list_messages, read_message, "
-                    "search, mark_read, mark_unread, download_attachment."
+                    "Actions: status, list_folders, list_messages, read_message, "
+                    "search, mark_read, mark_unread, download_attachment, "
+                    "download_all_attachments."
                 ),
                 usage_guide="""\
 WHEN TO USE
@@ -1855,42 +1748,25 @@ WHEN NOT TO USE
   IMAP/POP3 / Exchange EWS            → not supported here
   Calendar / contacts / tasks         → not in scope
 
-WORKFLOW
-  1. action='list_folders'                               (see counts)
-  2. action='list_messages' folder='Inbox' [unread_only=true] [limit=20]
-       → entry_id + subject + sender + 500-char preview
-  3. action='read_message' entry_id='...' [include_full_body=true]
-       → full body only when needed (LLM context budget)
-  4. action='search' query='...' [folder='Inbox']
-  5. action='download_attachment' entry_id='...' attachment_name='file.pdf'
-       → sandboxed to %USERPROFILE%\\HandQ\\email_attachments\\
-
 KEY INVARIANTS
   - body_preview always 500 chars; include_full_body=true for full text
   - Outlook stays open — the tool never calls app.Quit()
   - No write actions (compose_draft / send) in this phase
   - output_dir outside sandbox → refused (path-traversal guard)
 
-EXAMPLES
-  GOOD: action='list_folders'
-  GOOD: action='list_messages', folder='Inbox', unread_only=true, limit=20
-  GOOD: action='read_message', entry_id='000000007FAB...', include_full_body=true
-  GOOD: action='search', query='qprof ddr', folder='Inbox', limit=10
-  GOOD: action='download_attachment', entry_id='...', attachment_name='spec.pdf'
-  BAD:  action='send' — not in this phase
-  BAD:  output_dir='C:\\Windows\\System32' — refused by sandbox guard
-  BAD:  include_full_body=true on 50 messages — context overflow""",
+Read the 'email-workflow' skill for the recommended action sequence,
+match_mode tradeoffs, and performance tips.""",
                 parameter_schema=EmailTool.parameter_schema,
                 tool_class=EmailTool,
                 on_demand=True,
             )
 
         # Register TEAMS tool. Windows-only — registered alongside email so
-        # the Linux planner never sees it (consistent with the desktop /
-        # browser / email pattern). on_demand=True; activated via
-        # TeamsContextProvider when the planner declares "teams". Depends on
-        # httpx + playwright (both already required); missing deps surface a
-        # clear "install X" message via TeamsContextProvider.prepare().
+        # the Linux agent never sees it (consistent with the desktop /
+        # browser / email pattern). on_demand=True; enters the LLM tool list
+        # once the agent claims it. Depends on httpx + playwright (both
+        # already required); missing deps surface a clear "install X" message
+        # from the tool's own first-call bootstrap.
         if _IS_WINDOWS:
             cls._tools[cls.TEAMS] = ToolMetadata(
                 name=cls.TEAMS,
@@ -1929,13 +1805,6 @@ WHEN NOT TO USE / WHEN TO FALL BACK
   Read local Outlook mail            → email tool (COM)
   Drive Teams desktop app via mouse  → desktop tool steals input; use browser
 
-WORKFLOW
-  Always discover identifiers BEFORE send / create operations:
-    list_chats   → chat_id        → send_chat
-    list_teams   → team_id        → list_channels → channel_id → send_channel
-    find_person  → emails[] / id  → create_meeting attendees / send_chat
-    list_calendar_events → event_id → respond_event / get_event
-
 KEY INVARIANTS
   - top capped at 50 per call; paginate for older history
   - message_html: HTML or plain text, 32 KB cap per message
@@ -1945,17 +1814,8 @@ KEY INVARIANTS
     browser_tool action first if 'profile_locked' is reported
   - Do NOT shell-search the token cache file; the tool owns it
 
-EXAMPLES
-  GOOD: action='list_calendar_events', top=10
-  GOOD: action='create_meeting', subject='Spec review',
-        start='2026-06-05T15:00:00', end='2026-06-05T15:30:00',
-        time_zone='China Standard Time',
-        attendees=[{"email":"alice@x.com","name":"Alice"}]
-  GOOD: action='respond_event', event_id='AAMkAG...', response='accept'
-  GOOD: action='find_person', query='zhang san'
-  GOOD: action='list_chats', top=20  →  pick chat_id  →  read_chat
-  BAD:  send_chat without first running list_chats — chat_id is opaque
-  BAD:  Driving teams.microsoft.com via browser when teams tool covers it""",
+Read the 'teams-workflow' skill for the full capability matrix, browser
+fallback routes, and the id-discovery-before-send pattern.""",
                 parameter_schema=TeamsTool.parameter_schema,
                 tool_class=TeamsTool,
                 on_demand=True,
@@ -1964,9 +1824,8 @@ EXAMPLES
         # Register ASK_HUMAN tool. Windows-only — relies on the GUI bridge to
         # render the modal and capture the reply. Linux/CLI runtimes use the
         # IM's stderr+stdin fallback, but the official surface is the Electron
-        # UI. on_demand=True so it only enters the LLM tool list when
-        # AskHumanContextProvider activates it (mirrors browser/desktop
-        # pattern). Toggleable via the tool_ask_human interaction switch.
+        # UI. on_demand=True so it only enters the LLM tool list once the
+        # agent claims it. Toggleable via the tool_ask_human interaction switch.
         if _IS_WINDOWS:
             cls._tools[cls.ASK_HUMAN] = ToolMetadata(
                 name=cls.ASK_HUMAN,
@@ -1982,8 +1841,8 @@ RESTRAINT CONTRACT (read before EVERY call)
 
 WHEN TO USE
   - The task literally cannot proceed without information you (a) do not
-    have, AND (b) cannot derive by reading the project, asking the planner
-    via your reasoning, or making a sensible default choice that is easy
+    have, AND (b) cannot derive by reading the project, reasoning about it
+    yourself, or making a sensible default choice that is easy
     to revert.
   - Examples that legitimately need ask_human:
       • The user said "deploy it" but never specified the target
@@ -2083,6 +1942,398 @@ Choosing the interval:
             tool_class=WaitIntervalTool,
         )
 
+        cls._tools[cls.SPAWN_AGENT] = ToolMetadata(
+            name=cls.SPAWN_AGENT,
+            description=(
+                "Fork a read-only exploration sub-agent that investigates an "
+                "open-ended question by reading/searching and returns ONLY a text "
+                "summary. Runs in an isolated context — use it to keep bulky "
+                "exploration (dozens of file reads, wide greps) out of your own "
+                "context window."
+            ),
+            usage_guide="""\
+When to Use:
+  - Open-ended investigation whose intermediate reads you will NOT need again:
+    "map how auth works across the codebase", "find every config site for X".
+  - Any exploration that would otherwise flood your context with file dumps.
+
+When NOT to Use:
+  - You already know the file/target → just read/grep it directly.
+  - The work changes state (write/edit/ssh/browser) — the sub-agent is
+    read-only by design; do that work yourself.
+  - A single quick lookup — spawning has overhead; only worth it for wide/deep
+    exploration.
+
+The sub-agent has read / grep / glob / shell (read-only probes). It returns a
+concise findings summary with exact paths/values it observed. That summary is
+the only thing that enters your context.""",
+            parameter_schema={
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": (
+                            "The exploration question for the sub-agent to answer "
+                            "by reading/searching. Be specific about what to find "
+                            "and what to report (e.g. file:line references)."
+                        ),
+                    },
+                    "agent_type": {
+                        "type": "string",
+                        "enum": ["explore", "general"],
+                        "description": "'explore' (default) — read-only investigation.",
+                    },
+                },
+                "required": ["prompt"],
+            },
+            tool_class=SpawnAgentTool,
+        )
+
+        cls._tools[cls.FAN_OUT_AGENTS] = ToolMetadata(
+            name=cls.FAN_OUT_AGENTS,
+            description=(
+                "Run several independent sub-agent tasks concurrently, each in "
+                "its own isolated context. Returns one text summary per task — "
+                "use it to process independent items in parallel, or to get "
+                "genuinely independent second opinions on the same question."
+            ),
+            usage_guide="""\
+When to Use:
+  - Independent items that don't depend on each other's results (check N
+    hosts, review N files) and whose intermediate reads you won't need again.
+  - You want more than one independent judgment on the same question —
+    phrase it as several distinctly-angled prompts and compare the summaries
+    yourself; this tool only provides the isolation, not the comparison.
+
+When NOT to Use:
+  - The tasks depend on each other's output — run them yourself in sequence.
+  - A single task — use spawn_agent instead (this tool's overhead is for N>1).
+
+Each task runs with `tool_profile`'s tools only (read-only by default) and
+returns a text summary — the parent's context only sees the summaries, not
+the intermediate tool calls. A failed task does not fail the batch; check
+each result's `ok` field.""",
+            parameter_schema={
+                "type": "object",
+                "properties": {
+                    "tasks": {
+                        "type": "array",
+                        "description": (
+                            "1-30 independent tasks, each {\"prompt\": \"...\"}. "
+                            "Each prompt is self-contained (the sub-agent has no "
+                            "memory of this conversation)."
+                        ),
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "prompt": {"type": "string", "description": "The task/question for this sub-agent."},
+                            },
+                            "required": ["prompt"],
+                        },
+                    },
+                    "tool_profile": {
+                        "type": "string",
+                        "enum": ["explore", "worker"],
+                        "description": (
+                            "'explore' (default) — read-only tools. 'worker' — "
+                            "adds write/edit; a write/edit outside the working "
+                            "directory is refused."
+                        ),
+                    },
+                    "max_concurrency": {
+                        "type": "integer",
+                        "description": "Max tasks running at once. Default 6, clamped to [1, 10].",
+                    },
+                },
+                "required": ["tasks"],
+            },
+            tool_class=FanOutAgentsTool,
+        )
+
+        cls._tools[cls.TODO_WRITE] = ToolMetadata(
+            name=cls.TODO_WRITE,
+            description=(
+                "Track your own multi-step plan for the current task. Write the "
+                "full todo list (re-emit each call to update it); it's shown to "
+                "the user as a live progress panel and survives context "
+                "compaction. Use for any task with 3+ distinct steps; skip for "
+                "trivial one-step work."
+            ),
+            usage_guide="""\
+When to Use:
+  - A task with several distinct steps — capture them up front, then flip each
+    to in_progress → completed as you go. Keeps you (and the user) oriented
+    across a long task and survives compaction.
+
+When NOT to Use:
+  - Trivial single-step tasks (just do them).
+
+How:
+  - Pass the FULL list each call; it replaces the stored list (edit by
+    re-emitting). Each item is {content, status} with status ∈
+    pending|in_progress|completed. Keep exactly ONE item in_progress at a time.
+  - This is YOUR plan, not a contract — revise it freely as you learn.""",
+            parameter_schema={
+                "type": "object",
+                "properties": {
+                    "todos": {
+                        "type": "array",
+                        "description": (
+                            "Your full plan, re-emitted each call. One item "
+                            "in_progress at a time; flip to completed as you finish."
+                        ),
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "content": {"type": "string", "description": "One concrete step."},
+                                "status": {
+                                    "type": "string",
+                                    "enum": ["pending", "in_progress", "completed"],
+                                    "description": "pending | in_progress | completed",
+                                },
+                            },
+                            "required": ["content", "status"],
+                        },
+                    },
+                },
+                "required": ["todos"],
+            },
+            tool_class=TodoWriteTool,
+        )
+
+        # ── Self-extension: claim_tool / release_tool (real tool_use) ────────
+        # Always visible (on_demand=False, like TODO_WRITE) — a model calls
+        # these directly instead of embedding JSON in free-text reasoning.
+        # execute() only records intent on ctx.pending_claim_tool /
+        # pending_release_tool; PersistentAgent drains them after the tool
+        # result comes back and applies them via the existing
+        # _apply_self_extension. See self_extension_tool.py for the full
+        # rationale (fixes a confirmed structural bug, 2026-07-14).
+        cls._tools[cls.CLAIM_TOOL] = ToolMetadata(
+            name=cls.CLAIM_TOOL,
+            description=(
+                "Activate one or more on-demand tools (from the [Available "
+                "Tools] menu) so they appear in your tool list starting next "
+                "turn. Call this directly — do not just mention the tool name "
+                "in your reasoning, that has no effect."
+            ),
+            usage_guide="""\
+When to Use:
+  - You need a tool that isn't currently in your list (see [Available Tools]
+    menu in the system prompt) — e.g. schedule_create, browser_navigate,
+    ssh. Call claim_tool with the EXACT name(s) first; the tool becomes
+    callable starting the NEXT turn (not the same turn you claim it in).
+
+How:
+  - names: exact tool name(s), e.g. ["schedule_create", "schedule_list"].
+    No wildcards or family shorthand (\"schedule_*\" is not a valid name) —
+    claim each tool you need individually.
+  - Claiming an already-visible tool is a harmless no-op.
+  - An unknown name is reported back in the tool_result's error, not
+    silently dropped — check the result before assuming you're claimed.""",
+            parameter_schema={
+                "type": "object",
+                "properties": ClaimToolTool.get_schema(),
+                "required": ["names"],
+            },
+            tool_class=ClaimToolTool,
+        )
+
+        cls._tools[cls.RELEASE_TOOL] = ToolMetadata(
+            name=cls.RELEASE_TOOL,
+            description=(
+                "Hide one or more tools you no longer need from your tool "
+                "list, starting next turn. The tool's loaded instance stays "
+                "warm — re-claiming later is free."
+            ),
+            usage_guide="""\
+When to Use:
+  - You claimed a tool for a specific sub-task and are done with it — release
+    it to shrink your visible tool list (fewer choices to reason over).
+    Optional; never required for correctness.
+
+How:
+  - names: exact tool name(s) to hide.""",
+            parameter_schema={
+                "type": "object",
+                "properties": ReleaseToolTool.get_schema(),
+                "required": ["names"],
+            },
+            tool_class=ReleaseToolTool,
+        )
+
+        # ── Agent-facing scheduling tools (Claude Code parity) ───────────────
+        # Cross-platform, on_demand: only enter the LLM tool schema once the
+        # agent claims them. The three cron tools wrap the process-global
+        # Scheduler (ctx.scheduler); schedule_wakeup is a session-scoped
+        # self-paced loop primitive that re-queues onto the current TaskChannel.
+        cls._tools[cls.SCHEDULE_CREATE] = ToolMetadata(
+            name=cls.SCHEDULE_CREATE,
+            description=(
+                "Schedule a prompt to fire automatically on a cadence (like a "
+                "cron job). Each fire runs in a fresh scheduled session. Use for "
+                "recurring or future one-shot tasks ('every morning summarise "
+                "PRs', 'in 2 hours check the build')."
+            ),
+            usage_guide="""\
+When to Use:
+  - The user wants something run repeatedly on a clock ("every weekday at 9am")
+    or once at a future time ("remind me in 2 hours", "tomorrow morning run X").
+
+Schedule forms (the 'schedule' arg):
+  - Friendly: 'every 5 minutes', 'every 2 hours', 'daily 09:00', 'weekly mon
+    09:00', 'once at 2026-06-02 14:30', 'once in 10 minutes'.
+  - Standard 5-field cron: '*/5 * * * *' (every 5 min), '0 9 * * 1-5' (weekdays
+    9am), '0 0 1 * *' (1st of month). Fields: minute hour day-of-month month
+    day-of-week; each supports *, */n, a-b, a,b,c.
+  - Omit 'schedule' to infer the cadence from the prompt's own wording.
+
+durable:
+  - Leave False (default) for session-only tasks that vanish on app restart.
+  - Set True ONLY when the user explicitly wants it to persist across restarts.
+
+Prompt phrasing:
+  - Write 'prompt' as an instruction to execute NOW — no relative-time words
+    ('tomorrow', 'in 5 minutes'); the schedule already carries the timing.
+
+Not for live watching: this is polling on a clock. To react to a process/file
+changing in real time, stay in-session and use wait_interval loops instead.""",
+            parameter_schema={
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": (
+                            "The prompt to fire on the cadence, phrased as an "
+                            "instruction to do NOW (no relative-time words)."
+                        ),
+                    },
+                    "schedule": {
+                        "type": "string",
+                        "description": (
+                            "Cadence: friendly ('every 5 minutes', 'daily 09:00', "
+                            "'once in 10 minutes') or cron ('*/5 * * * *', "
+                            "'0 9 * * 1-5'). Omit to infer from the prompt."
+                        ),
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Optional label shown in the UI.",
+                    },
+                    "durable": {
+                        "type": "boolean",
+                        "description": (
+                            "False (default)=session-only; True=persist across "
+                            "restarts. Only True when the user explicitly asks."
+                        ),
+                    },
+                },
+                "required": ["prompt"],
+            },
+            tool_class=ScheduleCreateTool,
+            on_demand=True,
+        )
+
+        cls._tools[cls.SCHEDULE_LIST] = ToolMetadata(
+            name=cls.SCHEDULE_LIST,
+            description=(
+                "List all scheduled tasks (both persistent and session-only), "
+                "with their id, cadence, enabled flag, and last run status."
+            ),
+            usage_guide="""\
+When to Use:
+  - Before deleting a task (you need its id).
+  - To answer "what do I have scheduled?" or confirm a task was created.
+
+Output: {count, tasks:[{id, name, schedule, enabled, durable, next_run_at,
+last_status, run_count}]}.""",
+            parameter_schema={"type": "object", "properties": {}, "required": []},
+            tool_class=ScheduleListTool,
+            on_demand=True,
+        )
+
+        cls._tools[cls.SCHEDULE_DELETE] = ToolMetadata(
+            name=cls.SCHEDULE_DELETE,
+            description=(
+                "Delete a scheduled task by its id (get ids from schedule_list)."
+            ),
+            usage_guide="""\
+When to Use:
+  - The user wants to cancel/remove a scheduled task.
+
+How:
+  - Call schedule_list first to get the id, then schedule_delete(task_id=...).""",
+            parameter_schema={
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "string",
+                        "description": "Id of the task to delete (from schedule_list).",
+                    },
+                },
+                "required": ["task_id"],
+            },
+            tool_class=ScheduleDeleteTool,
+            on_demand=True,
+        )
+
+        cls._tools[cls.SCHEDULE_WAKEUP] = ToolMetadata(
+            name=cls.SCHEDULE_WAKEUP,
+            description=(
+                "Schedule yourself to wake up and continue after a delay, in "
+                "THIS same session (keeping your context). Use for a self-paced "
+                "loop: finish this turn, then resume the given prompt in N "
+                "seconds. Unlike schedule_create, this does not spawn a fresh "
+                "session — it re-queues work onto the current one."
+            ),
+            usage_guide="""\
+When to Use:
+  - A self-paced monitoring/iteration loop where YOU decide the next delay each
+    round, and you want to release the session in between (freeing it and saving
+    tokens) rather than blocking in-task.
+
+schedule_wakeup vs wait_interval:
+  - wait_interval BLOCKS the current item (session stays busy) — right for short
+    waits (seconds to a couple minutes) where you resume the same tool loop.
+  - schedule_wakeup RELEASES the turn and re-queues 'prompt' later — right for
+    longer delays (minutes to an hour) where holding the session open is waste.
+
+Choosing delay_seconds (clamped to [60, 3600]):
+  - Under ~270s keeps the prompt cache warm; 300s is the worst of both worlds
+    (cache miss without amortising it) — avoid it. For genuinely idle waits,
+    prefer 1200-1800s. Match the delay to how fast the thing you're watching
+    actually changes.
+
+Ending the loop: simply DON'T call schedule_wakeup on a turn — the loop ends.""",
+            parameter_schema={
+                "type": "object",
+                "properties": {
+                    "delay_seconds": {
+                        "type": "integer",
+                        "description": (
+                            "Seconds until you wake up (clamped to 60..3600)."
+                        ),
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": (
+                            "The instruction to resume with when you wake up."
+                        ),
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": (
+                            "One short sentence on what you're waiting for and "
+                            "why this delay (shown to the user)."
+                        ),
+                    },
+                },
+                "required": ["delay_seconds", "prompt"],
+            },
+            tool_class=ScheduleWakeupTool,
+            on_demand=True,
+        )
+
         cls._initialized = True
 
     @classmethod
@@ -2117,20 +2368,6 @@ Choosing the interval:
         return cls._tools.copy()
 
     @classmethod
-    def create_tool_instance(cls, name: str) -> BaseTool:
-        """
-        Create an instance of a tool
-
-        Args:
-            name: Tool name
-
-        Returns:
-            Instance of the tool
-        """
-        metadata = cls.get_tool_metadata(name)
-        return metadata.create_instance()
-
-    @classmethod
     def create_all_tool_instances(
         cls,
         ctx: Optional["SessionContext"] = None,
@@ -2154,7 +2391,8 @@ Choosing the interval:
                        equivalent to sourcing activate before each command.
             extra_tool_names: Optional list of on-demand tool names to include.
                               On-demand tools are excluded by default and only
-                              activated when a StepContextProvider requests them.
+                              included when the agent claims them via
+                              claim_tool.
 
         Returns:
             Dictionary mapping tool names to tool instances
@@ -2169,8 +2407,6 @@ Choosing the interval:
                 instances[name] = ShellTool(ctx=ctx, venv_path=venv_path)
             elif name == cls.SSH:
                 instances[name] = StatelessSSHTool(ctx=ctx) if ctx is not None else StatelessSSHTool()
-            elif name == cls.SESSION:
-                instances[name] = metadata.create_instance(ctx)
             else:
                 instances[name] = metadata.create_instance(ctx)
         return instances
@@ -2238,50 +2474,6 @@ Choosing the interval:
                 },
             })
         return tools
-
-    @classmethod
-    def generate_system_prompt_tools_section(cls) -> str:
-        """
-        Generate the tools section for the system prompt.
-
-        Each tool entry includes:
-          - Name and one-line description
-          - Detailed usage guide (when to use, when not to, strategy, examples)
-          - Parameter list with descriptions
-
-        Returns:
-            Formatted string describing all available tools
-        """
-        cls.initialize()
-
-        lines: List[str] = [
-            "## Available Tools",
-            "",
-            "You have access to the following tools. Select the right tool for each action.",
-            "",
-        ]
-
-        for name, metadata in cls._tools.items():
-            lines.append(f"---")
-            lines.append(f"### `{name}` — {metadata.description}")
-            lines.append("")
-
-            if metadata.usage_guide:
-                lines.append(metadata.usage_guide)
-                lines.append("")
-
-            # Parameter list
-            props = metadata.parameter_schema.get("properties", {})
-            required = metadata.parameter_schema.get("required", [])
-            if props:
-                lines.append("**Parameters**:")
-                for param_name, param_info in props.items():
-                    req_marker = " *(required)*" if param_name in required else " *(optional)*"
-                    param_desc = param_info.get("description", "")
-                    lines.append(f"  - `{param_name}`{req_marker}: {param_desc}")
-                lines.append("")
-
-        return "\n".join(lines).strip()
 
     @classmethod
     def generate_agent_response_schema(cls, extra_tool_names: Optional[List[str]] = None) -> Dict[str, Any]:

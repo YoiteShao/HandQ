@@ -11,7 +11,7 @@ Parsing strategy:
 from __future__ import annotations
 
 import logging
-from typing import Any, List, Optional, Union
+from typing import List, Optional, Union
 
 from ..utils import try_parse_json
 from .models import (
@@ -189,7 +189,7 @@ these per-source rules BEFORE the generic KEEP/REJECT logic:
   the content is concrete).
 
 - ``receptionist_turn``:
-  Receptionist captures EVERY user message during a conversation, so the
+  Every user message during a conversation gets captured here, so the
   vast majority of these candidates are noise (small talk, clarifying
   questions, error pastes, intermediate prompts, "ok thanks", etc.).
   **Default action is SKIP.** Only KEEP when the message contains an
@@ -216,7 +216,7 @@ these per-source rules BEFORE the generic KEEP/REJECT logic:
       * Anything that depends on this specific task's state to make sense
 
   When the LLM is on the fence: REJECT. A missed signal will resurface in
-  later turns; a wrong accept pollutes every future planner prompt.
+  later turns; a wrong accept pollutes every future prompt.
 
 - ``post_commit``:
   apply normal KEEP/REJECT logic. Default is reject; promote only when
@@ -753,20 +753,13 @@ def _all_skip_verdict(reason: str) -> TriageVerdict:
     )
 
 
-async def parse_verdict(
-    json_str: str,
-    *,
-    llm_services: Optional[List[Any]] = None,
-) -> TriageVerdict:
+async def parse_verdict(json_str: str) -> TriageVerdict:
     """Parse the LLM's JSON output into a TriageVerdict.
 
     Strategy:
       1. ``try_parse_json`` — handles fences, truncation, json_repair.
       2. ``_all_skip_verdict`` — final fallback so a malformed response
          degrades to "skip both tracks", never raises.
-
-    Args:
-        llm_services: Deprecated, ignored. Kept for backward compatibility.
     """
     raw = json_str or ""
 
@@ -808,6 +801,7 @@ Answer with a SINGLE JSON object, no prose, no markdown fences:
  "description": "<one line: what the skill does>",
  "when_to_use": "<one line: the trigger/situation>",
  "steps_md": "<markdown: the generalized, parameterized steps>",
+ "allowed_tools": ["<on-demand tool name the recipe needs>", ...],
  "reason": "<short, max 100 chars>"}
 
 Set "worth_skill": true ONLY when ALL hold:
@@ -844,6 +838,15 @@ most generic object noun, never the user's wording.
   "Bump the package version and tag a release"  -> release:package
   "Roll back the last database migration"       -> rollback:migration
 Use the base (dictionary) form of the verb and a singular object.
+
+The "allowed_tools" list carries any ON-DEMAND tool names the recipe needs.
+On-demand tools are the ones NOT in the always-on core (read/write/edit/shell/
+glob/grep/notebook_edit/read_skill/wait_interval/spawn_agent/todo_write). The
+usual candidates are: ssh, remote_handq, session, browser, desktop, web_search,
+email, teams, ask_human. Include ONLY tools the trajectory actually shows being
+used successfully. Skip anything you're unsure about. Return [] for skills that
+only use always-on tools. This lets read_skill activate the same tools the
+original run needed, so a future re-use doesn't have to rediscover them.
 """
 
 
@@ -863,6 +866,22 @@ def parse_skill_extraction(json_str: str) -> dict:
     name = str(parsed.get("name") or "").strip()
     if not name:
         return {"worth_skill": False}
+    # allowed_tools: tolerate list, comma-string, or missing. Filter to non-empty
+    # strings, dedupe, cap to a sane length so a runaway LLM can't stuff it.
+    raw_tools = parsed.get("allowed_tools") or parsed.get("allowed-tools")
+    if isinstance(raw_tools, str):
+        raw_tools = [p.strip() for p in raw_tools.split(",")]
+    elif not isinstance(raw_tools, list):
+        raw_tools = []
+    allowed_tools: list = []
+    _seen: set = set()
+    for t in raw_tools:
+        s = str(t).strip()
+        if s and s not in _seen and len(s) <= 40:
+            _seen.add(s)
+            allowed_tools.append(s)
+        if len(allowed_tools) >= 8:
+            break
     return {
         "worth_skill": True,
         "name": name[:120],
@@ -870,5 +889,6 @@ def parse_skill_extraction(json_str: str) -> dict:
         "description": str(parsed.get("description") or "").strip()[:300],
         "when_to_use": str(parsed.get("when_to_use") or "").strip()[:300],
         "steps_md": str(parsed.get("steps_md") or "").strip()[:4000],
+        "allowed_tools": allowed_tools,
         "reason": str(parsed.get("reason") or "").strip()[:200],
     }

@@ -17,8 +17,8 @@ llm:
   - anthropic::claude-4-5-sonnet
   - anthropic::claude-4-5-haiku:thinking
   - anthropic::claude-4-5-haiku
-  # Agent pool — checked subset of available_models used by the agent,
-  # planner, and receptionist.  Order = fallback priority.
+  # Agent pool — checked subset of available_models used by the coordinator
+  # and the agent.  Order = fallback priority.
   agent_models:
   - anthropic::claude-4-6-sonnet:1M
   - anthropic::claude-4-6-sonnet
@@ -160,8 +160,8 @@ web_search:
       enabled: true
       base_url: https://orbit
       search_url_template: 'https://orbit/search?query={q}&pagesize=10'
-      result_selector: 'a[href*="/CR/"]'
-      timeout_ms: 10000   # page.goto deadline; raise if intranet DNS is slow
+      result_selector: 'a.request-link'
+      timeout_ms: 30000   # page.goto deadline; the real intranet page can take >10s to load
 email:
   body_preview_chars: 500
   attachment_sandbox: '%USERPROFILE%\HandQ\email_attachments'

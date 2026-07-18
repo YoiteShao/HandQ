@@ -4,8 +4,8 @@ local-network outage handling.
 
 Design
 ------
-Each component (Planner, Receptionist, RuntimeAgent, …) receives a
-*pre-sliced* list of LLMService instances.  Within a single call,
+Each component (Orchestrator, PersistentAgent, background workers, …)
+receives a *pre-sliced* list of LLMService instances.  Within a single call,
 services are tried in order (index 0 = highest priority); if one fails
 the next is tried.  When **every** service in the slice fails AND the
 last error looks like a connectivity failure, the pool runs a single TCP
@@ -19,16 +19,16 @@ probe to the LLM endpoint host and chooses one of two outcomes:
       ``wait_on_network_down=True`` (default) — Pause and reprobe on a
       triangular cycle (30s, 300s, 600s, 1800s, 3600s, 1800s, 600s,
       300s, 30s, then repeat). When the host comes back, retry the
-      original call from ``services[0]``. Used by long-running roles
-      (Planner, Agent, background workers).
+      original call from ``services[0]``. Used by long-running callers
+      (Orchestrator, Agent, background workers).
       :class:`asyncio.CancelledError` propagates through the wait, so
       cancelling the asyncio task (e.g. when the user starts a fresh
       session) ends the wait cleanly.
 
       ``wait_on_network_down=False`` — Raise
       :class:`NetworkUnavailableError` immediately so the caller can
-      fail fast.  Used by Receptionist, where the user is staring at the
-      cursor and indefinite waiting would be worse than skipping.
+      fail fast.  Used where the user is staring at the cursor and
+      indefinite waiting would be worse than skipping.
 
 Probe state (cache + lock + last reachability) is module-level so
 concurrent callers across roles share the same view of network health.
@@ -118,8 +118,8 @@ def set_fallback_notifier(
 
 
 # Module-level hook for network-state changes ("down" / "waiting" / "restored").
-# Wired by stdio_bridge._ensure_flow; fires for ALL roles (Receptionist,
-# Planner, Agent) so the renderer can show a single, coherent offline banner.
+# Wired by stdio_bridge._ensure_flow; fires for ALL roles (Orchestrator,
+# Agent) so the renderer can show a single, coherent offline banner.
 # Signature: (state: str, attempt: int, sleep_secs: int) -> None
 _network_event_notifier: Optional[Callable[[str, int, int], None]] = None
 
@@ -137,9 +137,9 @@ def is_network_down() -> bool:
 
     Returns ``False`` before any probe has run, so callers don't get
     false negatives during cold start.  The InteractionManager queries
-    this to decide whether to invoke the receptionist at all when a new
-    user message arrives — short-circuiting saves ~the SDK's per-service
-    timeout (multiple seconds) per failed evaluation.
+    this to decide whether to invoke the coordinator's INTENT call at all
+    when a new user message arrives — short-circuiting saves ~the SDK's
+    per-service timeout (multiple seconds) per failed evaluation.
     """
     return _probe_status is False
 
@@ -171,7 +171,7 @@ async def _probe(target: Tuple[str, int], *, force: bool = False) -> bool:
     """Return True iff *target* accepts a TCP connection.
 
     The result is cached across callers for ``_PROBE_TTL`` seconds — a
-    receptionist call and an agent call hitting the same outage at the
+    coordinator call and an agent call hitting the same outage at the
     same instant share one probe rather than racing.  ``force=True``
     bypasses the cache, used by the wait loop so each retry round gets a
     fresh reading.
@@ -229,7 +229,7 @@ def _emit_network_event(
     UI hooks must never abort the retry loop, so every call is wrapped in
     try/except.  Both the per-call callback *cb* and the module-level
     ``_network_event_notifier`` (wired by the bridge) are fired so that
-    all roles (Receptionist, Planner, Agent) surface network events to the
+    all roles (Orchestrator, Agent) surface network events to the
     renderer without each caller having to pass its own callback.
     """
     for hook in (cb, _network_event_notifier):
@@ -413,7 +413,7 @@ async def call_with_fallback(
                          comes back, then retries from ``services[0]``.
                          When False, raises
                          :class:`NetworkUnavailableError` so the caller
-                         can short-circuit (used by Receptionist).
+                         can short-circuit.
         on_network_event: ``(state, attempt, sleep_secs) -> None`` UI hook
                          where ``state ∈ {"down", "waiting", "restored"}``.
 

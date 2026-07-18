@@ -95,12 +95,12 @@ class LlmReranker(Reranker):
 
     Cost: one LLM call per recall. At HandQ scale (one recall per task,
     bounded by RERANKER_INPUT_LIMIT candidates) this is ~$0.005/recall —
-    cheap enough to enable by default for the planner path.
+    cheap enough to enable by default when a caller wants it on.
 
     The implementation is deliberately decoupled from the DreamWorker's
     helper pool: we accept ``llm_services`` at construction so the
     factory can pass whatever pool the runtime decided to use (typically
-    receptionist-tier, same as triage).
+    the same cheap tier as triage).
     """
 
     available = True

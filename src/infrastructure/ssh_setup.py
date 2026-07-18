@@ -2,10 +2,13 @@
 """
 SSH Setup Manager — Automated SSH credential establishment for HandQ.
 
-When an agent item requires SSH remote work, SSHContextProvider (a V2
-ContextProvider) intercepts the item, establishes credentials, and
-injects a context hint into the agent's per-item host context so the agent
-knows exactly which credentials file to use and how to call the SSH tool.
+Round 5 (Phase 5E): credential setup moved from a per-item ContextProvider
+hook into the ssh/remote_handq tools themselves. When an agent calls either
+tool with ``ssh_target`` instead of an existing ``credentials_file``, the
+tool calls ``ensure_ssh_credentials_lazy`` below directly — no Planner
+declaration, no Coordinator-side hook, no pre-turn hint injection. The agent
+learns the resolved ``credentials_file`` path from the tool's own return
+value and passes it on subsequent calls.
 
 Authentication flow (tried in order):
   1. Key auth  — paramiko auto-discovers ~/.ssh/id_* or uses key_path
@@ -33,7 +36,6 @@ import textwrap
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
-from ..controller_v2.context import ContextProvider, ItemContext, ProviderCache
 from .logger import get_logger
 
 if TYPE_CHECKING:
@@ -55,7 +57,6 @@ class SSHReadyResult:
     auth_method: str      # "key" | "keyring" | "password"
     hostname: str
     username: str
-    context_hint: str     # String to append to effective_goal
 
 
 class SSHSetupError(Exception):
@@ -207,81 +208,6 @@ def _collect_default_key_files() -> list:
     ]
 
 
-def _build_context_hint(creds_file: str, auth_method: str, login_shell: str = "unknown") -> str:
-    """First-time hint: minimal — credentials path, auth method, remote shell.
-
-    The full SSH workflow lives in the ssh tool's usage_guide (single source of
-    truth). We only inject what changes per host: the creds_file path, how we
-    authenticated, and a non-bash advisory when relevant.
-
-    When auth_method is keyring/password we ALSO drop a short paramiko+keyring
-    template so an agent that does NOT have the ssh tool activated (e.g.
-    planner picked single-shot ``ssh host 'cmd'`` via the shell tool) can
-    still reach the remote without rediscovering the credential layout.
-    """
-    auth_label = {
-        "key":      "key",
-        "keyring":  "keyring",
-        "password": "password (cached in keyring)",
-    }.get(auth_method, auth_method)
-
-    shell_note = f"shell={login_shell}" if login_shell != "unknown" else "shell=?"
-    hint = (
-        f"[SSH ready] credentials_file={creds_file} | auth={auth_label} | {shell_note}\n"
-        f"Pass credentials_file in every ssh / remote_handq tool call."
-    )
-
-    if auth_method in ("keyring", "password"):
-        # Pull hostname/username/service from the creds file so the agent
-        # does not have to read it. Best-effort: silent on parse failure.
-        host_user_svc = _read_creds_summary(creds_file)
-        if host_user_svc:
-            hostname, username, service = host_user_svc
-            hint += (
-                "\nNo ssh tool? Fallback (works from shell with `python -c` or "
-                "a written .py script):\n"
-                "  import keyring, paramiko\n"
-                f"  pw = keyring.get_password('{service}', '{username}')\n"
-                "  c = paramiko.SSHClient(); c.set_missing_host_key_policy(paramiko.AutoAddPolicy())\n"
-                f"  c.connect('{hostname}', username='{username}', password=pw, timeout=15)\n"
-                "  _, out, _ = c.exec_command('<your command>'); print(out.read().decode())"
-            )
-
-    if login_shell not in ("bash", "unknown", "powershell"):
-        hint += (
-            f"\nNOTE: remote shell is {login_shell}, not bash. For action='exec' "
-            f"with custom commands wrap as: command='bash -c \"...\"'"
-        )
-
-    return hint
-
-
-def _read_creds_summary(creds_file: str) -> Optional[tuple]:
-    """Return ``(hostname, username, keyring_service)`` from a creds YAML.
-
-    Best-effort: returns ``None`` on any failure. Used by ``_build_context_hint``
-    to populate the paramiko-fallback template without forcing the caller to
-    re-read the file.
-    """
-    try:
-        import yaml as _yaml
-        with open(creds_file, "r", encoding="utf-8") as f:
-            data = _yaml.safe_load(f) or {}
-        hostname = (data.get("hostname") or "").strip()
-        username = (data.get("username") or "").strip()
-        service = (data.get("keyring_service") or "").strip()
-        if hostname and username and service:
-            return hostname, username, service
-    except Exception:
-        pass
-    return None
-
-
-def _build_context_hint_brief(creds_file: str) -> str:
-    """Minimal hint for subsequent steps — just the credentials file path."""
-    return f'[SSH Context] credentials_file="{creds_file}"'
-
-
 # ── SSHSetupManager ───────────────────────────────────────────────────────────
 
 class SSHSetupManager:
@@ -297,7 +223,6 @@ class SSHSetupManager:
             interaction_manager=im,
         )
         # result.creds_file  — path to write to agent goal
-        # result.context_hint — string to inject into effective_goal
     """
 
     def __init__(self) -> None:
@@ -355,7 +280,6 @@ class SSHSetupManager:
                     auth_method="key",
                     hostname=hostname,
                     username=username,
-                    context_hint=_build_context_hint(creds_file, "key", login_shell=login_shell),
                 )
         except SSHSetupError:
             raise
@@ -409,7 +333,6 @@ class SSHSetupManager:
                                 auth_method="keyring",
                                 hostname=hostname,
                                 username=username,
-                                context_hint=_build_context_hint(creds_file, "keyring", login_shell=login_shell),
                             )
                     except SSHSetupError:
                         raise
@@ -525,7 +448,6 @@ class SSHSetupManager:
             auth_method="password",
             hostname=hostname,
             username=username,
-            context_hint=_build_context_hint(creds_file, "password", login_shell=login_shell),
         )
 
     def _read_keyring_service(self, creds_file: str) -> Optional[str]:
@@ -606,10 +528,10 @@ class SSHSetupManager:
         return await asyncio.get_event_loop().run_in_executor(None, _getpass)
 
 
-# ── SSHContextProvider ────────────────────────────────────────────────────────
+# ── Lazy credential setup (called directly by ssh_tool / remote_handq_tool) ──
 
-# Regex to extract hostname/IP from step text — used as fallback by
-# _extract_host_user when step.ssh_target is not explicitly set by the Planner.
+# Regex to extract hostname/IP from free text — used as fallback when the
+# caller passes a bare host or the target has to be parsed out of a string.
 _HOST_RE = re.compile(
     r"(?:(\w[\w.-]*)@)?"                    # optional user@
     r"((?:\d{1,3}\.){3}\d{1,3}"            # IPv4
@@ -617,147 +539,66 @@ _HOST_RE = re.compile(
     r"|localhost)"
 )
 
-# Regex to extract username from "user@host" patterns (used for ssh_target parse).
+# Regex to extract username from "user@host" patterns.
 _USER_AT_RE = re.compile(r"(\w[\w.-]*)@([\w.-]+)")
 
+# Process-lifetime manager instance — credential establishment has no
+# per-session state (it writes a creds file + keyring entry, both durable
+# across sessions), so one shared instance is sufficient.
+_manager = SSHSetupManager()
 
-class SSHContextProvider(ContextProvider):
+# Per-hostname in-memory cache so a second call to the same host within the
+# same process skips re-probing key/keyring auth. Keyed by "user@host" (or
+# "host" when no user was given).
+_lazy_cache: Dict[str, str] = {}
+
+
+def parse_ssh_target(ssh_target: str) -> tuple[str, str]:
+    """Extract (hostname, username) from a ``"user@host"`` or bare-host string.
+
+    Returns ("", "") if *ssh_target* is empty or unparseable.
     """
-    ContextProvider for SSH remote work.
-
-    Activation: Planner declares "ssh" in tools_required (and should
-    also set ``ssh_target`` on the item so before_item knows which host to
-    authenticate against). FlowControllerV2 invokes before_item based purely
-    on the declaration — there is no keyword safety net.
-
-    Responsibility: establish SSH credentials (key/keyring/password) for
-    the target host BEFORE the agent runs, so the ssh tool's connection
-    pool can authenticate without prompting mid-execution. Per-hostname
-    cache in the ProviderCache ensures subsequent items reuse the same
-    credentials.
-    """
-
-    def __init__(self) -> None:
-        self._manager = SSHSetupManager()
-        self.logger = get_logger()
-
-    @property
-    def tool_name(self) -> str:
-        return "ssh"
-
-    async def before_item(
-        self,
-        ctx: ItemContext,
-        im: "InteractionManager",
-        cache: ProviderCache,
-    ) -> Optional[str]:
-        """
-        Establish SSH credentials and return a context hint string.
-
-        Progressive disclosure:
-          - First time a hostname is seen: full hint (workflow guide + creds path)
-          - Subsequent items for the same hostname: brief hint (creds path only)
-
-        Per-hostname caching: credentials are stored keyed by hostname so
-        parallel items targeting different hosts each receive the correct hint.
-        """
-        self.logger.info(
-            f"SSHContextProvider.before_item() triggered for item {ctx.item_id!r}: "
-            f"{ctx.instruction[:80]}",
-            component="SSHContextProvider",
-        )
-
-        # Extract hostname and username from item context first so we can do
-        # a per-hostname cache lookup.
-        hostname, username = self._extract_host_user(ctx)
-        if not hostname:
-            # Cannot determine target host — skip injection silently.
-            # The agent will have to figure it out from the instruction.
-            self.logger.warning(
-                f"SSHContextProvider: could not extract hostname from item "
-                f"{ctx.item_id!r} — skipping SSH context injection. "
-                f"Instruction (first 120): {ctx.instruction[:120]!r}",
-                component="SSHContextProvider",
-            )
-            return None
-
-        # Per-hostname cache check — returns brief hint if already established.
-        cached = cache.get("ssh", hostname)
-        if cached:
-            self.logger.debug(
-                f"Using cached SSH context for {hostname}: creds_file={cached['creds_file']}",
-                component="SSHContextProvider",
-            )
-            return _build_context_hint_brief(cached["creds_file"])
-
-        self.logger.info(
-            f"SSHContextProvider: establishing credentials for "
-            f"{username or '(unknown)'}@{hostname}",
-            component="SSHContextProvider",
-        )
-
-        try:
-            result = await self._manager.ensure_ssh_ready(
-                hostname=hostname,
-                username=username or "",
-                interaction_manager=im,
-            )
-        except SSHSetupError as exc:
-            # Surface the error as a hint so the agent can report it to the user.
-            self.logger.error(
-                f"SSH setup failed for {username or '?'}@{hostname}: {exc}",
-                component="SSHContextProvider",
-            )
-            return (
-                f"[SSH Setup Error]\n"
-                f"Failed to establish SSH credentials: {exc}\n"
-                f"Please verify the hostname, username, and password, then retry."
-            )
-
-        self.logger.info(
-            f"SSH credentials ready via {result.auth_method}: {result.creds_file}",
-            component="SSHContextProvider",
-        )
-
-        # Cache per hostname so parallel items targeting other hosts are unaffected.
-        cache.set("ssh", hostname, {
-            "creds_file": result.creds_file,
-            "hint": result.context_hint,
-        })
-        return result.context_hint
-
-    def _extract_host_user(self, ctx: ItemContext) -> tuple[str, str]:
-        """
-        Extract (hostname, username) from item context.
-
-        Priority:
-          1. ctx.ssh_target — structured field set by Planner ("user@hostname")
-          2. user@host regex in instruction text
-          3. bare IPv4 / FQDN regex
-        Returns ("", "") if nothing found.
-        """
-        # Priority 1: structured field — fastest and most reliable path.
-        ssh_target = ctx.ssh_target or ""
-        if ssh_target.strip():
-            m = _USER_AT_RE.match(ssh_target.strip())
-            if m:
-                return m.group(2), m.group(1)
-            # Bare hostname (no user@) in ssh_target — use current OS user.
-            host = ssh_target.strip()
-            return host, getpass.getuser()
-
-        text = ctx.instruction
-
-        # Try user@host pattern first
-        m = _USER_AT_RE.search(text)
-        if m:
-            return m.group(2), m.group(1)
-
-        # Try bare host (IP or FQDN)
-        m = _HOST_RE.search(text)
-        if m:
-            host = m.group(2) or ""
-            user = m.group(1) or getpass.getuser()  # fall back to current OS user
-            return host, user
-
+    target = (ssh_target or "").strip()
+    if not target:
         return "", ""
+    m = _USER_AT_RE.match(target)
+    if m:
+        return m.group(2), m.group(1)
+    return target, getpass.getuser()
+
+
+async def ensure_ssh_credentials_lazy(
+    ssh_target: str,
+    interaction_manager: Optional["InteractionManager"],
+) -> str:
+    """Establish SSH credentials for *ssh_target* and return the creds file path.
+
+    Called directly by ``ssh_tool`` / ``remote_handq_tool`` when the agent
+    passes ``ssh_target`` instead of an already-resolved ``credentials_file``.
+    No Planner declaration and no Coordinator-side hook are involved — the
+    tool call itself triggers key/keyring/password establishment, prompting
+    the user via *interaction_manager* only if neither key nor keyring auth
+    succeeds.
+
+    Raises ``SSHSetupError`` on failure (network unreachable, auth exhausted).
+    """
+    hostname, username = parse_ssh_target(ssh_target)
+    if not hostname:
+        raise SSHSetupError(
+            f"Could not parse ssh_target={ssh_target!r} — expected "
+            f"'user@host' or a bare hostname/IP."
+        )
+
+    cache_key = f"{username}@{hostname}" if username else hostname
+    cached = _lazy_cache.get(cache_key)
+    if cached:
+        return cached
+
+    result = await _manager.ensure_ssh_ready(
+        hostname=hostname,
+        username=username or "",
+        interaction_manager=interaction_manager,
+    )
+    _lazy_cache[cache_key] = result.creds_file
+    return result.creds_file
+

@@ -61,9 +61,9 @@ RERANKER_NOOP: str = "noop"
 RERANKER_LLM: str = "llm"                    # LLM-as-reranker (uses helper pool)
 RERANKER_CROSS_ENCODER: str = "cross_encoder_onnx"  # future placeholder
 
-# Default: LLM rerank for high-stakes call sites (planner). Receptionist
-# calls opt out via format_context_block(rerank=False) to avoid 1 extra
-# LLM call per user message.
+# Default: LLM rerank enabled at the RERANKER level; individual call sites
+# (e.g. INTENT) opt out via format_context_block(rerank=False) to avoid
+# 1 extra LLM call per user message.
 RERANKER_PROVIDER: str = RERANKER_LLM
 
 # Cap how many candidates we send to the rerank LLM. Beyond ~20 the
@@ -72,35 +72,34 @@ RERANKER_PROVIDER: str = RERANKER_LLM
 RERANKER_INPUT_LIMIT: int = 15
 
 # Per-call timeout. The rerank prompt is short (one query + ~15 short
-# summaries), so the LLM should respond fast — but receptionist tier
+# summaries), so the LLM should respond fast — but the chat hot-path
 # may still take a few seconds.
 RERANKER_TIMEOUT_SECONDS: float = 30.0
+
+# Ceiling on PersistentAgent's per-item recall call as a whole (BM25 + dense
+# scan, rerank off at fast-tier — see RECALL_MIN_SCORE_FAST below). This is
+# NOT the reranker's own timeout (that only fires when rerank=True, which
+# fast-tier never is); it exists because the BM25/dense path itself has no
+# per-call timeout of its own, so a stuck SQLite read (e.g. lock contention
+# with the background DreamWorker) would otherwise block item startup
+# indefinitely. On timeout, recall degrades to "no LTM context this item" —
+# same behavior as any other recall failure, never a task failure.
+RECALL_ITEM_TIMEOUT_SECONDS: float = 8.0
 
 
 # ── 2b. Tiered recall (rerank policy per call site) ─────────────────────────
 #
 # Rerank is expensive (3-8s LLM call, 10+s with fallback retry). Prod profiling
 # showed it dominates recall latency on chat-turn hot paths where the user is
-# actively waiting. The tiered policy splits calls into a fast lane (no rerank,
-# RRF+recency ordering only) and a quality lane (rerank on), each with its own
-# 60s cache slot keyed by (query, tier). Same query, two entries — so a chat
-# turn does not "burn" the quality slot the Planner will want.
+# actively waiting. FAST tier skips rerank entirely (RRF+recency ordering
+# only) for exactly that hot path. PRECISE tier runs rerank=True concurrently
+# alongside the FAST-tier INTENT call (not on its critical path — see
+# Orchestrator._gather_context_sections) so a queued task's Agent execution
+# starts with a rerank-quality LTM block without the user waiting for it.
 class RecallTier(str, Enum):
     FAST = "fast"        # no rerank, sub-second latency, chat-turn hot path
-    QUALITY = "quality"  # rerank=True, planning + recovery, cache per-query
+    PRECISE = "precise"  # rerank=True, run concurrently off the INTENT critical path
 
-
-# Per-role rerank flags. Wired at each call site; flip to True to elevate that
-# role back to the quality lane without touching call sites.
-#   INTENT / RECEPTIONIST — user is waiting, downstream stakes are low.
-#   PLANNER               — checklist quality decides whole-task success.
-#   PERSISTENT_AGENT_ITEM — fires 5-20× per session; rerank cost compounds.
-#   PERSISTENT_AGENT_STAGNATION — rare recovery path, quality matters more.
-RERANK_INTENT: bool = False
-RERANK_PLANNER: bool = True
-RERANK_PERSISTENT_AGENT_ITEM: bool = False
-RERANK_PERSISTENT_AGENT_STAGNATION: bool = True
-RERANK_RECEPTIONIST: bool = False
 
 
 # ── 3. DreamWorker ──────────────────────────────────────────────────────────
@@ -115,7 +114,7 @@ DREAM_STUCK_SECONDS: int = 300
 # writes; serially that's ~5-30s per candidate, so a bursty 8-candidate
 # batch could tie up the worker for minutes. Capping concurrent fan-out
 # at 3 cuts batch time without overwhelming the helper LLM's per-key
-# rate limit (most receptionist-tier providers tolerate single-digit
+# rate limit (most helper-tier providers tolerate single-digit
 # concurrency comfortably).
 DREAM_TRIAGE_CONCURRENCY: int = 3
 
@@ -354,8 +353,8 @@ RECALL_KNOWLEDGE_K: int = 5
 # recall. 0.35 trims that noise band while the rerank gate below remains the
 # authoritative relevance cutoff. Was 0.0 → 0.25 → 0.35.
 #
-# ``RECALL_MIN_SCORE`` still applies to the QUALITY tier (planner path) where
-# the rerank LLM enforces the final relevance decision at ``RECALL_RERANK_MIN_
+# ``RECALL_MIN_SCORE`` still applies to rerank-on callers, where the rerank
+# LLM enforces the final relevance decision at ``RECALL_RERANK_MIN_
 # SCORE=0.30``. FAST tier callers (INTENT, PersistentAgent per-item) DO NOT
 # rerank — without a final gate, top-K by RRF would surface the 0.34-0.41
 # activity-snapshot band as "least bad" matches on chat turns even when the
@@ -405,13 +404,6 @@ RECALL_FTS_OVERFETCH: int = 3
 # is never culled just for being old. 45d ≈ a memory needs ~2x relevance to
 # tie a fresh one after ~1.5 months.
 RECALL_DECAY_HALFLIFE_DAYS: float = 45.0
-
-# Dynamic K: planner over-fetches then trims by score gap after rerank.
-# Receptionist keeps fixed k=5 (no rerank, latency-sensitive).
-RECALL_PLANNER_OVERFETCH_K: int = 15
-RECALL_PLANNER_MAX_K: int = 12
-RECALL_PLANNER_MIN_K: int = 3
-RECALL_SCORE_GAP_THRESHOLD: float = 0.15
 
 # ── Identity ───────────────────────────────────────────────────────────────
 IDENTITY_MAX_ENTRIES: int = 20
@@ -854,6 +846,23 @@ SCHEDULER_TASK_TIMEOUT_SEC: int = 1800
 # We hard-code "skip" as the only safe default; "kill" would require
 # explicit user opt-in per task.
 SCHEDULER_BUSY_POLICY: str = "skip"
+
+# Recurring tasks auto-expire this long after creation — they fire one final
+# time on/after the deadline, then are disabled. Bounds the lifetime of a
+# session that leaves a loop running. Mirrors Claude Code's 7-day hard cap on
+# recurring cron jobs. One-shot ("once at ...") tasks are unaffected (they
+# already disable themselves after firing).
+SCHEDULER_RECURRING_MAX_AGE_SEC: int = 7 * 24 * 3600
+
+# Anti-thundering-herd jitter. Everyone who asks for "9am" gets the same
+# 0-minute mark, so absent jitter every client fires the same instant. We add
+# a DETERMINISTIC per-task offset (derived from the task id, NOT random, so
+# next_run_at stays reproducible and testable):
+#   * recurring: fire up to min(10% of period, cap) LATER.
+#   * one-shot landing exactly on :00 / :30 : fire up to 90s EARLIER.
+SCHEDULER_JITTER_MAX_FRACTION: float = 0.10      # ≤10% of the period
+SCHEDULER_JITTER_MAX_SEC: int = 15 * 60          # …capped at 15 minutes
+SCHEDULER_ONESHOT_JITTER_EARLY_SEC: int = 90     # one-shot on :00/:30 nudge
 
 
 # ── 13. Correction pipeline (retroactive memory hygiene) ────────────────────

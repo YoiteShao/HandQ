@@ -30,93 +30,7 @@ class ToolResult:
     def __post_init__(self):
         if self.timestamp is None:
             self.timestamp = datetime.now()
-    
-    def get_display_info(self) -> Dict[str, str]:
-        """
-        Get formatted display information for UI with truncation.
-        
-        Returns a dict with:
-        - tool_name: The tool name (for bash, truncated command)
-        - params: Truncated parameters string
-        - result: Truncated output/error string
-        
-        Truncation rules:
-        - bash: command[:50] as tool_name, stdout[:100] as result
-        - other tools: params and result truncated to 100 chars
-        - All truncations use '...' suffix
-        """
-        tool_name = self.tool_name or "unknown"
-        params_str = ""
-        result_str = ""
-        
-        # Special handling for bash/shell tool
-        if tool_name in ("bash", "shell"):
-            # Extract command from parameters
-            command = ""
-            if self.tool_parameters:
-                command = self.tool_parameters.get("command", "")
-            
-            # Truncate command to 50 chars for tool_name display
-            if command:
-                tool_name_display = command[:50]
-                if len(command) > 50:
-                    tool_name_display += "..."
-            else:
-                tool_name_display = "bash"
-            
-            # For result, show stdout truncated to 100 chars
-            if self.success and self.output:
-                output_str = str(self.output)
-                result_str = output_str[:100]
-                if len(output_str) > 100:
-                    result_str += "..."
-            elif self.error:
-                error_str = str(self.error)
-                result_str = error_str[:100]
-                if len(error_str) > 100:
-                    result_str += "..."
-            
-            return {
-                "tool_name": tool_name_display,
-                "params": "",  # Don't show params for bash, command is in tool_name
-                "result": result_str
-            }
-        
-        # For other tools
-        # Format parameters
-        if self.tool_parameters:
-            # Create a compact params string
-            param_parts = []
-            for key, value in self.tool_parameters.items():
-                value_str = str(value)
-                # Truncate individual param values
-                if len(value_str) > 50:
-                    value_str = value_str[:50] + "..."
-                param_parts.append(f"{key}={value_str}")
-            
-            params_str = ", ".join(param_parts)
-            # Truncate overall params string
-            if len(params_str) > 100:
-                params_str = params_str[:100] + "..."
-        
-        # Format result (output or error)
-        if self.success and self.output is not None:
-            output_str = str(self.output)
-            result_str = output_str[:100]
-            if len(output_str) > 100:
-                result_str += "..."
-        elif self.error:
-            error_str = str(self.error)
-            result_str = error_str[:100]
-            if len(error_str) > 100:
-                result_str += "..."
-        
-        return {
-            "tool_name": tool_name,
-            "params": params_str,
-            "result": result_str
-        }
-    
+
     def to_obs_dict(self, step_idx: int) -> dict:
         """
         Minimal, fixed-key-order observation dict for LLM context.
@@ -211,11 +125,6 @@ class ToolResult:
         """Serialise to_tool_result_dict() as a compact JSON string."""
         return json.dumps(self.to_tool_result_dict(), ensure_ascii=False)
 
-    def to_text(self) -> str:
-        """Convert to a text description (kept for backward compatibility / logging)."""
-        error_msg = f" Error: {self.error}" if self.error else ""
-        return f"Tool: {self.tool_name}. Parameters: {self.tool_parameters}. Success: {self.success}. Output: {self.output}.{error_msg}"
-
 
 class BaseTool(ABC):
     """Abstract base class — all tools must inherit from this."""
@@ -225,6 +134,18 @@ class BaseTool(ABC):
     # is_concurrency_safe: True  → tool can run in parallel with other safe tools
     is_read_only: bool = False
     is_concurrency_safe: bool = False
+
+    # Interrupt behavior when a user message arrives mid-execution:
+    #   "block"  (default) → the in-flight call finishes; the user message is
+    #            queued and handled at the next iteration boundary. Correct for
+    #            anything with side effects (edit, shell mutating state) — you
+    #            don't want a half-applied action.
+    #   "cancel" → the call may be aborted immediately when the user redirects.
+    #            Correct ONLY for tools whose cancellation is safe and whose work
+    #            is pure waiting/observation (wait_interval). Mirrors Claude
+    #            Code's Tool.interruptBehavior — the coordinator uses it to decide
+    #            whether a hard_task can interrupt right now or must queue.
+    interrupt_behavior: str = "block"
 
     # Cancellation contract.
     #
@@ -280,10 +201,6 @@ class BaseTool(ABC):
         missing = [p for p in required_params if p not in provided_params]
         if missing:
             raise ValueError(f"Parameters missing: {', '.join(missing)}")
-    
-    def get_description(self) -> str:
-        """Return the tool description string."""
-        return self.__doc__ or f"{self.name} tool"
 
     def resolve_in_workspace(self, path: str) -> str:
         """Resolve a possibly-relative *path* against the per-session workspace.

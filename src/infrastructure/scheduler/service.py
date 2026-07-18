@@ -12,7 +12,7 @@ The ``dispatch`` argument is a callable provided by the bridge:
     async def dispatch(task: ScheduledTask) -> None:
         # The bridge mints a fresh sched-{uuid} session, builds a
         # FlowControllerV2, runs on_user_message, and returns when
-        # the receptionist's reply is complete (NOT fire-and-forget).
+        # the coordinator's reply is complete (NOT fire-and-forget).
         ...
 
 Note: dispatch blocks for the full reply duration. The scheduler's _fire
@@ -30,7 +30,6 @@ from typing import Awaitable, Callable, Dict, List, Optional
 
 from ..long_term_memory import _constants as C
 from ..long_term_memory.models import ScheduledTask, SchedulerTaskStatus
-from .schedule import ScheduleSyntaxError, parse_schedule
 from .store import ScheduleStore
 
 _logger = logging.getLogger("handq.scheduler")
@@ -88,10 +87,11 @@ class Scheduler:
         prompt: str,
         schedule: str,
         dispatch_prompt: str = "",
+        durable: bool = True,
     ) -> Dict:
         t = await self._store.create(
             name=name, prompt=prompt, schedule=schedule,
-            dispatch_prompt=dispatch_prompt,
+            dispatch_prompt=dispatch_prompt, durable=durable,
         )
         self._wakeup.set()
         return t.to_dict()
@@ -141,17 +141,6 @@ class Scheduler:
         await self._store.mark_finished(
             task_id, ok=ok, error=error, count_as_failure=count_as_failure,
         )
-
-    # ── Validation hook for IPC ────────────────────────────────────────────
-
-    @staticmethod
-    def validate_schedule(spec: str) -> None:
-        """Raise ``ScheduleSyntaxError`` if *spec* is invalid. Kept as a
-        public helper so callers can validate without round-tripping
-        through ``create_task``; ``cron_create`` itself relies on the
-        same ``parse_schedule`` indirectly via the store.
-        """
-        parse_schedule(spec)
 
     # ── Main loop ───────────────────────────────────────────────────────────
 
@@ -214,9 +203,26 @@ class Scheduler:
             if not t.enabled:
                 continue
             if t.last_status == SchedulerTaskStatus.RUNNING:
-                # Bridge still has the previous fire in flight; honor
-                # the busy policy by skipping until it reports back.
-                continue
+                # Normally the bridge still has this fire in flight; skip until
+                # it reports back via notify_task_finished. BUT if the bridge
+                # died / crashed / never reported (e.g. flow setup threw after
+                # dispatch was accepted), the task would stay RUNNING forever
+                # and be skipped on every scan — a permanent zombie. Backstop:
+                # if it has been RUNNING longer than the task timeout, presume
+                # the fire is dead, reset it, and let this scan re-fire it.
+                stale_for = now - (t.last_run_at or 0)
+                if stale_for < C.SCHEDULER_TASK_TIMEOUT_SEC:
+                    continue
+                _logger.warning(
+                    "scheduler: task %s stuck RUNNING for %ds (> %ds timeout); "
+                    "resetting so it can fire again",
+                    t.id[:8], stale_for, C.SCHEDULER_TASK_TIMEOUT_SEC,
+                )
+                await self._store.reset_stale_running(t.id)
+                t = self._store.get(t.id)
+                if t is None or not t.enabled:
+                    continue
+                # fall through to the due-check below
             if not t.next_run_at or t.next_run_at > now:
                 continue
             await self._fire(t, manual=False)
@@ -236,9 +242,21 @@ class Scheduler:
             "scheduler firing task=%s name=%r manual=%s",
             t.id[:8], t.name, manual,
         )
-        # Don't pre-mark RUNNING — if the bridge refuses (busy), we'd
-        # leave a stale RUNNING that _scan_and_fire skips forever.
-        # Mark RUNNING only after dispatch is accepted.
+        # Mark RUNNING BEFORE dispatch, not after. ``self._dispatch`` (the
+        # bridge's accept_scheduled_task) blocks for the FULL session
+        # round-trip — it awaits on_user_message to completion and calls
+        # notify_task_finished (→ mark_finished, setting last_status to
+        # ok/failed) BEFORE returning True. Marking RUNNING only after
+        # `await self._dispatch(t)` returns therefore ran AFTER
+        # mark_finished had already recorded the real outcome, silently
+        # overwriting ok/failed back to a permanent-looking "running" —
+        # exactly the state a user would see stuck in the UI even though the
+        # task genuinely completed. If the bridge refuses (busy / shutting
+        # down), we correct back to PENDING below — mark_pending
+        # unconditionally overwrites last_status, so this can never leave a
+        # stale RUNNING behind.
+        original_next_run_at = t.next_run_at
+        await self._store.mark_running(t.id)
         try:
             accepted = await self._dispatch(t)
         except Exception as exc:
@@ -248,10 +266,15 @@ class Scheduler:
             )
             return
         if accepted:
-            await self._store.mark_running(t.id)
-            # The bridge will call notify_task_finished when its session
-            # completes. We do nothing else here.
+            # The bridge already called notify_task_finished (→ mark_finished)
+            # synchronously as part of this dispatch call. Nothing left to do.
+            pass
         else:
-            # Bridge was busy and refused. Mark PENDING and leave
-            # next_run_at unchanged so the next idle wakeup retries it.
-            await self._store.mark_pending(t.id)
+            # Bridge was busy/shutting down and refused BEFORE running
+            # anything. Correct the RUNNING mark we set above back to
+            # PENDING, and restore the pre-mark_running next_run_at (which
+            # mark_running already advanced/zeroed) so this trigger is
+            # retried on the next idle wakeup instead of being lost.
+            await self._store.mark_pending(
+                t.id, restore_next_run_at=original_next_run_at,
+            )

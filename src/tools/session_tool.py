@@ -46,6 +46,12 @@ _MAX_SESSIONS = 4
 _OPEN_INITIAL_WAIT = 0.8  # seconds to collect initial output on open
 _OPEN_SSH_WAIT = 2.0  # extra time for SSH handshake + remote shell startup
 _EXEC_DEFAULT_TIMEOUT = 30
+# Server-enforced ceiling on the caller-supplied `timeout` for exec/read —
+# matches shell_tool.py's _MAX_TIMEOUT_SECONDS. Without this, a caller passing
+# an unbounded timeout (e.g. 99999) would block the tool call for that long
+# with no upper limit, unlike every other timeout-bearing tool in this
+# codebase (ask_human: 1800s, shell: 600s).
+_MAX_TIMEOUT_SECONDS = 600
 _CLOSE_GRACE_TIMEOUT = 2.0
 
 # ── Real-time UI streaming ──────────────────────────────────────────────────
@@ -334,6 +340,18 @@ async def _close_session(session: InteractiveSession) -> Optional[str]:
 # ── InteractiveSessionTool ───────────────────────────────────────────────────
 
 class InteractiveSessionTool(BaseTool):
+    """Backend for the atomic ``session_*`` tool family (NOT registered).
+
+    Post-2.1: the old composite ``session`` tool with an ``action`` enum is gone.
+    Six atomic ``session_*`` tools (``session_open`` / ``_exec`` / ``_write`` /
+    ``_read`` / ``_list`` / ``_close``) each subclass this to inherit the shared
+    init (registry, interrupt_event, IM) and delegate their ``execute()`` to
+    the corresponding ``_action_<name>`` method.
+
+    This class is kept as an implementation backend, not a registered tool —
+    ``ToolRegistry`` exposes only the six atomic tools; the model never sees
+    ``session`` as a single tool with a nested action enum.
+    """
     """Spawn and control long-lived interactive subprocesses."""
 
     is_read_only = False
@@ -614,7 +632,9 @@ class InteractiveSessionTool(BaseTool):
     async def _action_exec(self, start_time: float, **kwargs: Any) -> ToolResult:
         session_id = kwargs.get("session_id", "")
         command = kwargs.get("command", "")
-        timeout = float(kwargs.get("timeout", _EXEC_DEFAULT_TIMEOUT))
+        requested_timeout = float(kwargs.get("timeout", _EXEC_DEFAULT_TIMEOUT))
+        timeout = min(requested_timeout, _MAX_TIMEOUT_SECONDS)
+        timeout_clamped = requested_timeout > _MAX_TIMEOUT_SECONDS
 
         session = self.registry.get(session_id)
         if not session:
@@ -797,11 +817,20 @@ class InteractiveSessionTool(BaseTool):
             "truncated": truncated,
             "status": session.status,
         }
+        if timeout_clamped:
+            result_data["timeout_clamped_to"] = _MAX_TIMEOUT_SECONDS
 
+        _timeout_note = (
+            f" (requested {requested_timeout:.0f}s clamped to the {_MAX_TIMEOUT_SECONDS}s ceiling)"
+            if timeout_clamped else ""
+        )
         return ToolResult(
             success=not timed_out and not interrupted,
             output=result_data,
-            error="Command timed out" if timed_out else ("Interrupted" if interrupted else None),
+            error=(
+                f"Command timed out{_timeout_note}" if timed_out
+                else ("Interrupted" if interrupted else None)
+            ),
             tool_name=self.name, tool_parameters=kwargs,
             execution_time=time.time() - start_time,
         )
@@ -866,7 +895,9 @@ class InteractiveSessionTool(BaseTool):
 
     async def _action_read(self, start_time: float, **kwargs: Any) -> ToolResult:
         session_id = kwargs.get("session_id", "")
-        timeout = float(kwargs.get("timeout", 0))
+        requested_timeout = float(kwargs.get("timeout", 0))
+        timeout = min(requested_timeout, _MAX_TIMEOUT_SECONDS)
+        timeout_clamped = requested_timeout > _MAX_TIMEOUT_SECONDS
 
         session = self.registry.get(session_id)
         if not session:
@@ -894,16 +925,20 @@ class InteractiveSessionTool(BaseTool):
         text, truncated = _truncate_output(text)
         idle = time.time() - session.last_output_ts
 
+        output: Dict[str, Any] = {
+            "session_id": session_id,
+            "output": text,
+            "truncated": truncated,
+            "status": session.status,
+            "alive": session.status == "alive",
+            "idle_seconds": round(idle, 1),
+        }
+        if timeout_clamped:
+            output["timeout_clamped_to"] = _MAX_TIMEOUT_SECONDS
+
         return ToolResult(
             success=True,
-            output={
-                "session_id": session_id,
-                "output": text,
-                "truncated": truncated,
-                "status": session.status,
-                "alive": session.status == "alive",
-                "idle_seconds": round(idle, 1),
-            },
+            output=output,
             tool_name=self.name, tool_parameters=kwargs,
             execution_time=time.time() - start_time,
         )
@@ -980,3 +1015,84 @@ def _emit_session_event(
         session._im.notify_session_event(event_name, data)
     except Exception:
         pass
+
+
+# ── Atomic session_* tools (Phase 2.1 split) ────────────────────────────────
+#
+# The old composite ``session`` tool with an ``action`` enum is gone — each
+# atomic tool below is registered in its own right and directly calls one
+# ``_action_<name>`` method on the shared backend. Every atomic tool inherits
+# InteractiveSessionTool's __init__ so the SessionRegistry + interrupt event +
+# IM references are pulled from the same ctx and pooled through the shared
+# per-session registry (state is shared regardless of which atomic instance
+# runs). ``is_concurrency_safe`` is False on every one — session state
+# mutations cannot be safely reordered.
+
+
+class SessionOpenTool(InteractiveSessionTool):
+    """Spawn a new long-lived interactive subprocess."""
+
+    def __init__(self, ctx=None) -> None:
+        InteractiveSessionTool.__init__(self, ctx=ctx)
+        BaseTool.__init__(self, "session_open", ctx=ctx)
+
+    async def execute(self, **kwargs: Any) -> ToolResult:
+        return await self._action_open(start_time=time.time(), **kwargs)
+
+
+class SessionExecTool(InteractiveSessionTool):
+    """Send a command to a session and wait for its completion (blocking)."""
+
+    def __init__(self, ctx=None) -> None:
+        InteractiveSessionTool.__init__(self, ctx=ctx)
+        BaseTool.__init__(self, "session_exec", ctx=ctx)
+
+    async def execute(self, **kwargs: Any) -> ToolResult:
+        return await self._action_exec(start_time=time.time(), **kwargs)
+
+
+class SessionWriteTool(InteractiveSessionTool):
+    """Write raw text to a session's stdin (no wait, no completion detection)."""
+
+    def __init__(self, ctx=None) -> None:
+        InteractiveSessionTool.__init__(self, ctx=ctx)
+        BaseTool.__init__(self, "session_write", ctx=ctx)
+
+    async def execute(self, **kwargs: Any) -> ToolResult:
+        return await self._action_write(start_time=time.time(), **kwargs)
+
+
+class SessionReadTool(InteractiveSessionTool):
+    """Read (drain) buffered output from a session."""
+
+    def __init__(self, ctx=None) -> None:
+        InteractiveSessionTool.__init__(self, ctx=ctx)
+        BaseTool.__init__(self, "session_read", ctx=ctx)
+
+    async def execute(self, **kwargs: Any) -> ToolResult:
+        return await self._action_read(start_time=time.time(), **kwargs)
+
+
+class SessionListTool(InteractiveSessionTool):
+    """List all live sessions in the registry."""
+
+    is_read_only = True
+    is_concurrency_safe = True  # pure enumeration — no state mutation
+
+    def __init__(self, ctx=None) -> None:
+        InteractiveSessionTool.__init__(self, ctx=ctx)
+        BaseTool.__init__(self, "session_list", ctx=ctx)
+
+    async def execute(self, **kwargs: Any) -> ToolResult:
+        return await self._action_list(start_time=time.time(), **kwargs)
+
+
+class SessionCloseTool(InteractiveSessionTool):
+    """Terminate a session and release its resources."""
+
+    def __init__(self, ctx=None) -> None:
+        InteractiveSessionTool.__init__(self, ctx=ctx)
+        BaseTool.__init__(self, "session_close", ctx=ctx)
+
+    async def execute(self, **kwargs: Any) -> ToolResult:
+        return await self._action_close(start_time=time.time(), **kwargs)

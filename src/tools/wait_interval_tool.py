@@ -33,6 +33,11 @@ class WaitIntervalTool(BaseTool):
 
     is_read_only = True
     is_concurrency_safe = True
+    # Pure waiting with no side effects — safe to abort the instant the user
+    # redirects. The execute() body already wakes on interrupt_event; this flag
+    # lets the coordinator treat a hard_task as immediately actionable when the
+    # only in-flight tool is a wait.
+    interrupt_behavior = "cancel"
 
     def __init__(self, ctx: Optional["SessionContext"] = None):
         super().__init__("wait_interval", ctx=ctx)

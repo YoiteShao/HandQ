@@ -569,9 +569,3 @@ async def bootstrap_from_teams_web(
         component="TeamsWebBridge",
     )
     return creds
-
-
-# Backwards-compat alias: the previous version exposed
-# ``extract_refresh_token`` from this module. Keep the name working so
-# any in-flight call sites don't 500 mid-rollout.
-extract_refresh_token = bootstrap_from_teams_web

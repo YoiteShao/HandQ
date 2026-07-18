@@ -8,7 +8,7 @@ Two pools, expressed in YAML under the ``llm:`` key:
       - <model-1>
       - <model-2>
       - ...
-    agent_models:           # checked subset — agent + planner + receptionist
+    agent_models:           # checked subset — used by the coordinator + agent
       - <model-1>
       - <model-2>
     helper_models:          # checked subset — background/cheap tasks
@@ -26,30 +26,9 @@ save in the Electron UI.
 from __future__ import annotations
 
 import logging
-import re
 from typing import List, Tuple
 
 logger = logging.getLogger("HandQ")
-
-# Claude 4-5 and above are planner-capable. Below that the planner JSON-schema
-# adherence is too unreliable to be the default.
-PLANNER_MIN_VERSION = (4, 5)
-
-
-def model_version(model_str: str) -> tuple:
-    """Return (major, minor) version tuple from a model string.
-
-    Examples:
-        "anthropic::claude-4-6-sonnet:1M" -> (4, 6)
-        "anthropic::claude-4-5-haiku:thinking" -> (4, 5)
-        "anthropic::claude-4-7-opus"       -> (4, 7)
-    """
-    name = model_str.split("::")[-1].split(":")[0]
-    if m := re.search(r"claude-(\d+)-(\d+)-", name):
-        return int(m.group(1)), int(m.group(2))
-    if m := re.search(r"claude-(\d+)-[a-z]", name):
-        return int(m.group(1)), 0
-    return (0, 0)
 
 
 def resolve_models_and_helper(llm_cfg: dict) -> Tuple[List[str], List[str]]:

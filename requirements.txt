@@ -2,8 +2,7 @@
 # Python 3.10 or higher required.
 #
 # Production runtime path: Electron app -> bridge_main.py (stdio bridge) ->
-# src/. The legacy `python handq.py` CLI is no longer in scope; nothing in
-# this file is kept for it.
+# src/.
 
 # ── Custom index (Qualcomm internal) ─────────────────────────────────────────
 # Uncomment the two lines below when re-enabling qgenie-sdk.

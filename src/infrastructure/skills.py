@@ -3,7 +3,7 @@ Skill — lightweight prompt assets discovered at boot.
 
 A skill is a single SKILL.md file inside %USERPROFILE%\\HandQ\\Skill\\<name>\\
 (Windows) or <install_dir>/Skill/<name>/ (POSIX) that ships professional
-guidance to the receptionist / planner / agent on demand.
+guidance to the orchestrator / agent on demand.
 
 Layout follows Anthropic's Claude Code convention so files are portable:
 
@@ -97,12 +97,17 @@ _FRONTMATTER_RE = re.compile(
 _SLUG_STRIP_RE = re.compile(r"[^a-z0-9]+")
 
 # Origin marks who owns a skill's *content*, gating the auto-miner's write path.
-# ``auto`` = minted by triage from a recurring task; anything else (missing key,
-# ``user``, hand-created / imported / panel-edited) = user-owned and OFF LIMITS
-# to the auto-miner. Origin fails *safe to user*: an ambiguous value must never
-# green-light a clobber (see ``_coerce_origin``).
+# ``auto`` = minted by triage from a recurring task; ``bundled`` = shipped
+# with HandQ itself and seeded into the user's Skill root by
+# seed_bundled_skills() — invisible to the panel and immutable via the
+# skill_* IPC surface (see SkillRegistry.list_all / _reject_if_bundled).
+# Anything else (missing key, ``user``, hand-created / imported / panel-
+# edited) = user-owned and OFF LIMITS to the auto-miner. Origin fails *safe
+# to user*: an ambiguous value must never green-light a clobber (see
+# ``_coerce_origin``) and must never silently hide a skill the user created.
 SKILL_ORIGIN_AUTO = "auto"
 SKILL_ORIGIN_USER = "user"
+SKILL_ORIGIN_BUNDLED = "bundled"
 
 
 def slugify_skill_name(text: str, *, fallback: str = "skill") -> str:
@@ -124,7 +129,7 @@ class SkillEntry:
 
     Fields:
       name:        canonical identifier (frontmatter ``name`` if valid,
-                   otherwise directory name; receptionist / planner refer
+                   otherwise directory name; the orchestrator and agent refer
                    to skills by this).
       description: short description shown in the L0 menu.
       body:        full skill body (everything after the closing ``---``).
@@ -139,7 +144,7 @@ class SkillEntry:
                    key means enabled, so legacy skills keep working.
       standing:    whether the skill is "always in effect". A standing skill's
                    body is injected unconditionally into every role
-                   (receptionist / planner / agent) — used for persona /
+                   (orchestrator / agent) — used for persona /
                    speaking-habit / general-methodology skills that should
                    apply without a task trigger. Fail-closed: a missing or
                    unrecognised frontmatter value means False.
@@ -149,6 +154,15 @@ class SkillEntry:
                    ``auto`` skill in place but must never overwrite a ``user``
                    one. Fail-safe: any non-``auto`` value resolves to ``user``,
                    so an ambiguous marker protects rather than exposes content.
+      allowed_tools:   on-demand tool names this skill's recipe uses. When the
+                   agent pulls the body via ``read_skill``, these are activated
+                   (loaded + available next turn) in one step — the skill is a
+                   recipe + its tool grant, mirroring Claude Code's
+                   ``allowed-tools`` frontmatter. Empty for pure-guidance skills.
+                   Every provider today is 1:1 with a tool, so activating a
+                   tool ALSO runs its provider's session-once setup via the
+                   ``on_tools_changed`` bus — no separate ``activates_providers``
+                   field is needed.
     """
 
     name: str
@@ -159,6 +173,7 @@ class SkillEntry:
     enabled: bool = True
     standing: bool = False
     origin: str = SKILL_ORIGIN_USER
+    allowed_tools: List[str] = field(default_factory=list)
 
 
 class SkillRegistry:
@@ -267,7 +282,7 @@ class SkillRegistry:
 
         Every role sees this awareness menu (name + description only). It is
         reference material, not an activation surface: the agent pulls a full
-        body on demand via ``read_skill``; receptionist and planner only reason
+        body on demand via ``read_skill``; the orchestrator only reasons
         about what exists. ``exclude`` lets a caller drop skills already shown
         in full (e.g. standing bodies) so they aren't listed twice.
         """
@@ -325,7 +340,15 @@ class SkillRegistry:
     # name can never escape the Skill root.
 
     def list_all(self) -> List[Dict[str, object]]:
-        """Full inventory for the panel — enabled AND disabled skills."""
+        """Full inventory for the panel — enabled AND disabled skills.
+
+        Excludes ``origin: bundled`` entries: product-shipped skills are not
+        part of the user's own inventory, so they never appear in the panel
+        and can't be discovered there to enable/disable/edit/delete. The
+        Agent-facing side (render_menu_block / render_standing_block) is a
+        SEPARATE code path and still surfaces bundled skills normally — this
+        method only gates what the human-facing panel can see.
+        """
         return [
             {
                 "name": e.name,
@@ -333,21 +356,29 @@ class SkillRegistry:
                 "enabled": e.enabled,
                 "standing": e.standing,
                 "origin": e.origin,
+                "allowed_tools": list(e.allowed_tools),
                 "body": e.body.strip(),
                 "source_path": e.source_path,
                 "problems": list(e.problems),
             }
             for e in sorted(self._entries.values(), key=lambda x: x.name)
+            if e.origin != SKILL_ORIGIN_BUNDLED
         ]
 
     def get_any(self, name: str) -> Optional[SkillEntry]:
         """Fetch an entry regardless of enabled state (panel / write use)."""
         return self._entries.get(name)
 
+    @staticmethod
+    def _bundled_immutable_result(name: str) -> Dict[str, object]:
+        return {"ok": False, "reason": "bundled_immutable", "name": name}
+
     def set_enabled(self, name: str, enabled: bool) -> Dict[str, object]:
         entry = self._entries.get(name)
         if entry is None:
             return {"ok": False, "reason": "not_found", "name": name}
+        if entry.origin == SKILL_ORIGIN_BUNDLED:
+            return self._bundled_immutable_result(name)
         path = Path(entry.source_path)
         try:
             text = path.read_text(encoding="utf-8")
@@ -368,6 +399,8 @@ class SkillRegistry:
         entry = self._entries.get(name)
         if entry is None:
             return {"ok": False, "reason": "not_found", "name": name}
+        if entry.origin == SKILL_ORIGIN_BUNDLED:
+            return self._bundled_immutable_result(name)
         path = Path(entry.source_path)
         try:
             text = path.read_text(encoding="utf-8")
@@ -386,7 +419,9 @@ class SkillRegistry:
 
     def create_skill(self, name: str, description: str, body: str,
                       *, enabled: bool = True, standing: bool = False,
-                      origin: str = SKILL_ORIGIN_USER) -> Dict[str, object]:
+                      origin: str = SKILL_ORIGIN_USER,
+                      allowed_tools: Optional[Iterable[str]] = None,
+                      ) -> Dict[str, object]:
         name = (name or "").strip()
         description = (description or "").strip()
         if not _NAME_PATTERN.match(name):
@@ -396,11 +431,13 @@ class SkillRegistry:
         if name in self._entries or (self._root / name).exists():
             return {"ok": False, "reason": "exists", "name": name}
         skill_md = self._root / name / _SKILL_FILE
+        allowed_list = _coerce_str_list(list(allowed_tools) if allowed_tools else None)
         try:
             skill_md.parent.mkdir(parents=True, exist_ok=True)
             skill_md.write_text(
                 _render_skill_md(name, description, body or "", enabled=enabled,
-                                 standing=standing, origin=origin),
+                                 standing=standing, origin=origin,
+                                 allowed_tools=allowed_list),
                 encoding="utf-8",
             )
         except OSError as exc:
@@ -413,10 +450,13 @@ class SkillRegistry:
         self, name: str, *, new_name: Optional[str] = None,
         description: Optional[str] = None, body: Optional[str] = None,
         standing: Optional[bool] = None, origin: Optional[str] = None,
+        allowed_tools: Optional[Iterable[str]] = None,
     ) -> Dict[str, object]:
         entry = self._entries.get(name)
         if entry is None:
             return {"ok": False, "reason": "not_found", "name": name}
+        if entry.origin == SKILL_ORIGIN_BUNDLED:
+            return self._bundled_immutable_result(name)
         final_name = name
         if new_name is not None:
             new_name = new_name.strip()
@@ -432,6 +472,12 @@ class SkillRegistry:
         final_body = entry.body if body is None else body
         final_standing = entry.standing if standing is None else standing
         final_origin = entry.origin if origin is None else origin
+        # allowed_tools: None means "preserve"; an explicit list (even empty)
+        # replaces. This lets callers add / change / clear the grant.
+        final_allowed = (
+            entry.allowed_tools if allowed_tools is None
+            else _coerce_str_list(list(allowed_tools))
+        )
         old_dir = Path(entry.source_path).parent
         new_md = self._root / final_name / _SKILL_FILE
         try:
@@ -439,7 +485,8 @@ class SkillRegistry:
             new_md.write_text(
                 _render_skill_md(final_name, final_desc, final_body,
                                  enabled=entry.enabled, standing=final_standing,
-                                 origin=final_origin),
+                                 origin=final_origin,
+                                 allowed_tools=final_allowed),
                 encoding="utf-8",
             )
             if final_name != name and old_dir.exists() and old_dir != new_md.parent:
@@ -456,6 +503,8 @@ class SkillRegistry:
         entry = self._entries.get(name)
         if entry is None:
             return {"ok": False, "reason": "not_found", "name": name}
+        if entry.origin == SKILL_ORIGIN_BUNDLED:
+            return self._bundled_immutable_result(name)
         try:
             shutil.rmtree(Path(entry.source_path).parent, ignore_errors=True)
         except OSError as exc:
@@ -498,13 +547,20 @@ class SkillRegistry:
         if not description:
             return {"ok": False, "reason": "missing_description"}
         standing = _coerce_standing(fm.get("standing"))
+        # Round-trip allowed-tools from source so an imported recipe skill
+        # keeps its tool grant. Silently dropping was the audit gap.
+        allowed_tools = _coerce_str_list(
+            fm.get("allowed-tools", fm.get("allowed_tools"))
+        )
         raw_name = str(fm.get("name", "") or "").strip() or path.parent.name
         name = slugify_skill_name(raw_name)
         if name in self._entries:
             return self.update_skill(name, description=description, body=body,
-                                     standing=standing, origin=SKILL_ORIGIN_USER)
+                                     standing=standing, origin=SKILL_ORIGIN_USER,
+                                     allowed_tools=allowed_tools)
         return self.create_skill(name, description, body, enabled=True,
-                                 standing=standing, origin=SKILL_ORIGIN_USER)
+                                 standing=standing, origin=SKILL_ORIGIN_USER,
+                                 allowed_tools=allowed_tools)
 
     def _refresh_entry(self, skill_md: Path, dir_name: str) -> None:
         """Re-parse one SKILL.md and replace its in-memory entry.
@@ -527,16 +583,18 @@ class SkillRegistry:
 
 def _render_skill_md(name: str, description: str, body: str, *,
                      enabled: bool = True, standing: bool = False,
-                     origin: str = SKILL_ORIGIN_USER) -> str:
+                     origin: str = SKILL_ORIGIN_USER,
+                     allowed_tools: Optional[List[str]] = None) -> str:
     """Serialize a canonical SKILL.md.
 
     Only writes ``enabled: false`` when the skill is disabled — an enabled
     skill keeps minimal frontmatter (missing key == enabled), so hand-authored
     files stay clean. Similarly only writes ``standing: true`` when the skill
-    is standing (missing key == not standing) and ``origin: auto`` only for
-    triage-minted skills (missing key == user-owned, the protective default).
-    ``description`` is flattened to a single line so it can't break the YAML
-    block.
+    is standing (missing key == not standing) and ``origin: auto``/``origin:
+    bundled`` only for triage-minted / product-shipped skills (missing key ==
+    user-owned, the protective default). ``allowed-tools`` is written only
+    when non-empty (missing == none). ``description`` is flattened to a
+    single line so it can't break the YAML block.
     """
     desc_line = " ".join(str(description).split())
     lines = ["---", f"name: {name}", f"description: {desc_line}"]
@@ -546,6 +604,10 @@ def _render_skill_md(name: str, description: str, body: str, *,
         lines.append("standing: true")
     if origin == SKILL_ORIGIN_AUTO:
         lines.append("origin: auto")
+    elif origin == SKILL_ORIGIN_BUNDLED:
+        lines.append("origin: bundled")
+    if allowed_tools:
+        lines.append("allowed-tools: [" + ", ".join(allowed_tools) + "]")
     lines.append("---")
     lines.append("")
     lines.append(str(body).strip())
@@ -599,9 +661,8 @@ def _set_frontmatter_enabled(text: str, enabled: bool) -> str:
 def _user_handq_root() -> Path:
     """%USERPROFILE%\\HandQ on Windows, ~/HandQ otherwise.
 
-    Mirrors ``bridge_main._user_handq_root()`` and
-    ``gep_template._user_handq_root()`` — single source of truth for the
-    user-owned data root per ARCHITECTURE.md §1.5.
+    Mirrors ``bridge_main._user_handq_root()`` — single source of truth for
+    the user-owned data root per ARCHITECTURE.md §1.5.
     """
     home = os.environ.get("USERPROFILE") or os.path.expanduser("~")
     return Path(home) / "HandQ"
@@ -624,7 +685,7 @@ def _default_skills_root() -> Path:
     Resolution order:
       1. ``HANDQ_SKILLS_DIR`` env var (tests / portable mode)
       2. Per-platform default — Windows uses %USERPROFILE%\\HandQ\\Skill\\,
-         POSIX uses <install_dir>/Skill/. Mirrors gep_template's policy.
+         POSIX uses <install_dir>/Skill/.
     """
     override = os.environ.get("HANDQ_SKILLS_DIR")
     if override:
@@ -632,6 +693,112 @@ def _default_skills_root() -> Path:
     if sys.platform == "win32":
         return _user_handq_root() / _SKILLS_SUBDIR
     return _install_dir() / _SKILLS_SUBDIR
+
+
+def _bundled_skills_dir() -> Optional[Path]:
+    """Repo/installed ``Skill/`` directory shipping product recipe skills.
+
+    Dev mode: ``<repo>/Skill``. Frozen build: ``<install_dir>/Skill``. Returns
+    None if it does not exist (a build without bundled recipes is fine).
+    """
+    d = _install_dir() / _SKILLS_SUBDIR
+    return d if d.is_dir() else None
+
+
+def seed_bundled_skills(dest_root: Optional[Path] = None) -> int:
+    """Copy shipped recipe skills into the user skill root if ABSENT.
+
+    Product-authored recipe skills (monitor-long-running, remote-handq-workflow,
+    …) live in the repo/installed ``Skill/`` dir. The registry only scans user
+    data (``%USERPROFILE%\\HandQ\\Skill``), so on boot we copy any bundled skill
+    the user does not already have. NEVER overwrites: a user edit or a same-named
+    user skill wins — seeding only fills gaps, so upgrades add new recipes
+    without clobbering customized ones. Returns the number of skills seeded.
+
+    When the bundled dir and the user dir resolve to the SAME path (dev mode
+    where the install dir is the repo AND the user root points there), seeding
+    is a no-op.
+
+    Historical-file backfill: a target that ALREADY exists (from before
+    ``origin: bundled`` existed in the shipped files) is compared byte-for-byte
+    against the shipped source with only the ``origin:`` line stripped from
+    both sides. An exact match proves the user never touched the file, so it
+    is safe to stamp ``origin: bundled`` onto it in place — this is the ONLY
+    write this function ever makes to an existing file. Any difference (the
+    user edited it, even trivially) leaves the file untouched: it keeps
+    reading as ``user``-owned, visible and editable in the panel, exactly as
+    before. This never runs on a target this function itself just created —
+    those are already byte-identical copies and get ``origin: bundled``
+    directly from the shipped source.
+    """
+    src = _bundled_skills_dir()
+    if src is None:
+        return 0
+    dest = dest_root if dest_root is not None else _default_skills_root()
+    try:
+        if src.resolve() == dest.resolve():
+            return 0
+    except OSError:
+        pass
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        _logger.exception("seed_bundled_skills: cannot create %s", dest)
+        return 0
+    seeded = 0
+    try:
+        candidates = [p for p in src.iterdir() if p.is_dir() and not p.name.startswith(".")]
+    except OSError:
+        return 0
+    for skill_dir in candidates:
+        src_md = skill_dir / _SKILL_FILE
+        if not src_md.is_file():
+            continue
+        target = dest / skill_dir.name
+        if target.exists():
+            _backfill_bundled_origin_if_untouched(src_md, target / _SKILL_FILE)
+            continue  # user already has this name — never overwrite
+        try:
+            shutil.copytree(skill_dir, target)
+            seeded += 1
+        except OSError:
+            _logger.exception(
+                "seed_bundled_skills: failed to copy %s", skill_dir.name
+            )
+    if seeded:
+        _logger.info("seed_bundled_skills: seeded %d bundled recipe skill(s)", seeded)
+    return seeded
+
+
+_ORIGIN_LINE_RE = re.compile(r"(?m)^origin:\s*\S+\s*\n?")
+
+
+def _backfill_bundled_origin_if_untouched(src_md: Path, target_md: Path) -> None:
+    """Stamp ``origin: bundled`` onto *target_md* iff it is byte-identical to
+    *src_md* apart from the ``origin:`` frontmatter line itself.
+
+    Pre-existing installs seeded a bundled skill before ``origin: bundled``
+    was added to the shipped files — this repairs those files in place, once,
+    the first time this runs after upgrading. Any read/write failure is
+    swallowed (best-effort — worst case the file just stays user-owned).
+    """
+    if not target_md.is_file():
+        return
+    try:
+        src_text = src_md.read_text(encoding="utf-8")
+        target_text = target_md.read_text(encoding="utf-8")
+    except OSError:
+        return
+    if _ORIGIN_LINE_RE.sub("", src_text) != _ORIGIN_LINE_RE.sub("", target_text):
+        return  # user has touched this file — leave it as user-owned
+    if _ORIGIN_LINE_RE.search(target_text):
+        return  # already stamped (or stamped with a non-bundled value; leave it)
+    try:
+        target_md.write_text(src_text, encoding="utf-8")
+    except OSError:
+        _logger.exception(
+            "seed_bundled_skills: failed to backfill origin for %s", target_md
+        )
 
 
 def _scan_skill_root(root: Path) -> Dict[str, SkillEntry]:
@@ -727,6 +894,12 @@ def _load_skill_file(skill_md: Path, *, dir_name: str) -> Optional[SkillEntry]:
     enabled = _coerce_enabled(fm.get("enabled"))
     standing = _coerce_standing(fm.get("standing"))
     origin = _coerce_origin(fm.get("origin"))
+    # allowed-tools accepts either an inline list or a comma-separated string
+    # (Claude Code allows both). Hyphen and underscore spellings are both
+    # honored so hand-authored files aren't brittle.
+    allowed_tools = _coerce_str_list(
+        fm.get("allowed-tools", fm.get("allowed_tools"))
+    )
 
     # Invariant: standing implies enabled. A standing skill that is somehow
     # disabled (only reachable by hand-editing the file — the panel can't
@@ -776,8 +949,33 @@ def _load_skill_file(skill_md: Path, *, dir_name: str) -> Optional[SkillEntry]:
         enabled=enabled,
         standing=standing,
         origin=origin,
+        allowed_tools=allowed_tools,
     )
     return entry
+
+
+def _coerce_str_list(raw: object) -> List[str]:
+    """Interpret a frontmatter value that should be a list of short strings.
+
+    Accepts an inline YAML list (``[a, b]``), a comma-separated string
+    (``"a, b"``), or a single scalar. Returns a de-duplicated, order-preserving
+    list of non-empty trimmed strings. Missing / null → empty list.
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        items = [p.strip() for p in raw.split(",")]
+    elif isinstance(raw, (list, tuple)):
+        items = [str(p).strip() for p in raw]
+    else:
+        items = [str(raw).strip()]
+    out: List[str] = []
+    seen = set()
+    for it in items:
+        if it and it not in seen:
+            seen.add(it)
+            out.append(it)
+    return out
 
 
 def _coerce_enabled(raw: object) -> bool:
@@ -824,14 +1022,20 @@ def _coerce_standing(raw: object) -> bool:
 def _coerce_origin(raw: object) -> str:
     """Interpret the frontmatter ``origin`` value — fail *safe to user-owned*.
 
-    Only the exact token ``auto`` (case-insensitive) marks a skill as
-    triage-minted; everything else — missing, ``user``, or an unrecognised
-    value — resolves to ``user``. This is deliberately the protective default:
-    origin gates whether the auto-miner may overwrite a skill's content, so an
-    ambiguous marker MUST mean "hands off" (user-owned), never "safe to
-    clobber". Mirror image of the enabled/standing coercers, but the failure
-    direction is chosen to protect content, not to toggle visibility.
+    Only the exact tokens ``auto`` and ``bundled`` (case-insensitive) mark a
+    skill as triage-minted / product-shipped respectively; everything else —
+    missing, ``user``, or an unrecognised value — resolves to ``user``. This
+    is deliberately the protective default: origin gates both whether the
+    auto-miner may overwrite a skill's content AND whether the panel may see
+    or modify it at all, so an ambiguous marker MUST mean "hands off, fully
+    visible" (user-owned), never "safe to clobber" or "hide from the user".
+    A parse hiccup can never accidentally make the user's own skill
+    disappear from their panel or become uneditable.
     """
-    if isinstance(raw, str) and raw.strip().lower() == SKILL_ORIGIN_AUTO:
-        return SKILL_ORIGIN_AUTO
+    if isinstance(raw, str):
+        token = raw.strip().lower()
+        if token == SKILL_ORIGIN_AUTO:
+            return SKILL_ORIGIN_AUTO
+        if token == SKILL_ORIGIN_BUNDLED:
+            return SKILL_ORIGIN_BUNDLED
     return SKILL_ORIGIN_USER

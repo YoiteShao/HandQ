@@ -10,7 +10,6 @@ Replaces the legacy bash_tool with full support for:
 """
 import asyncio
 import atexit
-import locale
 import logging
 import os
 import re
@@ -37,6 +36,79 @@ _MAX_TIMEOUT_SECONDS: int = 600
 _TRUNCATION_TOTAL_CHARS: int = 15_000
 _TRUNCATION_HEAD_CHARS: int = 5_000
 _TRUNCATION_TAIL_CHARS: int = 5_000
+
+# ── Concurrency-safety heuristic (server-side fallback for concurrent_safe) ───
+#
+# The model can declare `concurrent_safe: true` explicitly (see the tool
+# schema's description in tool_registry.py, which lists these exact commands
+# as examples) — this heuristic exists for the common case where it forgets
+# to, so read-only commands don't get needlessly serialized behind unrelated
+# in-flight tool calls (see PersistentAgent._is_concurrency_safe_call). It is
+# intentionally conservative: false negatives (a safe command left
+# unmarked) just cost a little concurrency; false positives (an unsafe
+# command wrongly marked safe) would be a real correctness bug, so anything
+# ambiguous is treated as unsafe. An explicit `concurrent_safe: false` from
+# the model always wins — this heuristic only fills the gap when the model
+# didn't say anything.
+_READONLY_COMMAND_PREFIXES = frozenset({
+    "ls", "find", "grep", "wc", "cat", "head", "tail", "which", "type",
+    "pwd", "echo", "env", "printenv", "whoami", "hostname", "date",
+    "get-childitem", "test-path", "select-string", "get-content",
+    "get-location", "get-item", "get-process",
+})
+# Multi-word prefixes (subcommands) checked against the first TWO tokens.
+_READONLY_SUBCOMMAND_PREFIXES = frozenset({
+    ("git", "status"), ("git", "log"), ("git", "diff"), ("git", "show"),
+    ("git", "branch"), ("git", "remote"), ("git", "blame"),
+    ("test", "-f"), ("test", "-d"), ("test", "-e"),
+})
+# Any of these appearing as the second token is a read-only probe regardless
+# of the leading command (e.g. `python --version`, `node --version`).
+_VERSION_PROBE_FLAGS = frozenset({"--version", "-v", "-V", "version"})
+
+
+def looks_read_only(command: str) -> bool:
+    """Heuristic: does this command look safe to run concurrently?
+
+    Deliberately narrow — matches only the LEADING command of the (first)
+    chained segment, never a substring anywhere in the string. A command
+    that chains a read-only prefix into something else via ``&&``/``;``/
+    ``|``/``|>`` etc. is NOT considered safe: e.g. ``ls && rm -rf x`` must
+    not short-circuit on ``ls``. Only a command with nothing chained after
+    the read-only leading word (aside from further pipe-safe read tools) is
+    treated as safe. Empty/unparseable input is never safe.
+    """
+    cmd = (command or "").strip()
+    if not cmd:
+        return False
+    # Any of these chain/redirect operators mean "more than one command" —
+    # bail to unsafe rather than try to prove every segment is read-only.
+    for op in ("&&", "||", ";", ">", ">>", "<", "$(", "`"):
+        if op in cmd:
+            return False
+    # A pipeline of read-only-looking segments is fine (e.g.
+    # `Get-ChildItem | Select-String foo`) — check every segment.
+    segments = [seg.strip() for seg in cmd.split("|") if seg.strip()]
+    if not segments:
+        return False
+    return all(_segment_is_read_only(seg) for seg in segments)
+
+
+def _segment_is_read_only(segment: str) -> bool:
+    tokens = segment.split()
+    if not tokens:
+        return False
+    head = tokens[0].lower().lstrip("./")
+    for suffix in (".exe", ".ps1"):
+        if head.endswith(suffix):
+            head = head[: -len(suffix)]
+    if len(tokens) >= 2 and tokens[1].lower() in _VERSION_PROBE_FLAGS:
+        return True
+    if len(tokens) >= 2 and (head, tokens[1].lower()) in _READONLY_SUBCOMMAND_PREFIXES:
+        return True
+    if head in _READONLY_COMMAND_PREFIXES:
+        return True
+    return False
 
 # ── Background task output buffer cap ─────────────────────────────────────────
 _BG_BUFFER_MAX_BYTES: int = 15_000
@@ -335,9 +407,12 @@ def _shell_label(executable: str) -> str:
 
 
 def _get_output_encoding() -> str:
-    if _IS_WINDOWS:
-        enc = locale.getpreferredencoding(False)
-        return enc if enc else "utf-8"
+    # PowerShell 7 (pwsh) encodes piped/redirected stdout as UTF-8 regardless
+    # of the console codepage, and _build_venv_env now forces every spawned
+    # Python child to do the same (PYTHONIOENCODING=utf-8). Decoding with the
+    # locale codepage here (the old behavior) mismatched that and produced
+    # mojibake/UnicodeDecodeError for any non-ASCII byte actually emitted as
+    # UTF-8 — always decode as UTF-8 to match what's actually on the wire.
     return "utf-8"
 
 
@@ -475,10 +550,21 @@ class ShellTool(BaseTool):
             self.interrupt_event = None
         self._registry = BackgroundTaskRegistry()
 
-    def _build_venv_env(self) -> Optional[dict]:
-        if not self.venv_path:
-            return None
+    def _build_venv_env(self) -> dict:
         env = dict(os.environ)
+        if _IS_WINDOWS:
+            # Python defaults stdout/stderr to the console codepage (cp1252 on
+            # most en-US/zh-CN Windows installs) whenever they're piped rather
+            # than a real console — which is exactly what happens here via
+            # asyncio.subprocess.PIPE. Any non-ASCII character a generated
+            # script prints (✓, →, em-dash, …) then raises UnicodeEncodeError
+            # instead of running. Forcing UTF-8 here fixes it at the source
+            # for every command this tool runs, instead of relying on each
+            # generated script to remember PYTHONIOENCODING/encoding="utf-8".
+            env["PYTHONIOENCODING"] = "utf-8"
+            env["PYTHONUTF8"] = "1"
+        if not self.venv_path:
+            return env
         bin_dir = os.path.join(
             self.venv_path,
             "Scripts" if _IS_WINDOWS else "bin"
@@ -838,7 +924,7 @@ class ShellTool(BaseTool):
                         return ToolResult(
                             success=False,
                             output={'stdout': '', 'stderr': 'interrupted by user', 'exit_code': -1, 'truncated': False},
-                            error=f"Interrupted by planner: {command}",
+                            error=f"Interrupted by coordinator: {command}",
                             execution_time=time.time() - start_time,
                             tool_name=self.name,
                             tool_parameters={'command': command, 'timeout': timeout},

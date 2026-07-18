@@ -7,7 +7,6 @@
     share, overwriting any existing files at the destination. Files that
     exist only at the destination are kept (use -Mirror to delete them).
 
-      handq.py
       handq_linux.py
       handq_setup.sh
       handq_config.example.yaml
@@ -47,12 +46,12 @@ if (-not $ProjectRoot) { $ProjectRoot = (Get-Location).Path }
 
 # Items to upload (paths relative to project root).
 $Items = @(
-    'handq.py',
     'handq_linux.py',
     'handq_setup.sh',
     'handq_config.example.yaml',
     'packaging',
-    'src'
+    'src',
+    'electron/package.json'
 )
 
 # Exclusions for directory copies.

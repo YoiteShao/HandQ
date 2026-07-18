@@ -10,6 +10,107 @@
 </head>
 <body>
 
+    <!-- ============================================================ -->
+    <!-- Liquid Glass — edge-refraction filter defs (Tier 1 controls). -->
+    <!-- feDisplacementMap bends whatever backdrop-filter samples      -->
+    <!-- behind the element using a radial "ring" bump map (bright     -->
+    <!-- near the rim, flat at center) — the same cue as light bending -->
+    <!-- through a real lens edge. objectBoundingBox units mean this   -->
+    <!-- single shape auto-adapts to any element's aspect ratio, so    -->
+    <!-- one bump serves both circular buttons and pill shapes. Applied-->
+    <!-- via CSS: backdrop-filter: blur(Npx) url(#lg-distort-circle);  -->
+    <!-- See styles.css "Tier 1 glass" rules.                          -->
+    <!-- ============================================================ -->
+    <!--
+        Bump map = two linear gradients (R varies left→right, G varies
+        top→bottom), merged with mix-blend-mode:lighten so each channel
+        stays independent (lighten = per-channel max; since each rect is
+        zero outside its own channel, the max just keeps both). Fed through
+        feDisplacementMap this gives: dx = scale*(R-0.5), dy = scale*(G-0.5)
+        — zero at the shape's center, growing toward every edge — i.e. a
+        smooth outward lens bulge, not a directionless blur.
+        The map is a same-document <g> referenced via feImage href="#id"
+        rather than a data: URI — the app's CSP is `default-src 'self'`
+        (no img-src override), which blocks data: image loads including
+        feImage's. A same-doc element reference isn't a resource "load" at
+        all, so CSP doesn't apply, and feImage still renders `<defs>`-only
+        elements (they're addressable even though never directly painted).
+
+        Chromatic dispersion (v3): a real glass edge refracts each
+        wavelength by a slightly different amount — that split-color halo,
+        not just the bend itself, is a large part of what reads as "glass"
+        in the reference art.
+        v2 tried three independent feDisplacementMap branches (one per
+        channel, different scales) recombined with feBlend/feComposite —
+        verified by direct pixel probing to be BROKEN in this Chromium:
+        any blend/composite of two feDisplacementMap-derived branches
+        silently collapses to either flat grayscale (screen, arithmetic-add)
+        or one branch fully overwriting the other (normal), never genuine
+        per-channel separation. Single-branch feDisplacementMap output is
+        fine on its own; it's specifically combining ≥2 of them that breaks.
+        v3 sidesteps this by running feDisplacementMap exactly ONCE (the
+        real lens bulge, "bent"), then faking the wavelength spread with a
+        cheap feOffset shift of that already-bent result — feOffset (not
+        feDisplacementMap) is what's blend-safe, confirmed working via the
+        same pixel probing. R reads from bent shifted one way, B shifted
+        the other way, G reads unshifted — so the three channel edges land
+        at slightly different x/y and no longer coincide.
+    -->
+    <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+        <defs>
+            <linearGradient id="lg-bump-gx" x1="0" y1="0" x2="1" y2="0">
+                <stop offset="0" stop-color="#000"/>
+                <stop offset="1" stop-color="#f00"/>
+            </linearGradient>
+            <linearGradient id="lg-bump-gy" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="0" stop-color="#000"/>
+                <stop offset="1" stop-color="#0f0"/>
+            </linearGradient>
+            <g id="lg-bump-map">
+                <rect x="0" y="0" width="100" height="100" fill="url(#lg-bump-gx)"/>
+                <rect x="0" y="0" width="100" height="100" fill="url(#lg-bump-gy)" style="mix-blend-mode:lighten"/>
+            </g>
+
+            <filter id="lg-distort-circle" x="-25%" y="-25%" width="150%" height="150%"
+                    primitiveUnits="objectBoundingBox" color-interpolation-filters="sRGB">
+                <feImage result="lgMap" href="#lg-bump-map" x="0" y="0" width="1" height="1"
+                         preserveAspectRatio="none"/>
+                <feGaussianBlur in="lgMap" stdDeviation="0.045" result="lgBlurred"/>
+                <feDisplacementMap in="SourceGraphic" in2="lgBlurred" scale="0.30"
+                                    xChannelSelector="R" yChannelSelector="G" result="lgBent"/>
+                <feOffset in="lgBent" dx="0.012" dy="0" result="lgBentR"/>
+                <feOffset in="lgBent" dx="-0.012" dy="0" result="lgBentB"/>
+                <feColorMatrix in="lgBentR" type="matrix"
+                    values="1 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 0 1 0" result="onlyR"/>
+                <feColorMatrix in="lgBent" type="matrix"
+                    values="0 0 0 0 0  0 1 0 0 0  0 0 0 0 0  0 0 0 1 0" result="onlyG"/>
+                <feColorMatrix in="lgBentB" type="matrix"
+                    values="0 0 0 0 0  0 0 0 0 0  0 0 1 0 0  0 0 0 1 0" result="onlyB"/>
+                <feBlend in="onlyR" in2="onlyG" mode="screen" result="lgRG"/>
+                <feBlend in="lgRG" in2="onlyB" mode="screen"/>
+            </filter>
+
+            <filter id="lg-distort-pill" x="-25%" y="-25%" width="150%" height="150%"
+                    primitiveUnits="objectBoundingBox" color-interpolation-filters="sRGB">
+                <feImage result="lgMap" href="#lg-bump-map" x="0" y="0" width="1" height="1"
+                         preserveAspectRatio="none"/>
+                <feGaussianBlur in="lgMap" stdDeviation="0.06" result="lgBlurred"/>
+                <feDisplacementMap in="SourceGraphic" in2="lgBlurred" scale="0.22"
+                                    xChannelSelector="R" yChannelSelector="G" result="lgBent"/>
+                <feOffset in="lgBent" dx="0.01" dy="0" result="lgBentR"/>
+                <feOffset in="lgBent" dx="-0.01" dy="0" result="lgBentB"/>
+                <feColorMatrix in="lgBentR" type="matrix"
+                    values="1 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 0 1 0" result="onlyR"/>
+                <feColorMatrix in="lgBent" type="matrix"
+                    values="0 0 0 0 0  0 1 0 0 0  0 0 0 0 0  0 0 0 1 0" result="onlyG"/>
+                <feColorMatrix in="lgBentB" type="matrix"
+                    values="0 0 0 0 0  0 0 0 0 0  0 0 1 0 0  0 0 0 1 0" result="onlyB"/>
+                <feBlend in="onlyR" in2="onlyG" mode="screen" result="lgRG"/>
+                <feBlend in="lgRG" in2="onlyB" mode="screen"/>
+            </filter>
+        </defs>
+    </svg>
+
     <div class="app">
         <!-- ============================================================ -->
         <!-- Boot overlay — covers the entire window until the bridge      -->
@@ -48,21 +149,37 @@
                         <li role="none">
                             <button class="island-menu-item" id="sc-settings" role="menuitem"
                                     type="button">
-                                <span class="im-icon" aria-hidden="true">⚙</span>
+                                <svg class="im-icon" viewBox="0 0 16 16" aria-hidden="true">
+                                    <circle cx="8" cy="8" r="2" stroke="currentColor" stroke-width="1.3" fill="none"/>
+                                    <path d="M8 1.6v1.8M8 12.6v1.8M14.4 8h-1.8M3.4 8H1.6
+                                             M12.4 3.6l-1.3 1.3M4.9 11.1l-1.3 1.3
+                                             M12.4 12.4l-1.3-1.3M4.9 4.9l-1.3-1.3"
+                                          stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
+                                </svg>
                                 <span class="im-label">Settings</span>
                             </button>
                         </li>
                         <li role="none">
                             <button class="island-menu-item" id="sc-scheduler" role="menuitem"
                                     type="button">
-                                <span class="im-icon" aria-hidden="true">⏱</span>
+                                <svg class="im-icon" viewBox="0 0 16 16" aria-hidden="true">
+                                    <circle cx="8" cy="8.5" r="5.7" stroke="currentColor" stroke-width="1.3" fill="none"/>
+                                    <path d="M8 5.5V8.5L10.2 10" stroke="currentColor" stroke-width="1.3"
+                                          fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+                                    <path d="M6.2 1.4h3.6" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"/>
+                                </svg>
                                 <span class="im-label">Scheduler</span>
                             </button>
                         </li>
                         <li role="none">
                             <button class="island-menu-item" id="sc-skills" role="menuitem"
                                     type="button">
-                                <span class="im-icon" aria-hidden="true">🧠</span>
+                                <svg class="im-icon" viewBox="0 0 16 16" aria-hidden="true">
+                                    <rect x="2.3" y="2.3" width="11.4" height="11.4" rx="2"
+                                          stroke="currentColor" stroke-width="1.3" fill="none"/>
+                                    <path d="M5.4 8h5.2M8 5.4v5.2" stroke="currentColor" stroke-width="1.3"
+                                          stroke-linecap="round"/>
+                                </svg>
                                 <span class="im-label">Skills</span>
                             </button>
                         </li>
@@ -229,7 +346,7 @@
                                 <button type="button" class="model-tab" data-tab="available">Available</button>
                             </div>
                             <div class="model-tab-panel" id="model-panel-agent">
-                                <small class="help-text">Models for agent, planner, and receptionist. Check order = fallback priority.</small>
+                                <small class="help-text">Models for the agent and orchestrator (task classification + execution). Check order = fallback priority.</small>
                                 <div class="model-check-list" id="cfg-llm-agent-checks"></div>
                             </div>
                             <div class="model-tab-panel hidden" id="model-panel-helper">
@@ -501,7 +618,6 @@
                             <select id="admin-mem-dim">
                                 <option value="">All dimensions</option>
                                 <option value="agentic">Agentic</option>
-                                <option value="insight">Insight</option>
                                 <option value="identity">Identity</option>
                             </select>
                             <button type="button" id="admin-mem-refresh">Refresh</button>
@@ -746,7 +862,7 @@
                     <span>Standing (always in effect)</span>
                     <small class="help-text">
                         When on, the skill body is injected into every role
-                        (receptionist, planner, agent) on every turn — use for
+                        (orchestrator, agent) on every turn — use for
                         persona / tone / general methodology. A standing skill is
                         always enabled.
                     </small>

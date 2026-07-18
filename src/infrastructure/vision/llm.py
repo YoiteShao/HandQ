@@ -361,6 +361,15 @@ def get_vision_client(config_manager: Any) -> VisionClient:
                 f"vision_client: cannot read 'llm:' section for API key: {exc}"
             )
         api_key = str(llm_section.get("API_KEY", "") or "").strip()
+        # Config is authoritative; fall back to the environment only when the
+        # config's llm.API_KEY is blank. Production ships a real key in config
+        # so this fallback never fires there (zero behavior change). It exists
+        # for setups that keep the key out of the yaml (e.g. the live test
+        # harness reads it from api.txt and injects HANDQ_LLM_API_KEY) — without
+        # it, vision silently loses the key the LLM service has, and every
+        # find_element vision fallback dies with "requires ... api_key".
+        if not api_key:
+            api_key = os.environ.get("HANDQ_LLM_API_KEY", "").strip()
         _client = VisionClient(
             endpoint=_VISION_ENDPOINT,
             api_key=api_key,

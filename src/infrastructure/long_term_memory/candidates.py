@@ -17,7 +17,7 @@ from .models import CandidateSource
 _logger = logging.getLogger("handq.ltm.candidates")
 
 
-# ── Receptionist pre-filter knobs ──────────────────────────────────────────
+# ── Per-message capture pre-filter knobs ────────────────────────────────────
 #
 # Tuned against real-world data: ~50% receptionist_turn acceptance
 # (against a "default skip" prompt) was driven by short clarifying /
@@ -207,7 +207,7 @@ async def submit_user_turn(
     current_goal: Optional[str] = None,
 ) -> str:
     # Pre-filter trivial chatter before paying for an LLM triage call.
-    # Receptionist captures EVERY user message, so most are noise (small
+    # Every user message gets captured here, so most are noise (small
     # talk, clarifying questions, error pastes). Default-skip in the
     # prompt isn't enough — the LLM still accepted ~50% in practice.
     # Drop here when BOTH:

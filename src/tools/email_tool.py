@@ -99,16 +99,6 @@ def _get_app():
     return _outlook_app
 
 
-def is_outlook_app_ready() -> bool:
-    """True if the Outlook.Application handle is already cached.
-
-    Read-safe from any thread — only inspects a module-level reference. Used
-    by ``EmailContextProvider.prepare`` to skip the 5s smoke-test round-trip
-    on every step's prepare after the first successful one in this process.
-    """
-    return _outlook_app is not None
-
-
 def _shutdown() -> None:
     try:
         import pythoncom  # type: ignore[import-untyped]
@@ -1242,7 +1232,7 @@ def _sync_download_all_attachments(params: Dict[str, Any]) -> Dict[str, Any]:
                 "index": i,
                 "name": save_name,
                 "original_name": original_name,
-                "error": str(exc),
+                "error": f"{type(exc).__name__}: {exc}",
             })
 
     return {"count": len(saved), "saved": saved}
@@ -1494,6 +1484,16 @@ class EmailTool(BaseTool):
                     "Explorer's collision pattern)."
                 ),
             },
+            "timeout": {
+                "type": "number",
+                "description": (
+                    "[search] Override the default wall-clock timeout "
+                    "(seconds) for this call. Default: 30, or "
+                    "email.search_timeout_seconds from config. Raise this "
+                    "for a search you expect to be slow (large recursive "
+                    "scan) rather than retrying after a timeout."
+                ),
+            },
         },
         "required": ["action"],
         "additionalProperties": False,
@@ -1539,7 +1539,7 @@ class EmailTool(BaseTool):
         try:
             data = await loop.run_in_executor(_outlook_executor, _sync_status, kwargs)
         except Exception as exc:
-            return self._fail(params, start, f"status: {exc}")
+            return self._fail(params, start, f"status: {type(exc).__name__}: {exc}")
         return self._ok(params, start, data)
 
     async def _action_list_folders(self, params, start, **kwargs):
@@ -1547,7 +1547,7 @@ class EmailTool(BaseTool):
         try:
             data = await loop.run_in_executor(_outlook_executor, _sync_list_folders, kwargs)
         except Exception as exc:
-            return self._fail(params, start, f"list_folders: {exc}")
+            return self._fail(params, start, f"list_folders: {type(exc).__name__}: {exc}")
         return self._ok(params, start, data)
 
     async def _action_list_messages(self, params, start, **kwargs):
@@ -1562,7 +1562,7 @@ class EmailTool(BaseTool):
                 _outlook_executor, _sync_list_messages, run_params
             )
         except Exception as exc:
-            return self._fail(params, start, f"list_messages: {exc}")
+            return self._fail(params, start, f"list_messages: {type(exc).__name__}: {exc}")
         return self._ok(params, start, data)
 
     async def _action_read_message(self, params, start, **kwargs):
@@ -1572,7 +1572,7 @@ class EmailTool(BaseTool):
         try:
             data = await loop.run_in_executor(_outlook_executor, _sync_read_message, kwargs)
         except Exception as exc:
-            return self._fail(params, start, f"read_message: {exc}")
+            return self._fail(params, start, f"read_message: {type(exc).__name__}: {exc}")
         return self._ok(params, start, data)
 
     async def _action_search(self, params, start, **kwargs):
@@ -1622,7 +1622,7 @@ class EmailTool(BaseTool):
                 f"ci_phrasematch handles body matching via the index."
             )
         except Exception as exc:
-            return self._fail(params, start, f"search: {exc}")
+            return self._fail(params, start, f"search: {type(exc).__name__}: {exc}")
         return self._ok(params, start, data)
 
     async def _action_mark_read(self, params, start, **kwargs):
@@ -1632,7 +1632,7 @@ class EmailTool(BaseTool):
         try:
             data = await loop.run_in_executor(_outlook_executor, _sync_mark_read, kwargs)
         except Exception as exc:
-            return self._fail(params, start, f"mark_read: {exc}")
+            return self._fail(params, start, f"mark_read: {type(exc).__name__}: {exc}")
         return self._ok(params, start, data)
 
     async def _action_mark_unread(self, params, start, **kwargs):
@@ -1642,7 +1642,7 @@ class EmailTool(BaseTool):
         try:
             data = await loop.run_in_executor(_outlook_executor, _sync_mark_unread, kwargs)
         except Exception as exc:
-            return self._fail(params, start, f"mark_unread: {exc}")
+            return self._fail(params, start, f"mark_unread: {type(exc).__name__}: {exc}")
         return self._ok(params, start, data)
 
     async def _action_download_attachment(self, params, start, **kwargs):
@@ -1680,7 +1680,7 @@ class EmailTool(BaseTool):
                 _outlook_executor, _sync_download_attachment, run_params
             )
         except Exception as exc:
-            return self._fail(params, start, f"download_attachment: {exc}")
+            return self._fail(params, start, f"download_attachment: {type(exc).__name__}: {exc}")
         return self._ok(params, start, data)
 
     async def _action_download_all_attachments(self, params, start, **kwargs):
@@ -1705,7 +1705,7 @@ class EmailTool(BaseTool):
                 _outlook_executor, _sync_download_all_attachments, run_params
             )
         except Exception as exc:
-            return self._fail(params, start, f"download_all_attachments: {exc}")
+            return self._fail(params, start, f"download_all_attachments: {type(exc).__name__}: {exc}")
         return self._ok(params, start, data)
 
     # ── Shared result builders ────────────────────────────────────────────────

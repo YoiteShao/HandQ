@@ -161,7 +161,7 @@ _DEFAULT_EXTRACT_SELECTOR_TIMEOUT_MS = 2_000
 # system prompt.
 _PASSWORD_REFUSAL = (
     "REFUSED: agent is forbidden from filling password fields. "
-    "Use action='request_user_login' (when available) to let the user log in "
+    "Call browser_request_user_login (when available) to let the user log in "
     "manually. Cookies will be persisted to the user-data-dir for future "
     "sessions."
 )
@@ -870,7 +870,21 @@ async def _probe_cdp_port(host: str, port: int, timeout: float = 0.5) -> bool:
 
     Uses asyncio.open_connection so we don't block the event loop. Closes
     the socket immediately — we only need to know the port is listening.
+
+    ``host="localhost"`` is normalized to ``127.0.0.1`` first. Chrome/Edge's
+    ``--remote-debugging-port`` binds IPv4 only, but on a machine where
+    ``localhost`` resolves to ``::1`` first (common on Windows), asyncio's
+    getaddrinfo-then-try-each-address behavior means the IPv6 attempt can
+    consume most or all of *timeout* before IPv4 is even tried — making a
+    genuinely-reachable port probe as unreachable. Confirmed live
+    2026-07-16: with a real Edge instance listening and reachable via
+    ``127.0.0.1:9222``, probing ``localhost:9222`` with this same 0.5s
+    timeout consistently returned unreachable, which cascaded into
+    browser_attach wrongly reporting "Chrome did not start listening" for
+    an instance that was, the whole time, right there.
     """
+    if host == "localhost":
+        host = "127.0.0.1"
     try:
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(host, port),
@@ -915,12 +929,51 @@ def _is_chrome_running() -> bool:
 
 def _kill_chrome_processes() -> None:
     """Best-effort terminate chrome.exe / msedge.exe — used after user approves
-    the "restart Chrome with debug port" path. /F forces unconditional kill.
-    Errors are swallowed: if the user has already closed Chrome between the
-    check and now, taskkill will fail and we'll just proceed to spawn the bat.
+    the "restart Chrome with debug port" path. Skips any process whose command
+    line already carries ``--remote-debugging-port`` — that's a debug-capable
+    instance (possibly already the one we want to attach to, just not yet
+    probed as reachable due to a transient race) and killing it would be
+    self-defeating: we'd destroy the exact browser this whole restart dance
+    exists to preserve. Falls back to unconditional ``taskkill`` (the old
+    behavior) if the WMI/CIM query itself fails for any reason.
+
+    Confirmed live 2026-07-16: the unconditional version, driven through a
+    real HandQ live_stack task with a real debug-port Edge already SSO'd
+    into an internal dashboard, taskkilled that very instance every time
+    the auto-approve path fired — the tool was destroying its own attach
+    target on the way to attaching to it.
     """
     if sys.platform != "win32":
         return
+    try:
+        import subprocess as _sp
+        result = _sp.run(
+            [
+                "powershell", "-NoProfile", "-NonInteractive", "-Command",
+                "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe' OR "
+                "Name='msedge.exe'\" | Where-Object { $_.CommandLine -notlike "
+                "'*--remote-debugging-port*' } | Select-Object -ExpandProperty "
+                "ProcessId",
+            ],
+            capture_output=True, text=True, timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        pids = [line.strip() for line in result.stdout.splitlines() if line.strip().isdigit()]
+        for pid in pids:
+            try:
+                subprocess.run(
+                    ["taskkill", "/F", "/PID", pid],
+                    capture_output=True, timeout=5,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            except Exception:
+                pass
+        return
+    except Exception:
+        pass
+    # Fallback: PowerShell/WMI unavailable for some reason — old unconditional
+    # behavior is still better than not killing anything (the caller only
+    # reaches here after explicit user approval to restart Chrome).
     for image in ("chrome.exe", "msedge.exe"):
         try:
             subprocess.run(
@@ -1332,8 +1385,14 @@ class BrowserTool(BaseTool):
         "additionalProperties": False,
     }
 
-    def __init__(self, ctx=None) -> None:
-        super().__init__("browser", ctx=ctx)
+    def __init__(self, ctx=None, *, name: str = "browser") -> None:
+        # ``name`` lets the atomic ``browser_*`` subclasses register under their
+        # own identifiers (browser_navigate, browser_click, …) while inheriting
+        # this composite's shared init (holder, logger). The default is kept
+        # for backward compat with any test / callsite that still constructs a
+        # bare BrowserTool — but after Phase 2.1 the registry only exposes the
+        # atomic subclasses; the ``browser`` name is not a live tool anymore.
+        super().__init__(name, ctx=ctx)
         self.logger = get_logger()
         # Per-session browser holder (SessionContext DI). Falls back to the
         # process-wide module holder when constructed without a ctx (legacy /
@@ -1393,7 +1452,7 @@ class BrowserTool(BaseTool):
                 )
                 return self._error(
                     params, start,
-                    f"browser action {action!r} failed: {exc}",
+                    f"browser action {action!r} failed ({type(exc).__name__}): {exc}",
                 )
 
     # ── launch_browser ────────────────────────────────────────────────────────
@@ -1560,7 +1619,7 @@ class BrowserTool(BaseTool):
                 "tabs":        [tab_id],
                 "first_tab":   tab_id,
                 "note": (
-                    "Browser launched off-screen. Use action='navigate' to load "
+                    "Browser launched off-screen. Call browser_navigate to load "
                     "a URL on the first tab; the tab_id parameter is optional "
                     "(defaults to the first open tab)."
                 ),
@@ -1591,7 +1650,7 @@ class BrowserTool(BaseTool):
           * Sets ``mode='attach'`` — flush_browser_pool then DISCONNECTS
             instead of closing Chrome.
 
-        New tabs created via ``action='new_tab'`` are opened in the
+        New tabs created via ``browser_new_tab`` are opened in the
         background by default so the user's focus is not stolen.
         """
         # Per-session v2: no cross-session gate. Attach mode connects to
@@ -1647,7 +1706,7 @@ class BrowserTool(BaseTool):
         try:
             pw = await async_playwright().start()
         except Exception as exc:
-            return self._error(params, start, f"attach_browser: playwright start failed: {exc}")
+            return self._error(params, start, f"attach_browser: playwright start failed ({type(exc).__name__}): {exc}")
 
         try:
             browser = await pw.chromium.connect_over_cdp(cdp_url)
@@ -1714,7 +1773,7 @@ class BrowserTool(BaseTool):
                 "tab_count": len(registered),
                 "note": (
                     "Connected to user's running Chrome. New tabs opened via "
-                    "action='new_tab' default to background=true so the user's "
+                    "browser_new_tab default to background=true so the user's "
                     "focus is preserved. flush_browser_pool only DISCONNECTS — "
                     "your Chrome stays open."
                 ),
@@ -1847,8 +1906,8 @@ class BrowserTool(BaseTool):
             if im is None:
                 return (
                     "attach_browser: cannot ask user about Chrome restart "
-                    "(no UI bound). Close Chrome manually and retry, or use "
-                    "action='launch_browser' for an independent profile."
+                    "(no UI bound). Close Chrome manually and retry, or call "
+                    "browser_launch for an independent profile."
                 )
             confirmation = await im.request_risk_confirmation(description)
             if confirmation.is_rejected() or confirmation.has_new_message():
@@ -1859,7 +1918,7 @@ class BrowserTool(BaseTool):
                 )
                 return (
                     f"attach_browser: cancelled — {msg} "
-                    "Use action='launch_browser' instead for an independent profile."
+                    "Call browser_launch instead for an independent profile."
                 )
             # Approved: kill Chrome.
             self.logger.info(
@@ -1893,7 +1952,7 @@ class BrowserTool(BaseTool):
             f"attach_browser: Chrome did not start listening on {host}:{port} "
             "within 10 seconds after running the setup script. Try starting "
             "Chrome manually with --remote-debugging-port=" + str(port) + " "
-            "or fall back to action='launch_browser'."
+            "or fall back to browser_launch."
         )
 
     # ── new_tab ───────────────────────────────────────────────────────────────
@@ -1912,7 +1971,7 @@ class BrowserTool(BaseTool):
         """
         sess = self.holder.session
         if sess is None:
-            return self._error(params, start, "No browser session. Call action='launch_browser' or 'attach_browser' first.")
+            return self._error(params, start, "No browser session. Call the browser_launch (or browser_attach) tool first.")
 
         url: str = (kwargs.get("url") or "about:blank").strip()
         background: bool = bool(kwargs.get("background", True))
@@ -1972,7 +2031,7 @@ class BrowserTool(BaseTool):
     ) -> ToolResult:
         sess = self.holder.session
         if sess is None:
-            return self._error(params, start, "No browser session. Call action='launch_browser' first.")
+            return self._error(params, start, "No browser session. Call the browser_launch tool first.")
 
         tabs: List[Dict[str, Any]] = []
         for tid, page in sess.tabs.items():
@@ -2008,7 +2067,7 @@ class BrowserTool(BaseTool):
     ) -> ToolResult:
         sess = self.holder.session
         if sess is None:
-            return self._error(params, start, "No browser session. Call action='launch_browser' first.")
+            return self._error(params, start, "No browser session. Call the browser_launch tool first.")
 
         url: str = (kwargs.get("url") or "").strip()
         if not url:
@@ -2071,7 +2130,7 @@ class BrowserTool(BaseTool):
     ) -> ToolResult:
         sess = self.holder.session
         if sess is None:
-            return self._error(params, start, "No browser session. Call action='launch_browser' first.")
+            return self._error(params, start, "No browser session. Call the browser_launch tool first.")
 
         page = self._resolve_tab(sess, kwargs.get("tab_id"))
         if page is None:
@@ -2170,7 +2229,7 @@ class BrowserTool(BaseTool):
                     return self._error(
                         params, start,
                         "extract mode=list requires a 'selector'. Use "
-                        "action='snapshot' for a selectorless overview.",
+                        "browser_snapshot for a selectorless overview.",
                     )
                 try:
                     raw_limit = int(kwargs.get("limit") or _EXTRACT_LIST_DEFAULT_LIMIT)
@@ -2277,7 +2336,7 @@ class BrowserTool(BaseTool):
                 params, start,
                 f"extract: selector {selector!r} not found within "
                 f"{sel_timeout_ms} ms: {exc}. If you are searching for what "
-                "is on the page, prefer action='snapshot' over guessing "
+                "is on the page, prefer browser_snapshot over guessing "
                 "selectors — it returns every interactable element in one call.",
             )
 
@@ -2312,7 +2371,7 @@ class BrowserTool(BaseTool):
     }
     return true;
   };
-  const sel = 'a[href], button, input:not([type=hidden]), textarea, select, [role=button], [role=link], [role=tab], [role=menuitem], [onclick], [tabindex]:not([tabindex="-1"])';
+  const sel = 'a[href], button, input:not([type=hidden]), textarea, select, [role=button], [role=link], [role=tab], [role=menuitem], [role=option], [role=combobox], [role=checkbox], [role=radio], [onclick], [tabindex]:not([tabindex="-1"])';
   const seen = new Set();
   const items = [];
   for (const el of document.querySelectorAll(sel)) {
@@ -2391,7 +2450,7 @@ class BrowserTool(BaseTool):
         """
         sess = self.holder.session
         if sess is None:
-            return self._error(params, start, "No browser session. Call action='launch_browser' first.")
+            return self._error(params, start, "No browser session. Call the browser_launch tool first.")
 
         page = self._resolve_tab(sess, kwargs.get("tab_id"))
         if page is None:
@@ -2406,7 +2465,7 @@ class BrowserTool(BaseTool):
         try:
             raw = await page.evaluate(js)
         except Exception as exc:
-            return self._error(params, start, f"snapshot: page.evaluate failed: {exc}")
+            return self._error(params, start, f"snapshot: page.evaluate failed ({type(exc).__name__}): {exc}")
 
         elements = list(raw.get("elements") or [])
         for el in elements:
@@ -2571,7 +2630,7 @@ class BrowserTool(BaseTool):
     ) -> ToolResult:
         sess = self.holder.session
         if sess is None:
-            return self._error(params, start, "No browser session. Call action='launch_browser' first.")
+            return self._error(params, start, "No browser session. Call the browser_launch tool first.")
 
         page = self._resolve_tab(sess, kwargs.get("tab_id"))
         if page is None:
@@ -2603,7 +2662,7 @@ class BrowserTool(BaseTool):
                 f"(element missing, hidden, or covered). Underlying: {exc}",
             )
         except Exception as exc:
-            return self._error(params, start, f"click failed: {exc}")
+            return self._error(params, start, f"click failed ({type(exc).__name__}): {exc}")
 
         # Give the click time to trigger any navigation; do NOT block on
         # full networkidle (some sites keep long-poll connections alive).
@@ -2638,7 +2697,7 @@ class BrowserTool(BaseTool):
     ) -> ToolResult:
         sess = self.holder.session
         if sess is None:
-            return self._error(params, start, "No browser session. Call action='launch_browser' first.")
+            return self._error(params, start, "No browser session. Call the browser_launch tool first.")
 
         page = self._resolve_tab(sess, kwargs.get("tab_id"))
         if page is None:
@@ -2678,7 +2737,7 @@ class BrowserTool(BaseTool):
                 f"type: selector {selector!r} not found within {timeout_ms} ms: {exc}",
             )
         except Exception as exc:
-            return self._error(params, start, f"type: probe failed: {exc}")
+            return self._error(params, start, f"type: probe failed ({type(exc).__name__}): {exc}")
         if (elem_type or "").strip().lower() == "password":
             return self._error(params, start, _PASSWORD_REFUSAL)
 
@@ -2692,7 +2751,7 @@ class BrowserTool(BaseTool):
                 f"type: fill timed out after {timeout_ms} ms: {exc}",
             )
         except Exception as exc:
-            return self._error(params, start, f"type failed: {exc}")
+            return self._error(params, start, f"type failed ({type(exc).__name__}): {exc}")
 
         url_before = page.url
         if press_enter:
@@ -2704,7 +2763,7 @@ class BrowserTool(BaseTool):
                 except _PlaywrightTimeoutError:
                     pass
             except Exception as exc:
-                return self._error(params, start, f"type: press Enter failed: {exc}")
+                return self._error(params, start, f"type: press Enter failed ({type(exc).__name__}): {exc}")
 
         page_state = await self._capture_page_state(page)
         out: Dict[str, Any] = {
@@ -2733,7 +2792,7 @@ class BrowserTool(BaseTool):
     ) -> ToolResult:
         sess = self.holder.session
         if sess is None:
-            return self._error(params, start, "No browser session. Call action='launch_browser' first.")
+            return self._error(params, start, "No browser session. Call the browser_launch tool first.")
 
         page = self._resolve_tab(sess, kwargs.get("tab_id"))
         if page is None:
@@ -2824,7 +2883,7 @@ class BrowserTool(BaseTool):
     ) -> ToolResult:
         sess = self.holder.session
         if sess is None:
-            return self._error(params, start, "No browser session. Call action='launch_browser' first.")
+            return self._error(params, start, "No browser session. Call the browser_launch tool first.")
 
         page = self._resolve_tab(sess, kwargs.get("tab_id"))
         if page is None:
@@ -2871,7 +2930,7 @@ class BrowserTool(BaseTool):
                 f"screenshot: not ready within {timeout_ms} ms: {exc}",
             )
         except Exception as exc:
-            return self._error(params, start, f"screenshot failed: {exc}")
+            return self._error(params, start, f"screenshot failed ({type(exc).__name__}): {exc}")
 
         try:
             size = os.path.getsize(out_path)
@@ -2914,7 +2973,7 @@ class BrowserTool(BaseTool):
     #     the main agent sees only the answer. This protects the main
     #     agent's KV-cache from per-screenshot churn.
     #   • Decouples model: vision_query pins to a dedicated multimodal
-    #     model without forcing the main agent's planner / executor to
+    #     model without forcing the main agent's reasoning loop to
     #     be vision-capable.
     #
     # Misuse guardrail lives at the prompt layer (tool_registry.py
@@ -3049,7 +3108,7 @@ class BrowserTool(BaseTool):
         try:
             cm = ConfigManager()
         except Exception as exc:
-            return self._error(params, start, f"vision_query: config load failed: {exc}")
+            return self._error(params, start, f"vision_query: config load failed ({type(exc).__name__}): {exc}")
 
         question: str = (kwargs.get("question") or "").strip()
         if not question:
@@ -3060,7 +3119,7 @@ class BrowserTool(BaseTool):
             )
         sess = self.holder.session
         if sess is None:
-            return self._error(params, start, "No browser session. Call action='launch_browser' first.")
+            return self._error(params, start, "No browser session. Call the browser_launch tool first.")
         page = self._resolve_tab(sess, kwargs.get("tab_id"))
         if page is None:
             return self._error(params, start, f"Unknown tab_id: {kwargs.get('tab_id')!r}")
@@ -3089,7 +3148,7 @@ class BrowserTool(BaseTool):
                 f"vision_query: screenshot not ready within {timeout_ms} ms: {exc}",
             )
         except Exception as exc:
-            return self._error(params, start, f"vision_query: screenshot failed: {exc}")
+            return self._error(params, start, f"vision_query: screenshot failed ({type(exc).__name__}): {exc}")
         store.enforce_retention("ephemeral")
 
         # ── Send to vision model ─────────────────────────────────────────────
@@ -3281,7 +3340,7 @@ class BrowserTool(BaseTool):
         """
         sess = self.holder.session
         if sess is None:
-            return self._error(params, start, "No browser session. Call action='launch_browser' first.")
+            return self._error(params, start, "No browser session. Call the browser_launch tool first.")
         page = self._resolve_tab(sess, kwargs.get("tab_id"))
         if page is None:
             return self._error(params, start, f"Unknown tab_id: {kwargs.get('tab_id')!r}")
@@ -3322,7 +3381,7 @@ class BrowserTool(BaseTool):
                 {"selector": selector, "max_cues": max_cues},
             )
         except Exception as exc:
-            return self._error(params, start, f"video_context: page.evaluate failed: {exc}")
+            return self._error(params, start, f"video_context: page.evaluate failed ({type(exc).__name__}): {exc}")
 
         if not isinstance(data, dict) or data.get("error"):
             return self._error(
@@ -3368,7 +3427,7 @@ class BrowserTool(BaseTool):
             return self._error(
                 params, start,
                 "fetch_json: no browser session. "
-                "Call action='launch_browser' first.",
+                "Call the browser_launch tool first.",
             )
 
         method = (kwargs.get("method") or "GET").upper()
@@ -3400,7 +3459,7 @@ class BrowserTool(BaseTool):
                 f"fetch_json url={url!r} raised: {exc}",
                 component="BrowserTool", exc_info=True,
             )
-            return self._error(params, start, f"fetch_json failed: {exc}")
+            return self._error(params, start, f"fetch_json failed ({type(exc).__name__}): {exc}")
 
         sess.last_used = time.time()
 
@@ -3461,7 +3520,7 @@ class BrowserTool(BaseTool):
         """
         sess = self.holder.session
         if sess is None:
-            return self._error(params, start, "No browser session. Call action='launch_browser' first.")
+            return self._error(params, start, "No browser session. Call the browser_launch tool first.")
 
         page = self._resolve_tab(sess, kwargs.get("tab_id"))
         if page is None:
@@ -3638,7 +3697,7 @@ class BrowserTool(BaseTool):
         try:
             await page.close()
         except Exception as exc:
-            return self._error(params, start, f"close failed: {exc}")
+            return self._error(params, start, f"close failed ({type(exc).__name__}): {exc}")
         sess.tabs.pop(tab_id, None)
 
         return ToolResult(
@@ -3802,3 +3861,138 @@ class BrowserTool(BaseTool):
             tool_name=self.name, tool_parameters=params,
             execution_time=time.time() - start,
         )
+
+
+# ── Atomic browser_* tools (Phase 2.1 split) ────────────────────────────────
+#
+# The old composite ``browser`` tool with a 16-value ``action`` enum is gone —
+# each atomic tool below subclasses BrowserTool, inherits the shared holder /
+# lock / dispatch, and delegates ``execute`` to ``super().execute(action=X)``.
+# Preserving `super().execute` means the per-session ``holder.lock`` (critical
+# for serialising DOM operations) still wraps every atomic call — one shared
+# lock across the family. Each atomic tool's schema is a subset of the old
+# composite schema, containing only the params relevant to its action.
+
+class _BrowserAtomic(BrowserTool):
+    """Common base for the atomic browser_* tools. Each subclass sets
+    ``_action`` (the composite's action name) and its own registered name."""
+
+    _action: str = ""
+
+    def __init__(self, ctx=None, *, name: str) -> None:
+        BrowserTool.__init__(self, ctx=ctx, name=name)
+
+    async def execute(self, **kwargs: Any) -> ToolResult:
+        # Reuse the composite's dispatch + holder.lock + exception handling.
+        # The shared parameter_schema (see _register_atomic) still lists
+        # 'action' as a property for every atomic tool, so a model that
+        # generalizes from the composite's own usage text (e.g. this family's
+        # "Use action='navigate' to load a URL" note) may pass it explicitly.
+        # Drop any caller-supplied 'action' — this tool's identity already
+        # fixes it — instead of crashing with a duplicate-keyword TypeError.
+        kwargs.pop("action", None)
+        return await BrowserTool.execute(self, action=self._action, **kwargs)
+
+
+class BrowserLaunchTool(_BrowserAtomic):
+    _action = "launch_browser"
+    def __init__(self, ctx=None) -> None:
+        super().__init__(ctx=ctx, name="browser_launch")
+
+
+class BrowserAttachTool(_BrowserAtomic):
+    _action = "attach_browser"
+    def __init__(self, ctx=None) -> None:
+        super().__init__(ctx=ctx, name="browser_attach")
+
+
+class BrowserNewTabTool(_BrowserAtomic):
+    _action = "new_tab"
+    def __init__(self, ctx=None) -> None:
+        super().__init__(ctx=ctx, name="browser_new_tab")
+
+
+class BrowserListTabsTool(_BrowserAtomic):
+    _action = "list_tabs"
+    is_read_only = True
+    def __init__(self, ctx=None) -> None:
+        super().__init__(ctx=ctx, name="browser_list_tabs")
+
+
+class BrowserNavigateTool(_BrowserAtomic):
+    _action = "navigate"
+    def __init__(self, ctx=None) -> None:
+        super().__init__(ctx=ctx, name="browser_navigate")
+
+
+class BrowserExtractTool(_BrowserAtomic):
+    _action = "extract"
+    is_read_only = True
+    def __init__(self, ctx=None) -> None:
+        super().__init__(ctx=ctx, name="browser_extract")
+
+
+class BrowserSnapshotTool(_BrowserAtomic):
+    _action = "snapshot"
+    is_read_only = True
+    def __init__(self, ctx=None) -> None:
+        super().__init__(ctx=ctx, name="browser_snapshot")
+
+
+class BrowserClickTool(_BrowserAtomic):
+    _action = "click"
+    def __init__(self, ctx=None) -> None:
+        super().__init__(ctx=ctx, name="browser_click")
+
+
+class BrowserTypeTool(_BrowserAtomic):
+    _action = "type"
+    def __init__(self, ctx=None) -> None:
+        super().__init__(ctx=ctx, name="browser_type")
+
+
+class BrowserWaitForTool(_BrowserAtomic):
+    _action = "wait_for"
+    is_read_only = True  # observation-only
+    def __init__(self, ctx=None) -> None:
+        super().__init__(ctx=ctx, name="browser_wait_for")
+
+
+class BrowserScreenshotTool(_BrowserAtomic):
+    _action = "screenshot"
+    is_read_only = True
+    def __init__(self, ctx=None) -> None:
+        super().__init__(ctx=ctx, name="browser_screenshot")
+
+
+class BrowserVisionQueryTool(_BrowserAtomic):
+    _action = "vision_query"
+    is_read_only = True
+    def __init__(self, ctx=None) -> None:
+        super().__init__(ctx=ctx, name="browser_vision_query")
+
+
+class BrowserVideoContextTool(_BrowserAtomic):
+    _action = "video_context"
+    is_read_only = True
+    def __init__(self, ctx=None) -> None:
+        super().__init__(ctx=ctx, name="browser_video_context")
+
+
+class BrowserFetchJsonTool(_BrowserAtomic):
+    _action = "fetch_json"
+    is_read_only = True  # network-only read
+    def __init__(self, ctx=None) -> None:
+        super().__init__(ctx=ctx, name="browser_fetch_json")
+
+
+class BrowserRequestUserLoginTool(_BrowserAtomic):
+    _action = "request_user_login"
+    def __init__(self, ctx=None) -> None:
+        super().__init__(ctx=ctx, name="browser_request_user_login")
+
+
+class BrowserCloseTabTool(_BrowserAtomic):
+    _action = "close_tab"
+    def __init__(self, ctx=None) -> None:
+        super().__init__(ctx=ctx, name="browser_close_tab")

@@ -30,6 +30,27 @@ When a task fires, the scheduler synthesises a regular ``request``
 envelope through the bridge so the renderer sees the new conversation
 land in the UI exactly like a manual run — that's why "结果可以走 handq
 的 UI 就行" works without any new rendering surface.
+
+Agent integration (Claude-Code CronCreate/ScheduleWakeup parity)
+----------------------------------------------------------------
+Beyond the UI, the AGENT can drive scheduling directly via on-demand tools
+(``src/tools/schedule_tool.py`` + ``schedule_wakeup_tool.py``):
+
+- ``schedule_create`` / ``schedule_list`` / ``schedule_delete`` wrap this
+  service (reached through ``ctx.scheduler``); each fire runs in a fresh
+  ``sched-{uuid}`` session, same as a UI-created cron. ``schedule_create``
+  defaults ``durable=False`` (session-only, in-memory) matching Claude Code's
+  ``CronCreate`` default; ``durable=True`` persists to scheduled_tasks.json.
+- ``schedule_wakeup`` is a SEPARATE, session-scoped self-paced-loop primitive
+  that does NOT touch this service — it re-queues a prompt onto the current
+  session's TaskChannel after a delay (see SessionContext.schedule_wakeup),
+  preserving the agent's context across the tick.
+
+Schedule grammar accepts both the friendly forms (``every N minutes`` /
+``daily HH:MM`` / ``weekly DOW HH:MM`` / ``once at`` / ``once in N``) AND
+standard 5-field cron (``*/5 * * * *``). Recurring tasks auto-expire after
+7 days (SCHEDULER_RECURRING_MAX_AGE_SEC); fires carry deterministic jitter
+to avoid thundering-herd alignment.
 """
 from __future__ import annotations
 

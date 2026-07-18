@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from ..long_term_memory.models import ScheduledTask, SchedulerTaskStatus
-from .schedule import is_one_shot, next_fire, parse_schedule
+from .schedule import is_one_shot, jittered_next_fire, next_fire, parse_schedule
 
 _logger = logging.getLogger("handq.scheduler.store")
 
@@ -78,7 +78,11 @@ class ScheduleStore:
 
     async def _flush_locked(self) -> None:
         # MUST be called with self._lock held.
-        data = [t.to_dict() for t in self._tasks.values()]
+        # Session-only (durable=False) tasks are kept in memory and scheduled
+        # normally, but never written to disk — so they vanish on restart.
+        data = [
+            t.to_dict() for t in self._tasks.values() if t.durable
+        ]
         payload = json.dumps(data, ensure_ascii=False, indent=2)
 
         def _write() -> None:
@@ -121,21 +125,26 @@ class ScheduleStore:
         prompt: str,
         schedule: str,
         dispatch_prompt: str = "",
+        durable: bool = True,
     ) -> ScheduledTask:
         # Validate the schedule first so the parse error surfaces in
         # the IPC response instead of a rejected create that left a
         # half-formed row behind.
         parse_schedule(schedule)
         async with self._lock:
+            task_id = str(uuid.uuid4())
             t = ScheduledTask(
-                id=str(uuid.uuid4()),
+                id=task_id,
                 name=(name or "").strip() or "(unnamed task)",
                 prompt=prompt,
                 schedule=schedule,
                 enabled=True,
                 last_run_at=0,
-                next_run_at=next_fire(schedule, last_run_at=0),
+                next_run_at=jittered_next_fire(
+                    schedule, last_run_at=0, seed=task_id,
+                ),
                 dispatch_prompt=dispatch_prompt or "",
+                durable=durable,
             )
             self._tasks[t.id] = t
             await self._flush_locked()
@@ -160,7 +169,9 @@ class ScheduleStore:
             if schedule is not None:
                 parse_schedule(schedule)
                 t.schedule = schedule
-                t.next_run_at = next_fire(schedule, last_run_at=t.last_run_at)
+                t.next_run_at = jittered_next_fire(
+                    schedule, last_run_at=t.last_run_at, seed=t.id,
+                )
             t.updated_at = int(time.time())
             await self._flush_locked()
         return t
@@ -184,9 +195,13 @@ class ScheduleStore:
                 # When re-enabling, recompute the next fire from now so
                 # we don't immediately replay every interval the task
                 # missed while disabled.
-                t.next_run_at = next_fire(t.schedule, last_run_at=int(time.time()))
+                t.next_run_at = jittered_next_fire(
+                    t.schedule, last_run_at=int(time.time()), seed=t.id,
+                )
             elif enabled:
-                t.next_run_at = next_fire(t.schedule, last_run_at=0)
+                t.next_run_at = jittered_next_fire(
+                    t.schedule, last_run_at=0, seed=t.id,
+                )
             await self._flush_locked()
         return t
 
@@ -226,23 +241,79 @@ class ScheduleStore:
                 # mark_finished arrives — clear it.
                 t.next_run_at = 0
             else:
-                t.next_run_at = next_fire(t.schedule, last_run_at=base)
+                from ..long_term_memory import _constants as C
+                if now - t.created_at >= C.SCHEDULER_RECURRING_MAX_AGE_SEC:
+                    # 7-day cap: this is the final fire — disable so it never
+                    # fires again (mirrors Claude Code's recurring auto-expiry).
+                    t.enabled = False
+                    t.next_run_at = 0
+                    _logger.info(
+                        "scheduler: recurring task %s auto-expired after %d days",
+                        task_id, C.SCHEDULER_RECURRING_MAX_AGE_SEC // 86400,
+                    )
+                else:
+                    t.next_run_at = jittered_next_fire(
+                        t.schedule, last_run_at=base, seed=t.id,
+                    )
             t.updated_at = now
             await self._flush_locked()
 
-    async def mark_pending(self, task_id: str) -> None:
-        """Bridge was busy when this task came due. Leave next_run_at
-        untouched so the next _scan_and_fire wakeup retries it once
-        bridge is idle. Idempotent — if the task is already PENDING
-        (we hit it on a previous wakeup of the same idle gap) this is
-        a no-op so we don't churn the JSON file."""
+    async def mark_pending(
+        self, task_id: str, *, restore_next_run_at: Optional[int] = None,
+    ) -> None:
+        """Bridge was busy when this task came due, OR (new call site) the
+        bridge refused a fire we had already optimistically mark_running'd.
+
+        ``restore_next_run_at``, when given, resets ``next_run_at`` back to
+        the value it held BEFORE the caller's ``mark_running`` mutated it
+        (one-shot: zeroed; recurring: advanced one interval) — otherwise a
+        refused dispatch would leave the trigger permanently skipped/lost
+        instead of retried on the next idle wakeup. ``None`` preserves the
+        original "leave next_run_at untouched" behaviour for the plain
+        busy-refusal call site, where mark_running was never called.
+
+        Idempotent — if the task is already PENDING (we hit it on a
+        previous wakeup of the same idle gap) this is a no-op so we don't
+        churn the JSON file (restore_next_run_at is still honoured on the
+        first call that sets PENDING, before the idempotence check would
+        matter — see below).
+        """
         async with self._lock:
             t = self._tasks.get(task_id)
-            if not t or t.last_status == SchedulerTaskStatus.PENDING:
+            if not t:
+                return
+            if t.last_status == SchedulerTaskStatus.PENDING:
                 return
             t.last_status = SchedulerTaskStatus.PENDING
+            if restore_next_run_at is not None:
+                t.next_run_at = restore_next_run_at
             t.updated_at = int(time.time())
             await self._flush_locked()
+
+    async def reset_stale_running(self, task_id: str) -> Optional[ScheduledTask]:
+        """Recover a task wedged in RUNNING because its fire never reported
+        back (bridge crash / flow-setup exception after dispatch was accepted).
+
+        Flips the status out of RUNNING and makes the task due NOW so the next
+        scan re-fires it, rather than skipping it forever. For one-shots that
+        already had next_run_at cleared by mark_running, we set next_run_at to
+        the current time so the due-check picks it up; recurring tasks whose
+        next_run_at is already in the future are re-fired immediately as a
+        catch-up for the lost run. Records the recovery in last_error so it is
+        visible in the UI.
+        """
+        async with self._lock:
+            t = self._tasks.get(task_id)
+            if not t or t.last_status != SchedulerTaskStatus.RUNNING:
+                return t
+            now = int(time.time())
+            t.last_status = SchedulerTaskStatus.FAILED
+            t.last_error = "previous fire never reported completion (timed out); auto-recovered"
+            # Make it due now so _scan_and_fire re-fires on this pass.
+            t.next_run_at = now
+            t.updated_at = now
+            await self._flush_locked()
+        return t
 
     async def mark_finished(
         self,

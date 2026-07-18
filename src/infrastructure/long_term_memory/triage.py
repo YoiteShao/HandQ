@@ -914,6 +914,7 @@ class DreamWorker:
 
     async def _write_live_skill(
         self, *, title: str, description: str, content: str,
+        allowed_tools: Optional[List[str]] = None,
     ) -> bool:
         """Write (or update) a live, DISABLED skill under the unified Skill root.
 
@@ -933,6 +934,13 @@ class DreamWorker:
         as an existing hand-tuned skill) must never silently overwrite the
         user's content. New skills are written ``origin=auto`` so a later run
         may refresh them.
+
+        ``allowed_tools`` (optional) — the on-demand tool names the recipe uses.
+        Extracted by the LLM in the skill-extraction pass (see
+        ``parse_skill_extraction``). Threaded through so an auto-minted "remote
+        HandQ workflow" skill carries ``allowed-tools: [remote_handq]`` and
+        ``read_skill`` activates the tool the same way a hand-authored recipe
+        would. Empty list ⇒ frontmatter has no ``allowed-tools`` key.
 
         Runs in the shared backend process, so ``SkillRegistry.get()`` is the
         same singleton the agent reads; the write is visible immediately.
@@ -955,9 +963,11 @@ class DreamWorker:
                 return reg.update_skill(
                     slug, description=description, body=content,
                     origin=SKILL_ORIGIN_AUTO,
+                    allowed_tools=allowed_tools,
                 )
             return reg.create_skill(
-                slug, description, content, enabled=False, origin=SKILL_ORIGIN_AUTO,
+                slug, description, content, enabled=False,
+                origin=SKILL_ORIGIN_AUTO, allowed_tools=allowed_tools,
             )
 
         res = await asyncio.to_thread(_apply)
@@ -1099,8 +1109,12 @@ class DreamWorker:
             )
 
         description = (verdict.get("description") or title).strip()
+        # allowed_tools comes from parse_skill_extraction (may be []). Threaded
+        # through so an auto-minted recipe carries its tool grant end-to-end.
+        allowed_tools = verdict.get("allowed_tools") or []
         return await self._write_live_skill(
             title=title, description=description, content=content,
+            allowed_tools=allowed_tools,
         )
 
 
@@ -1836,10 +1850,7 @@ class DreamWorker:
                 max_tokens=900,
             ),
         )
-        return await parse_verdict(
-            result.content or "",
-            llm_services=self._helper_services,
-        )
+        return await parse_verdict(result.content or "")
 
     async def _init_helper_pool(self) -> None:
         """Build the LLM service list the dream worker calls.

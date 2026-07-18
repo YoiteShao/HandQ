@@ -432,7 +432,7 @@
             // Per-session activity feed (cap 30 items, mirrors the legacy
             // global `activityItems` ring buffer semantics).
             activityItems: [],
-            // Per-session activity-strip state ("idle"|"planning"|...).
+            // Per-session activity-strip state ("idle"|"thinking"|"executing").
             sessionState: 'idle',
             // Current pill text (separate from sessionState so tooltips
             // can carry richer text without overwriting state).
@@ -446,11 +446,15 @@
             // First-send tracking — controls request vs user_input.
             firstSendDone: false,
             // Streaming bubbles + thinking placeholder.
-            activeReceptionistBubble: null,
+            activeCoordinatorBubble: null,
             thinkingBubble: null,
-            // Boundary state for the checklist popover.
-            checklistItems: null,
-            checklistExpanded: false,
+            // Boundary state for the task-plan popover.
+            taskPlanItems: null,
+            taskPlanExpanded: false,
+            // Boundary state for the agent's own todo popover (its private
+            // step-by-step breakdown of the current task item).
+            agentTodoItems: null,
+            agentTodoExpanded: false,
             // Workspace info from session_started event.
             sessionDir: '',
             workspaceDir: '',
@@ -1134,7 +1138,7 @@
 
                 const icon = document.createElement('span');
                 icon.className = 'mention-item-icon';
-                icon.textContent = r.isDir ? '📁' : '📄';
+                icon.innerHTML = _pathIconSvg(r.isDir);
                 item.appendChild(icon);
 
                 const name = document.createElement('span');
@@ -1383,7 +1387,7 @@
     // from a wedged old subtask whose blocking syscall prevents Python
     // from killing the OS thread on Windows.
 
-    // Thinking bubble shown in chat while receptionist prepares a reply.
+    // Thinking bubble shown in chat while the coordinator prepares a reply.
     // Per-session — looked up via _S().thinkingBubble during dispatch.
 
     // Module-level "current dispatch sid". Set at the top of each handq
@@ -1416,8 +1420,16 @@
         // Returns true if the event should be DROPPED.
         if (!evt) return true;
         if (evt.session_id && closedSessions.has(evt.session_id)) return true;
-        const sid = _resolveSid(evt);
-        if (sid && !sessions.has(sid)) return true;
+        // A session_id we've never seen (e.g. a scheduler-dispatched
+        // "sched-xxx" fire) must NOT be dropped here — onStatus's lazy-mount
+        // path (below) is what creates its tab. Dropping it here means the
+        // event never reaches _mountSession and no card ever appears.
+        // activeSid-fallback events (no session_id on the envelope at all)
+        // still gate on "do we have an active session" as before.
+        if (!evt.session_id) {
+            const sid = _resolveSid(evt);
+            if (sid && !sessions.has(sid)) return true;
+        }
         return false;
     }
 
@@ -1426,18 +1438,17 @@
         return s.length > n ? s.slice(0, n - 1) + '…' : s;
     }
 
-    // Whether the planner/agent has a real task in flight, for the dispatch
-    // session. Used to gate receptionist-side pill updates so a chat reply
+    // Whether the agent has a real task in flight, for the dispatch
+    // session. Used to gate coordinator-side pill updates so a chat reply
     // mid-task can't reset that session's pill to "idle". `sessionState` is set
-    // by state_changed events (V2 emits planning / thinking / executing /
-    // idle); `activeExecCount` covers the brief window where a tool is running
+    // by state_changed events (V2 emits thinking / executing / idle);
+    // `activeExecCount` covers the brief window where a tool is running
     // before the next state_changed lands. Callers run inside _onStatusBody, so
     // _dispatchSession() resolves the session the in-flight event belongs to.
     function isTaskRunning() {
         const s = _dispatchSession();
         if (!s) return false;
-        return s.sessionState === 'planning'
-            || s.sessionState === 'thinking'
+        return s.sessionState === 'thinking'
             || s.sessionState === 'executing'
             || s.activeExecCount > 0;
     }
@@ -1466,6 +1477,16 @@
             .replace(/'/g, '&#39;');
     }
 
+    // Folder / file glyph shared by the @-mention dropdown and rendered chips.
+    const _FOLDER_ICON_SVG =
+        '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M2 4.5a1 1 0 0 1 1-1h3.4l1.2 1.4H13a1 1 0 0 1 1 1v6.6a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1V4.5Z" stroke="currentColor" stroke-width="1.2" fill="none" stroke-linejoin="round"/></svg>';
+    const _FILE_ICON_SVG =
+        '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M4.5 2h5l2.5 2.5v8a1 1 0 0 1-1 1h-6.5a1 1 0 0 1-1-1V3a1 1 0 0 1 1-1Z" stroke="currentColor" stroke-width="1.2" fill="none" stroke-linejoin="round"/><path d="M9.5 2v2.5H12" stroke="currentColor" stroke-width="1.2" fill="none" stroke-linejoin="round"/></svg>';
+    function _pathIconSvg(isDir) {
+        return isDir ? _FOLDER_ICON_SVG : _FILE_ICON_SVG;
+    }
+
+
     // @-path mention chip — recognises three forms in already-HTML-escaped
     // text (as emitted by escapeHtml above):
     //   - quoted:      @&quot;<any-non-&-non-quote>&quot;
@@ -1491,7 +1512,7 @@
         const sepIdx = Math.max(stripped.lastIndexOf('\\'), stripped.lastIndexOf('/'));
         const rawLabel = sepIdx >= 0 ? stripped.slice(sepIdx + 1) : stripped;
         const label = rawLabel || path;
-        const icon = isDir ? '📁' : '📄';
+        const icon = _pathIconSvg(isDir);
         const safePath = escapeHtml(path);
         const safeLabel = escapeHtml(label);
         return '<span class="mention-chip" data-path="' + safePath + '" title="' + safePath + '">' +
@@ -1706,7 +1727,7 @@
     // session model — see plan #11/#12). Each session's pane now hosts its
     // own activity content as collapsible `<details>` groups interleaved
     // between chat bubbles. A group accumulates events (decision_made,
-    // tool_execution_started, tool result, planner step, network event...)
+    // tool_execution_started, tool result, inline step, network event...)
     // since the last chat bubble; the next chat bubble seals the group and
     // a fresh one opens on the next activity event. Sealed groups stay in
     // the DOM as collapsed history.
@@ -1759,16 +1780,6 @@
             });
             pane._activeActivityGroup = null;
         }
-        // Accordion: collapse any previously-sealed group in this pane before
-        // opening the new one. We only reach here when there's no live group
-        // (the pointer was nulled by _sealActivityGroup), so every open group
-        // found is completed history — tidy it into a chip so the transcript
-        // doesn't grow unbounded with expanded blocks, while the just-finished
-        // task's activity stays visible until the next turn actually starts.
-        try {
-            pane.querySelectorAll(':scope > .activity-group[open]')
-                .forEach((g) => { g.open = false; });
-        } catch (_) { /* querySelectorAll :scope unsupported — non-fatal */ }
         const group = document.createElement('details');
         group.className = 'activity-group';
         // Open the live group so activity is visible as it streams in. It stays
@@ -2203,7 +2214,7 @@
     }
 
     function addAssistantTextBubble(text) {
-        // Single-shot non-streaming assistant message (e.g. receptionist reply,
+        // Single-shot non-streaming assistant message (e.g. coordinator reply,
         // task completion summary). Markdown-render the body too.
         const bubble = el('div', 'bubble assistant');
         const body = el('div', 'bubble-body');
@@ -2218,50 +2229,50 @@
         scrollToBottom();
     }
 
-    // Streaming receptionist reply — incremental markdown render per delta.
+    // Streaming coordinator reply — incremental markdown render per delta.
     // The "currently streaming" bubble is tracked PER SESSION via the
-    // session bucket's `activeReceptionistBubble` field; this allows two
+    // session bucket's `activeCoordinatorBubble` field; this allows two
     // concurrent sessions to each have their own streaming bubble in-flight.
 
-    function appendReceptionistDelta(text) {
+    function appendCoordinatorDelta(text) {
         if (!text) return;
         const s = _dispatchSession();
         if (!s) return;
-        if (!s.activeReceptionistBubble) {
-            s.activeReceptionistBubble = el('div', 'bubble assistant streaming');
+        if (!s.activeCoordinatorBubble) {
+            s.activeCoordinatorBubble = el('div', 'bubble assistant streaming');
             const body = el('div', 'bubble-body');
-            s.activeReceptionistBubble.appendChild(body);
-            s.activeReceptionistBubble._body = body;
-            s.activeReceptionistBubble._currentTextSpan = null;
+            s.activeCoordinatorBubble.appendChild(body);
+            s.activeCoordinatorBubble._body = body;
+            s.activeCoordinatorBubble._currentTextSpan = null;
             const pane = s.pane || conversation;
             // New assistant turn — seal any open activity group so it
             // settles above the upcoming streaming bubble.
             _sealActivityGroup(pane);
-            pane.appendChild(s.activeReceptionistBubble);
+            pane.appendChild(s.activeCoordinatorBubble);
         }
-        var span = s.activeReceptionistBubble._currentTextSpan;
+        var span = s.activeCoordinatorBubble._currentTextSpan;
         if (!span) {
             span = el('div', 'text-stream md-rendered');
             span._rawText = '';
-            s.activeReceptionistBubble._body.appendChild(span);
-            s.activeReceptionistBubble._currentTextSpan = span;
+            s.activeCoordinatorBubble._body.appendChild(span);
+            s.activeCoordinatorBubble._currentTextSpan = span;
         }
         span._rawText += text;
         scheduleMarkdownRender(span);
         scrollToBottom();
     }
 
-    function sealReceptionistBubble() {
+    function sealCoordinatorBubble() {
         const s = _dispatchSession();
-        if (!s || !s.activeReceptionistBubble) return;
-        s.activeReceptionistBubble.classList.remove('streaming');
-        s.activeReceptionistBubble.classList.add('complete');
-        if (s.activeReceptionistBubble._currentTextSpan) {
-            var span = s.activeReceptionistBubble._currentTextSpan;
+        if (!s || !s.activeCoordinatorBubble) return;
+        s.activeCoordinatorBubble.classList.remove('streaming');
+        s.activeCoordinatorBubble.classList.add('complete');
+        if (s.activeCoordinatorBubble._currentTextSpan) {
+            var span = s.activeCoordinatorBubble._currentTextSpan;
             try { span.innerHTML = renderMarkdown(span._rawText || ''); }
             catch (_) { span.textContent = span._rawText || ''; }
         }
-        s.activeReceptionistBubble = null;
+        s.activeCoordinatorBubble = null;
     }
 
     function showThinkingBubble() {
@@ -2314,7 +2325,7 @@
     }
 
     function addStepBubble(icon, desc) {
-        // Step events (planner inline_event) are activity-class; route them
+        // Step events (backend inline_event) are activity-class; route them
         // into the current session's activity group instead of producing
         // standalone bubbles. Keeps the conversation thread focused on
         // user/assistant messages while letting the user expand activity to
@@ -2891,28 +2902,28 @@
     // so the panel never blocks the top of the conversation; the header alone
     // (progress + current item) stays visible, and clicking it floats the full
     // list as an overlay (like the activity strip ↔ popover pair).
-    let checklistExpanded = false;
+    let taskPlanExpanded = false;
 
-    function renderChecklist(items) {
+    function renderTaskPlan(items) {
         // Per-session live task panel pinned at the top of the session's
         // conversation pane. Each session has its own panel — multiple
-        // concurrent sessions never overwrite each other's checklist.
+        // concurrent sessions never overwrite each other's plan.
         // Stored as a class (not id) so multiple coexist in the DOM at the
         // same time; the panel lives inside that session's pane.
         const pane = _dispatchPane();
         const s = _dispatchSession();
         if (!pane || !s) return;
-        let panel = pane.querySelector(':scope > .checklist-panel');
+        let panel = pane.querySelector(':scope > .task-plan-panel');
         if (!items || items.length === 0) {
             if (panel) panel.remove();
             return;
         }
         if (!panel) {
             panel = document.createElement('div');
-            panel.className = 'checklist-panel';
+            panel.className = 'task-plan-panel';
             pane.insertBefore(panel, pane.firstChild);
         }
-        const expanded = !!s.checklistExpanded;
+        const expanded = !!s.taskPlanExpanded;
         panel.classList.toggle('collapsed', !expanded);
 
         const GLYPH = {
@@ -2929,13 +2940,13 @@
         // Header — always visible; clicking it toggles the floating list.
         const header = document.createElement('button');
         header.type = 'button';
-        header.className = 'checklist-header';
+        header.className = 'task-plan-header';
         header.setAttribute('aria-expanded', String(expanded));
         const chevron = document.createElement('span');
-        chevron.className = 'cl-chevron';
+        chevron.className = 'tp-chevron';
         chevron.textContent = expanded ? '▾' : '▸';
         const label = document.createElement('span');
-        label.className = 'cl-summary';
+        label.className = 'tp-summary';
         let summary = 'Task plan · ' + doneCount + ' done';
         if (failedCount) summary += ' · ' + failedCount + ' failed';
         if (interruptedCount) summary += ' · ' + interruptedCount + ' interrupted';
@@ -2949,8 +2960,8 @@
         header.appendChild(chevron);
         header.appendChild(label);
         header.addEventListener('click', () => {
-            s.checklistExpanded = !s.checklistExpanded;
-            renderChecklist(items);
+            s.taskPlanExpanded = !s.taskPlanExpanded;
+            renderTaskPlan(items);
         });
         panel.appendChild(header);
 
@@ -2958,16 +2969,16 @@
         // so it covers the conversation instead of pushing it down.
         if (expanded) {
             const list = document.createElement('div');
-            list.className = 'checklist-items';
+            list.className = 'task-plan-items';
             for (const it of items) {
                 const status = String((it && it.status) || 'pending');
                 const row = document.createElement('div');
-                row.className = 'checklist-item cl-' + status;
+                row.className = 'task-plan-item tp-' + status;
                 const glyph = document.createElement('span');
-                glyph.className = 'cl-glyph';
+                glyph.className = 'tp-glyph';
                 glyph.textContent = GLYPH[status] || '·';
                 const text = document.createElement('span');
-                text.className = 'cl-text md-rendered';
+                text.className = 'tp-text md-rendered';
                 text.innerHTML = renderMarkdownInline(
                     escapeHtml(String((it && it.instruction) || '')));
                 row.appendChild(glyph);
@@ -2979,7 +2990,91 @@
         // Track items on the session bucket so a session switch could
         // re-render in v2 (the pane's DOM already retains the rendered
         // panel, so this is for state persistence not re-render).
-        s.checklistItems = items;
+        s.taskPlanItems = items;
+    }
+
+    // Live agent-todo panel — the agent's OWN private step breakdown of the
+    // current task item (written via the `todo_write` tool), distinct from
+    // the task-plan panel above (which is the Coordinator↔Agent IPC queue —
+    // that queue is at most one item, so this panel is the only place a
+    // user can see multi-step progress).
+    // Same collapsed-pill ↔ floating-overlay pattern as renderTaskPlan.
+    function renderAgentTodo(todos) {
+        const pane = _dispatchPane();
+        const s = _dispatchSession();
+        if (!pane || !s) return;
+        let panel = pane.querySelector(':scope > .agent-todo-panel');
+        if (!todos || todos.length === 0) {
+            if (panel) panel.remove();
+            s.agentTodoItems = null;
+            return;
+        }
+        if (!panel) {
+            panel = document.createElement('div');
+            panel.className = 'agent-todo-panel';
+            // Sits just below the task-plan panel when both are present —
+            // insert after it if it exists, else pin to the top like it does.
+            const taskPlanPanel = pane.querySelector(':scope > .task-plan-panel');
+            if (taskPlanPanel && taskPlanPanel.nextSibling) {
+                pane.insertBefore(panel, taskPlanPanel.nextSibling);
+            } else if (taskPlanPanel) {
+                pane.appendChild(panel);
+            } else {
+                pane.insertBefore(panel, pane.firstChild);
+            }
+        }
+        const expanded = !!s.agentTodoExpanded;
+        panel.classList.toggle('collapsed', !expanded);
+
+        const GLYPH = { completed: '✓', in_progress: '▶', pending: '☐' };
+        const doneCount = todos.filter((t) => t && t.status === 'completed').length;
+        const current = todos.find((t) => t && t.status === 'in_progress');
+
+        panel.innerHTML = '';
+
+        const header = document.createElement('button');
+        header.type = 'button';
+        header.className = 'agent-todo-header';
+        header.setAttribute('aria-expanded', String(expanded));
+        const chevron = document.createElement('span');
+        chevron.className = 'at-chevron';
+        chevron.textContent = expanded ? '▾' : '▸';
+        const label = document.createElement('span');
+        label.className = 'at-summary';
+        let summary = 'Agent todo · ' + doneCount + ' / ' + todos.length;
+        if (!expanded && current) {
+            summary += ' · ▶ ' + String(current.content || '');
+        }
+        label.textContent = summary;
+        header.appendChild(chevron);
+        header.appendChild(label);
+        header.addEventListener('click', () => {
+            s.agentTodoExpanded = !s.agentTodoExpanded;
+            renderAgentTodo(todos);
+        });
+        panel.appendChild(header);
+
+        if (expanded) {
+            const list = document.createElement('div');
+            list.className = 'agent-todo-items';
+            for (const t of todos) {
+                const status = String((t && t.status) || 'pending');
+                const row = document.createElement('div');
+                row.className = 'agent-todo-item at-' + status;
+                const glyph = document.createElement('span');
+                glyph.className = 'at-glyph';
+                glyph.textContent = GLYPH[status] || '·';
+                const text = document.createElement('span');
+                text.className = 'at-text md-rendered';
+                text.innerHTML = renderMarkdownInline(
+                    escapeHtml(String((t && t.content) || '')));
+                row.appendChild(glyph);
+                row.appendChild(text);
+                list.appendChild(row);
+            }
+            panel.appendChild(list);
+        }
+        s.agentTodoItems = todos;
     }
 
     function handleSessionEvent(eventName, data) {
@@ -3115,16 +3210,13 @@
             const s = _dispatchSession();
             if (s) s.sessionState = evt.state;
             // V2 activity-strip vocabulary (see controller_v2):
-            //   planning  — orchestrator is composing/revising the checklist
             //   thinking  — agent has the LLM stream open (reasoning + tools)
             //   executing — agent dispatching tools / between think-streams
             //   idle      — task settled, final reply sent
-            // The first three are live working phases → animated label,
-            // consistent with the receptionist's "thinking…". idle clears the
+            // The first two are live working phases → animated label,
+            // consistent with the coordinator's "thinking…". idle clears the
             // working animation and rests the strip.
-            if (evt.state === 'planning') {
-                setWorking('designing…');
-            } else if (evt.state === 'thinking') {
+            if (evt.state === 'thinking') {
                 // Show the actual thinking content (latest reasoning) rather
                 // than a generic label; falls back to "thinking…" only before
                 // any reasoning has streamed for this task.
@@ -3141,7 +3233,7 @@
             }
         } else if (evt.kind === 'inline_event') {
             // Backend-emitted step-style line.
-            // Render with addStepBubble so it visually matches planner step
+            // Render with addStepBubble so it visually matches other step
             // events instead of the chunkier system bubble used by display_message.
             addStepBubble(String(evt.icon || '·'), String(evt.desc || ''));
         } else if (evt.kind === 'recall_started') {
@@ -3149,7 +3241,7 @@
             // per-item / stagnation agent recall). Show a transient working
             // label on the activity strip; the next state_changed / decision /
             // tool event (or a streamed chat reply) supersedes it.
-            setWorking('🧠 recalling…');
+            setWorking('recalling…');
         } else if (evt.kind === 'decision_made') {
             const iter = args[0] || '';
             const reasoning = args[1] || '';
@@ -3207,20 +3299,20 @@
         } else if (evt.kind === 'reply') {
             addAssistantTextBubble(evt.text || '');
         } else if (evt.kind === 'reply_delta') {
-            // Receptionist is streaming a chat reply. Always clear the chat-side
+            // Coordinator is streaming a chat reply. Always clear the chat-side
             // thinking bubble so the streaming text replaces it. The activity
-            // strip pill is owned by the planner/agent task state — only reset
+            // strip pill is owned by the agent's task state — only reset
             // it when no task is in flight; otherwise the pill would flash to
-            // "idle" mid-task while the receptionist chats.
+            // "idle" mid-task while the coordinator chats.
             removeThinkingBubble();
             if (!isTaskRunning()) {
                 clearWorking();
                 setPill('');
             }
-            appendReceptionistDelta(evt.text || '');
+            appendCoordinatorDelta(evt.text || '');
         } else if (evt.kind === 'reply_done') {
-            sealReceptionistBubble();
-        } else if (evt.kind === 'receptionist_thinking_on') {
+            sealCoordinatorBubble();
+        } else if (evt.kind === 'coordinator_thinking_on') {
             // Show the chat-side thinking bubble unconditionally; only steal
             // the activity strip pill when no real task is running, otherwise
             // the agent's working indicator would be hidden by "thinking…".
@@ -3228,12 +3320,12 @@
             if (!isTaskRunning()) {
                 setWorking('thinking…');
             }
-        } else if (evt.kind === 'receptionist_thinking_off') {
+        } else if (evt.kind === 'coordinator_thinking_off') {
             removeThinkingBubble();
             if (!isTaskRunning()) {
                 // clearWorking() only strips the spin animation class — it never
                 // resets pillText/textContent. Without setPill(''), a leftover
-                // label from an intermediate signal (e.g. "🧠 recalling…") stays
+                // label from an intermediate signal (e.g. "recalling…") stays
                 // stuck on the pill forever on the chat path, which never visits
                 // state_changed→idle or reply_delta (the only other resets).
                 clearWorking();
@@ -3246,8 +3338,10 @@
         } else if (evt.kind === 'scheduled_task_started') {
             const name = evt.session_name || ('⏱ ' + (evt.name || 'Scheduled'));
             _renameSession(_dispatchSid, name);
-        } else if (evt.kind === 'checklist') {
-            renderChecklist(Array.isArray(evt.items) ? evt.items : []);
+        } else if (evt.kind === 'task_plan') {
+            renderTaskPlan(Array.isArray(evt.items) ? evt.items : []);
+        } else if (evt.kind === 'agent_todo') {
+            renderAgentTodo(Array.isArray(evt.todos) ? evt.todos : []);
         } else if (evt.kind === 'llm_server_error') {
             const retryIn = (typeof evt.retry_in === 'number' && evt.retry_in > 0)
                 ? ' — retrying in ' + evt.retry_in + 's'
