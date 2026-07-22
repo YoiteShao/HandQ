@@ -91,6 +91,17 @@ class WriteTool(BaseTool):
 
             file_exists = path_obj.exists()
 
+            # Checkpoint the PRE-write state for undo (RewindStore, Tier-1.3).
+            # First-write-wins inside the store, so repeated writes to the same
+            # path in one item still restore to the pre-item content. Captured
+            # BEFORE the atomic write below and BEFORE the staleness early-
+            # returns are irrelevant (no mutation happens on those paths). Runs
+            # in the executor because it reads the file off disk. No-op when the
+            # session has no store (ctx-less test fixtures).
+            rewind = getattr(self.ctx, "rewind_store", None) if self.ctx else None
+            if rewind is not None:
+                await loop.run_in_executor(None, lambda: rewind.capture_before(path))
+
             # Staleness check: block write if file has not been read or changed since last read.
             # For append mode use check_stale_and_read so the existing content comes from the
             # same open() call as the hash comparison — no TOCTOU window between check and read.
@@ -195,6 +206,11 @@ class WriteTool(BaseTool):
                     "WARNING: Possible secret(s) detected in written content: "
                     + ", ".join(secret_hits)
                 )
+
+            # Live file-touch event → session sidebar (nebula + change list).
+            # Fires AFTER the atomic write + FileState update so the sidebar
+            # only lights up on writes that actually succeeded.
+            self.emit_file_touch(str(path_obj.absolute()), "edit")
 
             return ToolResult(
                 success=True,

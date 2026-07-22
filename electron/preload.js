@@ -266,6 +266,17 @@ contextBridge.exposeInMainWorld('handq', {
     listDirectory: (dirPath, filter) => {
         return ipcRenderer.invoke('handq:listDirectory', { path: dirPath, filter });
     },
+
+    /**
+     * revealFile(path) — pop the OS file explorer to the given file, with
+     * that file selected. Resolves to { ok:true } on success or
+     * { ok:false, reason } on any failure — the caller can silently no-op.
+     * Backed by Electron's shell.showItemInFolder in main.js. Fires from
+     * the FILES tree in the session sidebar (double-click on a leaf).
+     */
+    revealFile: (filePath) => {
+        return ipcRenderer.invoke('handq:revealFile', { path: filePath });
+    },
 });
 
 // Custom-titlebar window controls (frameless window). The renderer ships its
@@ -283,12 +294,16 @@ contextBridge.exposeInMainWorld('windowControls', {
         preloadLog('window:hide');
         ipcRenderer.send('window:hide');
     },
-    // Ask main to grow the window based on the current session count.
-    // Grow-only + capped at maximize when count reaches the threshold (6).
+    // Ask main to grow the window based on the current visible layout.
+    // Grow-only + capped at maximize when session count reaches the
+    // threshold (6). Payload is a descriptor object; main resolves the
+    // desired size via a formula (baseline + per-panel deltas).
     // Renderer calls this every time _updateLayout runs.
-    autoResize: (count) => {
-        preloadLog('window:auto-resize', { count });
-        ipcRenderer.send('window:auto-resize', count);
+    autoResize: (layout) => {
+        // Backwards compatible: if a bare number is passed, forward it
+        // as a session count; main.js accepts either shape.
+        preloadLog('window:auto-resize', typeof layout === 'object' ? layout : { sessions: layout });
+        ipcRenderer.send('window:auto-resize', layout);
     },
     // Subscribe to maximize / unmaximize events so the custom titlebar
     // can swap the max-button icon (single square ↔ two overlapping squares).

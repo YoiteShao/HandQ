@@ -1,22 +1,17 @@
 """
 fan_out_agents — dispatch many independent sub-agent tasks concurrently.
 
-Same isolation contract as `spawn_agent` (own message list, no task channel,
-no compaction, only a text summary returns) but for N tasks at once instead of
-one. Value is NOT execution speed — it's two things the main agent otherwise
-can't get on its own:
-
-  1. Independent processing of independent items (e.g. check 20 hosts) without
-     dumping 20 items' worth of raw tool output into its own context.
-  2. A genuinely independent second (third, fourth...) opinion on the same
-     question — spawn N tasks that each look at the same claim from a
-     different angle, get back N separate judgments instead of one pass
-     re-read by the same context that produced it.
+Same mechanism as `spawn_agent` (fork of the agent itself, same tool list,
+same prompt/context inheritance — see spawn_agent_tool.py's design note) but
+for N tasks at once instead of one. Value is NOT execution speed for its own
+sake — it's processing independent items (e.g. check 20 hosts) in parallel
+without dumping 20 items' worth of raw tool output into the parent's own
+context; each task's intermediate reads stay in its own isolated message
+list, and only its final summary comes back.
 
 The tool provides only the atomic primitive (isolation + concurrency). How
-many tasks to spawn, how to phrase them, and how to weigh/reconcile the
-returned summaries is entirely the calling agent's judgment — not encoded
-here.
+many tasks to spawn and how to phrase them is entirely the calling agent's
+judgment — not encoded here.
 """
 import asyncio
 import os
@@ -53,30 +48,46 @@ _SUMMARY_CHAR_LIMIT = 3000
 
 
 class FanOutAgentsTool(BaseTool):
-    """Run N independent sub-agent tasks concurrently; return N summaries."""
+    """Run N forks of the agent concurrently; return N summaries."""
 
-    is_read_only = False  # a "worker" profile task can write/edit
+    is_read_only = False  # its fixed tool list includes write/edit/notebook_edit
     is_concurrency_safe = True
 
     def __init__(self, ctx: Optional["SessionContext"] = None):
         super().__init__("fan_out_agents", ctx=ctx)
         self._services: Optional[list] = None
         self._tool_instances: Optional[Dict[str, BaseTool]] = None
+        # Providers, not frozen values — see SpawnAgentTool's __init__ for why
+        # (parent's iteration budget / context block change over its
+        # lifetime; calling these at spawn-time keeps every task fresh).
+        self._parent_iter_budget_fn: Optional[Any] = None
+        self._parent_context_block_fn: Optional[Any] = None
 
     def bind_runtime(self, services: list, tool_instances: Dict[str, BaseTool]) -> None:
         """Wire the parent's LLM services + tool instances (see spawn_agent)."""
         self._services = services
         self._tool_instances = tool_instances
 
+    def bind_context(self, iter_budget_fn, context_block_fn) -> None:
+        """Wire providers for the parent's live iteration budget + inheritable
+        context block (see SpawnAgentTool.bind_context — same contract,
+        shared by both)."""
+        self._parent_iter_budget_fn = iter_budget_fn
+        self._parent_context_block_fn = context_block_fn
+
     async def execute(
         self,
         tasks: Optional[List[Dict[str, Any]]] = None,
-        tool_profile: str = "explore",
+        inherit_context: bool = True,
+        iter_budget: Optional[int] = None,
         max_concurrency: int = _DEFAULT_CONCURRENCY,
         **kwargs: Any,
     ) -> ToolResult:
         start = time.time()
-        params = {"tasks": tasks, "tool_profile": tool_profile, "max_concurrency": max_concurrency}
+        params = {
+            "tasks": tasks, "inherit_context": inherit_context,
+            "iter_budget": iter_budget, "max_concurrency": max_concurrency,
+        }
 
         if not isinstance(tasks, list) or not tasks:
             return self._err("fan_out_agents requires a non-empty 'tasks' list.", params, start)
@@ -94,11 +105,6 @@ class FanOutAgentsTool(BaseTool):
                 return self._err(f"tasks[{i}] is missing a non-empty 'prompt'.", params, start)
             prompts.append(p)
 
-        if tool_profile not in ("explore", "worker"):
-            return self._err(
-                f"tool_profile must be 'explore' or 'worker' (got {tool_profile!r}).",
-                params, start,
-            )
         if not self._services or self._tool_instances is None:
             return self._err(
                 "fan_out_agents is not wired to an LLM pool in this context.",
@@ -107,14 +113,24 @@ class FanOutAgentsTool(BaseTool):
 
         concurrency = max(_MIN_CONCURRENCY, min(_MAX_CONCURRENCY, int(max_concurrency or _DEFAULT_CONCURRENCY)))
         semaphore = asyncio.Semaphore(concurrency)
+        # Resolved ONCE for the whole batch (not per-task) — every task in
+        # one fan_out_agents call shares the same snapshot of "what the
+        # parent currently knows", consistent with them all being dispatched
+        # from the same parent turn.
+        effective_budget = iter_budget or (self._parent_iter_budget_fn() if self._parent_iter_budget_fn else None)
+        effective_context = (
+            self._parent_context_block_fn() if (inherit_context and self._parent_context_block_fn) else None
+        )
 
         async def _run_one(p: str) -> Dict[str, Any]:
             async with semaphore:
                 try:
                     result = await run_subagent_task(
-                        p, tool_profile=tool_profile,
+                        p,
                         services=self._services, tool_instances=self._tool_instances,
                         ctx=self.ctx,
+                        iter_budget=effective_budget,
+                        inherited_context_block=effective_context,
                     )
                 except Exception as exc:
                     # run_subagent_task already catches its own internal
@@ -167,30 +183,36 @@ class FanOutAgentsTool(BaseTool):
                 "type": "array",
                 "description": (
                     f"1-{_MAX_TASKS} independent tasks to run concurrently, each as "
-                    "{\"prompt\": \"...\"}. Each runs in its own isolated context "
-                    "(own message history, no shared state between tasks) and "
-                    "returns only a text summary — the parent's context only "
-                    "sees the summaries, not the intermediate tool calls."
+                    "{\"prompt\": \"...\"}. Each is a fork of YOU — same tool list, "
+                    "same behavioral prompt, and (by default) the same session "
+                    "context — running in its own isolated message history; only "
+                    "its final text summary comes back to you."
                 ),
                 "items": {
                     "type": "object",
                     "properties": {
                         "prompt": {
                             "type": "string",
-                            "description": "The task/question for this sub-agent, self-contained (it has no memory of this conversation).",
+                            "description": "The task/question for this sub-agent.",
                         },
                     },
                     "required": ["prompt"],
                 },
             },
-            "tool_profile": {
-                "type": "string",
-                "enum": ["explore", "worker"],
+            "inherit_context": {
+                "type": "boolean",
                 "description": (
-                    "'explore' (default) — read-only tools (read/grep/glob/shell "
-                    "probes). 'worker' — adds write/edit for tasks that must "
-                    "produce file changes; a write/edit outside the working "
-                    "directory is refused (no way to ask the user mid-task)."
+                    "Default true: seed every task's first message with your "
+                    "current session progress / task / LTM context. Set false "
+                    "only when you want deliberately blank-slate tasks."
+                ),
+            },
+            "iter_budget": {
+                "type": "integer",
+                "description": (
+                    "Max iterations per task's own loop. Defaults to YOUR OWN "
+                    "current iteration budget — set this only to explicitly "
+                    "shorten quick tasks."
                 ),
             },
             "max_concurrency": {

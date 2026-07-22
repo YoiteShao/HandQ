@@ -1,6 +1,6 @@
 ---
 name: web-search-workflow
-description: Enterprise cross-source search (Confluence/Jira/SharePoint/orbit) — sources, login recovery, ranking-vs-reading split
+description: Enterprise cross-source search (Confluence/Jira/SharePoint/orbit) + qgenie synthesised-answer assistant — sources, login recovery, ranking-vs-reading split
 enabled: true
 standing: false
 origin: bundled
@@ -17,6 +17,9 @@ in once per source and HandQ inherits the cookie afterward.
 - The request names Confluence/Jira/SharePoint/orbit/intranet, or asks to
   find internal docs/wiki/ticket content.
 - Any cross-source enterprise search.
+- The request asks qgenie something ("ask qgenie X", "what does qgenie say
+  about X"), or wants a synthesised answer from internal knowledge rather than
+  a list of documents to open → `source=qgenie`.
 
 ## When NOT to use
 
@@ -28,11 +31,16 @@ in once per source and HandQ inherits the cookie afterward.
 
 ## Ranking vs. reading
 
-`web_search` returns snippet-truncated hits (~300 chars) — it is for ranking
-which result to open, not for reading full documents. Pick a hit and call
-`browser.navigate` to read it; auto-fetching full bodies through this tool
-is out of scope. `browser.launch_browser` is idempotent — call it first if
-a session may not be open yet.
+For confluence/jira/sharepoint/orbit, `web_search` returns snippet-truncated
+hits (~300 chars) — it is for ranking which result to open, not for reading
+full documents. Pick a hit and call `browser.navigate` to read it; auto-fetching
+full bodies through this tool is out of scope. `browser.launch_browser` is
+idempotent — call it first if a session may not be open yet.
+
+**qgenie is the exception — it is for reading, not ranking.** It returns ONE
+hit whose `snippet` is qgenie's full, untruncated answer (markdown, possibly
+long), optionally followed by the source documents it cited. Read `hits[0]`
+directly; don't navigate to open it. qgenie ignores `limit`/`offset`.
 
 ## Login recovery
 
@@ -55,5 +63,11 @@ expiry.
 - **orbit** — intranet portal, DOM-extract fallback (no JSON API). Selector
   tunable via `web_search.sources.orbit.result_selector` in config if the
   portal markup shifts.
+- **qgenie** — the qgenie-chat assistant (qgenie-chat.qualcomm.com). Returns a
+  synthesised, cited answer to a natural-language question, RAG-searching
+  Qualcomm internal knowledge first. Auth is two tokens harvested from the live
+  session (not cookies); needs a launched browser session like orbit. Query is
+  plain natural language ("What is the X release schedule?"). Ignores `limit`.
 
 Default `limit` 10, hard cap 25 (clamped from `web_search.max_limit` in config).
+Applies to the ranking sources; qgenie always returns one answer.

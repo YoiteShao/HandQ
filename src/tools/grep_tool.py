@@ -382,6 +382,35 @@ class GrepTool(BaseTool):
                     tool_parameters={"pattern": pattern, "path": path, "include": include, "output_mode": output_mode},
                 )
 
+            # Sidebar hits: one file_touch(kind='hit') per DISTINCT file the
+            # scan actually matched. Result shapes vary by output_mode
+            # (files_with_matches/count use a `matches` list; content mode
+            # groups per-file too) — walk every dict-like entry and pull the
+            # `file` key. Deduped so a file matched 20 times is one hit, not
+            # 20 orbs of noise. Bounded because a pathological pattern can
+            # match thousands of files and each event is a stdout write.
+            try:
+                matches = result.get("matches") if isinstance(result, dict) else None
+                if isinstance(matches, list):
+                    seen: set = set()
+                    _root = self.ctx.working_directory if (
+                        self.ctx and self.ctx.working_directory) else None
+                    for m in matches[:150]:
+                        rel = None
+                        if isinstance(m, dict):
+                            rel = m.get("file") or m.get("path")
+                        elif isinstance(m, str):
+                            rel = m
+                        if not rel or rel in seen:
+                            continue
+                        seen.add(rel)
+                        abs_path = rel if os.path.isabs(rel) else (
+                            os.path.join(_root, rel) if _root else rel
+                        )
+                        self.emit_file_touch(abs_path, "hit")
+            except Exception:
+                pass
+
             return ToolResult(
                 success=True,
                 output=result,

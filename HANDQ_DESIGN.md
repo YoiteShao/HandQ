@@ -803,7 +803,7 @@ messages = [
    {"tool":...,"decision":"elided","chars_saved":655}],
  "tokens":{"in":...,"out":...,"total":...,"cache_read":...,"cache_create":...},
  "totals":{"messages":30,"est_chars":21672}}      ← 当轮完整上下文规模(增长曲线)
-{"kind":"item_end","item_id":...,"status":...,"factual_outcome":[...],"artifacts":[...],"findings":[...],"issues":[...]}
+{"kind":"item_end","item_id":...,"status":...,"final_answer":"...","verification":[...],"artifacts":[...],"findings":[...],"issues":[...]}
 {"kind":"session_end","session_id":...,"status":...,"completion":...,"tokens":{...}}
 ```
 
@@ -845,8 +845,8 @@ ToolRegistry (src/tools/tool_registry.py)
 | `shell` | 执行终端命令(有 risk_check 门控 + 并发安全性启发式,见 2.6.4) |
 | `glob` / `grep` | 文件查找 + 内容搜索 |
 | `read_skill` | 拉取 Skill 的完整 body(渐进式披露) |
-| `spawn_agent` | 分叉一个只读子 Agent(最多 12 轮,结果回传) |
-| `fan_out_agents` | 并发分叉多个独立子 Agent 任务,各自隔离,分别回传摘要 |
+| `spawn_agent` | 把自己分叉成一个子任务(同一份工具集/行为提示/会话上下文,默认继承父级迭代预算),隔离消息列表跑,只回传文本摘要——是 `fan_out_agents` N=1 场景的便捷入口 |
+| `fan_out_agents` | 把自己并发分叉成 N 个子任务,每个都是同一套机制(见 `spawn_agent`),各自隔离消息列表,分别回传摘要——用于并行处理互不依赖的独立项 |
 | `todo_write` | Agent 私有便签,覆盖写(实时流到用户 UI) |
 | `wait_interval` | 等待指定秒数(用于定时轮询/等待外部流程) |
 | `schedule_create` / `schedule_list` / `schedule_delete` | Agent 自建/查/删定时任务(cron 或友好语法);每次触发在独立 `sched-{uuid}` 会话跑。薄封装 `Scheduler` 服务(经 `ctx.scheduler`),对齐 Claude Code 的 `CronCreate`/`CronList`/`CronDelete`。默认 `durable=false`(会话级、内存态),`durable=true` 才落盘跨重启 |
@@ -1140,7 +1140,9 @@ Skill 面板走独立的 `skill_list`/`skill_set_enabled`/`skill_set_standing`/`
    - 思考:验证一下
    - 调 read(path="config.yaml") → 确认 port: 8080
    - 无更多 tool_call → done=True
-11. Agent 写 TaskResult(success=True, factual_outcome=["config.yaml 端口已改为 8080"],
+11. Agent 写 TaskResult(success=True, final_answer="端口已改为 8080。",
+                        verification=["read config.yaml (确认 port: 8080)",
+                                      "edit config.yaml (port 8080)"],
                         artifacts=["config.yaml"])
 12. channel.mark_current_done(result) → 触发 _on_item_done_sync(同步机械检查)
 13. 无更多排队 item + completed_count>0 + 无 active_goal + 无挂起 wakeup → 判定任务完成 → _compose_completion_reply()

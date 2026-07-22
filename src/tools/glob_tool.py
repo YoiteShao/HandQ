@@ -157,6 +157,22 @@ class GlobTool(BaseTool):
                     f"{result['total_found']} matches. Use a more specific pattern."
                 )
 
+            # Sidebar hits: one file_touch per matched file (bounded so a
+            # naive glob for '**/*' doesn't flood the event stream).
+            try:
+                matches = result.get("matches")
+                if isinstance(matches, list):
+                    for m in matches[:150]:
+                        p = m if isinstance(m, str) else (
+                            m.get("path") if isinstance(m, dict) else None
+                        )
+                        if not p:
+                            continue
+                        abs_path = p if os.path.isabs(p) else os.path.join(search_dir, p)
+                        self.emit_file_touch(abs_path, "hit")
+            except Exception:
+                pass
+
             return ToolResult(
                 success=True,
                 output=output,

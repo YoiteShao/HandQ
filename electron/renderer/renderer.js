@@ -182,6 +182,8 @@
     // ----- DOM refs --------------------------------------------------------
 
     const conversation = document.getElementById('conversation');
+    const stageRail = document.getElementById('stage-rail');
+    const stageRailList = document.getElementById('stage-rail-list');
 
     // Shortcut bar
     const scSettings = document.getElementById('sc-settings');
@@ -429,9 +431,6 @@
             // null. The owning sid IS this session, so the answer is always
             // stamped with `sid` (never the globally-active tab).
             pendingConfirm: null,
-            // Per-session activity feed (cap 30 items, mirrors the legacy
-            // global `activityItems` ring buffer semantics).
-            activityItems: [],
             // Per-session activity-strip state ("idle"|"thinking"|"executing").
             sessionState: 'idle',
             // Current pill text (separate from sessionState so tooltips
@@ -448,18 +447,31 @@
             // Streaming bubbles + thinking placeholder.
             activeCoordinatorBubble: null,
             thinkingBubble: null,
-            // Boundary state for the task-plan popover.
-            taskPlanItems: null,
-            taskPlanExpanded: false,
-            // Boundary state for the agent's own todo popover (its private
-            // step-by-step breakdown of the current task item).
-            agentTodoItems: null,
-            agentTodoExpanded: false,
             // Workspace info from session_started event.
             sessionDir: '',
             workspaceDir: '',
             // Has unseen activity since the user last looked at this tab.
             unread: false,
+            // Stage-Manager placement — 'main' (one of the 2 center-stage
+            // slots) or 'rail' (minimized thumbnail in the left rail).
+            // Assigned by _placeSession; null until first placed.
+            slot: null,
+            // Which of the 2 mainSlots entries this sid occupies, or -1
+            // when not in main (kept for quick lookups; mainSlots is the
+            // source of truth).
+            mainIndex: -1,
+            // Bumped from the module-level _focusCounter every time this
+            // session is focused — the LRU signal _placeSession uses to
+            // decide which main occupant to evict when both slots are full.
+            lastFocusedAt: 0,
+            // Per-card minimize/maximize button refs (only shown once a
+            // 2nd concurrent session exists — see _updateLayout).
+            minBtn: null,
+            maxBtn: null,
+            // The .stage-rail-thumb wrapper currently holding this
+            // session's card, or null while it's on the main stage. Set by
+            // _moveToRail / cleared by _occupyMainSlot.
+            _railWrap: null,
         };
     }
 
@@ -469,6 +481,23 @@
     // Sids explicitly closed by the user. Prevents straggler events from
     // resurrecting a closed tab via lazy-mount (zombie tab).
     const closedSessions = new Set();
+    // Stage-Manager main stage — exactly ONE session visible in the center
+    // #conversation row at a time; everything else lives in the left
+    // .stage-rail as a live-but-minimized thumbnail. null = empty slot.
+    //
+    // NOTE: the array is length 2 for legacy compatibility — many downstream
+    // functions (_ensureSomeMainOccupant, _updateLayout's mainCount,
+    // _maximizeSession, closeSession, _minimizeSession) hardcode
+    // `mainSlots[0] || mainSlots[1]` or write `mainSlots[1] = null`. Rather
+    // than rewrite every one of those (and re-verify each edge case), the
+    // "only one active card" constraint is enforced at the SINGLE placement
+    // entry point: _findFreeMainSlot() below only ever reports slot 0 as
+    // free, so slot 1 stays perpetually null. Every other path that reads
+    // mainSlots[1] gracefully treats it as an empty slot (`null || X === X`).
+    // This keeps the fix surgical.
+    const mainSlots = [null, null];
+    // Monotonic counter for LRU eviction — see _placeSession.
+    let _focusCounter = 0;
 
     // macOS-style card open/close: run the DOM mutation inside a View
     // Transition so the closing card scales+fades (::view-transition-old)
@@ -514,13 +543,15 @@
         return s ? s.pane : null;
     }
 
-    // Build the DOM scaffolding for a new session: its tiled session card
-    // (header + scrollable body + inline confirmation host + per-pane
-    // composer) and its tab button. Does NOT switch to it — caller decides.
+    // Build the DOM scaffolding for a new session: its session card (header
+    // + scrollable body + inline confirmation host + per-pane composer).
+    // Does NOT attach the card to the DOM or decide main-vs-rail placement —
+    // callers place it via _placeSession / _placeSessionPassive right after.
     function _mountSession(sid, name) {
         const s = _newSessionState(sid, name);
 
-        // ── Outer card (a flex item in the tiled #conversation row) ──────
+        // ── Card (parented into either #conversation or a rail thumbnail
+        // wrapper by the placement functions below) ──────────────────────
         const card = document.createElement('div');
         card.className = 'session-card';
         card.dataset.sid = sid;
@@ -529,17 +560,41 @@
         // remaining cards. Static per card lifetime.
         card.style.viewTransitionName = 'session-' + sid;
 
-        // Header: name · status pill · close.
+        // Header: name · status pill · minimize · maximize · close.
         const head = el('div', 'session-card-head');
         const title = el('span', 'session-card-title', name);
         title.addEventListener('dblclick', () => _startRenameSession(sid));
         const pill = el('span', 'session-card-pill', 'idle');
+
+        // Minimize (→ rail) / maximize (sole main occupant) — hidden by
+        // _updateLayout until a 2nd concurrent session exists (a lone
+        // session has nothing to minimize into or maximize over).
+        const minBtn = el('button', 'session-card-min hidden');
+        minBtn.type = 'button';
+        minBtn.setAttribute('aria-label', 'Minimize session');
+        minBtn.title = 'Minimize to rail';
+        minBtn.innerHTML =
+            '<svg viewBox="0 0 12 12" width="12" height="12" aria-hidden="true">' +
+            '<line x1="2.5" y1="9" x2="9.5" y2="9" stroke="currentColor" ' +
+            'stroke-width="1.4" stroke-linecap="round"/></svg>';
+
+        const maxBtn = el('button', 'session-card-max hidden');
+        maxBtn.type = 'button';
+        maxBtn.setAttribute('aria-label', 'Maximize session');
+        maxBtn.title = 'Maximize — take the whole stage';
+        maxBtn.innerHTML =
+            '<svg viewBox="0 0 12 12" width="12" height="12" aria-hidden="true">' +
+            '<rect x="2.5" y="2.5" width="7" height="7" rx="1.3" ' +
+            'stroke="currentColor" stroke-width="1.3" fill="none"/></svg>';
+
         const cardClose = el('button', 'session-card-close', '×');
         cardClose.type = 'button';
         cardClose.setAttribute('aria-label', 'Close session');
         cardClose.title = 'Close session';
         head.appendChild(title);
         head.appendChild(pill);
+        head.appendChild(minBtn);
+        head.appendChild(maxBtn);
         head.appendChild(cardClose);
 
         // Body: the scroll container where chat bubbles + activity groups go.
@@ -574,7 +629,6 @@
         card.appendChild(body);
         card.appendChild(confirm);
         card.appendChild(form);
-        conversation.appendChild(card);
 
         s.card = card;
         s.pane = body;
@@ -582,15 +636,29 @@
         s.pillEl = pill;
         s.confirmEl = confirm;
         s.composerInput = ta;
+        s.minBtn = minBtn;
+        s.maxBtn = maxBtn;
 
-        // Clicking anywhere on the card focuses this session (jump aid +
-        // unread clear). The close button stops propagation below.
+        // Clicking anywhere on a MAIN-slot card focuses it (jump aid + unread
+        // clear); while minimized the card itself is pointer-events:none (see
+        // .stage-rail-thumb .session-card in styles.css) so this never fires
+        // for a rail thumbnail — the thumbnail wrapper's own click handler
+        // (wired in _moveToRail) is what restores it. The close button stops
+        // propagation below.
         card.addEventListener('mousedown', () => {
             if (activeSid !== sid) switchSession(sid);
         });
         cardClose.addEventListener('click', (ev) => {
             ev.stopPropagation();
             closeSession(sid);
+        });
+        minBtn.addEventListener('click', (ev) => {
+            ev.stopPropagation();
+            _minimizeSession(sid);
+        });
+        maxBtn.addEventListener('click', (ev) => {
+            ev.stopPropagation();
+            _maximizeSession(sid);
         });
         form.addEventListener('submit', (ev) => {
             ev.preventDefault();
@@ -610,7 +678,6 @@
         _MentionAutocomplete.attach(ta);
 
         sessions.set(sid, s);
-        _updateLayout();
         return s;
     }
 
@@ -625,6 +692,7 @@
         if (!s || !name) return;
         s.name = name;
         if (s.titleEl) s.titleEl.textContent = name;
+        if (window.SessionSidebar) window.SessionSidebar.setSessionName(sid, name);
     }
 
     function _startRenameSession(sid) {
@@ -664,26 +732,282 @@
         return sid;
     }
 
+    // Single stable entry point every call site uses to "go to" a session —
+    // dispatches on its current placement so callers never need to know
+    // whether a sid is a fresh mount, a main-stage occupant, or a rail
+    // thumbnail. This is what lets old call sites (lazy-mount, the card's
+    // own mousedown handler, closeSession's neighbour-switch) keep working
+    // unchanged after the Stage-Manager rewrite below.
     function switchSession(sid) {
-        if (!sessions.has(sid)) return;
-        // All cards are visible in the tiled layout; "switching" just moves
-        // the focus highlight + scrolls the card into view + clears unread.
+        const s = sessions.get(sid);
+        if (!s) return;
+        if (s.slot === 'main') { _focusMainSession(sid); return; }
+        if (s.slot === 'rail') { _promoteFromRail(sid); return; }
+        _placeSession(sid); // brand new, never placed yet
+    }
+
+    // ── Stage-Manager placement state machine ─────────────────────────────
+    //
+    // At most 2 sessions are ever visible in the main #conversation stage
+    // (mainSlots[0]/[1]); every other session lives as a live thumbnail in
+    // .stage-rail. "Focus" (activeSid, the right-hand detail panel's
+    // subject, the composer that receives keyboard focus) is only ever a
+    // main-slot occupant — rail thumbnails are look-don't-touch (see
+    // .stage-rail-thumb .session-card { pointer-events: none } in
+    // styles.css) and must be promoted back to main before they're usable.
+
+    function _findFreeMainSlot() {
+        // Single-slot policy: only slot 0 is ever considered "free" for new
+        // placements. Slot 1 exists in the array only for legacy readers
+        // (see mainSlots' declaration comment) — never fill it. This is the
+        // one and only enforcement point for "exactly one card in main."
+        return mainSlots[0] ? -1 : 0;
+    }
+
+    // Index (0/1) of the main occupant least recently focused, or -1 if
+    // both slots are empty. Excludes `excludeSid` so a session can look for
+    // "who else is in main" without matching itself.
+    function _lruMainIndex(excludeSid) {
+        let best = -1, bestAt = Infinity;
+        for (let i = 0; i < mainSlots.length; i++) {
+            const sid = mainSlots[i];
+            if (!sid || sid === excludeSid) continue;
+            const occ = sessions.get(sid);
+            const at = occ ? occ.lastFocusedAt : 0;
+            if (at < bestAt) { bestAt = at; best = i; }
+        }
+        return best;
+    }
+
+    // Moves sid's card DOM node into the main stage at slot `index`,
+    // unwrapping it from a rail thumbnail first if that's where it was.
+    // Does not touch focus — callers decide whether to focus afterward.
+    function _occupyMainSlot(index, sid) {
+        const s = sessions.get(sid);
+        if (!s) return;
+        if (s._railWrap) {
+            if (s._railWrap.parentNode) s._railWrap.parentNode.removeChild(s._railWrap);
+            s._railWrap = null;
+        }
+        mainSlots[index] = sid;
+        s.slot = 'main';
+        s.mainIndex = index;
+        // Re-append every occupied slot in order 0-then-1 so DOM order always
+        // matches slot order regardless of which slot just changed —
+        // appendChild on an already-attached node moves it, so this is a
+        // cheap no-op for whichever slot didn't just move.
+        for (let i = 0; i < mainSlots.length; i++) {
+            const occSid = mainSlots[i];
+            const occ = occSid && sessions.get(occSid);
+            if (occ && occ.card) conversation.appendChild(occ.card);
+        }
+    }
+
+    // Moves sid's card DOM node into a rail thumbnail wrapper. Also clears
+    // any mainSlot entry that still points at this sid — the function used
+    // to depend on the caller to null out mainSlots first, but that led to
+    // subtle "someone forgot to clear" bugs. Now the invariant holds no
+    // matter who calls it: after this returns, sid is in the rail AND
+    // nowhere else in mainSlots.
+    function _moveToRail(sid) {
+        const s = sessions.get(sid);
+        if (!s || !stageRailList) return;
+        // Clear any stale mainSlot reference to this sid so slot state
+        // stays consistent even when callers forget.
+        for (let i = 0; i < mainSlots.length; i++) {
+            if (mainSlots[i] === sid) mainSlots[i] = null;
+        }
+        // If this session already has a rail wrap (e.g. from a prior move
+        // that wasn't unwound), remove the stale wrap first so we don't
+        // leave an empty wrapper in the rail. Then build a fresh one.
+        if (s._railWrap && s._railWrap.parentNode) {
+            s._railWrap.parentNode.removeChild(s._railWrap);
+            s._railWrap = null;
+        }
+        const wrap = el('div', 'stage-rail-thumb');
+        wrap.dataset.sid = sid;
+        wrap.addEventListener('click', () => switchSession(sid));
+        wrap.appendChild(s.card); // moves the card node out of #conversation
+        stageRailList.insertBefore(wrap, stageRailList.firstChild);
+        s._railWrap = wrap;
+        s.slot = 'rail';
+        s.mainIndex = -1;
+        s.card.classList.remove('active');
+    }
+
+    // Sets activeSid to a session that's ALREADY a main occupant — updates
+    // the .active highlight, bumps LRU recency, and repoints the right-hand
+    // detail panel. Does not move any DOM (the card is already on stage).
+    function _focusMainSession(sid) {
+        const s = sessions.get(sid);
+        if (!s || s.slot !== 'main') return;
         if (activeSid && activeSid !== sid && sessions.has(activeSid)) {
             const old = sessions.get(activeSid);
             if (old.card) old.card.classList.remove('active');
         }
         activeSid = sid;
-        const s = sessions.get(sid);
+        s.lastFocusedAt = ++_focusCounter;
         if (s.card) {
             s.card.classList.add('active');
             try { s.card.scrollIntoView({ inline: 'nearest', block: 'nearest' }); }
             catch (_) { /* ignore */ }
         }
         s.unread = false;
-        // Repaint UI affordances that reflect the active session's state.
         _repaintActivityForActive();
+        if (window.SessionSidebar) {
+            window.SessionSidebar.setActiveSession(sid, s.name || sid);
+        }
         try { if (s.composerInput) s.composerInput.focus(); } catch (_) { /* ignore */ }
-        window.__handqLog('INFO', 'switchSession', { sid });
+        window.__handqLog('INFO', 'focusMainSession', { sid });
+    }
+
+    // Places a never-yet-placed session onto the main stage (free slot if
+    // one exists, otherwise LRU-evicts a current main occupant to the rail)
+    // and focuses it. Used for brand-new sessions the user explicitly
+    // created — an explicit action is expected to grab focus.
+    //
+    // Single-slot enforcement: the main stage holds EXACTLY one session.
+    // If someone else is currently in slot 0, they get evicted to the rail
+    // FIRST (with mainSlots[0] cleared so _occupyMainSlot doesn't see a
+    // stale reference), THEN the new session takes slot 0. Written this
+    // explicitly (rather than routing through _findFreeMainSlot) so no
+    // future refactor accidentally reintroduces "if there's a free slot
+    // just use it" logic and revives the 2-cards-in-main layout.
+    function _placeSession(sid) {
+        const currentSid = mainSlots[0];
+        if (currentSid && currentSid !== sid) {
+            mainSlots[0] = null;
+            _moveToRail(currentSid);
+        }
+        // Belt-and-suspenders: also flush any stray occupant of slot 1 (a
+        // leftover from historical 2-slot placement that a stale in-memory
+        // state might still carry after hot-reload during dev). Nothing
+        // should ever put a session in slot 1 under the new code, but if
+        // one is there, evict it too so the main stage is guaranteed to
+        // hold exactly one card after this call returns.
+        if (mainSlots[1] && mainSlots[1] !== sid) {
+            const strayS1 = mainSlots[1];
+            mainSlots[1] = null;
+            _moveToRail(strayS1);
+        }
+        _occupyMainSlot(0, sid);
+        _focusMainSession(sid);
+        _updateLayout();
+    }
+
+    // Same placement logic as _placeSession, but for a session that's
+    // already mounted and may already be sitting in the rail — used for
+    // background/lazy-mounted sessions (e.g. a scheduler-dispatched task)
+    // that should become VISIBLE without stealing focus from whatever the
+    // user is currently looking at. Only the very first session (nothing
+    // active yet) is auto-focused, matching pre-Stage-Manager boot behavior.
+    //
+    // Single-slot enforcement: if main is already occupied, the NEW session
+    // goes to the rail (does NOT evict the current occupant — passive
+    // placement never steals the user's focused card). If main is empty,
+    // the new session takes slot 0.
+    function _placeSessionPassive(sid) {
+        if (!mainSlots[0]) {
+            _occupyMainSlot(0, sid);
+            if (!activeSid) _focusMainSession(sid);
+        } else {
+            _moveToRail(sid);
+        }
+        _updateLayout();
+    }
+
+    // Promotes a rail thumbnail back onto the main stage (freeing a slot
+    // via LRU eviction if both are full) and focuses it — the "click a
+    // minimized session to bring it back" affordance. Wrapped in the same
+    // View Transition helper session open/close uses (_runVT) so the card
+    // morphs (position + size interpolate) from its rail thumbnail into
+    // its main-stage slot instead of snapping there instantly — each
+    // .session-card already carries a stable view-transition-name (set
+    // once in _mountSession), so the browser can track it across the
+    // reparent from .stage-rail-thumb back into #conversation.
+    async function _promoteFromRail(sid) {
+        const s = sessions.get(sid);
+        if (!s || s.slot !== 'rail') return;
+        await _runVT(() => {
+            // Single-slot enforcement: same as _placeSession — if someone
+            // else is in slot 0, swap them into the rail before this
+            // session takes the main stage. Written explicitly (not routed
+            // through _findFreeMainSlot) so the "one card in main" invariant
+            // is visible at the call site.
+            const currentSid = mainSlots[0];
+            if (currentSid && currentSid !== sid) {
+                mainSlots[0] = null;
+                _moveToRail(currentSid);
+            }
+            _occupyMainSlot(0, sid);
+            _focusMainSession(sid);
+        });
+        _updateLayout();
+    }
+
+    // Never leaves the stage with zero main occupants while a session still
+    // exists in the rail — promotes whichever rail session was focused most
+    // recently. No-op if a main occupant already exists or the rail is
+    // empty too (that combination means every session is gone, which
+    // callers handle separately by spawning a fresh one).
+    function _ensureSomeMainOccupant() {
+        if (mainSlots[0] || mainSlots[1]) return;
+        let bestSid = null, bestAt = -1;
+        for (const [sid, s] of sessions) {
+            if (s.slot === 'rail' && s.lastFocusedAt > bestAt) {
+                bestAt = s.lastFocusedAt;
+                bestSid = sid;
+            }
+        }
+        if (bestSid) _promoteFromRail(bestSid);
+    }
+
+    // Minimize: main → rail. Only reachable via the card's minimize button,
+    // itself only shown when sessions.size > 1 (see _updateLayout), so a
+    // rail session promoted by _ensureSomeMainOccupant below is always a
+    // real, valid fallback candidate — minimizing can never actually empty
+    // the stage while other sessions exist. Wrapped in _runVT for the same
+    // morph animation as _promoteFromRail above.
+    async function _minimizeSession(sid) {
+        const s = sessions.get(sid);
+        if (!s || s.slot !== 'main') return;
+        await _runVT(() => {
+            mainSlots[s.mainIndex] = null;
+            _moveToRail(sid);
+            if (activeSid === sid) {
+                activeSid = null;
+                const otherSid = mainSlots[0] || mainSlots[1];
+                if (otherSid) _focusMainSession(otherSid);
+                else _ensureSomeMainOccupant();
+            }
+        });
+        _updateLayout();
+        window.__handqLog('INFO', 'minimizeSession', { sid });
+    }
+
+    // Maximize: sid becomes the SOLE main occupant — any other main
+    // occupant (and sid itself, if it was in the rail) gets reshuffled so
+    // sid ends up alone in slot 0 and slot 1 is empty. Wrapped in _runVT so
+    // every card that moves (evicted sibling → rail, sid → main) morphs in
+    // one cohesive transition rather than snapping.
+    async function _maximizeSession(sid) {
+        const s = sessions.get(sid);
+        if (!s) return;
+        await _runVT(() => {
+            for (let i = 0; i < mainSlots.length; i++) {
+                const occSid = mainSlots[i];
+                if (occSid && occSid !== sid) {
+                    mainSlots[i] = null;
+                    _moveToRail(occSid);
+                }
+            }
+            mainSlots[0] = null;
+            mainSlots[1] = null;
+            _occupyMainSlot(0, sid);
+            _focusMainSession(sid);
+        });
+        _updateLayout();
+        window.__handqLog('INFO', 'maximizeSession', { sid });
     }
 
     function _repaintActivityForActive() {
@@ -694,9 +1018,12 @@
         if (!sessions.has(sid)) return;
         closedSessions.add(sid);
         window.__handqLog('INFO', 'closeSession', { sid });
+        // Drop the sidebar's per-session state before the pane is unmounted
+        // (does nothing visible if the session wasn't active).
+        if (window.SessionSidebar) window.SessionSidebar.notifySessionClosed(sid);
         // Finalize any tool cards still spinning before the session's data is
         // dropped below — nothing will ever deliver their matching result now.
-        _forceFinalizePendingActivity(sessions.get(sid));
+        _forceFinalizePendingActivity(sid);
         // Kill the floating pop-out editor if it was pointed at this session
         // — its backing textarea is about to be removed from the DOM.
         try { _FloatingComposer.destroyFor(sid); } catch (_) { /* ignore */ }
@@ -712,38 +1039,83 @@
         // the remaining cards into their new slots.
         await _runVT(() => {
             const s = sessions.get(sid);
-            if (s && s.card && s.card.parentNode) {
+            if (s) {
                 if (s.composerInput) _MentionAutocomplete.detach(s.composerInput);
-                s.card.parentNode.removeChild(s.card);
+                if (s.slot === 'main' && s.mainIndex >= 0) mainSlots[s.mainIndex] = null;
+                // Whichever node is actually the card's current DOM parent —
+                // the rail wrapper if minimized, the card itself if on stage.
+                const node = s._railWrap || s.card;
+                if (node && node.parentNode) node.parentNode.removeChild(node);
             }
             sessions.delete(sid);
-            _updateLayout();
-            if (activeSid === sid) {
-                // Switch to neighbour tab, or auto-spawn a fresh one if this
-                // was the last session.
-                const next = sessions.keys().next();
-                if (next && !next.done) {
-                    switchSession(next.value);
-                } else {
-                    createSession();
-                }
+            if (sessions.size === 0) {
+                // Last session closed — auto-spawn a fresh one so the
+                // composer always has a session_id to ride on.
+                createSession();
+                return;
             }
+            if (activeSid === sid) {
+                activeSid = null;
+                const otherSid = mainSlots[0] || mainSlots[1];
+                if (otherSid) _focusMainSession(otherSid);
+                // A freed main slot is deliberately NOT auto-refilled from
+                // the rail here (closing is an explicit reduction, not a
+                // request for HandQ to pick a replacement) — UNLESS doing
+                // so is the only way to avoid leaving the stage with zero
+                // main occupants while sessions still exist in the rail.
+                else _ensureSomeMainOccupant();
+            }
+            _updateLayout();
         });
     }
 
     function _updateLayout() {
-        const n = sessions.size;
-        conversation.classList.remove('layout-row', 'layout-grid', 'layout-scroll');
-        if (n <= 3) conversation.classList.add('layout-row');
-        else if (n <= 6) conversation.classList.add('layout-grid');
-        else conversation.classList.add('layout-scroll');
-        // Ask main to grow the window to fit the new tile count (grow-only;
-        // maximized at 6). Main is authoritative on display bounds + clamps.
+        // Rail collapses to zero width when nothing is minimized — same
+        // "no dead stub" idiom as .session-sidebar[data-collapsed].
+        const railEmpty = !stageRailList || stageRailList.children.length === 0;
+        if (stageRail) stageRail.dataset.empty = railEmpty ? 'true' : 'false';
+
+        // Minimize/maximize only make sense once >1 session exists at all
+        // — the literal condition the user specified — independent of how
+        // many of them currently happen to be in main vs rail.
+        const showControls = sessions.size > 1;
+        for (const [, s] of sessions) {
+            if (s.minBtn) s.minBtn.classList.toggle('hidden', !showControls);
+            if (s.maxBtn) s.maxBtn.classList.toggle('hidden', !showControls);
+        }
+
+        // Ask main to grow the window to fit the CURRENT visible layout:
+        // just the main card by default, plus rail if any session is
+        // minimized, plus sidebar if the detail panel is expanded. Baseline
+        // is "main card only" (~840 sq) — the two side panels are additive
+        // deltas that only reserve horizontal space when actually visible.
+        // sessions count reports the TOTAL open sessions (main + rail) so
+        // main.js's maximize-at-6 threshold still triggers correctly.
+        // Main is authoritative on display bounds + clamps.
+        const totalSessions = sessions.size;
+        const sidebarEl = document.getElementById('session-sidebar');
+        const sidebarOpen = !!(sidebarEl && sidebarEl.getAttribute('data-collapsed') !== 'true');
+        const railOpen = !railEmpty;
         if (window.windowControls && typeof window.windowControls.autoResize === 'function') {
-            try { window.windowControls.autoResize(n); }
-            catch (_) { /* ignore */ }
+            try {
+                window.windowControls.autoResize({
+                    sessions: Math.max(1, totalSessions),
+                    sidebarOpen: sidebarOpen,
+                    railOpen: railOpen,
+                });
+            } catch (_) { /* ignore */ }
         }
     }
+
+    // Re-layout the window whenever the sidebar toggles open/closed. This
+    // is the signal that lets the window grow by SIDEBAR_DELTA (+278px)
+    // when the sidebar auto-opens on first activity — without it, the
+    // sidebar would eat into the main card's width instead of pushing the
+    // window wider from the baseline. Fired from session-sidebar.js's
+    // _setCollapsed via a CustomEvent (decoupled — no direct import).
+    window.addEventListener('session-sidebar-toggle', () => {
+        try { _updateLayout(); } catch (_) { /* ignore */ }
+    });
 
     function currentSid() {
         return activeSid;
@@ -1721,21 +2093,15 @@
         return out.join('');
     }
 
-    // ----- Per-session activity groups ------------------------------------
+    // ----- Activity feed (right-hand detail panel) ------------------------
     //
-    // The legacy global activity strip + popover have been removed (multi-
-    // session model — see plan #11/#12). Each session's pane now hosts its
-    // own activity content as collapsible `<details>` groups interleaved
-    // between chat bubbles. A group accumulates events (decision_made,
-    // tool_execution_started, tool result, inline step, network event...)
-    // since the last chat bubble; the next chat bubble seals the group and
-    // a fresh one opens on the next activity event. Sealed groups stay in
-    // the DOM as collapsed history.
-    //
-    // The session bucket holds the events as JS objects (`s.activityItems`)
-    // so a session's activity persists across tab switches.
-
-    const ACTIVITY_TRUNC = 2000;
+    // Activity used to render inline as collapsible <details> groups
+    // between chat bubbles in each session's own pane. It now lives
+    // exclusively in the right-hand detail panel (session-sidebar.js's
+    // flat activity list) — these are thin wrappers that resolve the
+    // in-flight dispatch session's sid and forward to SessionSidebar, so
+    // every existing call site below (pushActivity('⚠', ...), etc.) keeps
+    // working unchanged.
 
     // Per-session status pill (UI1). The dispatch session is resolved from
     // `_dispatchSid` (set while handling each inbound event) so each card
@@ -1765,227 +2131,41 @@
         if (s.pillEl) s.pillEl.classList.remove('working');
     }
 
-    // ── Activity group rendering inside per-session panes ───────────────
-
-    function _getOrCreateActivityGroup(pane) {
-        if (!pane) return null;
-        if (pane._activeActivityGroup) {
-            if (pane._activeActivityGroup.isConnected) return pane._activeActivityGroup;
-            // Stale reference to a node no longer in the document (e.g. an
-            // ancestor got rebuilt/replaced out from under it). Reusing it
-            // would keep appending items into an invisible group forever —
-            // drop it and fall through to create a fresh, attached one.
-            window.__handqLog('WARN', 'activity group detached, recreating', {
-                count: pane._activeActivityGroup._count,
-            });
-            pane._activeActivityGroup = null;
-        }
-        const group = document.createElement('details');
-        group.className = 'activity-group';
-        // Open the live group so activity is visible as it streams in. It stays
-        // open after the turn's reply seals it (the pointer is nulled but the
-        // DOM node is untouched), so completed activity remains on screen — and
-        // the next task opens a fresh visible group. Collapsing here was the
-        // regression that made activity look like it "disappeared" on task
-        // completion and never reappeared on session continuation.
-        group.open = true;
-        const summary = document.createElement('summary');
-        summary.className = 'activity-group-summary';
-        const sCount = document.createElement('span');
-        sCount.className = 'ai-group-count';
-        sCount.textContent = 'Activity (0)';
-        summary.appendChild(sCount);
-        group.appendChild(summary);
-        const itemsContainer = document.createElement('div');
-        itemsContainer.className = 'activity-group-items';
-        group.appendChild(itemsContainer);
-        group._itemsContainer = itemsContainer;
-        group._count = 0;
-        group._countLabel = sCount;
-        pane.appendChild(group);
-        pane._activeActivityGroup = group;
-        window.__handqLog('DEBUG', 'activity group created', {
-            paneConnected: pane.isConnected,
-        });
-        return group;
-    }
-
-    function _sealActivityGroup(pane) {
-        if (pane && pane._activeActivityGroup) {
-            window.__handqLog('DEBUG', 'activity group sealed', {
-                count: pane._activeActivityGroup._count,
-            });
-        }
-        if (pane) pane._activeActivityGroup = null;
-    }
-
-    function _renderActivityItem(entry) {
-        const item = el('div', 'activity-item');
-        const head = el('div', 'ai-head');
-        head.appendChild(el('span', 'ai-icon', entry.icon));
-        head.appendChild(el('span', 'ai-label', entry.label));
-        head.appendChild(el('span', 'ai-time', entry.time));
-        item.appendChild(head);
-        if (entry.content) {
-            const contentIsJson = isJsonString(entry.content);
-            const content = el('span', 'ai-content' + (contentIsJson ? ' ai-json' : ''));
-            if (contentIsJson) content.appendChild(renderJsonContent(entry.content));
-            else content.textContent = truncate(entry.content, ACTIVITY_TRUNC);
-            item.appendChild(content);
-            item.title = contentIsJson ? '' : entry.content;
-        }
-        if (entry.resultContent) {
-            _appendActivityResult(item, entry);
-        }
-        item.addEventListener('click', (ev) => {
-            // Don't toggle expansion when the click bubbled up from the
-            // outer <details> summary — let the summary handle its own toggle.
-            ev.stopPropagation();
-            item.classList.toggle('expanded');
-            const c = item.querySelector('.ai-content');
-            if (c && !c.classList.contains('ai-json')) {
-                c.textContent = item.classList.contains('expanded')
-                    ? entry.content
-                    : truncate(entry.content, ACTIVITY_TRUNC);
-            }
-            const r = item.querySelector('.ai-result');
-            if (r && !r.classList.contains('ai-json')) {
-                r.textContent = '↳ ' + (item.classList.contains('expanded')
-                    ? entry.resultContent
-                    : truncate(entry.resultContent, ACTIVITY_TRUNC));
-            }
-        });
-        return item;
-    }
-
-    function _appendActivityResult(item, entry) {
-        const resultIsJson = isJsonString(entry.resultContent);
-        const resultEl = el('div', 'ai-result' + (resultIsJson ? ' ai-json' : ''));
-        if (resultIsJson) {
-            resultEl.appendChild(document.createTextNode('↳ '));
-            resultEl.appendChild(renderJsonContent(entry.resultContent));
-        } else {
-            resultEl.textContent = '↳ ' + truncate(entry.resultContent, ACTIVITY_TRUNC);
-        }
-        item.appendChild(resultEl);
-    }
-
     function pushActivity(icon, label, content, opts) {
-        // Append an activity entry to the current dispatch session's
-        // pane. The entry lands inside the session's "open" activity
-        // group; if no group is open, one is created at the current
-        // bottom of the pane (which is where it semantically belongs —
-        // events that happen between two chat bubbles get grouped
-        // together visually).
-        const pane = _dispatchPane();
         const s = _dispatchSession();
-        if (!pane || !s) return null;
-        const time = new Date().toLocaleTimeString([], { hour12: false });
-        const entry = {
-            icon: icon || '·',
-            label: label || '',
-            content: content == null ? '' : String(content),
-            time: time,
-            iter: opts && opts.iter != null ? String(opts.iter) : null,
-            tool: opts && opts.tool ? String(opts.tool) : null,
-            pending: !!(opts && opts.pending),
-            resultIcon: null,
-            resultContent: null,
-            _el: null,
-        };
-        s.activityItems.push(entry);
-        const group = _getOrCreateActivityGroup(pane);
-        const itemEl = _renderActivityItem(entry);
-        entry._el = itemEl;
-        group._itemsContainer.appendChild(itemEl);
-        group._count += 1;
-        group._countLabel.textContent = 'Activity (' + group._count + ')';
-        scrollToBottom();
-        return entry;
+        if (!s || !window.SessionSidebar) return null;
+        return window.SessionSidebar.pushActivity(s.sid, {
+            icon, label, content,
+            iter: opts && opts.iter,
+            tool: opts && opts.tool,
+            pending: opts && opts.pending,
+        });
     }
 
     function updateActivityResult(iter, tool, resultIcon, headLabel, resultContent) {
-        // Fold a tool's post-execution result into its matching pre-event
-        // entry instead of pushing a separate "done" line. We scan THIS
-        // session's items (newest first) for a pending entry with
-        // matching (iter, tool).
         const s = _dispatchSession();
-        if (!s) return;
-        const iterStr = iter == null ? null : String(iter);
-        let match = null;
-        for (let i = s.activityItems.length - 1; i >= 0; i--) {
-            const e = s.activityItems[i];
-            if (!e.pending) continue;
-            if (iterStr != null && e.iter !== iterStr) continue;
-            if (tool && e.tool && e.tool !== tool) continue;
-            match = e;
-            break;
-        }
-        if (!match) {
-            pushActivity(resultIcon || '✓',
-                         (tool || 'tool') + ' done',
-                         resultContent || '');
-            return;
-        }
-        match.icon = resultIcon || '✓';
-        match.label = headLabel || match.tool || match.label;
-        match.resultIcon = resultIcon || '✓';
-        match.resultContent = resultContent == null ? '' : String(resultContent);
-        match.pending = false;
-        if (match._el) {
-            const head = match._el.querySelector('.ai-head');
-            if (head) {
-                const icon = head.querySelector('.ai-icon');
-                const label = head.querySelector('.ai-label');
-                if (icon)  icon.textContent  = match.icon;
-                if (label) label.textContent = match.label;
-            }
-            if (!match._el.querySelector('.ai-result')) {
-                _appendActivityResult(match._el, match);
-            }
-        }
+        if (!s || !window.SessionSidebar) return;
+        window.SessionSidebar.updateActivityResult(s.sid, iter, tool, resultIcon, headLabel, resultContent);
     }
 
     function clearActivity() {
         // Reset this session's activity history. Called from scNew (the
-        // "reset current tab" shortcut). The pane's bubbles have already
-        // been cleared by the caller via innerHTML = ''; here we just
-        // drop the in-memory ring + clear the active-group pointer.
+        // "reset current tab" shortcut).
         const s = _dispatchSession() || active();
-        if (!s) return;
-        s.activityItems = [];
-        if (s.pane) s.pane._activeActivityGroup = null;
+        if (!s || !window.SessionSidebar) return;
+        window.SessionSidebar.clearActivity(s.sid);
     }
 
-    function _forceFinalizePendingActivity(s) {
-        // Defensive cleanup for activity cards left stuck in the "running"
-        // spinner state (pending:true) because the task ended abnormally
-        // (bridge crash, fatal error, session closed) before the matching
-        // tool-result event arrived to flip them via updateActivityResult.
-        // Operates directly on the given session bucket rather than
-        // _dispatchSession() so it also works from contexts with no
-        // in-flight dispatch (e.g. closeSession).
-        if (!s || !Array.isArray(s.activityItems)) return;
-        for (const entry of s.activityItems) {
-            if (!entry.pending) continue;
-            entry.icon = '⊗';
-            entry.label = (entry.label || entry.tool || 'tool') + ' (interrupted)';
-            entry.resultIcon = '⊗';
-            entry.resultContent = '';
-            entry.pending = false;
-            if (entry._el) {
-                const head = entry._el.querySelector('.ai-head');
-                if (head) {
-                    const icon = head.querySelector('.ai-icon');
-                    const label = head.querySelector('.ai-label');
-                    if (icon)  icon.textContent  = entry.icon;
-                    if (label) label.textContent = entry.label;
-                }
-                if (!entry._el.querySelector('.ai-result')) {
-                    _appendActivityResult(entry._el, entry);
-                }
-            }
-        }
+    function _forceFinalizePendingActivity(sid) {
+        // Defensive cleanup for activity entries left stuck in the
+        // "running" spinner state (pending:true) because the task ended
+        // abnormally (bridge crash, fatal error, session closed) before the
+        // matching tool-result event arrived to flip them via
+        // updateActivityResult. Takes a sid (not a session bucket) since
+        // the detail panel's activity state now lives in session-sidebar.js,
+        // not on the session bucket.
+        if (!sid || !window.SessionSidebar) return;
+        window.SessionSidebar.forceFinalizePendingActivity(sid);
     }
 
     function briefToolContext(tool, params) {
@@ -2065,62 +2245,6 @@
         catch (_) { return String(params); }
     }
 
-    function isJsonString(s) {
-        if (!s || typeof s !== 'string') return false;
-        const trimmed = s.trim();
-        if ((trimmed[0] === '{' && trimmed[trimmed.length - 1] === '}') ||
-            (trimmed[0] === '[' && trimmed[trimmed.length - 1] === ']')) {
-            try { JSON.parse(trimmed); return true; }
-            catch (_) { return false; }
-        }
-        return false;
-    }
-
-    function renderJsonValue(value) {
-        if (value === null) return el('span', 'ai-json-null', 'null');
-        if (typeof value === 'boolean') return el('span', 'ai-json-bool', String(value));
-        if (typeof value === 'number') return el('span', 'ai-json-num', String(value));
-        if (typeof value === 'string') {
-            const display = value.length > 120 ? value.slice(0, 117) + '…' : value;
-            return el('span', 'ai-json-str', '"' + display + '"');
-        }
-        if (Array.isArray(value)) {
-            if (value.length === 0) return el('span', 'ai-json-bracket', '[]');
-            const ul = el('ul', 'ai-json-tree');
-            for (let i = 0; i < value.length; i++) {
-                const li = el('li', 'ai-json-entry');
-                const idx = el('span', 'ai-json-key', '[' + i + '] ');
-                li.appendChild(idx);
-                li.appendChild(renderJsonValue(value[i]));
-                ul.appendChild(li);
-            }
-            return ul;
-        }
-        if (typeof value === 'object') {
-            const keys = Object.keys(value);
-            if (keys.length === 0) return el('span', 'ai-json-bracket', '{}');
-            const ul = el('ul', 'ai-json-tree');
-            for (const k of keys) {
-                const li = el('li', 'ai-json-entry');
-                const keySpan = el('span', 'ai-json-key', k + ': ');
-                li.appendChild(keySpan);
-                li.appendChild(renderJsonValue(value[k]));
-                ul.appendChild(li);
-            }
-            return ul;
-        }
-        return document.createTextNode(String(value));
-    }
-
-    function renderJsonContent(jsonStr) {
-        try {
-            const parsed = JSON.parse(jsonStr.trim());
-            return renderJsonValue(parsed);
-        } catch (_) {
-            return document.createTextNode(jsonStr);
-        }
-    }
-
     // ----- chat state ------------------------------------------------------
 
     function el(tag, className, textContent) {
@@ -2141,7 +2265,6 @@
         const bubble = el('div', 'bubble user');
         bubble.appendChild(el('div', 'bubble-body', text));
         const pane = _dispatchPane();
-        _sealActivityGroup(pane);
         pane.appendChild(bubble);
         scrollToBottom();
     }
@@ -2224,7 +2347,6 @@
         body.appendChild(span);
         bubble.appendChild(body);
         const pane = _dispatchPane();
-        _sealActivityGroup(pane);
         pane.appendChild(bubble);
         scrollToBottom();
     }
@@ -2245,9 +2367,7 @@
             s.activeCoordinatorBubble._body = body;
             s.activeCoordinatorBubble._currentTextSpan = null;
             const pane = s.pane || conversation;
-            // New assistant turn — seal any open activity group so it
-            // settles above the upcoming streaming bubble.
-            _sealActivityGroup(pane);
+            // New assistant turn starts here.
             pane.appendChild(s.activeCoordinatorBubble);
         }
         var span = s.activeCoordinatorBubble._currentTextSpan;
@@ -2287,7 +2407,6 @@
         body.appendChild(dots);
         s.thinkingBubble.appendChild(body);
         const pane = s.pane || conversation;
-        _sealActivityGroup(pane);
         pane.appendChild(s.thinkingBubble);
         scrollToBottom();
     }
@@ -2305,7 +2424,6 @@
         const bubble = el('div', 'bubble system');
         bubble.appendChild(el('div', 'bubble-body', text || ''));
         const pane = _dispatchPane();
-        _sealActivityGroup(pane);
         pane.appendChild(bubble);
         scrollToBottom();
     }
@@ -2318,7 +2436,6 @@
         for (const [, s] of sessions) {
             const bubble = el('div', 'bubble system global-notice');
             bubble.appendChild(el('div', 'bubble-body', text || ''));
-            _sealActivityGroup(s.pane);
             s.pane.appendChild(bubble);
         }
         scrollToBottom();
@@ -2326,10 +2443,9 @@
 
     function addStepBubble(icon, desc) {
         // Step events (backend inline_event) are activity-class; route them
-        // into the current session's activity group instead of producing
-        // standalone bubbles. Keeps the conversation thread focused on
-        // user/assistant messages while letting the user expand activity to
-        // see step traces.
+        // into the right-hand detail panel's activity feed instead of
+        // producing standalone chat bubbles — keeps the conversation
+        // thread focused on user/assistant messages.
         pushActivity(icon || '·', String(desc || ''), '');
     }
 
@@ -2338,7 +2454,6 @@
         const prefix = where ? '[' + where + '] ' : '';
         bubble.appendChild(el('div', 'bubble-body', prefix + (message || '(no message)')));
         const pane = _dispatchPane();
-        _sealActivityGroup(pane);
         pane.appendChild(bubble);
         scrollToBottom();
     }
@@ -2897,185 +3012,13 @@
         });
     }
 
-    // Live task panel collapse state — persists across re-renders within a
-    // session; reset to collapsed on New (see scNew handler). Default collapsed
-    // so the panel never blocks the top of the conversation; the header alone
-    // (progress + current item) stays visible, and clicking it floats the full
-    // list as an overlay (like the activity strip ↔ popover pair).
-    let taskPlanExpanded = false;
+    // Task-plan + agent-todo panels used to render inline at the top of
+    // each session's chat pane; they now live in the right-hand detail
+    // panel exclusively (session-sidebar.js's _renderPlanBar), fed via
+    // SessionSidebar.setTaskPlan / .setAgentTodo from the onStatus
+    // dispatcher below — kept the chat pane free of anything but the
+    // actual conversation.
 
-    function renderTaskPlan(items) {
-        // Per-session live task panel pinned at the top of the session's
-        // conversation pane. Each session has its own panel — multiple
-        // concurrent sessions never overwrite each other's plan.
-        // Stored as a class (not id) so multiple coexist in the DOM at the
-        // same time; the panel lives inside that session's pane.
-        const pane = _dispatchPane();
-        const s = _dispatchSession();
-        if (!pane || !s) return;
-        let panel = pane.querySelector(':scope > .task-plan-panel');
-        if (!items || items.length === 0) {
-            if (panel) panel.remove();
-            return;
-        }
-        if (!panel) {
-            panel = document.createElement('div');
-            panel.className = 'task-plan-panel';
-            pane.insertBefore(panel, pane.firstChild);
-        }
-        const expanded = !!s.taskPlanExpanded;
-        panel.classList.toggle('collapsed', !expanded);
-
-        const GLYPH = {
-            done: '✓', running: '▶', pending: '○', failed: '✗', interrupted: '⊗', skipped: '⊘',
-        };
-        const doneCount = items.filter((it) => it && it.status === 'done').length;
-        const failedCount = items.filter((it) => it && it.status === 'failed').length;
-        const interruptedCount = items.filter((it) => it && it.status === 'interrupted').length;
-        const skippedCount = items.filter((it) => it && it.status === 'skipped').length;
-        const current = items.find((it) => it && it.status === 'running');
-
-        panel.innerHTML = '';
-
-        // Header — always visible; clicking it toggles the floating list.
-        const header = document.createElement('button');
-        header.type = 'button';
-        header.className = 'task-plan-header';
-        header.setAttribute('aria-expanded', String(expanded));
-        const chevron = document.createElement('span');
-        chevron.className = 'tp-chevron';
-        chevron.textContent = expanded ? '▾' : '▸';
-        const label = document.createElement('span');
-        label.className = 'tp-summary';
-        let summary = 'Task plan · ' + doneCount + ' done';
-        if (failedCount) summary += ' · ' + failedCount + ' failed';
-        if (interruptedCount) summary += ' · ' + interruptedCount + ' interrupted';
-        if (skippedCount) summary += ' · ' + skippedCount + ' skipped';
-        summary += ' / ' + items.length;
-        if (!expanded && current) {
-            // Collapsed: surface what's running so the panel is useful unopened.
-            summary += ' · ▶ ' + String(current.instruction || '');
-        }
-        label.textContent = summary;
-        header.appendChild(chevron);
-        header.appendChild(label);
-        header.addEventListener('click', () => {
-            s.taskPlanExpanded = !s.taskPlanExpanded;
-            renderTaskPlan(items);
-        });
-        panel.appendChild(header);
-
-        // Items — built only when expanded; floats as an overlay (CSS absolute)
-        // so it covers the conversation instead of pushing it down.
-        if (expanded) {
-            const list = document.createElement('div');
-            list.className = 'task-plan-items';
-            for (const it of items) {
-                const status = String((it && it.status) || 'pending');
-                const row = document.createElement('div');
-                row.className = 'task-plan-item tp-' + status;
-                const glyph = document.createElement('span');
-                glyph.className = 'tp-glyph';
-                glyph.textContent = GLYPH[status] || '·';
-                const text = document.createElement('span');
-                text.className = 'tp-text md-rendered';
-                text.innerHTML = renderMarkdownInline(
-                    escapeHtml(String((it && it.instruction) || '')));
-                row.appendChild(glyph);
-                row.appendChild(text);
-                list.appendChild(row);
-            }
-            panel.appendChild(list);
-        }
-        // Track items on the session bucket so a session switch could
-        // re-render in v2 (the pane's DOM already retains the rendered
-        // panel, so this is for state persistence not re-render).
-        s.taskPlanItems = items;
-    }
-
-    // Live agent-todo panel — the agent's OWN private step breakdown of the
-    // current task item (written via the `todo_write` tool), distinct from
-    // the task-plan panel above (which is the Coordinator↔Agent IPC queue —
-    // that queue is at most one item, so this panel is the only place a
-    // user can see multi-step progress).
-    // Same collapsed-pill ↔ floating-overlay pattern as renderTaskPlan.
-    function renderAgentTodo(todos) {
-        const pane = _dispatchPane();
-        const s = _dispatchSession();
-        if (!pane || !s) return;
-        let panel = pane.querySelector(':scope > .agent-todo-panel');
-        if (!todos || todos.length === 0) {
-            if (panel) panel.remove();
-            s.agentTodoItems = null;
-            return;
-        }
-        if (!panel) {
-            panel = document.createElement('div');
-            panel.className = 'agent-todo-panel';
-            // Sits just below the task-plan panel when both are present —
-            // insert after it if it exists, else pin to the top like it does.
-            const taskPlanPanel = pane.querySelector(':scope > .task-plan-panel');
-            if (taskPlanPanel && taskPlanPanel.nextSibling) {
-                pane.insertBefore(panel, taskPlanPanel.nextSibling);
-            } else if (taskPlanPanel) {
-                pane.appendChild(panel);
-            } else {
-                pane.insertBefore(panel, pane.firstChild);
-            }
-        }
-        const expanded = !!s.agentTodoExpanded;
-        panel.classList.toggle('collapsed', !expanded);
-
-        const GLYPH = { completed: '✓', in_progress: '▶', pending: '☐' };
-        const doneCount = todos.filter((t) => t && t.status === 'completed').length;
-        const current = todos.find((t) => t && t.status === 'in_progress');
-
-        panel.innerHTML = '';
-
-        const header = document.createElement('button');
-        header.type = 'button';
-        header.className = 'agent-todo-header';
-        header.setAttribute('aria-expanded', String(expanded));
-        const chevron = document.createElement('span');
-        chevron.className = 'at-chevron';
-        chevron.textContent = expanded ? '▾' : '▸';
-        const label = document.createElement('span');
-        label.className = 'at-summary';
-        let summary = 'Agent todo · ' + doneCount + ' / ' + todos.length;
-        if (!expanded && current) {
-            summary += ' · ▶ ' + String(current.content || '');
-        }
-        label.textContent = summary;
-        header.appendChild(chevron);
-        header.appendChild(label);
-        header.addEventListener('click', () => {
-            s.agentTodoExpanded = !s.agentTodoExpanded;
-            renderAgentTodo(todos);
-        });
-        panel.appendChild(header);
-
-        if (expanded) {
-            const list = document.createElement('div');
-            list.className = 'agent-todo-items';
-            for (const t of todos) {
-                const status = String((t && t.status) || 'pending');
-                const row = document.createElement('div');
-                row.className = 'agent-todo-item at-' + status;
-                const glyph = document.createElement('span');
-                glyph.className = 'at-glyph';
-                glyph.textContent = GLYPH[status] || '·';
-                const text = document.createElement('span');
-                text.className = 'at-text md-rendered';
-                text.innerHTML = renderMarkdownInline(
-                    escapeHtml(String((t && t.content) || '')));
-                row.appendChild(glyph);
-                row.appendChild(text);
-                list.appendChild(row);
-            }
-            panel.appendChild(list);
-        }
-        s.agentTodoItems = todos;
-    }
 
     function handleSessionEvent(eventName, data) {
         if (eventName === 'session_opened') {
@@ -3119,7 +3062,7 @@
         // events from the dying flow must be silently dropped.
         if (evt.session_id && !sessions.has(evt.session_id) && !closedSessions.has(evt.session_id)) {
             _mountSession(evt.session_id, _autoNameForNewSession());
-            if (!activeSid) switchSession(evt.session_id);
+            _placeSessionPassive(evt.session_id);
         }
         // Mark non-active tabs as having unread updates.
         if (_dispatchSid && _dispatchSid !== activeSid) {
@@ -3242,6 +3185,20 @@
             // label on the activity strip; the next state_changed / decision /
             // tool event (or a streamed chat reply) supersedes it.
             setWorking('recalling…');
+            // Also nudge the detail sidebar to auto-expand — recall alone
+            // wouldn't otherwise fire _maybeAutoExpand, so a session whose
+            // ONLY current signal is "recall in flight" (very common during
+            // orchestrator INTENT/PLAN prep, before any tool or decision has
+            // fired) would leave the panel collapsed even though the agent
+            // is clearly working. We use nudgeExpand (not pushActivity)
+            // because there's no matching recall_finished signal, so a
+            // pushed "recalling…" entry would linger forever with a
+            // misleading placeholder as its content — the pill already
+            // owns the transient status.
+            const s = _dispatchSession();
+            if (s && window.SessionSidebar) {
+                window.SessionSidebar.nudgeExpand(s.sid);
+            }
         } else if (evt.kind === 'decision_made') {
             const iter = args[0] || '';
             const reasoning = args[1] || '';
@@ -3295,7 +3252,7 @@
             // The whole backend process died — every session's in-flight
             // tool cards would otherwise spin forever. Finalize them all,
             // not just the dispatching session's.
-            for (const [, sess] of sessions) _forceFinalizePendingActivity(sess);
+            for (const sid of sessions.keys()) _forceFinalizePendingActivity(sid);
         } else if (evt.kind === 'reply') {
             addAssistantTextBubble(evt.text || '');
         } else if (evt.kind === 'reply_delta') {
@@ -3339,9 +3296,36 @@
             const name = evt.session_name || ('⏱ ' + (evt.name || 'Scheduled'));
             _renameSession(_dispatchSid, name);
         } else if (evt.kind === 'task_plan') {
-            renderTaskPlan(Array.isArray(evt.items) ? evt.items : []);
+            // Task plan now renders exclusively in the right-hand detail
+            // panel (session-sidebar.js's plan bar) — it also groups file
+            // touches by task item and needs each item's current status
+            // (running/done/pending) to drive glyph + Undo affordance.
+            if (window.SessionSidebar) {
+                window.SessionSidebar.setTaskPlan(
+                    _resolveSid(evt),
+                    Array.isArray(evt.items) ? evt.items : [],
+                );
+            }
+        } else if (evt.kind === 'file_touch') {
+            // Live file activity → session sidebar (change list). Fired by
+            // write/edit/read tools right after a successful op; the
+            // sidebar accumulates per-session and re-renders when the
+            // event belongs to the active session.
+            if (window.SessionSidebar) {
+                window.SessionSidebar.ingestFileTouch(_resolveSid(evt), {
+                    path:    evt.path,
+                    touch:   evt.touch,
+                    tool:    evt.tool,
+                    item_id: evt.item_id,
+                });
+            }
         } else if (evt.kind === 'agent_todo') {
-            renderAgentTodo(Array.isArray(evt.todos) ? evt.todos : []);
+            if (window.SessionSidebar) {
+                window.SessionSidebar.setAgentTodo(
+                    _resolveSid(evt),
+                    Array.isArray(evt.todos) ? evt.todos : [],
+                );
+            }
         } else if (evt.kind === 'llm_server_error') {
             const retryIn = (typeof evt.retry_in === 'number' && evt.retry_in > 0)
                 ? ' — retrying in ' + evt.retry_in + 's'
@@ -3464,7 +3448,7 @@
         if (evt.fatal) {
             const s = _dispatchSession();
             if (s) s.sessionState = 'fatal';
-            _forceFinalizePendingActivity(s);
+            _forceFinalizePendingActivity(s && s.sid);
             setPill('fatal');
         }
     }
@@ -3703,13 +3687,63 @@
 
     // ----- +New session button wiring --------------------------------------
 
-    document.getElementById('sc-new-session').addEventListener('click', async () => {
-        let sid;
-        await _runVT(() => {
-            sid = createSession();
-        });
+    // Deliberately NOT wrapped in _runVT — the View Transition adds a pre-
+    // animation snapshot pause that scales with the number of existing
+    // `.session-card`s (each carries a view-transition-name and a
+    // backdrop-filter, both expensive to re-rasterize), then plays a 400ms
+    // `::view-transition-new` fade-in that overlaps with `.session-card`'s
+    // own 380ms `liquid-entrance` CSS animation (styles.css). Two entrance
+    // animations on one fresh card + N backdrop-filter snapshots = 200-400ms
+    // of "hitch" on +New that reads to users as "waiting for the backend"
+    // (there is no backend on this path — createSession is fully local).
+    // The fix is to let `liquid-entrance` be the single entrance animation
+    // and skip VT here entirely. Old-main-card → rail is a same-frame DOM
+    // reparent; its rail wrapper gets a lightweight `stage-rail-thumb-enter`
+    // CSS animation (styles.css) so it doesn't hard-snap either. All the
+    // OTHER VT wrappers (minimize/maximize/promote-from-rail/close) stay —
+    // those genuinely benefit from FLIP because they animate an existing
+    // card between two positions, which liquid-entrance can't express.
+    document.getElementById('sc-new-session').addEventListener('click', () => {
+        const sid = createSession();
         window.__handqLog('INFO', 'sc-new-session clicked', { sid });
     });
+
+    // ── Right sidebar (session detail: plan / activity / files) ──────────
+    // The sidebar consumes file_touch / task_plan status envelopes plumbed
+    // through the existing onStatus dispatcher above. Its ↺ Undo buttons
+    // fan back out to the bridge's existing file_undo IPC (see
+    // stdio_bridge.py _handle → msg_type=='file_undo'), scoped to the sid
+    // the button was rendered for — matching how per-session mutations flow.
+    //
+    // MUST run BEFORE the bootstrap createSession() below — otherwise the
+    // first session's _focusMainSession → SessionSidebar.setActiveSession
+    // fires while dom.host is undefined, and the resulting exception
+    // aborts _placeSession before it can call _updateLayout(). That was
+    // the "new session covers current, rail not showing" bug: rail children
+    // WERE moved correctly, but rail's data-empty attribute never got
+    // toggled to false, so it stayed at 0 width.
+    if (window.SessionSidebar) {
+        try {
+            window.SessionSidebar.init();
+            window.SessionSidebar.onUndoRequest((sid, itemId) => {
+                if (!sid || !itemId) return;
+                window.__handqLog('INFO', 'sidebar undo', { sid, itemId });
+                try {
+                    handq.sendRequest({
+                        type: 'file_undo',
+                        session_id: sid,
+                        item_id: itemId,
+                    });
+                } catch (err) {
+                    window.__handqLog('ERROR', 'file_undo dispatch failed',
+                        { err: err && err.message });
+                }
+            });
+        } catch (err) {
+            window.__handqLog('ERROR', 'SessionSidebar init failed',
+                { err: err && err.message });
+        }
+    }
 
     // Bootstrap the initial default session so the first composer submit has
     // a session_id to ride on. The bridge defaults a session_id-less request

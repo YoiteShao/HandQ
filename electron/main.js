@@ -1129,9 +1129,25 @@ function createWindow() {
 
     mainWindow = new BrowserWindow({
         width: 840,
-        height: 560,
-        minWidth: 720,
-        minHeight: 480,
+        height: 720,
+        // Baseline is "only the main session card, ~800×680, no side
+        // panels reserved" — the Stage-Manager rail and detail sidebar are
+        // expected to appear/disappear on demand, and the window grows on
+        // top of this baseline when either arrives (see the layout-driven
+        // auto-resize handler further down).
+        //   chat-region padding (10+10) + 1 card 800    =  820 → default 840 wide
+        //   titlebar 28 + top pad 7 + card 680 + pad 10 =  725 → default 720 tall
+        //     (card ≈ 680 tall — comfortable chat viewport at ~800 wide
+        //      without the window itself feeling oversized on 900px-tall
+        //      laptop screens where the previous 840 default hit the task-
+        //      bar and read as cramped).
+        //
+        // Min sizing keeps the main card usable (down to its own 340px
+        // floor) even when the user shrinks the window aggressively. Rail
+        // and sidebar shrink/hide when the window is too narrow to host
+        // them together.
+        minWidth: 640,
+        minHeight: 520,
         title: 'HandQ',
         frame: false,
         hasShadow: false,
@@ -1559,6 +1575,23 @@ ipcMain.handle('handq:listDirectory', async (_event, payload) => {
     return await listDirectory(dir, filter);
 });
 
+// Reveal a file path in the OS file explorer (Explorer / Finder). Bounces
+// on shell.showItemInFolder — Chromium's built-in cross-platform bridge.
+// Fires from the FILES tree in the session sidebar (double-click on a row);
+// non-fatal by design — bad paths and permission errors return { ok:false }
+// rather than throwing back into the renderer.
+ipcMain.handle('handq:revealFile', (_event, payload) => {
+    const p = payload && payload.path;
+    if (!p || typeof p !== 'string') return { ok: false, reason: 'invalid path' };
+    try {
+        shell.showItemInFolder(p);
+        return { ok: true };
+    } catch (err) {
+        logLine('IPC-IN', 'handq:revealFile failed', { path: p, err: String(err && err.message || err) });
+        return { ok: false, reason: String(err && err.message || err) };
+    }
+});
+
 // Renderer/preload-originated log forwarding. Preload runs in an isolated
 // world and cannot write to fs directly; it forwards every log line to us so
 // all frontend logs land in a single file.
@@ -1600,59 +1633,144 @@ ipcMain.on('window:hide', () => {
     ensureTray();
 });
 
-// Session-count-driven auto-resize. As the renderer adds session cards, the
-// window grows so the tiled row / grid stays roomy; at 6 cards the layout is
-// full grid (3×2) and we escalate to maximize. Semantics:
-//   * Grows only — a smaller session count never shrinks the window, so a
-//     user who's manually stretched the window keeps their layout.
-//   * Never touches a manually-maximized window until the count drops back
-//     under the maximize threshold and the window is unmaximized elsewhere.
+// Layout-driven auto-resize. The renderer sends a compact descriptor for
+// the current visible layout (total open sessions, rail visibility,
+// sidebar visibility) each time _updateLayout fires; main computes the
+// desired window size from a formula rather than a hard-coded table so
+// each column's contribution is explicit and additive on top of a
+// "main card only" baseline:
+//
+//   baseline (main card only, 800 sq + chat-region padding + titlebar)
+//     width  = 840
+//     height = 840
+//   + rail visible                → width += RAIL_DELTA    (160 + margin + gap 0)
+//   + sidebar visible             → width += SIDEBAR_DELTA (264 + margin + gap)
+//
+// The new Stage-Manager state machine keeps at most 1 card in the main
+// stage — any 2nd+ session drops into the rail — so the "rail visible"
+// signal already captures "more than one session exists". No extra
+// per-extra-session delta is needed on top of RAIL_DELTA.
+//
+// Semantics:
+//   * Delta-application: _autoResizeApply tracks the previously-applied
+//     "auto extras" (target width above baseline) and applies only the
+//     DIFFERENCE on each call. Panel opens → window grows by that
+//     panel's delta; panel closes → window shrinks by the same delta;
+//     manual user resizes in between ride on top and are preserved.
+//     Without this, the chat region would keep the widened space after
+//     a panel closed (flex:1 auto swallowing the freed pixels), which
+//     reads as "the window won't shrink back".
+//   * Never touches a manually-maximized window (the user picked that
+//     state on purpose; we won't fight them).
+//   * No more auto-maximize threshold. The Stage-Manager rail absorbs
+//     any 2nd+ session; more sessions don't need more screen space, they
+//     just add rows to the rail.
 //   * Sizes are clamped to the current display's work area so the window
-//     doesn't spill onto an adjacent monitor.
+//     doesn't spill onto an adjacent monitor, and floored at baseline so
+//     a shrink from a panel-close can't drag the window below baseline
+//     even if the user had manually made it smaller.
+//   * Never smaller than BrowserWindow's own minWidth/minHeight floor.
+//
+// AUTO_RESIZE_TABLE is retained ONLY for the legacy `window:auto-resize`
+// numeric payload (backwards compat with an older renderer build that
+// sent a bare session count instead of a descriptor).
+const AUTO_RESIZE_BASELINE = { w: 840, h: 720 };
+const AUTO_RESIZE_RAIL_DELTA    = 170;   // rail width 160 + margin 10 + gap 0
+const AUTO_RESIZE_SIDEBAR_DELTA = 278;   // sidebar 264 + margin 10 + gap 4
 const AUTO_RESIZE_TABLE = [
-    { w: 840,  h: 560 },  // 1 card
-    { w: 1000, h: 600 },  // 2 cards
-    { w: 1140, h: 640 },  // 3 cards
-    { w: 1220, h: 680 },  // 4 cards
-    { w: 1320, h: 720 },  // 5 cards
+    { w: 840,  h: 720 },   // 1 session (legacy payload only)
+    { w: 1010, h: 720 },   // ≥2 sessions (legacy payload only — assumes rail)
 ];
-const AUTO_RESIZE_MAXIMIZE_AT = 6;
 
-ipcMain.on('window:auto-resize', (_event, sessionCount) => {
+function _computeDesiredSize(layout) {
+    // layout: { sessions:int, sidebarOpen:bool, railOpen:bool }
+    const sidebarOpen = !!(layout && layout.sidebarOpen);
+    const railOpen = !!(layout && layout.railOpen);
+    let w = AUTO_RESIZE_BASELINE.w;
+    let h = AUTO_RESIZE_BASELINE.h;
+    if (railOpen) w += AUTO_RESIZE_RAIL_DELTA;
+    if (sidebarOpen) w += AUTO_RESIZE_SIDEBAR_DELTA;
+    return { w: w, h: h };
+}
+
+// Delta-application state: how much this session has auto-grown the
+// window ABOVE the baseline (from panels opening). Each _autoResizeApply
+// call computes the newly-requested "extras" (target - baseline) and
+// applies the DIFFERENCE from what we grew by last time. Closing a panel
+// therefore SHRINKS the window by that panel's delta, while any manual
+// resize the user did in between rides on top and is preserved. Reset to
+// {0,0} at module load; the first call after launch computes its true
+// baseline delta from whatever panels the renderer reports as open.
+let _lastAutoExtras = { w: 0, h: 0 };
+
+function _autoResizeApply(target) {
     if (!mainWindow || mainWindow.isDestroyed()) return;
-    const n = Math.max(1, Number(sessionCount) || 1);
-    // Cap at maximize threshold.
-    if (n >= AUTO_RESIZE_MAXIMIZE_AT) {
-        if (!mainWindow.isMaximized()) mainWindow.maximize();
-        return;
-    }
-    // Below the maximize threshold, never touch a window the user has
-    // already maximized manually — they picked that state on purpose.
     if (mainWindow.isMaximized()) return;
-
-    const target = AUTO_RESIZE_TABLE[Math.min(n, AUTO_RESIZE_TABLE.length) - 1];
     const cur = mainWindow.getBounds();
-    // Grow-only: skip if the window is already at least as big on both axes.
-    if (cur.width >= target.w && cur.height >= target.h) return;
+
+    // Extras above the fixed baseline this call is asking for. Clamped
+    // to ≥0 defensively — every current caller emits target ≥ baseline,
+    // but a stray legacy payload with a below-baseline entry would
+    // otherwise underflow deltaW/deltaH into a spurious extra shrink.
+    const wantExtraW = Math.max(0, target.w - AUTO_RESIZE_BASELINE.w);
+    const wantExtraH = Math.max(0, target.h - AUTO_RESIZE_BASELINE.h);
+    const deltaW = wantExtraW - _lastAutoExtras.w;
+    const deltaH = wantExtraH - _lastAutoExtras.h;
+    _lastAutoExtras = { w: wantExtraW, h: wantExtraH };
+    if (deltaW === 0 && deltaH === 0) return;
 
     const display = screen.getDisplayMatching(cur);
     const wa = display.workArea;
-    const nextW = Math.min(target.w, wa.width);
-    const nextH = Math.min(target.h, wa.height);
-    // Keep the window centered on its growth: shift the top-left so the
-    // window's centre stays roughly in place (nice visual continuity).
-    const cx = cur.x + cur.width / 2;
+    // Floor at baseline: if the user shrank the window BELOW baseline and
+    // then a panel closed, we don't want that -delta to drag them further
+    // down. Ceiling at the current display's work area so a +delta near
+    // the right edge doesn't push the window off-screen.
+    const nextW = Math.max(AUTO_RESIZE_BASELINE.w, Math.min(wa.width,  cur.width  + deltaW));
+    const nextH = Math.max(AUTO_RESIZE_BASELINE.h, Math.min(wa.height, cur.height + deltaH));
+    if (nextW === cur.width && nextH === cur.height) return;
+
+    // Keep the window's centre roughly in place — the visual continuity
+    // reads as "panel slid in from one side" rather than "whole window
+    // jumped". Same math for grow and shrink: half the delta goes to
+    // each side. Then clamp so we don't spill off the display.
+    const cx = cur.x + cur.width  / 2;
     const cy = cur.y + cur.height / 2;
     let nextX = Math.round(cx - nextW / 2);
     let nextY = Math.round(cy - nextH / 2);
-    // Clamp inside the work area so we don't spill off-screen.
-    nextX = Math.max(wa.x, Math.min(nextX, wa.x + wa.width - nextW));
+    nextX = Math.max(wa.x, Math.min(nextX, wa.x + wa.width  - nextW));
     nextY = Math.max(wa.y, Math.min(nextY, wa.y + wa.height - nextH));
     try {
         mainWindow.setBounds({ x: nextX, y: nextY, width: nextW, height: nextH }, true);
     } catch (err) {
         logLine('MAIN', 'auto-resize setBounds failed', { err: err && err.message });
     }
+}
+
+ipcMain.on('window:auto-resize', (_event, payload) => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    // Two payload shapes accepted:
+    //   { sessions, sidebarOpen, railOpen }  ← current renderer
+    //   <number>                             ← legacy: bare session count
+    let sessions;
+    let target;
+    if (payload && typeof payload === 'object') {
+        sessions = Math.max(1, Number(payload.sessions) || 1);
+        target = _computeDesiredSize({
+            sessions: sessions,
+            sidebarOpen: !!payload.sidebarOpen,
+            railOpen: !!payload.railOpen,
+        });
+    } else {
+        sessions = Math.max(1, Number(payload) || 1);
+        target = AUTO_RESIZE_TABLE[Math.min(sessions, AUTO_RESIZE_TABLE.length) - 1];
+    }
+    // No more auto-maximize-at-N-sessions. The old threshold assumed the
+    // tiled-card layout where 6+ visible cards genuinely needed the whole
+    // screen; with the Stage-Manager rail (≤1 card in main, everything
+    // else scrolls in the 160px rail), extra sessions don't want more
+    // screen space at all — they just add rows to the rail. If the user
+    // wants full-screen they can maximize themselves.
+    _autoResizeApply(target);
 });
 
 // Global hotkey IPC — renderer can read and update the toggle shortcut.

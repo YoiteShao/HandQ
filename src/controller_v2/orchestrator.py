@@ -31,6 +31,7 @@ Architectural decisions:
 import asyncio
 import time
 import uuid as _uuid
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional, Set, cast
 
 from ..infrastructure.json_key_streamer import JsonKeyStreamer
@@ -74,19 +75,65 @@ _LTM_BLOCK_CACHE_TTL_SEC: float = 60.0
 # a goal the judge (or the agent) may never be able to satisfy.
 _GOAL_MAX_ITERATIONS = 20
 
-_GOAL_JUDGE_SYSTEM_PROMPT = """You judge whether a STANDING CONDITION holds, \
-given every task outcome accumulated since the goal was declared. This is NOT \
-the same question as "did the most recent task succeed" — a task can complete \
-successfully while the standing condition still does not hold (e.g. "tell me \
-when CPU exceeds 90%" — a check task always "succeeds" by running the check; \
-the CONDITION is only satisfied when the check actually observed CPU > 90%). \
-Conversely a task can fail or be abandoned while the condition nonetheless \
-already holds from earlier evidence. Read across ALL evidence entries, not \
-just the latest one. Output JSON only: \
-{"satisfied": bool, "rationale": "<one sentence citing which evidence entry \
-(if any) actually satisfies the condition>"}. \
-If ambiguous or only partially satisfied, satisfied=false — continuing costs \
-nothing but a false positive stops real work prematurely."""
+
+@dataclass
+class _GoalVerdict:
+    """One adversarial goal-verifier verdict.
+
+    ``blocking`` distinguishes a plain not-yet-satisfied (retry may help) from a
+    "needs a human" state: ``contradiction`` (evidence contradicts the
+    objective) or ``unverifiable`` (can't be checked from available evidence).
+    Both short-circuit the re-queue loop so the goal doesn't burn attempts up
+    to the cap on something retrying can't fix.
+    """
+
+    satisfied: bool
+    blocking: str = "none"   # none | contradiction | unverifiable
+    rationale: str = ""
+
+_GOAL_JUDGE_SYSTEM_PROMPT = """You are a skeptical verifier. Decide whether a \
+STANDING CONDITION holds, given the objective, the REAL file changes made since \
+the goal was declared (CHANGED_FILES + DIFF — ground truth, captured by the \
+harness, not self-reported), and the agent's own REPORTED outcomes across every \
+task since. This is NOT "did the most recent task succeed" — a task can complete \
+successfully while the condition still does not hold (e.g. "tell me when CPU \
+exceeds 90%" — a check task always "succeeds" by running the check; the CONDITION \
+holds only when the check actually observed CPU > 90%). Conversely the condition \
+may already hold even if the latest task failed or was abandoned.
+
+Your default is REFUTED: if you are not convinced the condition holds, \
+satisfied=false. Continuing costs only more work; a false "satisfied" stops real \
+work prematurely.
+
+But do NOT manufacture reasons to refute. Guard against these failure modes:
+
+- ANTI-RATCHET. The bar does NOT rise between check-ins. Attempt #5 is judged \
+against the SAME objective as attempt #1 — never a stricter one. Do not invent \
+new requirements the objective never stated (missing edge cases, extra tests, \
+stylistic preferences, "could be more robust") as grounds to refute. If the \
+objective as written is met, satisfied=true even on the first attempt.
+
+- AUDIT, DON'T AUTHOR. Judge the evidence the agent actually produced against the \
+objective. You are auditing, not redesigning. "I would have done it differently" \
+is not a refutation.
+
+- HONESTY CHECK. If a REPORTED outcome claims a file was created/modified but that \
+file is absent from CHANGED_FILES, the claim is unsubstantiated — that is grounds \
+to refute (the agent may be reporting work it did not do). Trust CHANGED_FILES/DIFF \
+over prose when they conflict.
+
+Also classify whether this is even retry-able:
+- blocking="none":         a normal not-yet-satisfied — retrying may help.
+- blocking="contradiction": the evidence CONTRADICTS the objective in a way retry \
+  won't fix (e.g. the objective is based on a false premise, or the world state \
+  makes it impossible). Needs the user, not another attempt.
+- blocking="unverifiable": the condition cannot be checked from the available \
+  evidence (e.g. it depends on external state nobody captured). Needs the user.
+
+Output JSON only:
+{"satisfied": bool, "blocking": "none"|"contradiction"|"unverifiable", \
+"rationale": "<one sentence citing the specific evidence (a changed file, a diff \
+hunk, or a reported outcome) that decides it>"}"""
 
 
 class Orchestrator:
@@ -939,11 +986,32 @@ class Orchestrator:
         per-item loop already answers on its own. See GoalState's docstring.
         """
         evidence = completed[goal.baseline_result_count:]
-        satisfied, rationale = await self._judge_goal_satisfaction(goal, evidence)
+        verdict = await self._judge_goal_satisfaction(goal, evidence)
 
-        if satisfied:
+        if verdict.satisfied:
             self._session_ctx.active_goal = None
-            self._emit_completion_reply(prefix=f"✓ 目标已达成:{rationale}")
+            self._emit_completion_reply(prefix=f"✓ Goal achieved: {verdict.rationale}")
+            await self._run_task_complete_cleanup()
+            return
+
+        # Blocking verdict: the evidence contradicts the objective, or the
+        # condition can't be checked from what's available. Retrying won't fix
+        # either — hand back to the user instead of burning attempts up to the
+        # cap. This is the adversarial verifier's "needs a human, not another
+        # loop" signal (borrowed from Grok's goal_classifier `blocking` field).
+        if verdict.blocking in ("contradiction", "unverifiable"):
+            self._session_ctx.active_goal = None
+            label = (
+                "Goal contradicts the current state"
+                if verdict.blocking == "contradiction"
+                else "Goal cannot be verified from the available evidence"
+            )
+            self._emit_completion_reply(
+                prefix=(
+                    f"⚠ {label} — retrying won't resolve it, so I'm stopping: "
+                    f"{verdict.rationale}"
+                )
+            )
             await self._run_task_complete_cleanup()
             return
 
@@ -956,42 +1024,143 @@ class Orchestrator:
         self._session_ctx.active_goal = None
         self._emit_completion_reply(
             prefix=(
-                f"⚠ 目标「{goal.condition}」已连续尝试 {goal.iterations} 次仍未达成,"
-                f"先停下来——需要你确认是否继续。"
+                f"⚠ Goal \"{goal.condition}\" is still unmet after "
+                f"{goal.iterations} consecutive attempts — stopping here; "
+                f"please confirm whether to keep going."
             )
         )
         await self._run_task_complete_cleanup()
 
     async def _judge_goal_satisfaction(
         self, goal: "GoalState", evidence: List[TaskResult],
-    ) -> tuple[bool, str]:
-        """Ask whether *goal*'s standing condition holds given accumulated evidence.
+    ) -> "_GoalVerdict":
+        """Adversarially verify whether *goal*'s standing condition holds.
 
-        Deliberately fed EVERY TaskResult since the goal was declared, not
-        just the latest one: the condition can still be false after an item
-        "succeeds" (a check task always succeeds by running the check), and
-        can already be true even if the most recent item failed or was
-        abandoned. Reusing `_call_and_parse` means this runs on the same
-        `agent_models` pool as INTENT/the Agent — no new LLM plumbing.
+        Two upgrades over the old single-prose-judge:
+
+        1. **Ground-truth evidence.** Alongside the agent's self-reported
+           outcomes, we feed the REAL file changes since the goal was declared
+           (RewindStore.capture_diff → CHANGED_FILES + truncated DIFF). The
+           judge audits what the files ACTUALLY became against the objective,
+           so it catches "reported writing config.yaml but nothing changed" —
+           the class of false-completion the mechanical channel-empty check and
+           the speculative-completion guard both miss (they verify a
+           world-touching tool was CALLED, not that its output met the goal).
+
+        2. **Optional skeptic panel.** ``goal_verifier.voters`` (config,
+           default 1) runs N independent judges; approval needs a strict
+           majority AND every abstention/parse-failure degrades to refuted
+           (bias-to-fail, Grok's cold-panel aggregation). Default 1 keeps the
+           haiku hot path at exactly one call — same cost as before, just a
+           sharper prompt + real diff. Opus deployments can raise it.
+
+        Still fed EVERY TaskResult since the goal was declared: the condition
+        can be false after an item "succeeds" and true after one fails. Reuses
+        `_call_and_parse` — same model pool as INTENT/the Agent, no new plumbing.
         """
-        evidence_block = "\n\n".join(
-            f"--- evidence #{i + 1} (item={r.item_id}) ---\n"
+        reported_block = "\n\n".join(
+            f"--- reported outcome #{i + 1} (item={r.item_id}) ---\n"
             f"success={r.success}\n"
-            f"factual_outcome={r.factual_outcome}\n"
+            f"final_answer={r.final_answer}\n"
+            f"verification={r.verification}\n"
             f"key_findings={r.key_findings}\n"
             f"issues={r.issues}"
             for i, r in enumerate(evidence)
+        ) or "(no reported outcomes)"
+
+        # Ground-truth file changes since the goal's baseline. Best-effort:
+        # no store (tests) or empty capture → an explicit "no file changes"
+        # block so the judge distinguishes "nothing changed" from "unavailable".
+        changes_block = self._render_goal_file_changes(goal, evidence)
+
+        user_content = (
+            f"OBJECTIVE:\n{goal.condition}\n\n"
+            f"{changes_block}\n\n"
+            f"REPORTED_OUTCOMES ({len(evidence)} task(s) since goal declared):\n"
+            f"{reported_block}\n"
         )
         messages = [
             {"role": "system", "content": _GOAL_JUDGE_SYSTEM_PROMPT},
-            {"role": "user", "content": (
-                f"[Standing Goal Condition]\n{goal.condition}\n\n"
-                f"[Accumulated Evidence Since Goal Declared "
-                f"({len(evidence)} task(s))]\n{evidence_block}\n"
-            )},
+            {"role": "user", "content": user_content},
         ]
+
+        voters = self._goal_verifier_voters()
+        if voters <= 1:
+            return await self._single_goal_vote(messages)
+
+        results = await asyncio.gather(
+            *[self._single_goal_vote(messages) for _ in range(voters)],
+            return_exceptions=True,
+        )
+        votes: List["_GoalVerdict"] = []
+        for r in results:
+            # An exception (transport/parse) degrades to a refuted vote —
+            # bias-to-fail keeps a missing verdict from counting as approval.
+            votes.append(r if isinstance(r, _GoalVerdict) else _GoalVerdict(
+                satisfied=False, blocking="none", rationale="verifier error",
+            ))
+        return self._aggregate_goal_votes(votes)
+
+    def _goal_verifier_voters(self) -> int:
+        """Read goal_verifier.voters from config (default 1, clamped 1..5)."""
+        try:
+            cm = self._session_ctx.config_manager if self._session_ctx else None
+            if cm is None:
+                return 1
+            raw = cm.get_section("goal_verifier").get("voters", 1)
+            return max(1, min(int(raw), 5))
+        except Exception:
+            return 1
+
+    async def _single_goal_vote(self, messages: List[Dict[str, str]]) -> "_GoalVerdict":
         parsed = await self._call_and_parse(messages, "goal-judge") or {}
-        return bool(parsed.get("satisfied")), str(parsed.get("rationale") or "")
+        blocking = str(parsed.get("blocking") or "none").strip().lower()
+        if blocking not in ("none", "contradiction", "unverifiable"):
+            blocking = "none"
+        return _GoalVerdict(
+            satisfied=bool(parsed.get("satisfied")),
+            blocking=blocking,
+            rationale=str(parsed.get("rationale") or ""),
+        )
+
+    def _aggregate_goal_votes(self, votes: List["_GoalVerdict"]) -> "_GoalVerdict":
+        """Strict-majority approval; any blocking verdict from any voter wins.
+
+        - A single voter flagging `contradiction`/`unverifiable` surfaces that
+          (it's a "needs a human" signal — err toward escalation, not looping).
+        - satisfied requires a STRICT majority of voters (n//2 + 1). Ties and
+          minorities stay refuted (bias-to-fail).
+        - rationale = the first refuting/blocking rationale (the actionable one)
+          when not satisfied, else the first approving one.
+        """
+        n = len(votes)
+        for v in votes:
+            if v.blocking in ("contradiction", "unverifiable"):
+                return v
+        approvals = sum(1 for v in votes if v.satisfied)
+        if approvals >= (n // 2 + 1):
+            first_yes = next((v for v in votes if v.satisfied), votes[0])
+            return _GoalVerdict(satisfied=True, blocking="none",
+                                rationale=first_yes.rationale)
+        first_no = next((v for v in votes if not v.satisfied), votes[0])
+        return _GoalVerdict(satisfied=False, blocking="none",
+                            rationale=first_no.rationale)
+
+    def _render_goal_file_changes(
+        self, goal: "GoalState", evidence: List[TaskResult],
+    ) -> str:
+        """Render CHANGED_FILES + DIFF for the items since the goal's baseline,
+        from the session RewindStore. Falls back to an explicit no-evidence
+        block on any error / absent store."""
+        try:
+            store = self._session_ctx.rewind_store if self._session_ctx else None
+            if store is None:
+                return "CHANGED_FILES: (file-change capture unavailable this session)"
+            item_ids = [r.item_id for r in evidence if r.item_id]
+            diff_ev = store.capture_diff(item_ids or None)
+            return diff_ev.render()
+        except Exception:
+            return "CHANGED_FILES: (file-change capture failed)"
 
     async def _requeue_goal(self, goal: "GoalState") -> None:
         """Mechanically re-queue the goal's verbatim condition as a new item.
@@ -1053,11 +1222,13 @@ class Orchestrator:
     def _emit_completion_reply(self, prefix: str = "") -> None:
         """Compose + send the final task-completion reply (private helper).
 
-        The reply is assembled deterministically from the agent's verified
-        structured facts (factual_outcome / key_findings / artifacts) — there
-        is no LLM-authored prose layer. This keeps the reply strictly
-        skeleton-first: every line traces to a structured field the agent
-        actually reported, never to a second LLM's narration.
+        The reply is assembled deterministically from the agent's structured
+        completion (final_answer / verification / artifacts / key_findings).
+        The `final_answer` field carries the user-facing content directly;
+        `verification` is the mechanical audit trail (rendered as a details /
+        folded section); `artifacts` surfaces only when the user explicitly
+        asked for files. There is no SECOND LLM call layer — the composer
+        stitches only what the agent already produced.
         """
         # Reaching here means the task channel has nothing in flight. Settle the
         # activity strip to idle before the summary goes out; covers the no-body
@@ -1083,14 +1254,24 @@ class Orchestrator:
         Called when the task channel has no pending and no in-progress item.
         Renders structured markdown (no LLM call).
 
-        Grounding priority (skeleton-first): `artifacts` are GROUND TRUTH — the
-        persistent agent extracts them from the write/edit tools' actual output
-        paths (`_produced_paths`), never from the LLM's self-report. So when a
-        task produced artifacts, we LEAD with them. `factual_outcome` /
-        `key_findings` are the agent's own prose and are NOT mechanically
-        verified, so they follow the grounded block and are labeled as reported
-        — a hallucinated outcome bullet can no longer masquerade as the headline
-        result. A failed tail's issues are always surfaced.
+        Layout, top → bottom:
+
+        1. **`final_answer`** — the user-facing content the agent authored.
+           This is the headline: whatever the user asked for, in whatever
+           shape fits (paragraph, table, list, code block). If empty (agent
+           didn't emit an answer body), we fall through so at least *something*
+           renders.
+
+        2. **Files** — only when `artifacts` is non-empty, i.e. the user
+           explicitly asked for files. Verified paths (tool-output ground
+           truth, not LLM self-report).
+
+        3. **Verification / Key findings** — audit-trail bullets folded into a
+           collapsed <details> block. These are the mechanical evidence and
+           discrete facts; they're not the answer, they're the audit line.
+
+        4. **Unresolved** — a failed tail's blockers, always surfaced (never
+           hidden inside <details>).
         """
         completed = self._task_channel.get_completed_results()
         if not completed:
@@ -1099,7 +1280,7 @@ class Orchestrator:
 
         # Artifacts span the whole task — collect across every completed item,
         # deduping while preserving first-seen order. These are the grounded
-        # facts (tool output paths), so they anchor the reply.
+        # facts (tool output paths).
         artifacts: List[str] = []
         seen: Set[str] = set()
         for r in completed:
@@ -1112,32 +1293,40 @@ class Orchestrator:
         header = "## Task complete" if (last.success and not last.issues) else "## Task ended"
         sections.append(header)
 
-        # 1. GROUNDED first: files actually written/edited (verified paths).
+        # 1. FINAL ANSWER first — the user's actual answer, headline position.
+        if last.final_answer:
+            sections.append(last.final_answer)
+
+        # 2. Files ONLY when the user asked for them (artifacts non-empty).
         if artifacts:
             sections.append(
                 "**Files created / modified** (verified from tool output)\n"
                 + "\n".join(f"- {a}" for a in artifacts)
             )
 
-        # 2. Agent-reported prose SECOND, explicitly labeled as the agent's own
-        #    account (not mechanically verified). When artifacts already carry
-        #    the concrete result, this is context, not the headline.
-        if last.factual_outcome:
-            label = (
-                "**Reported outcomes**" if artifacts
-                else "**Outcomes**"
-            )
-            sections.append(
-                label + "\n"
-                + "\n".join(f"- {o}" for o in last.factual_outcome)
+        # 3. Audit trail folded into <details>. verification (mechanical, tool-
+        #    grounded bullets) and key_findings (discrete facts) live here.
+        #    Rendered together in one collapsed block so the reply stays
+        #    scannable when the agent verifies many things.
+        audit_parts: List[str] = []
+        if last.verification:
+            audit_parts.append(
+                "**Verification**\n"
+                + "\n".join(f"- {v}" for v in last.verification)
             )
         if last.key_findings:
-            sections.append(
+            audit_parts.append(
                 "**Key findings**\n"
                 + "\n".join(f"- {f}" for f in last.key_findings)
             )
+        if audit_parts:
+            sections.append(
+                "<details>\n<summary>Audit trail</summary>\n\n"
+                + "\n\n".join(audit_parts)
+                + "\n</details>"
+            )
 
-        # 3. A failed tail's blockers are always surfaced, never hidden.
+        # 4. A failed tail's blockers are always surfaced, never folded.
         if not last.success and last.issues:
             sections.append(
                 "**Unresolved**\n"

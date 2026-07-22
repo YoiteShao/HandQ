@@ -495,6 +495,55 @@ class BackgroundTaskRegistry:
 
 # ── ShellTool ─────────────────────────────────────────────────────────────────
 
+# Directories a workspace-mtime scan skips outright — heavy VCS, build
+# artefact, and cache trees where the agent's shell won't touch anything
+# the user cares to see in the nebula, and which would blow the walk cost
+# out of proportion on typical projects.
+_WORKSPACE_SCAN_EXCLUDE_DIRS = frozenset([
+    ".git", "node_modules", "__pycache__",
+    ".venv", "venv", "env",
+    ".mypy_cache", ".pytest_cache", ".ruff_cache", ".tox",
+    "dist", "build", ".next", ".nuxt", "target", ".gradle",
+    ".idea", ".vscode", ".DS_Store",
+])
+# Guard rail: a walk that would iterate more files than this bails empty
+# rather than emit a partial picture — quietly missing a file the shell
+# actually touched is a worse signal than "we didn't scan this run".
+_WORKSPACE_SCAN_MAX_FILES = 20_000
+
+
+def _scan_workspace_changes(root: str, since_ts: float) -> List[str]:
+    """Return absolute paths under *root* whose mtime is at or after
+    *since_ts* — the shell tool's crude "which files did that command
+    touch?" detector. 1-second slop is applied so a filesystem whose
+    mtime resolution rounds down still reports fresh writes.
+
+    Skips ``_WORKSPACE_SCAN_EXCLUDE_DIRS`` at every level. Returns an
+    empty list on any walk error or if the tree exceeds
+    ``_WORKSPACE_SCAN_MAX_FILES`` — see the const's docstring.
+    """
+    changed: List[str] = []
+    total = 0
+    threshold = since_ts - 1.0
+    try:
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in _WORKSPACE_SCAN_EXCLUDE_DIRS]
+            for fname in filenames:
+                total += 1
+                if total > _WORKSPACE_SCAN_MAX_FILES:
+                    return []
+                fp = os.path.join(dirpath, fname)
+                try:
+                    mt = os.stat(fp).st_mtime
+                except OSError:
+                    continue
+                if mt >= threshold:
+                    changed.append(fp)
+    except OSError:
+        pass
+    return changed
+
+
 def _augment_ssh_command(command: str) -> str:
     """Auto-add safety flags to bare ``ssh`` commands.
 
@@ -1008,6 +1057,26 @@ class ShellTool(BaseTool):
                     "cwd": effective_cwd,
                     "venv": self.venv_path,
                 }
+
+                # Workspace-mtime scan: emit file_touch(edit) for every file
+                # under effective_cwd whose mtime landed after this command
+                # started. Only meaningful on success (a failed rm didn't
+                # touch anything worth showing) and skipped for demonstrably
+                # read-only commands (ls, grep) where the scan would just
+                # burn CPU. Runs in the executor so a big tree doesn't
+                # stall the event loop.
+                if (process.returncode == 0
+                        and effective_cwd
+                        and not looks_read_only(command)):
+                    try:
+                        changed = await asyncio.get_event_loop().run_in_executor(
+                            None,
+                            lambda: _scan_workspace_changes(effective_cwd, start_time),
+                        )
+                        for fp in changed:
+                            self.emit_file_touch(fp, "edit")
+                    except Exception:
+                        pass
 
                 return ToolResult(
                     success=process.returncode == 0,

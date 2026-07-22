@@ -241,12 +241,90 @@
         <!-- Main content                                                  -->
         <!-- ============================================================ -->
         <main class="main">
-            <!-- Chat: ~90% of remaining height -->
+            <!-- ============================================================ -->
+            <!-- Stage rail (left) — Stage-Manager-style live thumbnails of   -->
+            <!-- minimized sessions. Holds up to 3 visible cards (overflow    -->
+            <!-- scrolls); each thumbnail is the session's REAL card DOM node -->
+            <!-- reparented in (not a screenshot), scaled down via CSS zoom   -->
+            <!-- so it keeps rendering live while minimized. Populated/       -->
+            <!-- emptied by renderer.js's session placement state machine.    -->
+            <!-- ============================================================ -->
+            <aside class="stage-rail" id="stage-rail" data-empty="true" aria-label="Minimized sessions">
+                <div class="stage-rail-list" id="stage-rail-list"></div>
+            </aside>
+
+            <!-- Chat: main stage — up to 2 parallel session cards -->
             <section class="chat-region" id="chat-region">
                 <div class="conversation" id="conversation">
                     <!-- Message bubbles get appended here by renderer.js -->
                 </div>
             </section>
+
+            <!-- ============================================================ -->
+            <!-- Session sidebar — right-hand detail panel for the focused    -->
+            <!-- main-stage session: plan bar, activity feed, and file r/w    -->
+            <!-- record. Populated by session-sidebar.js reacting to          -->
+            <!-- task_plan / file_touch / activity events routed from        -->
+            <!-- renderer.js. Empty until the focused session emits its       -->
+            <!-- first activity; collapses when the ‹ button is clicked.      -->
+            <!-- ============================================================ -->
+            <aside class="session-sidebar" id="session-sidebar" data-collapsed="true" aria-label="Session detail">
+                <div class="ss-width-handle" id="ss-width-handle" title="Drag to resize"></div>
+                <header class="ss-header">
+                    <span class="ss-title">Session detail</span>
+                    <span class="ss-name" id="ss-session-name">—</span>
+                    <button class="ss-collapse" id="ss-collapse" type="button"
+                            aria-label="Hide sidebar" title="Hide sidebar (session detail is remembered)">
+                        <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+                            <path d="M11 3 L5 8 L11 13" fill="none" stroke="currentColor"
+                                  stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+                        </svg>
+                    </button>
+                </header>
+
+                <div class="ss-inner" id="ss-inner">
+                    <!-- Plan bar (top) — full task-plan queue, always expanded -->
+                    <div class="ss-planbar" id="ss-planbar"></div>
+
+                    <!-- Middle: activity feed (larger) + file r/w record
+                         (smaller, guaranteed-visible floor) — each its own
+                         independently-scrollable card. -->
+                    <div class="ss-body" id="ss-body">
+                        <section class="ss-section ss-activity-section">
+                            <div class="ss-section-head">
+                                <span class="ss-section-title">Activity</span>
+                                <span class="ss-section-count" id="ss-activity-count"></span>
+                            </div>
+                            <div class="ss-activity-list" id="ss-activity-list"></div>
+                        </section>
+
+                        <section class="ss-section ss-files-section">
+                            <div class="ss-section-head">
+                                <span class="ss-section-title">Files</span>
+                                <span class="ss-section-count" id="ss-files-count"></span>
+                            </div>
+                            <div class="ss-files-list" id="ss-files-list"></div>
+                        </section>
+                    </div>
+                </div>
+            </aside>
+
+            <!-- ============================================================ -->
+            <!-- Floating "reopen" button — appears on the right edge only    -->
+            <!-- when the sidebar is hidden AND the focused session has       -->
+            <!-- accumulated activity worth surfacing. Session-sidebar.js     -->
+            <!-- toggles data-visible; CSS handles the slide-in/out.          -->
+            <!-- ============================================================ -->
+            <button class="ss-reopen" id="ss-reopen" type="button"
+                    aria-label="Show session detail"
+                    title="Show session detail"
+                    data-visible="false">
+                <span class="ss-reopen-dot"></span>
+                <svg viewBox="0 0 16 16" width="12" height="12" aria-hidden="true">
+                    <path d="M5 3 L11 8 L5 13" fill="none" stroke="currentColor"
+                          stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+            </button>
         </main>
 
         <!-- Note: the global activity strip + popover have been removed.
@@ -877,6 +955,7 @@
     </div>
 
     <script src="vendor/xterm.bundle.js"></script>
+    <script src="session-sidebar.js"></script>
     <script src="renderer.js"></script>
     <script src="admin-panel.js"></script>
     <script src="glass-effect.js"></script>

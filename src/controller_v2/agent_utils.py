@@ -36,6 +36,21 @@ INFRA_TOOL_NAMES: frozenset = frozenset({
     "llm_stream", "context_truncation_notice",
 })
 
+# Bookkeeping tools that never touch the world — planning, reading a recipe, or
+# adjusting the agent's own tool list. A completion "grounded" ONLY by these is
+# not real evidence the task was done (see the speculative-completion guard in
+# PersistentAgent._item_loop). Single source of truth: the online guard and the
+# offline laziness analyzer (tools_v3/analyze_laziness.py) both key off this set,
+# so a tool added here is treated as non-grounding everywhere at once.
+#
+# claim_tool / release_tool MUST be here: activating a tool is not using it. A
+# real 2026-07-17 trace declared success after only read_skill + claim_tool
+# ("SSH ... auto-probing verified") without ever calling ssh — the offline
+# analyzer caught it; the online guard had missed claim_tool/release_tool.
+BOOKKEEPING_ONLY_TOOLS: frozenset = frozenset({
+    "todo_write", "read_skill", "claim_tool", "release_tool",
+})
+
 TOOL_NAME_ALIASES: Dict[str, str] = {
     "write_file": "write",
     "read_file": "read",
@@ -672,7 +687,11 @@ class TurnOutcome:
     reasoning: str
     tool_calls: List[ToolCall] = field(default_factory=list)
     error: Optional[str] = None
-    factual_outcome: Optional[List[str]] = None
+    # User-facing answer body — markdown shown in the chat bubble. Only
+    # populated on completion turns.
+    final_answer: Optional[str] = None
+    # Tool-grounded audit bullets — what tools verified this task.
+    verification: Optional[List[str]] = None
     artifacts: Optional[List[str]] = None
     key_findings: Optional[List[str]] = None
     claim_tool: List[str] = field(default_factory=list)
@@ -739,11 +758,12 @@ class TurnOutcome:
     def from_completion_text(cls, raw_content: str) -> 'TurnOutcome':
         """Parse non-tool LLM output into a completion TurnOutcome.
 
-        Attempts JSON parsing for structured fields. Falls back to
-        treating plain text as a factual_outcome summary. When json_repair
+        Attempts JSON parsing for structured fields (``final_answer`` /
+        ``verification`` / ``artifacts`` / ``key_findings``). When json_repair
         had to salvage the input (a strong signal of mid-stream truncation),
         the returned TurnOutcome carries a ``truncation_note`` so the caller
-        can surface it in the item's issues.
+        can surface it in the item's issues. Non-JSON prose sets
+        ``format_violation`` and the item_loop retries.
         """
         def _coerce_str_list(v: Any) -> Optional[List[str]]:
             if v is None:
@@ -757,10 +777,13 @@ class TurnOutcome:
         if isinstance(parsed, dict) and "reasoning" in parsed:
             claim, release = extract_self_extension_fields(parsed)
             _pf = parsed.get("plan_feedback")
+            _fa = parsed.get("final_answer")
+            final_answer = str(_fa).strip() if _fa is not None else None
             return cls(
                 reasoning=parsed.get("reasoning", ""),
                 error=parsed.get("error"),
-                factual_outcome=_coerce_str_list(parsed.get("factual_outcome")),
+                final_answer=final_answer or None,
+                verification=_coerce_str_list(parsed.get("verification")),
                 artifacts=_coerce_str_list(parsed.get("artifacts")),
                 key_findings=_coerce_str_list(parsed.get("key_findings")),
                 claim_tool=claim,
@@ -775,18 +798,24 @@ class TurnOutcome:
 
         # Fallback: the LLM returned something that isn't a JSON object with
         # a `reasoning` key — most commonly pure markdown prose ignoring the
-        # completion contract. Do NOT stash the raw content as factual_outcome
-        # (that field is for short structured facts; long content belongs in
-        # artifacts). Instead flag ``format_violation`` and hand a short
-        # preview back. The item_loop reads ``format_violation`` and drives a
-        # corrective retry (see persistent_agent.py speculative-completion
-        # guard) — the LLM gets the schema pointed out and can re-emit a
-        # proper JSON completion, moving long text to artifacts.
-        preview_len = 500
-        preview = raw_content[:preview_len] if raw_content else ""
+        # completion contract. Do NOT stash the raw content as `final_answer`
+        # here (that would silently let a schema-violating completion succeed
+        # and bypass the corrective retry). Instead flag ``format_violation``
+        # and carry the FULL raw content back as `reasoning`. The item_loop
+        # reads ``format_violation`` and drives a corrective retry (see
+        # persistent_agent.py speculative-completion guard) — the LLM gets the
+        # schema pointed out and re-emits a proper JSON completion, moving the
+        # user-facing content into `final_answer`.
+        #
+        # We keep the raw content whole (no truncation here) so downstream
+        # observers see what the model actually attempted: ExecutionRecorder
+        # writes it into the JSONL turn record (its own MAX_OUTPUT_LEN cap
+        # applies there), and notify_decision_made surfaces it to the UI so a
+        # rejected summary is not silently lost.
         return cls(
-            reasoning=preview if raw_content else "Failed to parse LLM response.",
-            factual_outcome=None,
+            reasoning=raw_content if raw_content else "Failed to parse LLM response.",
+            final_answer=None,
+            verification=None,
             truncation_note=(
                 "Completion output was not valid JSON with a `reasoning` key; "
                 f"raw_len={len(raw_content)}; item_loop will request a retry."

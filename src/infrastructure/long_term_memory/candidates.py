@@ -44,7 +44,7 @@ def _is_trivial_session(*, last_steps) -> Optional[str]:
     None.
 
     The previous version counted "substantive steps" (any step with
-    artifacts / factual_outcome / key_findings). It had two failure
+    artifacts / verification / key_findings / final_answer). It had two failure
     modes worth fixing:
       - One genuinely productive write step (e.g. "implement feature X
         in file Y", produces 1 artifact + outcome) was rejected because
@@ -58,8 +58,8 @@ def _is_trivial_session(*, last_steps) -> Optional[str]:
         +1.0 per other step that has any structured output
         +0.3 per pure read/search/list step (mostly informational)
         +0.5 per DISTINCT artifact path
-        +0..5 for total output volume (factual_outcome + key_findings
-              text length, capped — diminishing returns past 2.5 KB)
+        +0..5 for total output volume (verification + key_findings +
+              final_answer text length, capped — diminishing returns past 2.5 KB)
 
     REJECT when score < TRIVIAL_SCORE_THRESHOLD (default 4.0).
     The reason string returned to logs encodes the score so an
@@ -92,7 +92,8 @@ def _is_trivial_session(*, last_steps) -> Optional[str]:
         is_read = any(v in desc for v in read_verbs)
         has_output = bool(
             getattr(s, "artifacts", None)
-            or getattr(s, "factual_outcome", None)
+            or getattr(s, "verification", None)
+            or getattr(s, "final_answer", None)
             or getattr(s, "key_findings", None)
         )
 
@@ -110,8 +111,11 @@ def _is_trivial_session(*, last_steps) -> Optional[str]:
         # Distinct artifacts (de-duplicated across the session).
         for a in (getattr(s, "artifacts", None) or []):
             artifacts.add(str(a))
-        # Total textual output across factual_outcome + key_findings.
-        for key in ("factual_outcome", "key_findings"):
+        # Total textual output across verification + key_findings + final_answer.
+        # `final_answer` is the primary user-facing content under the new schema,
+        # so it participates in the "substantive output" score the same way
+        # verification / key_findings do.
+        for key in ("verification", "key_findings"):
             v = getattr(s, key, None)
             if not v:
                 continue
@@ -119,6 +123,9 @@ def _is_trivial_session(*, last_steps) -> Optional[str]:
                 total_output_chars += sum(len(str(x)) for x in v)
             else:
                 total_output_chars += len(str(v))
+        ans = getattr(s, "final_answer", None)
+        if ans:
+            total_output_chars += len(str(ans))
 
     score += len(artifacts) * 0.5
     # Diminishing returns past ~2.5 KB. A 200-char outcome is barely
@@ -286,9 +293,12 @@ def _render_session(goal: str, summary: str, last_steps, success: bool) -> str:
             status_name = getattr(status, "name", str(status) if status else "?")
             description = getattr(s, "description", "") or ""
             line = f"- [{status_name}] {description}"
-            factual = getattr(s, "factual_outcome", None) or []
-            if factual:
-                line += "\n  outcome: " + "; ".join(map(str, factual[:3]))
+            final_answer = getattr(s, "final_answer", None) or ""
+            if final_answer:
+                line += "\n  final_answer: " + str(final_answer)[:200]
+            verification = getattr(s, "verification", None) or []
+            if verification:
+                line += "\n  verification: " + "; ".join(map(str, verification[:3]))
             artifacts = getattr(s, "artifacts", None) or []
             if artifacts:
                 line += "\n  artifacts: " + ", ".join(map(str, artifacts[:3]))

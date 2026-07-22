@@ -45,6 +45,7 @@ if TYPE_CHECKING:
 from .agent_utils import (
     LLM_API_ERROR_TAG,
     INFRA_TOOL_NAMES,
+    BOOKKEEPING_ONLY_TOOLS,
     TOOL_NAME_ALIASES,
     ToolCall,
     TurnOutcome,
@@ -136,15 +137,54 @@ class PersistentAgent:
         self._api_tools: List[Dict[str, Any]] = ToolRegistry.generate_tools_for_api()
 
         # Wire the spawn_agent / fan_out_agents tools' runtime: both reuse
-        # THIS agent's LLM fallback chain and tool instances to run isolated
-        # sub-loops, so their reads/writes never enter this agent's own
-        # _turns. Bound here (post-construction) because the tools need live
-        # references, not registry metadata.
+        # THIS agent's LLM fallback chain to run isolated sub-loops, so their
+        # reads/writes never enter this agent's own _turns. Bound here
+        # (post-construction) because the tools need live references, not
+        # registry metadata.
+        #
+        # The tool_instances dict passed in is NOT simply self.tools: a
+        # sub-agent's fixed tool list (_SUBAGENT_TOOLS) includes tools like
+        # `ssh` that are on_demand=True and therefore may not have an
+        # instance in self.tools yet if THIS agent hasn't claimed them for
+        # itself. A sub-agent's capability must not depend on whether the
+        # parent happens to have claimed the same tool — so any
+        # _SUBAGENT_TOOLS member missing from self.tools is instantiated
+        # here and merged in, once, for the sub-agents' exclusive use. This
+        # never adds anything to self.tools / self._api_tools — the PARENT's
+        # own visible tool list is untouched.
+        from ..tools.spawn_agent_tool import _SUBAGENT_TOOLS
+        _sub_tool_instances = dict(self.tools)
+        _missing_for_subagents = [
+            n for n in _SUBAGENT_TOOLS if n not in _sub_tool_instances
+        ]
+        if _missing_for_subagents:
+            try:
+                _sub_tool_instances.update(
+                    ToolRegistry.create_all_tool_instances(
+                        ctx=ctx, extra_tool_names=_missing_for_subagents,
+                    )
+                )
+            except Exception:
+                pass
         for _sub_name in ("spawn_agent", "fan_out_agents"):
             _sub = self.tools.get(_sub_name)
             if _sub is not None and hasattr(_sub, "bind_runtime"):
                 try:
-                    _sub.bind_runtime(self._services, self.tools)
+                    _sub.bind_runtime(self._services, _sub_tool_instances)
+                except Exception:
+                    pass
+            # bind_context wires PROVIDERS (zero-arg callables), not frozen
+            # values — _max_item_iterations / _conversation_summary /
+            # _current_item_block all change over this agent's lifetime
+            # (new item, compaction), so a sub-agent spawned an hour into a
+            # long session must see what the parent knows NOW, not whatever
+            # was true at construction time.
+            if _sub is not None and hasattr(_sub, "bind_context"):
+                try:
+                    _sub.bind_context(
+                        lambda: self._max_item_iterations,
+                        self._render_subagent_context_block,
+                    )
                 except Exception:
                     pass
 
@@ -354,12 +394,31 @@ class PersistentAgent:
                 skills_required=self._standing_skill_names(),
             )
 
+        # Open a file-checkpoint window for this item so write/edit captures
+        # land under item.item_id and a user can later undo this task's file
+        # changes (RewindStore, Tier-1.3). No-op without a session store.
+        rewind = getattr(self._ctx, "rewind_store", None) if self._ctx else None
+        if rewind is not None:
+            try:
+                rewind.begin_item(item.item_id)
+            except Exception:
+                pass
+
         try:
             self._interaction_manager.notify_state_changed("executing")
         except Exception:
             pass
 
         item_result = await self._item_loop(item)
+
+        # Close the checkpoint window: snapshot the post-item state of every
+        # touched path for later external-modification detection at undo time.
+        if rewind is not None:
+            try:
+                rewind.end_item()
+            except Exception:
+                pass
+
         # Item boundary: drop any stale progress concern so a judgment from THIS
         # item cannot bleed into the next one.
         self._task_channel.clear_progress_concern()
@@ -375,10 +434,11 @@ class PersistentAgent:
                 step_id=item.item_id,
                 success=item_result.success,
                 goal=item.instruction,
-                factual_outcome=item_result.factual_outcome,
+                verification=item_result.verification,
                 artifacts=item_result.artifacts,
                 key_findings=item_result.key_findings,
                 issues=item_result.issues,
+                final_answer=item_result.final_answer,
             )
 
         self._task_channel.mark_current_done(item_result)
@@ -397,14 +457,14 @@ class PersistentAgent:
         instruction = item.instruction
         iteration = 0
         _tools_used: list = []
-        # Bookkeeping-only tools (planning/reading a recipe) never touch the
-        # world and must not satisfy the speculative-completion guard below —
-        # confirmed live (2026-07-14): an item that called claim_tool + 3x
-        # todo_write, and NOTHING else, was accepted as success=True because
-        # _tools_used counted todo_write as "tool-grounded evidence" for a
-        # task whose entire point was calling live_shell_open/exec/close.
-        # Same root cause behind the schedule_wakeup false-accept finding.
-        _BOOKKEEPING_ONLY_TOOLS = frozenset({"todo_write", "read_skill"})
+        # Bookkeeping-only tools (planning, reading a recipe, adjusting the tool
+        # list) never touch the world and must not satisfy the speculative-
+        # completion guard below. Canonical set lives in agent_utils
+        # (BOOKKEEPING_ONLY_TOOLS) so the online guard and the offline laziness
+        # analyzer stay in lock-step. Confirmed live (2026-07-14): an item that
+        # called claim_tool + 3x todo_write and NOTHING else was accepted as
+        # success — and a 2026-07-17 trace repeated it via read_skill+claim_tool
+        # because claim_tool/release_tool were originally missing from this set.
         _grounding_tools_used: list = []
         # Absolute paths of files actually written/edited this item, collected
         # from the write/edit tool OUTPUTS (str(path.absolute())) — NOT from the
@@ -441,6 +501,7 @@ class PersistentAgent:
 
             # ── 1. Background + Compact ─────────────────────────────────────
             self._poll_completed_background_tasks()
+            self._drain_pending_file_notices()
             await self._compact_conversation()
 
             # ── 2. Reminders (via IterationAdvisor) ────────────────────────
@@ -571,7 +632,7 @@ class PersistentAgent:
                 # and returned pure prose (no dict with `reasoning`). Reject
                 # like the speculative-completion guard below: inject a
                 # corrective observation reminding the LLM of the schema and
-                # of the "long content → artifact file, not factual_outcome"
+                # of the "user-facing content → `answer`, not free prose"
                 # rule, then loop. Empirically this happens after an
                 # interrupt reframes the item as "just summarise what you
                 # have" and the LLM dumps markdown; the corrective turn lets
@@ -582,29 +643,52 @@ class PersistentAgent:
                         f"LLM returned non-JSON prose. Forcing retry.",
                         component="PersistentAgent",
                     )
+                    # Synthetic tool-result carrying the guard's rejection
+                    # reason — used both to record this turn in the JSONL trace
+                    # (so a rejected iter3-style completion is not invisible)
+                    # and to seed the model's next-turn prompt via
+                    # _persist_event_observations. The `reasoning` on
+                    # turn_result already carries the full raw markdown the
+                    # model attempted (from_completion_text no longer
+                    # truncates), so the JSONL turn record captures what the
+                    # model actually wrote.
+                    guard_obs = ToolResult(
+                        success=False, output=None,
+                        tool_name="completion_guard", tool_parameters={},
+                        error=(
+                            "Completion output was not a JSON object with a "
+                            "`reasoning` key. Re-emit the completion in the "
+                            "documented envelope: "
+                            "{\"reasoning\": \"internal thought\", "
+                            "\"final_answer\": \"the user-facing answer in markdown\", "
+                            "\"verification\": [\"short mechanical bullets\"], "
+                            "\"artifacts\": [\"file paths — only if the user "
+                            "asked for a file\"], "
+                            "\"key_findings\": [\"discrete facts\"]}. "
+                            "The prose you just emitted is the ANSWER — it "
+                            "belongs in `final_answer`, not as raw markdown. "
+                            "`verification` bullets are <30 words each and "
+                            "describe what tools verified. `artifacts` is "
+                            "ONLY for files the user explicitly asked for."
+                        ),
+                    )
+                    if self.execution_recorder:
+                        self.execution_recorder.write_turn(
+                            turn=self.current_iteration,
+                            step_id=item.item_id,
+                            decision=turn_result,
+                            tool_results=[guard_obs],
+                            token_usage=_iter_token_usage,
+                            retiered=self._last_build_retiered,
+                            totals=self._last_build_totals,
+                        )
                     self._persist_event_observations(
-                        [ToolResult(
-                            success=False, output=None,
-                            tool_name="completion_guard", tool_parameters={},
-                            error=(
-                                "Completion output was not a JSON object with a "
-                                "`reasoning` key. Re-emit the completion in the "
-                                "documented envelope: "
-                                "{\"reasoning\": \"...\", "
-                                "\"factual_outcome\": [\"short structured fact\", ...], "
-                                "\"artifacts\": [\"path/to/file\"], "
-                                "\"key_findings\": [\"brief fact\"]}. "
-                                "`factual_outcome` bullets are <30 words each — "
-                                "for a long summary, write the prose to a file "
-                                "under the session dir and put that path in "
-                                "`artifacts`, NOT the summary text in "
-                                "`factual_outcome`."
-                            ),
-                        )],
+                        [guard_obs],
                         note=(
-                            "(My last completion was pure markdown, not JSON. "
-                            "I must re-emit as the JSON completion envelope; "
-                            "long content goes to a file in artifacts.)"
+                            "(My last completion was raw markdown, not the "
+                            "JSON envelope. The user-facing content belongs "
+                            "in the `final_answer` field, not as free prose. "
+                            "Re-emitting with the correct schema now.)"
                         ),
                     )
                     continue
@@ -626,21 +710,36 @@ class PersistentAgent:
                         f"Forcing retry.",
                         component="PersistentAgent",
                     )
+                    # Same JSONL-capture pattern as the format_violation guard
+                    # above — record the rejected turn so the trace shows the
+                    # model's attempt + why it was rejected, before continuing.
+                    guard_obs = ToolResult(
+                        success=False, output=None,
+                        tool_name="completion_guard", tool_parameters={},
+                        error=(
+                            "Item declared complete without calling any tool "
+                            "that actually does the task's work — claim_tool / "
+                            "todo_write / read_skill alone are not evidence. "
+                            "If you claimed a tool, this is the turn to actually "
+                            "call it. Completion requires tool-grounded evidence. "
+                            "If a required tool is unavailable in your tool list, "
+                            "return an error JSON naming the missing tool — do "
+                            "not synthesise a free-form `final_answer` or "
+                            "`verification`."
+                        ),
+                    )
+                    if self.execution_recorder:
+                        self.execution_recorder.write_turn(
+                            turn=self.current_iteration,
+                            step_id=item.item_id,
+                            decision=turn_result,
+                            tool_results=[guard_obs],
+                            token_usage=_iter_token_usage,
+                            retiered=self._last_build_retiered,
+                            totals=self._last_build_totals,
+                        )
                     self._persist_event_observations(
-                        [ToolResult(
-                            success=False, output=None,
-                            tool_name="completion_guard", tool_parameters={},
-                            error=(
-                                "Item declared complete without calling any tool "
-                                "that actually does the task's work — claim_tool / "
-                                "todo_write / read_skill alone are not evidence. "
-                                "If you claimed a tool, this is the turn to actually "
-                                "call it. Completion requires tool-grounded evidence. "
-                                "If a required tool is unavailable in your tool list, "
-                                "return an error JSON naming the missing tool — do "
-                                "not synthesise a free-form factual_outcome."
-                            ),
-                        )],
+                        [guard_obs],
                         note=(
                             "(I declared the item complete without calling any "
                             "tool that does real work — the completion-guard "
@@ -665,11 +764,21 @@ class PersistentAgent:
                 return TaskResult(
                     item_id=item.item_id,
                     success=True,
-                    factual_outcome=list(turn_result.factual_outcome or []),
+                    verification=list(turn_result.verification or []),
                     artifacts=self._reconcile_artifacts(
                         _produced_paths, turn_result.artifacts
                     ),
                     key_findings=list(turn_result.key_findings or []),
+                    # Defensive fallback: if the model emitted a valid completion
+                    # JSON but left `final_answer` empty, use `reasoning` so the
+                    # chat bubble isn't blank. A well-formed completion should
+                    # always fill `final_answer` per the prompt, but this belt-
+                    # and-suspenders keeps the UX from silently degrading when
+                    # it doesn't.
+                    final_answer=(
+                        (turn_result.final_answer or "").strip()
+                        or (turn_result.reasoning or "").strip()
+                    ),
                     issues=_issues,
                     plan_feedback=turn_result.plan_feedback or "",
                     iterations=iteration,
@@ -701,7 +810,7 @@ class PersistentAgent:
                     else:
                         primary_input = next(iter(params.values()), None) if params else None
                     _tools_used.append(format_tool_entry(tool_nm, primary_input))
-                    if tool_nm not in _BOOKKEEPING_ONLY_TOOLS:
+                    if tool_nm not in BOOKKEEPING_ONLY_TOOLS:
                         _grounding_tools_used.append(tool_nm)
 
                     # Capture the authoritative absolute path from successful
@@ -1307,6 +1416,40 @@ class PersistentAgent:
 
         return messages
 
+    def _render_subagent_context_block(self) -> Optional[str]:
+        """Assemble the same session-progress/current-task/LTM text
+        ``_build_messages`` would show THIS agent right now, for seeding a
+        spawn_agent/fan_out_agents sub-task's first message (see
+        SpawnAgentTool.bind_context). Read fresh on every call — never
+        cached — so a sub-agent spawned late in a long session sees the
+        CURRENT compacted summary/task/LTM, not a stale snapshot from
+        whenever bind_context happened to be wired.
+
+        Mirrors _build_messages's top+bottom block assembly (persistent_
+        agent.py's own "[Earlier session progress]" / "[Current Task]" /
+        LTM parts) but flattened into one block — a sub-agent has no turn
+        trace of its own to split a "stable prefix" from, so there's no
+        prefix-cache reason to keep top and bottom separate the way the
+        parent's own messages do.
+
+        Returns None when there is nothing to inherit (fresh session, no
+        item started yet) so callers can skip adding an empty message.
+        """
+        parts: List[str] = []
+        if self._conversation_summary:
+            parts.append(f"[Earlier session progress]\n{self._conversation_summary}")
+        if self._current_item_block:
+            parts.append(self._current_item_block)
+        if self._current_ltm_block:
+            parts.append(self._current_ltm_block)
+        if not parts:
+            return None
+        return (
+            "[Inherited from the agent that spawned you — this is the SAME "
+            "session context it currently has, not a separate briefing]\n\n"
+            + "\n\n".join(parts)
+        )
+
     def _render_agent_todo_block(self) -> str:
         """Render the agent's own todo (written via `todo_write`) as a status block.
 
@@ -1757,6 +1900,36 @@ class PersistentAgent:
             assistant_message={"role": "assistant", "content": note},
             observations=list(observations),
         ))
+
+    def _drain_pending_file_notices(self) -> None:
+        """Surface user-driven file-undo notices as an observation (Tier-1.3).
+
+        A user undo runs on the bridge task and appends a faithful notice to
+        ``ctx.pending_file_notices`` rather than touching ``_turns`` (which only
+        this agent task may mutate — a cross-task append could desync
+        tool_calls/tool_results and 400 the API). We drain it here at a safe
+        loop point and persist each notice as its own observation turn so the
+        model's history stays faithful to the world: it learns a file it edited
+        was reverted and that its in-context copy is void. Drain-not-read means
+        each notice surfaces exactly once.
+        """
+        notices = getattr(self._ctx, "pending_file_notices", None) if self._ctx else None
+        if not notices:
+            return
+        drained = list(notices)
+        notices.clear()
+        observations = [
+            ToolResult(
+                success=True, output={"message": text},
+                tool_name="file_undo", tool_parameters={},
+            )
+            for text in drained
+        ]
+        self._persist_event_observations(
+            observations,
+            note="(The user reverted some of my file changes — noted; I must "
+            "re-read those files before relying on their contents.)",
+        )
 
     def _poll_completed_background_tasks(self) -> None:
         """Check shell tool for completed background tasks, persist as a turn."""

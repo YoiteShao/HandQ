@@ -195,15 +195,15 @@ const DESKTOP_REFRESH_MS = 200;     // max ~5fps desktop-content refresh when bu
 // `.app { border-radius: 30px }` in styles.css) rather than the demo's own
 // 14px default, which was only sized for its own smaller demo window.
 const STATE = {
-    edgeThickness: 45,   // px — width of the bend band inward from the rim
-    refraction: 34,      // peak displacement magnitude at the rim
-    dispersion: 0,       // px — peak per-channel spectral spread at the rim
+    edgeThickness: 100,   // px — width of the bend band inward from the rim
+    refraction: 100,       // peak displacement magnitude at the rim
+    dispersion: 1,     // px — peak per-channel spectral spread at the rim
                           // (independent of refraction — see shader comment)
-    glowStrength: 0.5,   // additive, color-tinted glow intensity at the rim
-    edgeOpacity: 0,      // white-tint mix strength at the rim (near-clear glass)
+    glowStrength: 0,   // additive, color-tinted glow intensity at the rim
+    edgeOpacity: 0.23,   // white-tint mix strength at the rim (near-clear glass)
     coreOpacity: 0,      // white-tint mix strength at the interior (frosted body)
-    glassAlpha: 0.0,     // tint mix strength (material color)
-    frostiness: 8,     // extra blur radius, px (0 = off)
+    glassAlpha: 0,       // tint mix strength (material color)
+    frostiness: 13,      // extra blur radius, px (0 = off)
     radius: 30,          // corner radius, px — matches .app's CSS radius
 };
 
@@ -509,13 +509,28 @@ async function initGlass() {
 }
 
 // --- Ctrl+Shift+G tuning panel ---
-// Dev-only live control over STATE (see above), mirroring the existing
-// Ctrl+Shift+L debug-log-panel pattern in renderer.js. Sliders write directly
-// into the same STATE object renderOnce() reads every frame, then trigger an
-// immediate (non-uploading) redraw so changes are visible instantly against
-// the real window instead of round-tripping through the standalone demo app.
+// Dev-only live control, split into the two glass layers so each can be
+// tuned independently without one obscuring the other's effect:
+//   Layer 1 — the WebGL edge-refraction canvas itself (STATE above): the
+//     pure, always-transparent base glass. Sliders write into STATE and
+//     trigger a non-uploading redraw (requestRedraw), same as before.
+//   Layer 2 — plain frosted-glass compositing ON TOP of Layer 1's already-
+//     rendered result (.session-card, .task-plan-panel/.agent-todo-panel,
+//     .ss-section — see the --l2-* custom properties in styles.css's
+//     :root). Fill/shadow-alpha (5 fields), shadow blur+spread (4 fields),
+//     border alpha, backdrop-filter blur, and its saturate companion (12
+//     fields total, same breadth as Layer 1's 9). Layer 2 deliberately
+//     does NOT reimplement Layer 1's refraction/dispersion physics — it's
+//     an ordinary backdrop-filter blur+saturate (the same recipe used
+//     elsewhere in the app for overlays/dropdowns) sitting on top of
+//     whatever Layer 1 already produced underneath, not a second attempt
+//     at simulating glass. Sliders write directly onto
+//     document.documentElement.style, which overrides the :root default
+//     and repaints immediately — no WebGL redraw involved, so no
+//     requestRedraw() call for these.
+// Mirrors the existing Ctrl+Shift+L debug-log-panel pattern in renderer.js.
 function installTuningPanel(requestRedraw) {
-    const FIELDS = [
+    const LAYER1_FIELDS = [
         { key: 'edgeThickness', label: 'Edge thickness (px)', min: 4, max: 100, step: 1 },
         { key: 'refraction',    label: 'Refraction strength', min: 0, max: 100, step: 1 },
         { key: 'dispersion',    label: 'Dispersion (px)',       min: 0, max: 40,  step: 0.5 },
@@ -526,9 +541,66 @@ function installTuningPanel(requestRedraw) {
         { key: 'frostiness',    label: 'Frostiness (blur px)', min: 0, max: 20,  step: 0.5 },
         { key: 'radius',        label: 'Corner radius (px)',   min: 0, max: 60,  step: 1 },
     ];
+    // CSS custom-property name, not a STATE key — read/written via
+    // documentElement.style, not the STATE object above. `unit` (default
+    // '') is appended to the slider's numeric value on write — px-based
+    // vars (blur radii, spread) need it so e.g. `16` becomes `16px`;
+    // unitless alpha/opacity vars leave it empty.
+    const LAYER2_FIELDS = [
+        { cssVar: '--l2-fill-a',   label: 'Fill — center alpha', min: 0, max: 1, step: 0.01 },
+        { cssVar: '--l2-fill-b',   label: 'Fill — mid alpha',    min: 0, max: 1, step: 0.01 },
+        { cssVar: '--l2-fill-c',   label: 'Fill — edge alpha',   min: 0, max: 1, step: 0.01 },
+        { cssVar: '--l2-shadow-a', label: 'Shadow — near alpha', min: 0, max: 1, step: 0.01 },
+        { cssVar: '--l2-shadow-b', label: 'Shadow — far alpha',  min: 0, max: 1, step: 0.01 },
+        { cssVar: '--l2-shadow-a-blur',   label: 'Shadow — near blur (px)',   min: 0, max: 60, step: 1, unit: 'px' },
+        { cssVar: '--l2-shadow-a-spread', label: 'Shadow — near spread (px)', min: -10, max: 20, step: 1, unit: 'px' },
+        { cssVar: '--l2-shadow-b-blur',   label: 'Shadow — far blur (px)',    min: 0, max: 30, step: 1, unit: 'px' },
+        { cssVar: '--l2-shadow-b-spread', label: 'Shadow — far spread (px)',  min: -10, max: 20, step: 1, unit: 'px' },
+        { cssVar: '--l2-border-alpha', label: 'Border alpha',          min: 0, max: 1,  step: 0.01 },
+        { cssVar: '--l2-blur',          label: 'Card blur (px)',        min: 0, max: 30, step: 0.5, unit: 'px' },
+        { cssVar: '--l2-saturate',      label: 'Card saturate (%)',     min: 50, max: 200, step: 5, unit: '%' },
+    ];
 
     let panelEl = null;
     let panelVisible = false;
+
+    function currentCssVar(name) {
+        const v = parseFloat(getComputedStyle(document.documentElement).getPropertyValue(name));
+        return Number.isFinite(v) ? v : 0;
+    }
+
+    function addSectionHeading(text) {
+        const h = document.createElement('div');
+        h.textContent = text;
+        h.style.cssText = 'font-weight:600;margin-top:14px;margin-bottom:4px;' +
+            'padding-top:10px;border-top:1px solid rgba(255,255,255,0.15);';
+        panelEl.appendChild(h);
+    }
+
+    function addSlider(label, min, max, step, initialValue, onInput) {
+        const row = document.createElement('label');
+        row.style.cssText = 'display:block;margin-top:8px;';
+        const valueSpan = document.createElement('span');
+        valueSpan.textContent = String(initialValue);
+        row.appendChild(document.createTextNode(label + ' '));
+        row.appendChild(valueSpan);
+
+        const input = document.createElement('input');
+        input.type = 'range';
+        input.min = String(min);
+        input.max = String(max);
+        input.step = String(step);
+        input.value = String(initialValue);
+        input.style.cssText = 'display:block;width:100%;';
+        input.addEventListener('input', () => {
+            const v = parseFloat(input.value);
+            valueSpan.textContent = String(v);
+            onInput(v);
+        });
+
+        row.appendChild(input);
+        panelEl.appendChild(row);
+    }
 
     function buildPanel() {
         if (panelEl) return panelEl;
@@ -536,6 +608,7 @@ function installTuningPanel(requestRedraw) {
         panelEl.id = 'glass-tuning-panel';
         panelEl.style.cssText =
             'position:fixed;top:12px;right:12px;width:260px;z-index:99999;' +
+            'max-height:calc(100vh - 24px);overflow-y:auto;' +
             'background:rgba(20,20,24,0.90);color:#fff;border-radius:10px;' +
             'padding:12px;font:11px/1.4 -apple-system,Segoe UI,sans-serif;' +
             'box-shadow:0 8px 32px rgba(0,0,0,0.4);display:none;';
@@ -545,30 +618,19 @@ function installTuningPanel(requestRedraw) {
         title.style.cssText = 'font-weight:600;margin-bottom:8px;';
         panelEl.appendChild(title);
 
-        FIELDS.forEach((f) => {
-            const row = document.createElement('label');
-            row.style.cssText = 'display:block;margin-top:8px;';
-            const valueSpan = document.createElement('span');
-            valueSpan.textContent = String(STATE[f.key]);
-            row.appendChild(document.createTextNode(f.label + ' '));
-            row.appendChild(valueSpan);
-
-            const input = document.createElement('input');
-            input.type = 'range';
-            input.min = String(f.min);
-            input.max = String(f.max);
-            input.step = String(f.step);
-            input.value = String(STATE[f.key]);
-            input.style.cssText = 'display:block;width:100%;';
-            input.addEventListener('input', () => {
-                const v = parseFloat(input.value);
+        addSectionHeading('Layer 1 — base glass (WebGL edge)');
+        LAYER1_FIELDS.forEach((f) => {
+            addSlider(f.label, f.min, f.max, f.step, STATE[f.key], (v) => {
                 STATE[f.key] = v;
-                valueSpan.textContent = String(v);
                 requestRedraw();
             });
+        });
 
-            row.appendChild(input);
-            panelEl.appendChild(row);
+        addSectionHeading('Layer 2 — card readability (CSS)');
+        LAYER2_FIELDS.forEach((f) => {
+            addSlider(f.label, f.min, f.max, f.step, currentCssVar(f.cssVar), (v) => {
+                document.documentElement.style.setProperty(f.cssVar, String(v) + (f.unit || ''));
+            });
         });
 
         document.body.appendChild(panelEl);

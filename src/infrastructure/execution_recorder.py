@@ -35,7 +35,8 @@ Greppable, diffable, and programmatically replayable. Filename:
                             "retiered": [<older turns whose tier changed>],
                             "tokens": {...}, "totals": {...}}
   {"kind": "item_end",      "item_id": ..., "status": ..., "ts": ...,
-                            "factual_outcome": [...], "artifacts": [...],
+                            "final_answer": "...",
+                            "verification": [...], "artifacts": [...],
                             "findings": [...], "issues": [...]}
   {"kind": "session_end",   "session_id": ..., "status": ..., "ts": ...,
                             "completion": ..., "tokens": {...}}
@@ -72,7 +73,7 @@ Truncation policy
 
   Item metadata (structured LLM output — stored in full, no truncation):
   - item_start goal / reasoning / expected_outcomes
-  - item_end factual_outcome / findings / issues
+  - item_end final_answer / verification / findings / issues
   - user_request message (the user's raw prompt — ground truth)
 
 Thread safety
@@ -232,11 +233,12 @@ class ExecutionRecorder:
         step_id: str,
         success: bool,
         goal: str = "",
-        factual_outcome: Optional[List[str]] = None,
+        verification: Optional[List[str]] = None,
         artifacts: Optional[List[str]] = None,
         key_findings: Optional[List[str]] = None,
         issues: Optional[List[str]] = None,
         tools_used: Optional[List[str]] = None,
+        final_answer: str = "",
     ) -> None:
         record: Dict[str, Any] = {
             "kind": "item_end",
@@ -246,8 +248,10 @@ class ExecutionRecorder:
         }
         if goal:
             record["goal"] = goal
-        if factual_outcome:
-            record["factual_outcome"] = list(factual_outcome)
+        if final_answer:
+            record["final_answer"] = self._truncate(final_answer, self.MAX_OUTPUT_LEN)
+        if verification:
+            record["verification"] = list(verification)
         if artifacts:
             record["artifacts"] = list(artifacts)
         if key_findings:

@@ -654,6 +654,25 @@ class _StdioUI:
                "todos": todos if isinstance(todos, list) else []},
               session_id=self._session_id)
 
+    def notify_file_touch(
+        self, path: str, kind: str, tool: str, item_id: str = "",
+    ) -> None:
+        """Live file-touch event → renderer ``kind=file_touch``. Drives the
+        per-session right-side sidebar (nebula + file-change list). Fired from
+        write_tool / edit_tool / read_tool right after a successful op; the
+        renderer accumulates them per session and updates the nebula orb +
+        change list in place. Kind mapping: ``read`` blue, ``edit`` amber,
+        ``hit`` green (grep-style scan). ``item_id`` is the task item the
+        touch happened inside — empty string between items."""
+        _ui_logger.debug("notify_file_touch: %s %s %s item=%s",
+                         kind, tool, _truncate(path, 80), item_id)
+        _emit({"type": "status", "kind": "file_touch",
+               "path": str(path or ""),
+               "touch": str(kind or ""),
+               "tool": str(tool or ""),
+               "item_id": str(item_id or "")},
+              session_id=self._session_id)
+
     def show_coordinator_thinking(self) -> None:
         _emit({"type": "status", "kind": "coordinator_thinking_on"},
               session_id=self._session_id)
@@ -1190,6 +1209,30 @@ class StdioBridge:
                 _emit({"type": "error", "id": msg_id, "where": "bridge",
                        "message": f"config_get failed: {exc}", "fatal": False},
                       session_id=self._session_id)
+            return
+
+        if msg_type == "file_undo":
+            # User-driven undo of a task's file changes (RewindStore, Tier-1.3).
+            # Optional "item_id"; absent → undo the most recent item that
+            # changed files. Routes into FlowControllerV2.undo_files, which
+            # picks Case A (interrupt the in-flight item) vs Case B (revert +
+            # faithful notice) and returns restored paths + any external-
+            # modification conflicts for the renderer to surface.
+            sid = self._resolve_session_id(msg)
+            if sid is None or sid not in self._flows:
+                _emit({"type": "error", "id": msg_id, "where": "bridge",
+                       "message": "file_undo: no such session", "fatal": False},
+                      session_id=sid or self._session_id)
+                return
+            try:
+                result = await self._flows[sid].undo_files(msg.get("item_id"))
+                _emit({"type": "final", "id": msg_id, "result": result},
+                      session_id=sid)
+            except Exception as exc:
+                logger.exception("file_undo failed")
+                _emit({"type": "error", "id": msg_id, "where": "bridge",
+                       "message": f"file_undo failed: {exc}", "fatal": False},
+                      session_id=sid)
             return
 
         if msg_type == "ltm_stats":

@@ -8,8 +8,8 @@ agent owns decomposition, tool selection, and judging when it is done.
 
 Task completion is detected mechanically by the Orchestrator when the task
 channel has nothing pending and no in-progress item — no LLM re-judges it.
-The Orchestrator composes the final reply from the last item's factual_outcome
-and the completed task results.
+The Orchestrator composes the final reply from the last item's final_answer /
+verification / artifacts and the completed task results.
 """
 
 

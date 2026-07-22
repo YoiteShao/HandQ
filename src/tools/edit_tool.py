@@ -283,6 +283,15 @@ class EditTool(BaseTool):
                 # doubling up into \r\r\n.
                 new_file_content = new_file_content.replace("\r\n", "\n").replace("\n", "\r\n")
 
+            # Checkpoint the PRE-edit state for undo (RewindStore, Tier-1.3).
+            # Placed here — after all validation early-returns (not-found,
+            # stale, no-match, ambiguous) — so we only snapshot when a mutation
+            # is actually about to happen. First-write-wins in the store keeps
+            # the earliest pre-item content. No-op without a session store.
+            rewind = getattr(self.ctx, "rewind_store", None) if self.ctx else None
+            if rewind is not None:
+                await loop.run_in_executor(None, lambda: rewind.capture_before(path))
+
             # Write via temp file for atomicity. The temp-file dance is
             # synchronous and can stall on slow filesystems → executor.
             await loop.run_in_executor(
@@ -338,6 +347,9 @@ class EditTool(BaseTool):
                 output["replacements_made"] = match_count
             if file_changed_warning:
                 output["warning"] = file_changed_warning
+
+            # Live file-touch event → session sidebar (nebula + change list).
+            self.emit_file_touch(str(path_obj.absolute()), "edit")
 
             return ToolResult(
                 success=True,

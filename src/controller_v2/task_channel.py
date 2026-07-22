@@ -87,10 +87,15 @@ class TaskResult:
 
     item_id: str
     success: bool
-    factual_outcome: List[str] = field(default_factory=list)
+    # Tool-grounded audit bullets — what tools verified this task.
+    verification: List[str] = field(default_factory=list)
     key_findings: List[str] = field(default_factory=list)
     artifacts: List[str] = field(default_factory=list)
     issues: List[str] = field(default_factory=list)
+    # User-facing answer body — markdown shown in the chat bubble. Populated
+    # from the completion turn's ``final_answer`` field. Empty on non-success
+    # paths (interrupt / error / iteration cap).
+    final_answer: str = ""
     # Optional agent→coordinator advisory (see TurnOutcome.plan_feedback).
     # Non-empty when the agent — having read a skill body or discovered a fact —
     # judges the REMAINING plan should change. Surfaced via
@@ -375,8 +380,8 @@ class TaskChannel:
         for result in rendered:
             status_tag = "Done" if result.success else "Failed"
             lines.append(f"[{status_tag}] item={result.item_id}")
-            if result.factual_outcome:
-                lines.append(f"  Outcome: {'; '.join(result.factual_outcome)}")
+            if result.verification:
+                lines.append(f"  Outcome: {'; '.join(result.verification)}")
             if result.artifacts:
                 lines.append(f"  Artifacts: {', '.join(result.artifacts)}")
             if result.key_findings:
@@ -439,7 +444,7 @@ class TaskChannel:
                 tag = "⊗"
             else:
                 tag = "✗"
-            outcome = "; ".join(r.factual_outcome[:2]) if r.factual_outcome else ""
+            outcome = "; ".join(r.verification[:2]) if r.verification else ""
             issue = r.issues[0] if r.issues else ""
             detail = (outcome or issue)[:120]
             lines.append(f"{tag} [{r.item_id}] {detail}")

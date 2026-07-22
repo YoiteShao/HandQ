@@ -491,8 +491,8 @@ REASON_TRIVIAL_SESSION: str = "trivial_session_skipped"
 # would dilute genuine project knowledge.
 #
 # We use ONE structural signal — the count of completed steps that produced
-# substantive output (artifacts, factual_outcome, or key_findings). Goal-text
-# patterns and summary-length thresholds were tried and rejected as too
+# substantive output (artifacts, verification, final_answer, or key_findings).
+# Goal-text patterns and summary-length thresholds were tried and rejected as too
 # fragile (English-specific; gameable; trip on legitimate short summaries).
 # Step count is language-independent and reflects actual work delivered.
 #

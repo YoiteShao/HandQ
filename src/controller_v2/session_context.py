@@ -35,7 +35,7 @@ import asyncio
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import TYPE_CHECKING, Dict, Optional
+from typing import TYPE_CHECKING, Dict, Optional, Tuple
 
 if TYPE_CHECKING:
     from ..infrastructure.config_manager import ConfigManager
@@ -47,6 +47,7 @@ if TYPE_CHECKING:
     from ..tools.ssh_tool import SshConnectionPool
     from .interaction_manager import InteractionManager
     from .task_channel import TaskChannel
+    from .rewind_store import RewindStore
 
 
 _logger = logging.getLogger("handq.controller_v2.session_context")
@@ -102,6 +103,15 @@ class SessionContext:
     # ── Execution recorder (per-session, owned by ctx) ───────────────────
     execution_recorder: Optional["ExecutionRecorder"] = None
 
+    # ── File checkpoints for undo + change auditing (RewindStore) ─────────
+    # Per-session before/after file snapshots keyed by item_id. write/edit
+    # tools call ``capture_before`` pre-operation; PersistentAgent brackets
+    # each item with begin_item/end_item; the bridge exposes rewind_item for
+    # user-driven undo; the completion verifier calls capture_diff for
+    # ground-truth evidence. None in test fixtures / ctx-less callers — every
+    # call site treats None as "no checkpointing this session".
+    rewind_store: Optional["RewindStore"] = field(default=None, repr=False)
+
     # ── Agent-owned todo (Claude-Code-style) ─────────────────────────────
     # The agent's OWN progress scratchpad for decomposing its current item —
     # written and read by the agent via the `todo_write` tool, surfaced to the
@@ -121,6 +131,19 @@ class SessionContext:
     # call, even if a later turn re-reads this same ctx before the next call.
     pending_claim_tool: list = field(default_factory=list, repr=False)
     pending_release_tool: list = field(default_factory=list, repr=False)
+
+    # ── Pending file-undo notices (RewindStore → agent, cross-task safe) ──
+    # A user-driven undo runs on the bridge task, NOT the agent task. It must
+    # never mutate the agent's `_turns` directly (that would race the running
+    # turn and can desync tool_calls/tool_results → a 400). Instead the undo
+    # handler appends a short faithful-notice string here; PersistentAgent
+    # drains this list at a safe point in its loop (like
+    # _poll_completed_background_tasks) and persists each as an observation so
+    # the model learns "file X was reverted by the user; your recorded state
+    # for it is void — re-read before relying on it." Drained (not just read)
+    # so a notice surfaces exactly once. See [[project_cc_aligned_uniform_rendering]]:
+    # the model only self-heals when history stays faithful to the world.
+    pending_file_notices: list = field(default_factory=list, repr=False)
 
     # ── Standing goal (Coordinator-owned, survives across item boundaries) ──
     # Set by the Orchestrator when INTENT recognizes a persistent condition
@@ -162,6 +185,26 @@ class SessionContext:
         if lock is None:
             lock = asyncio.Lock()
             self.write_path_locks[path] = lock
+        return lock
+
+    # ── Cross-layer SSH-target dedup ─────────────────────────────────────
+    # Same pattern as write_path_locks, keyed by (hostname, username) instead
+    # of path. Sub-agents run with the SAME tool instances as the parent
+    # (ctx is shared — see spawn_agent_tool.py), so two agents targeting the
+    # SAME remote host serialize their exec/write/run_script calls instead of
+    # racing on shared remote state (job files, working dir); two agents
+    # targeting DIFFERENT hosts never contend. In normal use sub-tasks are
+    # dispatched over disjoint hosts, so this lock rarely activates — it is a
+    # safety net for the case where they overlap, not the common path.
+    ssh_host_locks: Dict[Tuple[str, str], asyncio.Lock] = field(default_factory=dict, repr=False)
+
+    def ssh_lock_for(self, hostname: str, username: str) -> asyncio.Lock:
+        """Return the shared lock for *(hostname, username)*, creating it on first use."""
+        key = (hostname, username)
+        lock = self.ssh_host_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self.ssh_host_locks[key] = lock
         return lock
 
     # ── Late-bound TaskChannel for interrupt event forwarding ────────────

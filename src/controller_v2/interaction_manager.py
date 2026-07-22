@@ -204,6 +204,32 @@ class InteractionManager:
         method, so unit tests with no delegate silently drop it."""
         self._ui_call("notify_task_plan_changed", items if isinstance(items, list) else [])
 
+    def notify_file_touch(
+        self,
+        path: str,
+        kind: str,
+        tool: str,
+        item_id: Optional[str] = None,
+    ) -> None:
+        """A file was read, edited, or matched by a scan — feeds the live
+        session sidebar (nebula + change-list).
+
+        ``kind`` is one of ``"read" | "edit" | "hit"``; the sidebar maps these
+        to touch state in the same order mindwalk uses (edit > read > hit).
+        ``item_id`` ties the event to a task item so the sidebar can group
+        edits by item for the ↺ Undo action; the caller passes
+        ``ctx.rewind_store.current_item_id`` verbatim (``None`` is fine —
+        events between items simply drop out of the rewind grouping). Kept
+        out of the UIDelegate Protocol — delegates opt in by exposing a
+        same-named method, so tests with no delegate silently drop it."""
+        self._ui_call(
+            "notify_file_touch",
+            str(path or ""),
+            str(kind or ""),
+            str(tool or ""),
+            str(item_id) if item_id else "",
+        )
+
     def notify_agent_todo_changed(self, todos: list) -> None:
         """Live snapshot of the AGENT's own todo (its private plan for the
         current item), for the UI. ``todos`` is a list of {content, status}

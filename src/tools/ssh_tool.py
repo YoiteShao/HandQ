@@ -1355,6 +1355,19 @@ class StatelessSSHTool(BaseTool):
                 execution_time=time.time() - start_time,
             )
 
+        # Serialize calls to the SAME (hostname, username) target across the
+        # whole session — the parent agent's own ssh calls AND every
+        # fan_out_agents/spawn_agent sub-task share this lock via ctx (see
+        # SessionContext.ssh_lock_for). Different hosts never contend. This
+        # matters because two agents targeting the same host would otherwise
+        # race on shared remote state (job files, cwd) despite each opening
+        # its own paramiko channel over the pooled transport.
+        ssh_lock = (
+            self.ctx.ssh_lock_for(creds["hostname"], creds["username"])
+            if self.ctx is not None
+            else None
+        )
+
         # Run blocking SSH work in a thread pool so we don't block the event loop.
         # run_with_abort_handle additionally:
         #   1. Mirrors self.interrupt_event into a thread-safe token that
@@ -1370,11 +1383,18 @@ class StatelessSSHTool(BaseTool):
         # cannot do that — but its blocking syscall returns within ~50ms
         # of the close, after which the thread exits naturally.
         try:
-            result = await run_with_abort_handle(
-                lambda: handler(creds, start_time, params, **kwargs),
-                interrupt_event=self.interrupt_event,
-                shutdown_deadline=self.shutdown_deadline,
-            )
+            async def _run_locked():
+                return await run_with_abort_handle(
+                    lambda: handler(creds, start_time, params, **kwargs),
+                    interrupt_event=self.interrupt_event,
+                    shutdown_deadline=self.shutdown_deadline,
+                )
+
+            if ssh_lock is not None:
+                async with ssh_lock:
+                    result = await _run_locked()
+            else:
+                result = await _run_locked()
             if not isinstance(result, ToolResult):
                 # handler should always return a ToolResult; this branch is
                 # defensive and only here so we don't silently mis-type.

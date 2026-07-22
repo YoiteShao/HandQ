@@ -151,6 +151,7 @@ class NotebookEditTool(BaseTool):
                 deleted_type = cells[cell_number].get("cell_type", "unknown")
                 del cells[cell_number]
                 await loop.run_in_executor(None, lambda: _save_notebook(path_obj, nb))
+                self.emit_file_touch(str(path_obj.absolute()), "edit")
                 return ToolResult(
                     success=True,
                     output={
@@ -190,6 +191,7 @@ class NotebookEditTool(BaseTool):
                 new_cell = _make_cell(cell_type, new_source)
                 cells.insert(insert_at, new_cell)
                 await loop.run_in_executor(None, lambda: _save_notebook(path_obj, nb))
+                self.emit_file_touch(str(path_obj.absolute()), "edit")
                 return ToolResult(
                     success=True,
                     output={
@@ -244,6 +246,7 @@ class NotebookEditTool(BaseTool):
                 target_cell.pop("execution_count", None)
 
             await loop.run_in_executor(None, lambda: _save_notebook(path_obj, nb))
+            self.emit_file_touch(str(path_obj.absolute()), "edit")
             return ToolResult(
                 success=True,
                 output={

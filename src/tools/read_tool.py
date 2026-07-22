@@ -217,6 +217,16 @@ class ReadTool(BaseTool):
     def __init__(self, ctx=None):
         super().__init__("read", ctx=ctx)
 
+    def _emit_touch(self, output: Optional[dict]) -> None:
+        """Fire a file_touch event for a successful FILE read (skips
+        directories, PDFs, binaries, and skipped stubs — nothing to light
+        up in the sidebar for those)."""
+        if not isinstance(output, dict) or output.get("type") != "file":
+            return
+        path = output.get("path")
+        if path:
+            self.emit_file_touch(str(path), "read")
+
     def _read_single_path(
         self,
         path: str,
@@ -539,6 +549,7 @@ class ReadTool(BaseTool):
                     ),
                 )
                 if result["success"]:
+                    self._emit_touch(result.get("output"))
                     return ToolResult(
                         success=True,
                         output=result["output"],
@@ -592,6 +603,7 @@ class ReadTool(BaseTool):
                 )
                 if r["success"]:
                     data = r["output"]
+                    self._emit_touch(data)
                     results.append({
                         "path": p,
                         "success": True,

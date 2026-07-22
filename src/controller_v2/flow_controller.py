@@ -37,6 +37,7 @@ from .session_context import SessionContext
 from .task_channel import TaskChannel, TaskSpec
 from .orchestrator import Orchestrator
 from .persistent_agent import PersistentAgent
+from .rewind_store import RewindStore
 
 
 class FlowControllerV2:
@@ -158,6 +159,7 @@ class FlowControllerV2:
             session_registry=SessionRegistry(),
             desktop_state=DesktopState(im=self.interaction_manager),
             execution_recorder=execution_recorder,
+            rewind_store=RewindStore(),
             scheduler=self._resolve_scheduler(),
             _task_channel=self._task_channel,
         )
@@ -461,4 +463,126 @@ class FlowControllerV2:
                 self.interaction_manager.notify_task_plan_changed(items)
             except Exception:
                 pass
+
+    # ── User-driven file undo (RewindStore, Tier-1.3, option-3 semantics) ────
+
+    async def undo_files(self, item_id: Optional[str] = None) -> Dict[str, Any]:
+        """Undo the file changes of a task item on explicit user request.
+
+        Undo is a USER action, not a silent disk edit — it changes the world
+        the agent believes in, and the agent only trusts its own history. So we
+        handle it in two modes (see the design notes below), never just
+        clobbering the disk:
+
+        **Case A — the undone item is the one currently in flight.** The user is
+        correcting the agent mid-task. We restore under the per-path write lock
+        (so an in-flight write/edit to the same path can't race or re-clobber),
+        then trip the existing coordinator interrupt so the running turn stops
+        cleanly and control returns to the user. The user's next message goes
+        through INTENT normally — whether that's "stop" or "try it another way"
+        is the Coordinator's call, not ours (principle #1: the agent never
+        guesses intent). This is why undo routes through interrupt rather than
+        silently reverting: it prevents the ping-pong where the agent's very
+        next turn just re-applies the edit we undid.
+
+        **Case B — the undone item already completed** and the agent is idle or
+        on a later, unrelated item. No interrupt. We restore under the write
+        lock, correct that completed TaskResult's artifacts (a reverted file is
+        no longer a produced artifact — the grounded completion contract must
+        stay honest), and queue a faithful notice so the agent's NEXT turn is
+        told the file was reverted (its in-context memory of that file is now
+        void). ``read`` does not staleness-check, so this notice is the only
+        thing that stops the model reasoning from a stale in-context copy.
+
+        In BOTH modes an external-modification conflict (disk changed since the
+        item ended) is NOT overwritten — it's returned for the caller to surface
+        for user confirmation ([[feedback_bulk_delete_verify_each_file]]).
+
+        Returns a result dict for the bridge: restored paths, conflicts, mode.
+        """
+        if self._ctx is None or self._ctx.rewind_store is None:
+            return {"ok": False, "error": "no active session / rewind store"}
+        store = self._ctx.rewind_store
+        channel = self._task_channel
+
+        target = item_id or store.last_item_id()
+        if target is None or not store.can_rewind(target):
+            return {"ok": False, "error": "nothing to undo for that task"}
+
+        current = channel.get_current_item() if channel else None
+        is_current = current is not None and current.item_id == target
+
+        # Acquire every touched path's write lock so the restore serializes
+        # against any in-flight write/edit to the same path (they share
+        # ctx.write_lock_for). Sorted for deterministic acquisition order.
+        paths = sorted(store.paths_for_item(target))
+        locks = [self._ctx.write_lock_for(p) for p in paths]
+        acquired: List[Any] = []
+        try:
+            for lk in locks:
+                await lk.acquire()
+                acquired.append(lk)
+            report = await asyncio.to_thread(store.rewind_item, target)
+        finally:
+            for lk in acquired:
+                lk.release()
+
+        mode = "interrupt" if is_current else "notice"
+
+        if is_current:
+            # Case A: stop the running turn; control returns to the user.
+            try:
+                await channel.interrupt_agent(
+                    reason=(
+                        f"User undid file changes for the current task "
+                        f"({len(report.restored_paths)} file(s) reverted). "
+                        f"Do not re-apply them; await the user's next instruction."
+                    )
+                )
+            except Exception:
+                self.logger.warning(
+                    "[FlowControllerV2] undo_files interrupt failed",
+                    component="FlowControllerV2",
+                )
+        else:
+            # Case B: correct the completed item's artifacts + queue a faithful
+            # notice for the agent's next turn.
+            self._correct_artifacts_after_undo(target, report.restored_paths)
+            if report.restored_paths:
+                try:
+                    self._ctx.pending_file_notices.append(
+                        "The user reverted your file changes to "
+                        + ", ".join(report.restored_paths)
+                        + f" (from task {target}). Your recorded content for "
+                        "these files is now void — re-read any of them before "
+                        "relying on their contents again."
+                    )
+                except Exception:
+                    pass
+
+        return {
+            "ok": True,
+            "mode": mode,
+            "item_id": target,
+            "restored": report.restored_paths,
+            "conflicts": [
+                {"path": c.path, "conflict": c.conflict.value, "detail": c.detail}
+                for c in report.conflicts
+            ],
+        }
+
+    def _correct_artifacts_after_undo(
+        self, item_id: str, reverted_paths: List[str]
+    ) -> None:
+        """Drop reverted paths from a completed item's TaskResult.artifacts so
+        the grounded completion contract stays honest (a reverted file is not a
+        produced artifact). Best-effort; no-op if the result isn't found."""
+        if not reverted_paths or self._task_channel is None:
+            return
+        reverted = set(reverted_paths)
+        for result in self._task_channel.get_completed_results():
+            if result.item_id == item_id and result.artifacts:
+                result.artifacts = [
+                    a for a in result.artifacts if a not in reverted
+                ]
 

@@ -55,6 +55,36 @@ _HARD_MAX_LIMIT = 25
 _DEFAULT_SNIPPET_MAX_CHARS = 300
 _DEFAULT_ORBIT_TIMEOUT_MS = 30_000
 
+# ── qgenie-chat defaults (overridable via web_search.sources.qgenie.*) ───────
+# The qgenie source talks to the SSO-gated qgenie-chat web app — NOT the QGenie
+# LLM API gateway SDK the rest of HandQ uses. Reverse-engineered + verified live
+# 2026-07-20 (see tmp/qgenie_chat_*.py). Unlike the other four sources it:
+#   * authenticates with TWO tokens (Bearer access_token + x-copilot-token Azure
+#     JWT), NOT cookies — so the bare-httpx fast path does not apply; it runs
+#     in-page like orbit.
+#   * returns a SYNTHESISED answer (SSE stream), not a ranked hit list.
+_DEFAULT_QGENIE_BASE_URL = "https://qgenie-chat.qualcomm.com"
+_DEFAULT_QGENIE_CHAT_PAGE = "https://qgenie-chat.qualcomm.com/apps/chat"
+_DEFAULT_QGENIE_TOKEN_URL = "https://qgenie-chat.qualcomm.com/api/apigee/token"
+_DEFAULT_QGENIE_CHAT_URL = "https://apigw-op.qualcomm.com/qgeniechat/ui/v1/chat"
+_DEFAULT_QGENIE_MODEL = "anthropic::claude-4-6-sonnet"
+# RAG + synthesis is slow — 30-60s+ is normal, so the default is generous.
+_DEFAULT_QGENIE_TIMEOUT_MS = 120_000
+# access_token lives ~8h (expires_in≈28799); refresh a bit early to be safe.
+_QGENIE_TOKEN_SAFETY_MARGIN_S = 300.0
+# Fixed headers the web app always sends on the /chat call (verified live).
+_QGENIE_FIXED_HEADERS = {
+    "x-qcom-tokentype": "Azure",
+    "x-qcom-clienttype": "web app",
+    "x-qcom-appname": "Aware",
+    "client-source": "QGenie::WebApp",
+}
+# Process-wide cache of the two tokens harvested passively from the app's own
+# /api/apigee/token traffic. Shared across calls so we skip the goto/reload
+# token dance while the access_token is still valid. Shape:
+#   {"access": str, "azure": str, "expires_at": float}
+_qgenie_token: Optional[Dict[str, Any]] = None
+
 # Per-process cache for repeat (source, query, limit) lookups. Bounded LRU
 # with a 60s TTL — covers the common case where the agent re-runs the same
 # query during retry / re-plan within a single task. Skipped for orbit
@@ -293,17 +323,26 @@ class WebSearchTool(BaseTool):
             },
             "source": {
                 "type": "string",
-                "enum": ["confluence", "jira", "sharepoint", "orbit"],
+                "enum": ["confluence", "jira", "sharepoint", "orbit", "qgenie"],
                 "description": (
                     "Which source to query. Choose ONE per call; agent can "
                     "fan out by issuing parallel calls — jira/confluence/"
                     "sharepoint genuinely run concurrently (each independently "
-                    "reads live cookies + fires its own request); only orbit "
-                    "serialises on the browser session lock (real page "
-                    "navigation + DOM read). Pick the most likely source "
+                    "reads live cookies + fires its own request); orbit and "
+                    "qgenie serialise on the browser session lock (real page "
+                    "navigation). Pick the most likely source "
                     "first; recommended order when you do not know which: "
                     "jira → sharepoint → orbit → confluence (confluence is "
                     "the flakiest under SSO and should be tried last). "
+                    "'qgenie' is DIFFERENT from the other four: it queries the "
+                    "qgenie-chat assistant, which returns ONE synthesised, "
+                    "cited answer (read hits[0].snippet — it is the full "
+                    "answer, not a ranking snippet) rather than a list of "
+                    "documents to open. Use qgenie when you want a direct "
+                    "answer synthesised from internal knowledge; use the other "
+                    "sources when you want to find and open specific documents. "
+                    "qgenie ignores limit/offset (always one answer + optional "
+                    "source docs). "
                     "Sources can be individually disabled in "
                     "handq_config.yaml under web_search.sources.<name>.enabled."
                 ),
@@ -407,6 +446,7 @@ class WebSearchTool(BaseTool):
             "jira":       self._search_jira,
             "sharepoint": self._search_sharepoint,
             "orbit":      self._search_orbit,
+            "qgenie":     self._search_qgenie,
         }
         executor = executors.get(source)
         if executor is None:
@@ -414,9 +454,13 @@ class WebSearchTool(BaseTool):
 
         # Per-process cache lookup — skips the browser round-trip when the
         # same (source, query, limit, offset, cursor) was answered recently.
-        # Orbit isn't cached because its DOM-extract may legitimately change.
+        # Orbit isn't cached because its DOM-extract may legitimately change;
+        # qgenie isn't cached because its answer is a fresh LLM synthesis
+        # (non-deterministic) and each call also mints a server-side
+        # conversation, so a cache hit would be misleading.
         cache_key: Optional[_CacheKey] = (
-            None if source == "orbit" else (source, query, limit, offset, cursor or "")
+            None if source in ("orbit", "qgenie")
+            else (source, query, limit, offset, cursor or "")
         )
         if cache_key is not None:
             cached = _cache_get(cache_key)
@@ -461,8 +505,14 @@ class WebSearchTool(BaseTool):
 
         # Whitespace normalization + snippet truncation — applied last so
         # per-source parsers can see full excerpts during normalisation.
-        for h in hits:
+        for i, h in enumerate(hits):
             h.title = _normalize_snippet(h.title)
+            # qgenie's first hit IS the synthesised answer (markdown body meant
+            # to be read in full), not a ranking snippet — skip normalisation
+            # and truncation for it so newlines / markdown / long text survive.
+            # Any additional qgenie hits (source docs) are truncated normally.
+            if source == "qgenie" and i == 0:
+                continue
             if h.snippet:
                 h.snippet = _normalize_snippet(h.snippet)
                 if len(h.snippet) > snippet_max:
@@ -866,6 +916,302 @@ class WebSearchTool(BaseTool):
         # suggests more may exist; an under-full page is treated as the last.
         has_more = len(hits) >= limit
         return hits, has_more, None
+
+    async def _search_qgenie(
+        self, query: str, limit: int, offset: int, cursor: Optional[str],
+        src_cfg: Dict[str, Any],
+    ) -> Tuple[List[SearchHit], bool, Optional[str]]:
+        """Ask the qgenie-chat assistant and return its synthesised answer.
+
+        Unlike the other four sources this does NOT return a ranked list — it
+        returns ONE hit whose ``snippet`` is qgenie's full answer, followed by
+        optional source-document hits (the RAG results qgenie cited). ``limit``
+        / ``offset`` / ``cursor`` are ignored (there is only ever one answer).
+
+        Auth is two tokens, NOT cookies (verified live 2026-07-20):
+          * ``Authorization: Bearer <access_token>`` — minted by the app's own
+            ``POST /api/apigee/token`` from an Azure JWT ``subject_token``.
+          * ``x-copilot-token: <Azure JWT>``.
+        Rather than reverse-engineer MSAL storage we harvest BOTH passively from
+        the app's own token traffic: attach request/response listeners, load the
+        chat page (which auto-fires the token call), and read subject_token from
+        the request body + access_token from the response. Tokens are cached
+        process-wide until they near expiry.
+
+        Runs entirely under the browser session lock (like orbit): the token
+        harvest needs a real page navigation, and the /chat SSE fetch runs
+        in-page so the qgenie-chat origin is the fetch origin (the API gateway's
+        CORS only allows that origin).
+        """
+        base_url = (src_cfg.get("base_url") or _DEFAULT_QGENIE_BASE_URL).rstrip("/")
+        chat_page = src_cfg.get("chat_page") or _DEFAULT_QGENIE_CHAT_PAGE
+        token_url = src_cfg.get("token_url") or _DEFAULT_QGENIE_TOKEN_URL
+        chat_url = src_cfg.get("chat_url") or _DEFAULT_QGENIE_CHAT_URL
+        model_name = src_cfg.get("model_name") or _DEFAULT_QGENIE_MODEL
+        internal_search = bool(src_cfg.get("internal_qualcomm_search", True))
+        timeout_ms = int(src_cfg.get("timeout_ms") or _DEFAULT_QGENIE_TIMEOUT_MS)
+
+        async with self.holder.acquire() as session:
+            tab_id = session.first_tab_id()
+            if tab_id is None:
+                page = await session.context.new_page()
+                tab_id = session.mint_tab_id()
+                session.tabs[tab_id] = page
+            else:
+                page = session.tabs[tab_id]
+
+            access, azure = await self._qgenie_ensure_tokens(
+                page, chat_page=chat_page, token_url_marker="/api/apigee/token",
+                base_url=base_url,
+            )
+
+            # Fire the chat request from inside the page (qgenie-chat origin) and
+            # stream the SSE body to completion. Returns {status, contentType,
+            # raw, error?}.
+            chat_js = r"""
+                async ({query, model, url, access, azure, internalSearch, fixedHeaders, timeoutMs}) => {
+                    const body = {
+                        query: query,
+                        reasoning_effort: 'medium',
+                        messages: [{role: 'user', content: query}],
+                        conversation_options: {regenerate_last_response: false,
+                            conversation_id: '', workspace_id: '', incognito_mode: false},
+                        model_name: model,
+                        filter_options: {saved_filter_id: '', filters: {}, attached_document_ids: []},
+                        agent_options: {
+                            deep_research_options: {enabled: false, research_level: 'low'},
+                            tool_options: {
+                                internal_qualcomm_search: {enabled: internalSearch},
+                                web_search_options: {enabled: false},
+                                python_sandbox: {enabled: false},
+                                image_generation: {enabled: false},
+                                image_editing: {enabled: false},
+                            },
+                        },
+                        stream: true,
+                    };
+                    const ctrl = new AbortController();
+                    const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+                    try {
+                        const headers = Object.assign({
+                            'Authorization': 'Bearer ' + access,
+                            'x-copilot-token': azure,
+                            'Content-Type': 'application/json',
+                        }, fixedHeaders);
+                        const r = await fetch(url, {method: 'POST', headers,
+                            body: JSON.stringify(body), signal: ctrl.signal});
+                        const info = {status: r.status, contentType: r.headers.get('content-type')};
+                        if (!r.ok) { info.raw = ''; info.errBody = (await r.text()).slice(0, 800); return info; }
+                        const reader = r.body.getReader();
+                        const dec = new TextDecoder();
+                        let raw = '';
+                        while (true) {
+                            const {done, value} = await reader.read();
+                            if (done) break;
+                            raw += dec.decode(value, {stream: true});
+                            if (raw.length > 500000) break;  // safety cap
+                        }
+                        info.raw = raw;
+                        return info;
+                    } catch (err) {
+                        return {status: 0, raw: '', error: (err && (err.message || String(err))) || 'fetch failed'};
+                    } finally {
+                        clearTimeout(timer);
+                    }
+                }
+            """
+            try:
+                chat = await page.evaluate(chat_js, {
+                    "query": query, "model": model_name, "url": chat_url,
+                    "access": access, "azure": azure,
+                    "internalSearch": internal_search,
+                    "fixedHeaders": dict(_QGENIE_FIXED_HEADERS),
+                    "timeoutMs": timeout_ms,
+                })
+            except Exception as exc:
+                raise RuntimeError(f"qgenie chat request failed: {exc}")
+
+        status = int(chat.get("status") or 0)
+        if chat.get("error"):
+            raise RuntimeError(f"qgenie chat transport error: {chat['error']}")
+        if status in (401, 403):
+            # Token likely expired/revoked — drop the cache so the next call
+            # re-harvests, and route through the standard login-recovery error.
+            global _qgenie_token
+            _qgenie_token = None
+            raise _AuthRequired("qgenie", base_url, status)
+        if status >= 400 or status == 0:
+            raise RuntimeError(
+                f"qgenie HTTP {status}: {(chat.get('errBody') or '')[:300]}"
+            )
+
+        raw = chat.get("raw") or ""
+        answer, conversation_id, source_docs = self._parse_qgenie_sse(raw)
+        if not answer.strip():
+            raise RuntimeError(
+                "qgenie returned no answer text (SSE had no 'final' tokens). "
+                f"Raw head: {raw[:200]!r}"
+            )
+
+        conv_url = (
+            f"{base_url}/apps/chat?conversation_id={conversation_id}"
+            if conversation_id else chat_page
+        )
+        hits: List[SearchHit] = [SearchHit(
+            title=f"QGenie: {query[:60]}",
+            url=conv_url,
+            snippet=answer,
+            source="qgenie",
+            last_modified=None,
+        )]
+        # Optional: cited source documents. Only include ones with a usable
+        # url + title so they behave like the other sources' hits.
+        for doc in source_docs[:limit]:
+            d_url = (doc.get("url") or "").strip()
+            d_title = (doc.get("title") or "").strip()
+            if not d_url or not d_title:
+                continue
+            hits.append(SearchHit(
+                title=d_title,
+                url=d_url,
+                snippet=_strip_html(doc.get("content") or ""),
+                source="qgenie",
+                last_modified=None,
+            ))
+        return hits, False, None
+
+    async def _qgenie_ensure_tokens(
+        self, page: Any, *, chat_page: str, token_url_marker: str, base_url: str,
+    ) -> Tuple[str, str]:
+        """Return a valid (access_token, azure_jwt) pair, harvesting them from
+        the app's own ``/api/apigee/token`` traffic if the cache is cold/stale.
+
+        Raises :class:`_AuthRequired` when the page redirects to SSO or the
+        tokens never appear (so the agent runs the standard login recovery).
+        """
+        global _qgenie_token
+        now = time.time()
+        cached = _qgenie_token
+        if cached and cached.get("access") and cached.get("azure") \
+                and cached.get("expires_at", 0) > now:
+            return cached["access"], cached["azure"]
+
+        captured: Dict[str, Optional[str]] = {"azure": None, "access": None, "expires_in": None}
+
+        def on_request(req: Any) -> None:
+            try:
+                if token_url_marker in req.url and req.method == "POST":
+                    pd = req.post_data
+                    if pd and captured["azure"] is None:
+                        obj = json.loads(pd)
+                        tok = obj.get("subject_token")
+                        if tok:
+                            captured["azure"] = tok
+            except Exception:
+                pass
+
+        async def on_response(resp: Any) -> None:
+            try:
+                if token_url_marker in resp.url and resp.request.method == "POST":
+                    body = await resp.text()
+                    obj = json.loads(body)
+                    if obj.get("access_token") and captured["access"] is None:
+                        captured["access"] = obj["access_token"]
+                        captured["expires_in"] = obj.get("expires_in")
+            except Exception:
+                pass
+
+        import asyncio as _asyncio
+        page.on("request", on_request)
+        response_handler = lambda r: _asyncio.create_task(on_response(r))
+        page.on("response", response_handler)
+        try:
+            # Navigate to the chat page — the SPA auto-fires /api/apigee/token
+            # on load. If tokens are already warm in the SPA it may not re-fire,
+            # so we reload once as a fallback.
+            try:
+                await page.goto(chat_page, wait_until="domcontentloaded", timeout=60_000)
+            except Exception as exc:
+                raise RuntimeError(f"qgenie navigate {chat_page} failed: {exc}")
+
+            landed = (page.url or "").lower()
+            for marker in _SSO_BODY_MARKERS:
+                if marker in landed:
+                    raise _AuthRequired("qgenie", base_url, 302)
+
+            for _ in range(20):  # ~10s
+                if captured["azure"] and captured["access"]:
+                    break
+                await _asyncio.sleep(0.5)
+
+            if not (captured["azure"] and captured["access"]):
+                try:
+                    await page.reload(wait_until="domcontentloaded", timeout=60_000)
+                except Exception:
+                    pass
+                for _ in range(20):  # another ~10s
+                    if captured["azure"] and captured["access"]:
+                        break
+                    await _asyncio.sleep(0.5)
+        finally:
+            try:
+                page.remove_listener("request", on_request)
+                page.remove_listener("response", response_handler)
+            except Exception:
+                pass
+
+        if not (captured["azure"] and captured["access"]):
+            # Most likely not logged in (no token minted). Route to login recovery.
+            raise _AuthRequired("qgenie", base_url, 401)
+
+        try:
+            expires_in = float(captured["expires_in"] or 0)
+        except (TypeError, ValueError):
+            expires_in = 0.0
+        expires_at = now + max(0.0, expires_in - _QGENIE_TOKEN_SAFETY_MARGIN_S)
+        _qgenie_token = {
+            "access": captured["access"],
+            "azure": captured["azure"],
+            "expires_at": expires_at,
+        }
+        return captured["access"], captured["azure"]
+
+    @staticmethod
+    def _parse_qgenie_sse(raw: str) -> Tuple[str, Optional[str], List[Dict[str, Any]]]:
+        """Parse qgenie's SSE stream into (answer, conversation_id, source_docs).
+
+        Framing (verified live 2026-07-20): lines of ``data: {json}`` separated
+        by blank lines, terminated by ``data: [Done]``. Events carry a
+        ``messageTag``:
+          * ``final``          — answer body; concat the ``token`` fields in order.
+          * ``search_result``  — RAG hits in ``results`` (source documents).
+          * ``thinking`` / ``search_query`` / others — ignored for the answer.
+        ``responseId`` is the conversation_id.
+        """
+        final_tokens: List[str] = []
+        conversation_id: Optional[str] = None
+        source_docs: List[Dict[str, Any]] = []
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            payload = line[len("data:"):].strip()
+            if not payload or payload.lower() == "[done]":
+                continue
+            try:
+                ev = json.loads(payload)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if conversation_id is None and ev.get("responseId"):
+                conversation_id = ev.get("responseId")
+            tag = ev.get("messageTag")
+            if tag == "final":
+                final_tokens.append(ev.get("token") or "")
+            elif tag == "search_result":
+                for r in (ev.get("results") or []):
+                    if isinstance(r, dict):
+                        source_docs.append(r)
+        return "".join(final_tokens), conversation_id, source_docs
 
     # ── Helpers ──────────────────────────────────────────────────────────────
 

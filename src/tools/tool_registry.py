@@ -1700,13 +1700,19 @@ EXAMPLES
                     "user logs in once per source and HandQ inherits the "
                     "cookie thereafter. Returns a list of normalised "
                     "(title, url, snippet, source, last_modified) hits — "
-                    "use browser.navigate + extract to read full documents."
+                    "use browser.navigate + extract to read full documents. "
+                    "A fifth source, 'qgenie', is DIFFERENT: it queries the "
+                    "qgenie-chat assistant and returns ONE synthesised, cited "
+                    "answer (hits[0].snippet is the full answer, read it "
+                    "directly) rather than documents to open."
                 ),
                 usage_guide="""\
 WHEN TO USE
   - Step text says "search Confluence/Jira/SharePoint/orbit/intranet for X"
   - Step text says "find internal docs / wiki page / ticket about X"
   - Anything that looks like cross-source enterprise search
+  - Step text says "ask qgenie X" / "what does qgenie say about X" / you want a
+    synthesised answer from internal knowledge → source=qgenie
 
 WHEN NOT TO USE
   Public web search (Google / DuckDuckGo)        → browser navigate + extract
@@ -1714,12 +1720,18 @@ WHEN NOT TO USE
   Read a specific Confluence page / Jira ticket   → browser navigate + extract
   Email / calendar lookup                         → email tool
 
-Results are ranking hits, not full documents (snippet-truncated to ~300
-chars) — the agent picks which hit to open via browser.navigate. Default
-limit 10, hard cap 25 (clamped from web_search.max_limit in handq_config.yaml).
+confluence/jira/sharepoint/orbit return ranking hits, not full documents
+(snippet-truncated to ~300 chars) — the agent picks which hit to open via
+browser.navigate. Default limit 10, hard cap 25 (clamped from
+web_search.max_limit in handq_config.yaml).
 
-Read the 'web-search-workflow' skill for the source list (confluence/jira/
-sharepoint/orbit query syntax) and the login-recovery sequence.""",
+qgenie is the exception: it returns ONE hit whose snippet is qgenie's full,
+untruncated answer (optionally followed by the source docs it cited). It
+ignores limit/offset. Like orbit it needs a launched browser session
+(browser.launch_browser is idempotent — call it first if unsure).
+
+Read the 'web-search-workflow' skill for the source list (query syntax per
+source) and the login-recovery sequence.""",
                 parameter_schema=WebSearchTool.parameter_schema,
                 tool_class=WebSearchTool,
                 on_demand=True,
@@ -1945,43 +1957,57 @@ Choosing the interval:
         cls._tools[cls.SPAWN_AGENT] = ToolMetadata(
             name=cls.SPAWN_AGENT,
             description=(
-                "Fork a read-only exploration sub-agent that investigates an "
-                "open-ended question by reading/searching and returns ONLY a text "
-                "summary. Runs in an isolated context — use it to keep bulky "
-                "exploration (dozens of file reads, wide greps) out of your own "
-                "context window."
+                "Fork yourself into one bounded sub-task that runs in an "
+                "isolated message list and returns ONLY a text summary. Same "
+                "tool list, same behavioral prompt, same session context by "
+                "default (see inherit_context) — use it to keep bulky "
+                "intermediate work (dozens of file reads, wide greps, a "
+                "self-contained edit) out of your own context window."
             ),
             usage_guide="""\
 When to Use:
   - Open-ended investigation whose intermediate reads you will NOT need again:
     "map how auth works across the codebase", "find every config site for X".
-  - Any exploration that would otherwise flood your context with file dumps.
+  - A self-contained unit of work (including file writes/edits) whose
+    intermediate tool calls would otherwise flood your own context.
 
 When NOT to Use:
-  - You already know the file/target → just read/grep it directly.
-  - The work changes state (write/edit/ssh/browser) — the sub-agent is
-    read-only by design; do that work yourself.
+  - You already know the file/target → just read/grep/edit it directly.
   - A single quick lookup — spawning has overhead; only worth it for wide/deep
-    exploration.
+    work.
+  - N independent tasks at once → use fan_out_agents instead (this tool's
+    single-task shape is a convenience wrapper around the same mechanism).
 
-The sub-agent has read / grep / glob / shell (read-only probes). It returns a
-concise findings summary with exact paths/values it observed. That summary is
-the only thing that enters your context.""",
+The sub-agent has read/grep/glob/read_skill/write/edit/notebook_edit/shell/ssh/
+wait_interval — the same tools you'd use yourself, minus the ones tied to a
+single-instance resource (browser/desktop display, live_shell sessions,
+todo panel) that stays with you. It returns a concise summary; that summary
+is the only thing that enters your context.""",
             parameter_schema={
                 "type": "object",
                 "properties": {
                     "prompt": {
                         "type": "string",
                         "description": (
-                            "The exploration question for the sub-agent to answer "
-                            "by reading/searching. Be specific about what to find "
-                            "and what to report (e.g. file:line references)."
+                            "The task/question for the sub-agent to work on. Be "
+                            "specific about what to find/do and what to report "
+                            "(e.g. file:line references)."
                         ),
                     },
-                    "agent_type": {
-                        "type": "string",
-                        "enum": ["explore", "general"],
-                        "description": "'explore' (default) — read-only investigation.",
+                    "inherit_context": {
+                        "type": "boolean",
+                        "description": (
+                            "Default true: seed the sub-agent with your current "
+                            "session progress / task / LTM context. Set false "
+                            "for a deliberately blank-slate investigation."
+                        ),
+                    },
+                    "iter_budget": {
+                        "type": "integer",
+                        "description": (
+                            "Max iterations for the sub-agent's loop. Defaults "
+                            "to YOUR OWN current iteration budget."
+                        ),
                     },
                 },
                 "required": ["prompt"],
@@ -1992,27 +2018,25 @@ the only thing that enters your context.""",
         cls._tools[cls.FAN_OUT_AGENTS] = ToolMetadata(
             name=cls.FAN_OUT_AGENTS,
             description=(
-                "Run several independent sub-agent tasks concurrently, each in "
-                "its own isolated context. Returns one text summary per task — "
-                "use it to process independent items in parallel, or to get "
-                "genuinely independent second opinions on the same question."
+                "Fork yourself into several sub-tasks running CONCURRENTLY, "
+                "each in its own isolated message list. Returns one text "
+                "summary per task — use it to process independent items "
+                "(check N hosts, review N files) in parallel."
             ),
             usage_guide="""\
 When to Use:
   - Independent items that don't depend on each other's results (check N
     hosts, review N files) and whose intermediate reads you won't need again.
-  - You want more than one independent judgment on the same question —
-    phrase it as several distinctly-angled prompts and compare the summaries
-    yourself; this tool only provides the isolation, not the comparison.
 
 When NOT to Use:
   - The tasks depend on each other's output — run them yourself in sequence.
-  - A single task — use spawn_agent instead (this tool's overhead is for N>1).
+  - A single task — use spawn_agent instead (this tool's overhead is for N>1;
+    same underlying mechanism, just fanned out).
 
-Each task runs with `tool_profile`'s tools only (read-only by default) and
-returns a text summary — the parent's context only sees the summaries, not
-the intermediate tool calls. A failed task does not fail the batch; check
-each result's `ok` field.""",
+Each task runs with the same fixed tool list as spawn_agent and returns a
+text summary — your context only sees the summaries, not the intermediate
+tool calls. A failed task does not fail the batch; check each result's `ok`
+field.""",
             parameter_schema={
                 "type": "object",
                 "properties": {
@@ -2020,8 +2044,8 @@ each result's `ok` field.""",
                         "type": "array",
                         "description": (
                             "1-30 independent tasks, each {\"prompt\": \"...\"}. "
-                            "Each prompt is self-contained (the sub-agent has no "
-                            "memory of this conversation)."
+                            "Each is a fork of you running in its own isolated "
+                            "message list."
                         ),
                         "items": {
                             "type": "object",
@@ -2031,13 +2055,19 @@ each result's `ok` field.""",
                             "required": ["prompt"],
                         },
                     },
-                    "tool_profile": {
-                        "type": "string",
-                        "enum": ["explore", "worker"],
+                    "inherit_context": {
+                        "type": "boolean",
                         "description": (
-                            "'explore' (default) — read-only tools. 'worker' — "
-                            "adds write/edit; a write/edit outside the working "
-                            "directory is refused."
+                            "Default true: seed every task with your current "
+                            "session progress / task / LTM context. Set false "
+                            "for deliberately blank-slate tasks."
+                        ),
+                    },
+                    "iter_budget": {
+                        "type": "integer",
+                        "description": (
+                            "Max iterations per task's loop. Defaults to YOUR "
+                            "OWN current iteration budget."
                         ),
                     },
                     "max_concurrency": {
@@ -2341,6 +2371,63 @@ Ending the loop: simply DON'T call schedule_wakeup on a turn — the loop ends."
         """Get list of all registered tool names"""
         cls.initialize()
         return list(cls._tools.keys())
+
+    # Family-level one-liners for the claimable-tool menu rendered into the
+    # agent system prompt. Keyed by the family PREFIX (for grouped `*_` tools)
+    # or the exact tool name (for standalone on-demand tools). This is the
+    # menu's DISPLAY layer only — the source of truth for what is claimable is
+    # still each tool's `on_demand` flag plus its `_IS_WINDOWS` registration
+    # gate. A family absent from this map on the current platform simply never
+    # appears (its tools were never registered), so the menu is automatically
+    # platform-correct. Detail (perf numbers, gotchas, ordering) deliberately
+    # lives in each tool's own schema description + its <family>-workflow skill,
+    # never here — keeping the per-turn prompt small.
+    _MENU_FAMILY_ORDER: List[str] = [
+        "browser_", "desktop_", "ssh", "live_shell_", "email", "teams",
+        "web_search", "ask_human", "remote_handq", "schedule_",
+    ]
+    _MENU_FAMILY_LABELS: Dict[str, str] = {
+        "browser_":     "browser_*     Web page automation (Chromium)",
+        "desktop_":     "desktop_*     Windows native app automation (UIA + screenshot/OCR)",
+        "ssh":          "ssh           Remote batch execution on Linux hosts",
+        "live_shell_":  "live_shell_*  Persistent interactive subprocesses",
+        "email":        "email         Outlook mail (local MAPI)",
+        "teams":        "teams         Microsoft Teams (Graph API)",
+        "web_search":   "web_search    Internal enterprise search (Confluence, Jira, SharePoint, Orbit)",
+        "ask_human":    "ask_human     Ask the user ONE clarifying question (modal; use sparingly)",
+        "remote_handq": "remote_handq  Delegate a task to a remote Linux HandQ daemon",
+        "schedule_":    "schedule_*    Cron-style scheduling (schedule_create/list/delete) + schedule_wakeup (self-paced loop)",
+    }
+
+    @classmethod
+    def claimable_tool_menu(cls) -> str:
+        """Render the [Available Tools] menu body for the agent system prompt.
+
+        Walks the registry, keeps only on-demand (claimable) tools, groups them
+        into families, and emits one labeled line per family that actually has a
+        registered tool on THIS platform. Because Windows-only families are not
+        registered on Linux, they never appear here — the menu can never
+        advertise a tool the agent cannot claim.
+        """
+        cls.initialize()
+        present: set = set()
+        for name, meta in cls._tools.items():
+            if not meta.on_demand:
+                continue
+            for key in cls._MENU_FAMILY_ORDER:
+                if key.endswith("_"):
+                    if name.startswith(key):
+                        present.add(key)
+                        break
+                elif name == key:
+                    present.add(key)
+                    break
+        lines = [
+            "  " + cls._MENU_FAMILY_LABELS[key]
+            for key in cls._MENU_FAMILY_ORDER
+            if key in present
+        ]
+        return "\n".join(lines)
 
     @classmethod
     def get_tool_metadata(cls, name: str) -> ToolMetadata:

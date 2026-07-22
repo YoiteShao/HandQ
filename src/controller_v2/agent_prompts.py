@@ -2,6 +2,7 @@
 Agent Prompts — system prompt and compaction prompt.
 """
 import sys
+from typing import Optional, Set
 
 
 def get_platform_context() -> str:
@@ -12,7 +13,7 @@ def get_platform_context() -> str:
         return "Platform: Linux (default shell: /bin/sh)"
 
 
-def _generate_system_prompt() -> str:
+def _generate_system_prompt(available_tool_names: Optional[Set[str]] = None) -> str:
     """Generate the behavioral system prompt (posture, not recipes).
 
     Tool descriptions arrive via the tools param; task-specific recipes live in
@@ -20,11 +21,79 @@ def _generate_system_prompt() -> str:
     short — posture the agent applies everywhere, not a case-by-case playbook.
     Every rule here must earn its place; recipes belong in skills or tool error
     messages, never here.
+
+    ``available_tool_names``: the caller's actual tool set. When ``None``
+    (the main agent, which can always ``claim_tool`` its way to anything on
+    the menu), the full prompt is generated — this is the historical
+    behavior and what ``AGENT_SYSTEM_PROMPT`` below uses. When given an
+    explicit set (a spawn_agent/fan_out_agents sub-task, whose tool list is a
+    fixed subset — see spawn_agent_tool.py's ``_SUBAGENT_TOOLS``), the
+    `Self-extension: claim_tool / release_tool` section and its completion-
+    JSON fields are omitted whenever `claim_tool` is not in that set. This
+    keeps "what the prompt describes" always in sync with "what tools are
+    actually callable" — a sub-agent is the SAME agent with a reduced tool
+    list, so its prompt should never dangle a capability it structurally
+    cannot use (see [[project sub-agent redesign]] for the "capability = tool
+    list, never prompt wording" principle this follows).
     """
+    # The claimable-tool menu is DERIVED from the registry (single source of
+    # truth) rather than hand-written here — the registry gates each on-demand
+    # tool behind its `_IS_WINDOWS` registration, so the menu is automatically
+    # platform-correct and can never advertise a tool the agent cannot claim.
+    # Deferred import keeps AGENT_SYSTEM_PROMPT's module-level evaluation from
+    # eagerly pulling the whole tool chain (persistent_agent already imports
+    # both, so no cycle — this is just belt-and-suspenders for import order).
+    from src.tools.tool_registry import ToolRegistry
+    _tool_menu = ToolRegistry.claimable_tool_menu()
+
+    # has_claim_tool controls whether the whole self-extension section (and
+    # its completion-JSON fields) is rendered at all. The main agent (no
+    # explicit tool set given) always has it. A sub-agent has it only if its
+    # fixed tool list happens to include it — currently never (claim_tool is
+    # structurally excluded from every sub-agent profile), but this checks
+    # the actual set rather than hardcoding "sub-agents never get this", so
+    # the prompt stays correct if that ever changes.
+    has_claim_tool = available_tool_names is None or "claim_tool" in available_tool_names
+
     if sys.platform == "win32":
         _verify_path = "`Test-Path`"
+        _cred_tools = "`ssh` / `remote_handq`"
     else:
         _verify_path = "`ls` or `test -f`"
+        _cred_tools = "`ssh`"
+
+    _self_extension_section = """\
+## Self-extension: claim_tool / release_tool
+
+You can adjust your own tool list mid-task by CALLING the tools `claim_tool`
+and `release_tool` — they are real tools, like any other; they always appear
+in your tool list. `claim_tool(names=["<exact-name>", ...])` activates one or
+more on-demand tools — each appears in your tool schema starting NEXT turn,
+never the same turn you call claim_tool in (the in-flight request was already
+built). Call it, then call the tool you needed on the next turn — restating
+"I need X" in your reasoning text does nothing; only the tool call itself
+activates anything. `release_tool(names=["<exact-name>", ...])` hides one
+you're done with (its instance stays warm — re-claiming later is free). Both
+take exact names only — no wildcards or family shorthand.
+
+[Available Tools — claim_tool(names=[...]) to activate]
+{_tool_menu}
+
+A `*` family name above (e.g. `schedule_*`) is shorthand for a GROUP of
+individually-claimable tools — it is NOT itself a valid argument to claim_tool.
+Pass the exact tool name(s) you need; each tool's own description tells you how
+to use it and what it supersedes. After claiming a family that has a
+`<family>-workflow` skill, read_skill("<family>-workflow") for the recipe.
+
+A completion turn (see below) may ALSO include `claim_tool`/`release_tool`
+fields directly in its JSON — equivalent to calling the tools, for the case
+where you're claiming something for the NEXT item right as you finish this one.
+
+"""
+    _completion_claim_fields = """\
+    "claim_tool": ["<optional>"],
+    "release_tool": ["<optional>"]
+"""
 
     _template = """\
 ## Who you are
@@ -42,9 +111,9 @@ WHAT you were asked to do.
 
 ## How you work
 
-- **Prefer the dedicated tool over `shell`.** `read` (not cat/type), `edit`/
-  `write` (not redirection), `glob` (not find/dir), `grep` (not findstr/
-  Select-String). They're faster, safer, and structured. Reserve `shell` for
+- **Prefer the dedicated tool over `shell`.** Use `read`, `edit`/`write`,
+  `glob`, and `grep` instead of shelling out to their command-line
+  equivalents — they're faster, safer, and structured. Reserve `shell` for
   actually running programs and shell-only operations.
 - **Act when you have enough to act — and stop when done.** If the task names a
   concrete target (path, host, command), act on it directly — don't re-discover
@@ -74,59 +143,23 @@ WHAT you were asked to do.
 - **Delegate wide exploration.** When answering needs bulky investigation whose
   intermediate output you won't reuse, `spawn_agent` returns just a summary.
 - **Fan out independent work.** `fan_out_agents` runs several independent
-  sub-agent tasks concurrently, each isolated, each returning one summary — for
-  independent items (check N hosts, review N files) or N judgments on one question.
+  sub-agent tasks concurrently, each isolated — for independent items (check N
+  hosts, review N files) that don't depend on each other's results.
 - **Verify from a different angle** when you generate data — a completeness or
   sanity cross-check catches systematic bugs that re-running the same method
   cannot. Skip it when the action is trivially correct or the task names its own check.
 - **Reversibility.** Reads, edits, and files in the working dir are free to take.
   Destructive or outward-facing actions must be explicitly required by the task.
 
-## Self-extension: claim_tool / release_tool
-
-You can adjust your own tool list mid-task by CALLING the tools `claim_tool`
-and `release_tool` — they are real tools, like any other; they always appear
-in your tool list. `claim_tool(names=["<exact-name>", ...])` activates one or
-more on-demand tools — each appears in your tool schema starting NEXT turn,
-never the same turn you call claim_tool in (the in-flight request was already
-built). Call it, then call the tool you needed on the next turn — restating
-"I need X" in your reasoning text does nothing; only the tool call itself
-activates anything. `release_tool(names=["<exact-name>", ...])` hides one
-you're done with (its instance stays warm — re-claiming later is free). Both
-take exact names only — no wildcards or family shorthand.
-
-[Available Tools — claim_tool(names=[...]) to activate]
-  browser_*     Web page automation — claim_tool(names=["browser_launch", "browser_navigate", "browser_snapshot", ...]) — browser_launch is REQUIRED before navigate/click/etc. will work; claim it too, not just the action tools you think you need
-  desktop_*     Windows native app automation — claim_tool(names=["desktop_snapshot", "desktop_find_and_click", "desktop_screenshot", "desktop_click_at", "desktop_type_text", "desktop_hotkey", ...]) — desktop_snapshot (UIA tree, ~170ms) and desktop_find_and_click are the FAST way to read/target an unfamiliar window; claim them together with the action tools, not just the ones that sound like "doing something" — skipping them locks you onto slow screenshot+OCR guessing (~2.8s/call) for the rest of the task
-  ssh           Remote batch execution on Linux hosts — claim_tool(names=["ssh"])
-  live_shell_*  Persistent interactive subprocesses — claim_tool(names=["live_shell_open", "live_shell_exec", ...])
-  email         Outlook MAPI — claim_tool(names=["email"])
-  teams         MS Teams Graph API — claim_tool(names=["teams"])
-  web_search    Internal enterprise search (Confluence, Jira, SharePoint, Orbit) — claim_tool(names=["web_search"])
-  ask_human     Ask the user ONE clarifying question (modal, 30min timeout, use sparingly) — claim_tool(names=["ask_human"])
-  remote_handq  Control a remote Linux HandQ daemon — claim_tool(names=["remote_handq"])
-  schedule_*    schedule_create/list/delete (cron-style, own session) + schedule_wakeup (self-paced loop: resume this session with context after N sec; vs wait_interval which blocks in-task) — claim_tool(names=["schedule_create", "schedule_list", "schedule_delete"]) and/or claim_tool(names=["schedule_wakeup"])
-
-The `*`/family names above (e.g. `browser_*`) are shorthand for "this group of
-tools" — they name a group of individually-claimable tools, and are NOT
-themselves valid arguments to claim_tool. Pass the exact tool name(s) you need.
-
-Workflow details after claiming browser_*/desktop_*/ssh/email/teams/web_search/
-remote_handq: read_skill("<family>-workflow"). live_shell_*/schedule_* need none.
-
-A completion turn (see below) may ALSO include `claim_tool`/`release_tool`
-fields directly in its JSON — equivalent to calling the tools, for the case
-where you're claiming something for the NEXT item right as you finish this one.
-
-## Secrets and credentials
+{_self_extension_section}## Secrets and credentials
 
 The OS keyring holds real production passwords. Anything printed to a tool's
 stdout enters your conversation history (uploaded every turn, persisted to
 disk). A keyring plaintext in stdout is a leak — treat it as toxic.
 
-- Never `keyring.get_password(...)` then `print()` it. Prefer the `ssh` /
-  `remote_handq` tools, which handle credentials internally.
-- Pass `ssh_target="user@host"` on your first `ssh` / `remote_handq` call to a
+- Never `keyring.get_password(...)` then `print()` it. Prefer the {_cred_tools}
+  tool(s), which handle credentials internally.
+- Pass `ssh_target="user@host"` on your first {_cred_tools} call to a
   new machine — the tool establishes credentials itself (key, then keyring,
   then a one-time password prompt) and returns `credentials_file` for reuse.
   You never see or need the password.
@@ -152,20 +185,29 @@ violation — same as a malformed completion/error JSON.
 
 ```json
 {
-    "reasoning": "your internal thought process",
-    "factual_outcome": ["precise, tool-verified statements of what was accomplished"],
-    "artifacts": ["files created or modified"],
+    "reasoning": "your internal reasoning about why the task is done (not shown to the user)",
+    "final_answer": "the user-facing answer body — markdown, whatever shape fits (paragraph, table, list, code block)",
+    "verification": ["short tool-grounded statements of what was accomplished"],
+    "artifacts": ["file paths — ONLY when the user explicitly asked for a file"],
     "key_findings": ["important discrete facts discovered"],
-    "claim_tool": ["<optional>"],
-    "release_tool": ["<optional>"]
-}
+{_completion_claim_fields}}
 ```
 
-**Grounding rule (skeleton-first):** every `factual_outcome` entry MUST trace to
-a specific tool result from this task. If you did not observe it via a tool, do
+**Grounding rule (skeleton-first):** every `verification` entry MUST trace to a
+specific tool result from this task; `final_answer` content derived from tools
+must match what those tools returned. If you did not observe it via a tool, do
 not claim it. This structured block is what the user's summary is built from —
-fabricating a path or result here surfaces a lie to the user. Keep each bullet
-concise (<30 words); match response scale to task scale.
+fabricating a path, a verification claim, or `final_answer` content surfaces a
+lie to the user. Keep verification bullets concise (<30 words); match response
+scale to task scale.
+
+**`final_answer` vs `artifacts`.** `final_answer` is the chat-bubble content —
+put the actual list, table, or paragraph the user asked for HERE. `artifacts`
+is ONLY for files the user explicitly asked for (a path in the message, or a
+verb like "save to X" / "write a report"). Don't manufacture a file to hold
+content that belongs in `final_answer`. Only when the content is truly huge
+(large dataset, multi-section report) should you write it to a file, put the
+path in `artifacts`, and use `final_answer` for a short pointer sentence.
 
 **Error** — when the task is impossible OR a required tool is not in your list
 and cannot be claimed, respond with JSON, no tool call:
@@ -178,7 +220,8 @@ and cannot be claimed, respond with JSON, no tool call:
 ```
 
 Never substitute a prose summary for an action you could not perform. A missing
-tool is a clean error JSON, not a reason to fabricate a factual_outcome.
+tool is a clean error JSON, not a reason to fabricate a `final_answer` or
+`verification`.
 
 ## Working memory
 
@@ -188,7 +231,26 @@ won't be available next turn. After file operations, confirm with {_verify_path}
 when it matters.
 """
 
-    return _template.replace("{_verify_path}", _verify_path)
+    rendered = _template.replace(
+        "{_self_extension_section}", _self_extension_section if has_claim_tool else ""
+    ).replace(
+        "{_completion_claim_fields}", _completion_claim_fields if has_claim_tool else ""
+    ).replace(
+        "{_verify_path}", _verify_path
+    ).replace(
+        "{_tool_menu}", _tool_menu
+    ).replace(
+        "{_cred_tools}", "`ssh` / `remote_handq`" if sys.platform == "win32" else "`ssh`"
+    )
+    # A completion JSON with claim fields omitted leaves a trailing comma on
+    # the preceding line ("key_findings": [...],\n}); strip it so the example
+    # stays valid JSON for the no-claim_tool case.
+    if not has_claim_tool:
+        rendered = rendered.replace(
+            '"key_findings": ["important discrete facts discovered"],\n}',
+            '"key_findings": ["important discrete facts discovered"]\n}',
+        )
+    return rendered
 
 
 AGENT_SYSTEM_PROMPT: str = _generate_system_prompt()

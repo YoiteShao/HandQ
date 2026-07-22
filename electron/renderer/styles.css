@@ -178,6 +178,81 @@ html[data-vt-scope="session"]::view-transition-new(*) {
     --hairline-soft:rgba(0, 0, 0, 0.06);
     --hairline-bright: rgba(255, 255, 255, 0.60);
 
+    /* Layer 2 — "card readability" tint. Layer 1 (the WebGL edge-
+       refraction canvas in glass-effect.js) is the pure transparent glass
+       base; these vars are the SEPARATE knob for how opaque the cards
+       sitting on top of it get, so text stays legible. Shared by
+       .session-card, .task-plan-panel/.agent-todo-panel, and .ss-section —
+       tunable live via Ctrl+Shift+G's "Layer 2" section (see
+       glass-effect.js) without touching Layer 1's WebGL uniforms at all. */
+    /* Faint interior sheen painted ON TOP of the stabilized plate — a soft
+       center dome that gives the surface a sense of body/volume rather than
+       reading as a dead-flat fill. Kept small; the plate (readable-floor)
+       does the readability work, this only implies "thickness". */
+    --l2-fill-a:   0;   /* radial-gradient center stop alpha */
+    --l2-fill-b:   0;   /* radial-gradient mid stop alpha */
+    --l2-fill-c:   0;      /* radial-gradient edge stop alpha */
+    /* Elevation shadow — one of the four thickness cues (border edge,
+       highlight band, inner stroke, quiet shadow) from the liquid-glass
+       playbook. A restrained soft drop that lifts the card off Layer 1 so
+       it reads as a discrete pane with depth, not a decal on the glass. */
+    --l2-shadow-a: 0.14;   /* near drop-shadow alpha */
+    --l2-shadow-b: 0.10;   /* far drop-shadow alpha */
+    /* Blur radius (3rd box-shadow value) + spread (4th value) for each of
+       the two stacked drop-shadows. */
+    --l2-shadow-a-blur:   22px;
+    --l2-shadow-a-spread: -2px;
+    --l2-shadow-b-blur:   5px;
+    --l2-shadow-b-spread: 0px;
+    /* Thin bright edge that breaks the silhouette — thickness cue #1. Locked
+       to one baseline across the card family (session cards + the detail
+       panel) per the "lock one border baseline" rule so the whole system
+       reads as the same material, not stitched renders. Kept restrained
+       (0.35) because it stacks with the always-on conic highlight ring
+       (::before, the "light-direction highlight band" cue) — the two are
+       distinct cues (silhouette edge vs. highlight band) and 0.35 keeps the
+       flat edge from doubling the ring into a hard white outline. */
+    --l2-border-alpha: 0.35;
+    /* Plain frosted-glass blur — sits ON TOP of whatever Layer 1's WebGL
+       shader already produced underneath (the desktop, refracted/
+       dispersed/glowing), so this is compositing a second, ordinary
+       backdrop-filter over Layer 1's result rather than reimplementing
+       refraction here. With every other Layer 2 knob at 0 (no fill tint,
+       no shadow, no border), this blur is now the ENTIRE Layer 2 effect —
+       cards read as "a blurred porthole into Layer 1's glass" rather than
+       a tinted card sitting on top of it. --l2-saturate at 0% additionally
+       desaturates that blurred view to grayscale (see the flag on that
+       var below) — remove/raise it if that wasn't intended alongside a
+       pure-blur card look. */
+    --l2-blur: 30px;
+    /* Kept at normal (100%, not the 115% "boost" used elsewhere, and
+       explicitly NOT 0%) — 0% would desaturate every card family member
+       to grayscale, confirmed NOT wanted when this was flagged during the
+       "set everything except card blur to 0" sweep. */
+    --l2-saturate: 100%;
+
+    /* CONTENT PLATE — the article's real "inner stabilized plate", and the
+       thesis I'd been missing: liquid glass is a STACK of two INDEPENDENT
+       parts. The glass SHELL stays glass (transparent, background
+       perceptible, thickness cues sell the material); a SEPARATE plate backs
+       ONLY the content — "a slightly denser patch under the typography." The
+       article explicitly forbids the workaround I'd done: raising the whole
+       surface's opacity until "the card becomes a normal surface — you did
+       not pass." So the shells (.ss-section, plan/todo panels) are pure
+       glass again (no floor), and ALL readability lives in these plates,
+       which HUG the text runs instead of filling the module — the glass
+       shows through in the gaps, so the module still reads as glass while no
+       glyph ever sits on the raw desktop.
+
+       REVISED: plates are now much thinner (0.28/0.42 vs old 0.74/0.88) and
+       rely on their own `backdrop-filter: brightness(1.35) blur(6px)` to
+       ADAPTIVELY boost contrast — on dark desktops the brightness lift makes
+       text readable without needing heavy opaque white; on light desktops
+       the plates are barely visible. This is the Apple approach: the
+       material system adapts, not a flat white rectangle. */
+    --l2-plate:        rgba(255, 255, 255, 0.28);
+    --l2-plate-strong: rgba(255, 255, 255, 0.42);
+
     /* Liquid glass — transparent enough to see desktop, opaque enough to read */
     --user-bubble:        rgba(255, 255, 255, 0.88);
     --user-bubble-border: transparent;
@@ -242,6 +317,23 @@ html[data-vt-scope="session"]::view-transition-new(*) {
             "Segoe UI", system-ui, "Inter", Roboto, sans-serif;
     --mono: "SF Mono", ui-monospace, Menlo, Monaco, "Cascadia Mono",
             Consolas, "Liberation Mono", monospace;
+
+    /* White glow halo that lifts dark text off an unpredictable backdrop.
+       The right-hand detail panel sits over Layer 1's glass with
+       coreOpacity:0 (no white tint at the window interior — see
+       glass-effect.js), so text there can land on raw dark desktop content
+       and vanish without this. Same 3-layer recipe as .session-card-title,
+       promoted to a token so the whole detail panel (titles, plan/activity/
+       file text) can share it rather than each re-declaring the shadow.
+       NEUTRALIZED to `none`: readability now lives in the content plates
+       (--l2-plate / --l2-plate-strong) that hug each text run, so dark text
+       has real contrast against a denser patch without a halo — and the
+       playbook names a text drop-shadow-to-compensate as an explicit failure
+       ("Fail: you add a stronger drop shadow under text"). It also made the
+       font read fuzzy/straining. Kept as a token (not deleted) so the single
+       `text-shadow: var(--text-halo)` consumer resolves cleanly; flip back
+       to a shadow here if the plates are ever dialed far down again. */
+    --text-halo: none;
 }
 
 /* ============================================================ */
@@ -262,10 +354,10 @@ html[data-vt-scope="session"]::view-transition-new(*) {
 .bubble::before,
 .overlay-card::before,
 .tool-card::before,
-.task-plan-items::before,
-.agent-todo-items::before,
+.task-plan-panel::before,
+.agent-todo-panel::before,
+.ss-section::before,
 .session-card::before,
-.activity-group::before,
 .floating-composer::before,
 .mention-dropdown::before {
     content: '';
@@ -287,7 +379,10 @@ html[data-vt-scope="session"]::view-transition-new(*) {
 .tb-btn::before,
 .titlebar-new-btn::before,
 .titlebar-island::before,
-.composer-input-wrap > button::before {
+.composer-input-wrap > button::before,
+.session-card-close::before,
+.session-card-min::before,
+.session-card-max::before {
     content: '';
     position: absolute;
     inset: 0;
@@ -304,6 +399,45 @@ html[data-vt-scope="session"]::view-transition-new(*) {
     mask-composite: exclude;
     pointer-events: none;
 }
+
+/* ============================================================ */
+/* Liquid Glass — adaptive content plates.                      */
+/* Elements carrying var(--l2-plate) / var(--l2-plate-strong)   */
+/* get their own backdrop-filter: brightness() + blur() so the  */
+/* plate adapts to whatever sits behind it. On dark desktops    */
+/* the brightness lift ensures WCAG-AA text contrast without    */
+/* needing high-opacity white; on light desktops the plate is   */
+/* nearly invisible — a subtle frosted patch, not a white card. */
+/* This is what makes the glass system ADAPTIVE rather than     */
+/* background-dependent. Never raise plate fill opacity to fix  */
+/* readability — raise brightness() instead.                    */
+/* ============================================================ */
+.task-plan-header,
+.agent-todo-header,
+.ss-section-head,
+.ss-header .ss-name {
+    backdrop-filter: blur(6px) brightness(1.4);
+    -webkit-backdrop-filter: blur(6px) brightness(1.4);
+}
+.task-plan-items,
+.agent-todo-items,
+.ss-activity-list,
+.ss-files-list {
+    backdrop-filter: blur(6px) brightness(1.3);
+    -webkit-backdrop-filter: blur(6px) brightness(1.3);
+}
+
+/* ============================================================ */
+/* Session card head — adaptive plate replacing crude text-glow.*/
+/* Rather than painting a 3-layer white text-shadow halo on the */
+/* title (which reads as cheap CSS glow = plastic), the entire  */
+/* head strip now carries a subtle adaptive plate so ALL its    */
+/* content (title, pill, close btn) stays readable on any       */
+/* background without per-element hacks. The plate uses         */
+/* backdrop-filter:brightness() against the card's already-     */
+/* blurred surface, creating adaptive luma boost precisely      */
+/* where it's needed — refined, not crude.                      */
+/* ============================================================ */
 
 * { box-sizing: border-box; }
 
@@ -353,17 +487,34 @@ html, body {
     box-shadow:
         /* outer hairline outline */
         0 0 0 0.5px rgba(0, 0, 0, 0.12),
-        /* neutral depth bevel — soft dark falloff on the outer edges */
-        inset 10px 0 20px -2px rgba(0, 0, 0, 0.10),
-        inset -10px 0 20px -2px rgba(0, 0, 0, 0.10),
-        inset 0 5px 12px -2px rgba(0, 0, 0, 0.08),
-        inset 0 -5px 12px -2px rgba(0, 0, 0, 0.08),
-        /* bright glass-rim hairline */
-        inset 0 0 0 1px rgba(255, 255, 255, 0.65),
-        /* soft interior glow */
-        inset 0 0 0 3px rgba(255, 255, 255, 0.14),
-        /* top specular hair-line */
-        inset 0 1.5px 0 rgba(255, 255, 255, 0.90),
+        /* Neutral depth bevel — a SINGLE symmetric inset shadow instead of
+           four axis-aligned strips. The old four-shadow stack (LR ±10 +
+           TB ±5) summed at each corner, amplifying darkness on the 45°
+           diagonal — on certain desktop backgrounds this read as a visible
+           diagonal streak radiating from each corner. One inset shadow with
+           zero offset fades uniformly inward from all four edges, no
+           directional bias, no corner amplification. */
+        inset 0 0 22px rgba(0, 0, 0, 0.09),
+        /* Glass-rim highlight — DIMMED (0.65 → 0.18) so it no longer paints
+           a sharp 1px bright ring on the CSS border-radius curve. The WebGL
+           shader in glass-effect.js already owns the rim (rim glow +
+           refraction/dispersion) on its own SDF-quarter-circle at each
+           corner; the CSS border-radius uses Chromium's Bezier
+           approximation of the same curve, and those two curves diverge by
+           a subpixel-to-1px at the corners. A bright CSS rim on top of the
+           WebGL rim exposed that divergence as a visible diagonal hairline
+           radiating from each corner. Keeping the CSS rim faint means any
+           residual disagreement now sits below the visual noise floor. */
+        inset 0 0 0 1px rgba(255, 255, 255, 0.18),
+        /* Soft interior glow — dimmed to match (0.14 → 0.05) for the same
+           reason: three concentric CSS rings emphasised any WebGL/CSS edge
+           disagreement at corners. */
+        inset 0 0 0 3px rgba(255, 255, 255, 0.05),
+        /* Top specular hair-line — dimmed (0.90 → 0.28) so its horizontal
+           line no longer terminates in a bright arc at the top-left/right
+           border-radius, which was the most visible of the corner
+           artifacts on high-contrast (dark) desktop backgrounds. */
+        inset 0 1.5px 0 rgba(255, 255, 255, 0.28),
         /* ambient drop-shadow */
         0 24px 80px rgba(0, 0, 0, 0.14);
     backdrop-filter: none;
@@ -386,20 +537,22 @@ html, body {
             transparent 35%,
             transparent 70%,
             rgba(0, 0, 0, 0.035) 100%);
-    /* CSS mask is decoupled from the WebGL shader's BEVEL_WIDTH_LR /
-       BEVEL_WIDTH_TB — the shader handles the sharp edge refraction (~2-7%
-       of min dim); this mask handles the soft interior haze. Asymmetric on
-       purpose: the top fades over 2vmin so the 42px titlebar sits inside
-       the plateau (not in a fade zone) and reads the same tint as the
-       content region beneath. LR/bottom keep the 7vmin fade so the outer
-       glass frame still reads on those edges. */
+    /* Symmetric edge fade — all four sides fade over the same 5vmin, so the
+       alpha isolines at every corner form a smooth arc instead of the folded
+       diagonal seam the old asymmetric mask (2vmin top vs 7vmin sides)
+       produced. The seam was the "visible diagonal line at the corner"
+       readable on high-contrast desktop backgrounds. Titlebar now sits
+       inside the fade zone alongside the rest of the outer glass frame —
+       the fade tint is subtle (alpha 0.06→0.035 in ::before) so this is
+       visually a non-event; readability lives on the .session-card panels
+       below regardless. */
     -webkit-mask-image:
-        linear-gradient(to right,  rgba(0,0,0,0), black 7vmin, black calc(100% - 7vmin), rgba(0,0,0,0)),
-        linear-gradient(to bottom, rgba(0,0,0,0), black 2vmin, black calc(100% - 7vmin), rgba(0,0,0,0));
+        linear-gradient(to right,  rgba(0,0,0,0), black 5vmin, black calc(100% - 5vmin), rgba(0,0,0,0)),
+        linear-gradient(to bottom, rgba(0,0,0,0), black 5vmin, black calc(100% - 5vmin), rgba(0,0,0,0));
     -webkit-mask-composite: source-in;
     mask-image:
-        linear-gradient(to right,  rgba(0,0,0,0), black 7vmin, black calc(100% - 7vmin), rgba(0,0,0,0)),
-        linear-gradient(to bottom, rgba(0,0,0,0), black 2vmin, black calc(100% - 7vmin), rgba(0,0,0,0));
+        linear-gradient(to right,  rgba(0,0,0,0), black 5vmin, black calc(100% - 5vmin), rgba(0,0,0,0)),
+        linear-gradient(to bottom, rgba(0,0,0,0), black 5vmin, black calc(100% - 5vmin), rgba(0,0,0,0));
     mask-composite: intersect;
     pointer-events: none;
     z-index: 0;
@@ -467,19 +620,18 @@ html, body {
 }
 
 .titlebar-brand {
-    /* Display-family + heavier weight + darker colour + three-layer halo —
-       same readability strategy as .session-card-title. The titlebar is
-       fully transparent, so the brand relies entirely on the font itself
-       to stay legible over any wallpaper. */
+    /* Display-family + heavier weight + darker colour for legibility.
+       Single tight shadow provides emergency contrast on dark desktops
+       without the crude "white glow" of the old 3-layer recipe. The
+       titlebar is fully transparent, so this minimal shadow is the one
+       concession to readability that doesn't violate glass aesthetics. */
     font-family: "SF Pro Display", "Segoe UI Variable Display",
                  "Segoe UI Semibold", var(--sans);
     font-weight: 700;
     letter-spacing: 0.3px;
     font-size: 12px;
     color: var(--fg);
-    text-shadow: 0 0 3px rgba(255, 255, 255, 0.95),
-                 0 1px 4px rgba(255, 255, 255, 0.55),
-                 0 0 10px rgba(255, 255, 255, 0.25);
+    text-shadow: 0 0.5px 2px rgba(255, 255, 255, 0.55);
 }
 
 .titlebar-controls {
@@ -528,14 +680,11 @@ html, body {
 }
 .tb-btn svg     {
     width: 12px; height: 12px; display: block;
-    /* The puck's own fill is intentionally very low (see above) so the
-       backdrop shows through — but that means a dark/red icon glyph has
-       nothing to contrast against over a dark desktop. Same fix as
-       .titlebar-brand's text-shadow halo, just via drop-shadow since these
-       are SVG strokes, not text: a light halo behind the stroke keeps it
-       legible on any backdrop without raising the puck's own opacity. */
-    filter: drop-shadow(0 0 1.5px rgba(255, 255, 255, 0.95))
-            drop-shadow(0 0 3px rgba(255, 255, 255, 0.55));
+    /* Single tight drop-shadow — enough to separate the glyph from dark
+       backdrops without the chunky double-layer halo that screamed
+       "readability hack." The puck's own backdrop-filter already carries
+       the glass identity; this just ensures the SVG stroke reads. */
+    filter: drop-shadow(0 0 0.5px rgba(255, 255, 255, 0.65));
 }
 /* Max/restore icon toggle. The .tb-max button carries both SVGs; renderer.js
    flips the `is-maximized` class in response to main-process maximize /
@@ -630,10 +779,8 @@ html, body {
 }
 .titlebar-new-btn svg {
     width: 14px; height: 14px; display: block;
-    /* Same halo fix as .tb-btn svg above — keeps the "+" glyph legible
-       over a dark backdrop without raising the button's own opacity. */
-    filter: drop-shadow(0 0 1.5px rgba(255, 255, 255, 0.95))
-            drop-shadow(0 0 3px rgba(255, 255, 255, 0.55));
+    /* Single tight shadow — same refined approach as .tb-btn svg. */
+    filter: drop-shadow(0 0 0.5px rgba(255, 255, 255, 0.65));
 }
 .titlebar-new-btn:hover {
     background: rgba(184, 175, 196, 0.65);
@@ -789,19 +936,37 @@ html, body {
     flex: 1;
 }
 
-/* ---------- Main column ---------- */
+/* ---------- Main column (Stage-Manager triptych: rail | stage | detail) ---------- */
 
 .main {
     flex: 1 1 auto;
     display: flex;
-    flex-direction: column;
+    flex-direction: row;
+    gap: 0;
     min-height: 0;
     min-width: 0;
-    position: relative;
+    position: relative; /* anchor for the absolute .ss-reopen */
+    /* Zero flex-gap between rail and chat-region — the chat-region's own
+       10px left padding (part of its concentric-corner math with .app) is
+       plenty of visual breathing room between the Stage-Manager thumbs
+       and the main card. Was 4px; dropped to bring the tilted thumbs
+       visually closer to the chat card without touching chat-region's
+       padding (which is geometrically tied to the corner-radius formula).
+       If you re-add flex-gap here, update AUTO_RESIZE_RAIL_DELTA in
+       main.js by the same amount — the window-grow math bakes in this
+       gap. */
+    /* Drag-the-window base region. Every actual interactive content block
+       (session cards, rail thumbnails, the detail panel's sections) opts
+       back out to no-drag below, so only genuinely blank chrome — flex
+       gaps, section margins, the sidebar's own padding — drags the
+       window, exactly like the titlebar already does elsewhere. */
+    -webkit-app-region: drag;
+    app-region: drag;
 }
 
 .chat-region {
-    flex: 1 1 0;
+    flex: 1 1 auto;
+    min-width: 0;
     min-height: 0;
     display: flex;
     flex-direction: column;
@@ -812,6 +977,8 @@ html, body {
        = 30 - 10 = 20 (concentric on all 4 bottom-and-side corners on
        the horizontal axis; top-ry clamped since titlebar > app_radius). */
     padding: 7px 10px 10px;
+    position: relative;
+    z-index: 1;
 }
 
 .conversation {
@@ -826,25 +993,17 @@ html, body {
     display: grid;
     gap: 10px;
     overflow: auto;
-}
-
-.conversation.layout-row {
-    grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+    position: relative;
+    z-index: 1;
+    /* The main stage holds at most 2 session cards (see the session
+       placement state machine in renderer.js — anything beyond 2 lives in
+       .stage-rail instead). A single main-slot session fills the stage;
+       two sit side by side. grid-auto-flow:column + minmax(340px,1fr)
+       never wraps to a second row, so a card is never squeezed shorter
+       than its floor even while the 2nd slot is still empty/filling in. */
+    grid-auto-flow: column;
+    grid-auto-columns: minmax(340px, 1fr);
     grid-template-rows: 1fr;
-    overflow-x: auto;
-    overflow-y: hidden;
-}
-
-.conversation.layout-grid {
-    grid-template-columns: repeat(3, 1fr);
-    grid-template-rows: repeat(2, 1fr);
-    overflow: hidden;
-}
-
-.conversation.layout-scroll {
-    grid-template-columns: repeat(3, 1fr);
-    grid-auto-rows: calc(50% - 5px);
-    overflow: auto;
 }
 
 /* ---------- Bubbles — liquid glass morphism ---------- */
@@ -2164,88 +2323,54 @@ code {
 .admin-entry-actions button:hover { background: rgba(255, 255, 255, 0.78); }
 .admin-entry-actions button:active { transform: translateY(1px); }
 
-/* ── Live task-plan panel (renderer.renderTaskPlan) ────────────────────── */
-/* Collapsed by default: the panel is just a one-line header pill pinned at the
-   top of the conversation. Clicking the header floats the full item list as an
-   absolute overlay (it covers the conversation instead of pushing it down), so
-   the panel never permanently blocks the chat — same strip ↔ popover idea as
-   the activity button. */
-.task-plan-panel {
-    position: sticky;
-    top: 0;
-    z-index: 12;
-    margin: 0 0 10px 0;
-}
-.task-plan-header {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    width: 100%;
-    padding: 6px 12px;
-    font: inherit;
-    font-size: 12px;
-    text-align: left;
+/* ── Task-plan / agent-todo item rows (session-sidebar.js's plan bar) ──── */
+/* Panel/header chrome (.task-plan-panel, .agent-todo-panel, etc.) lives in
+   the "Session sidebar" section below alongside the rest of the right-hand
+   detail panel's styling — only the per-row item styling lives here, since
+   it's shared visual vocabulary (glyph + status color) independent of
+   which panel it's rendered inside. */
+.task-plan-header,
+.agent-todo-header {
+    display: inline-block;
+    font-size: 12.5px;
+    font-weight: 700;
     color: var(--fg);
-    border: none;
-    border-radius: 999px;
-    background: rgba(255, 255, 255, 0.90);
-    backdrop-filter: blur(16px) saturate(115%);
-    -webkit-backdrop-filter: blur(16px) saturate(115%);
-    cursor: pointer;
-    transition: background 180ms var(--ease-glass);
+    /* Title chip — adaptive plate; backdrop-filter:brightness() applied
+       by the plate selector group ensures contrast on dark desktops. */
+    background: var(--l2-plate-strong);
+    padding: 2px 9px; border-radius: 7px;
+    box-shadow: inset 0 0.5px 0 rgba(255, 255, 255, 0.55);
 }
-.task-plan-header:hover {
-    background: rgba(255, 255, 255, 0.98);
-}
-.task-plan-header .tp-chevron {
-    font-family: var(--mono);
-    color: var(--fg-mute);
-    flex: 0 0 auto;
-}
-.task-plan-header .tp-summary {
-    flex: 1 1 auto;
-    min-width: 0;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    font-weight: 600;
-}
-
-.task-plan-items {
-    position: absolute;
-    top: calc(100% + 4px);
-    left: 0;
-    right: 0;
+.task-plan-items,
+.agent-todo-items {
     display: flex;
     flex-direction: column;
     gap: 4px;
-    max-height: 320px;
-    overflow-y: auto;
-    padding: 10px 12px;
-    border: none;
-    border-radius: 12px;
-    background: rgba(255, 255, 255, 0.92);
-    backdrop-filter: blur(18px) saturate(115%);
-    -webkit-backdrop-filter: blur(18px) saturate(115%);
-    box-shadow: var(--shadow-floating);
-    z-index: 20;
-    animation: liquid-entrance 250ms var(--spring-soft) both;
+    margin-top: 8px;
+    /* Inset content plate under the plan/todo rows so the item text stays
+       readable on any desktop while the panel shell stays glass. */
+    background: var(--l2-plate);
+    padding: 6px 8px;
+    border-radius: 10px;
 }
-.task-plan-item {
+.task-plan-item,
+.agent-todo-item {
     display: grid;
     grid-template-columns: 16px 1fr;
     gap: 8px;
     align-items: start;
-    font-size: 12px;
+    font-size: 12.5px;
     line-height: 1.45;
     color: var(--fg);
 }
-.task-plan-item .tp-glyph {
+.task-plan-item .tp-glyph,
+.agent-todo-item .at-glyph {
     font-family: var(--mono);
     text-align: center;
     color: var(--fg-mute);
 }
-.task-plan-item .tp-text { word-break: break-word; }
+.task-plan-item .tp-text,
+.agent-todo-item .at-text { word-break: break-word; }
 
 .task-plan-item.tp-done .tp-glyph     { color: #2e8b57; }
 .task-plan-item.tp-done .tp-text      { color: var(--fg-mute); text-decoration: line-through; }
@@ -2262,92 +2387,6 @@ code {
 }
 .task-plan-item.tp-pending .tp-glyph,
 .task-plan-item.tp-pending .tp-text   { color: var(--fg-mute); }
-
-/* ── Live agent-todo panel (renderer.renderAgentTodo) ────────────────────── */
-/* The agent's own private step breakdown of the current task item (written
-   via `todo_write`) — sits below the task-plan panel, same collapsed-pill ↔
-   floating-overlay pattern. Distinct accent (dashed border) so it doesn't
-   read as a duplicate of the task-plan panel above it. */
-.agent-todo-panel {
-    position: relative;
-    z-index: 11;
-    margin: 0 0 10px 0;
-}
-/* When it's the only pinned panel (no task-plan panel above it), pin it too. */
-.agent-todo-panel:first-child {
-    position: sticky;
-    top: 0;
-}
-.agent-todo-header {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    width: 100%;
-    padding: 6px 12px;
-    font: inherit;
-    font-size: 12px;
-    text-align: left;
-    color: var(--fg);
-    border: 1px dashed rgba(0, 0, 0, 0.12);
-    border-radius: 999px;
-    background: rgba(255, 255, 255, 0.90);
-    backdrop-filter: blur(16px) saturate(115%);
-    -webkit-backdrop-filter: blur(16px) saturate(115%);
-    cursor: pointer;
-    transition: background 180ms var(--ease-glass);
-}
-.agent-todo-header:hover {
-    background: rgba(255, 255, 255, 0.98);
-}
-.agent-todo-header .at-chevron {
-    font-family: var(--mono);
-    color: var(--fg-mute);
-    flex: 0 0 auto;
-}
-.agent-todo-header .at-summary {
-    flex: 1 1 auto;
-    min-width: 0;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    font-weight: 600;
-}
-
-.agent-todo-items {
-    position: absolute;
-    top: calc(100% + 4px);
-    left: 0;
-    right: 0;
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    max-height: 320px;
-    overflow-y: auto;
-    padding: 10px 12px;
-    border: 1px dashed rgba(0, 0, 0, 0.12);
-    border-radius: 12px;
-    background: rgba(255, 255, 255, 0.92);
-    backdrop-filter: blur(18px) saturate(115%);
-    -webkit-backdrop-filter: blur(18px) saturate(115%);
-    box-shadow: var(--shadow-floating);
-    z-index: 20;
-    animation: liquid-entrance 250ms var(--spring-soft) both;
-}
-.agent-todo-item {
-    display: grid;
-    grid-template-columns: 16px 1fr;
-    gap: 8px;
-    align-items: start;
-    font-size: 12px;
-    line-height: 1.45;
-    color: var(--fg);
-}
-.agent-todo-item .at-glyph {
-    font-family: var(--mono);
-    text-align: center;
-    color: var(--fg-mute);
-}
-.agent-todo-item .at-text { word-break: break-word; }
 
 .agent-todo-item.at-completed .at-glyph { color: #2e8b57; }
 .agent-todo-item.at-completed .at-text  { color: var(--fg-mute); text-decoration: line-through; }
@@ -2482,11 +2521,16 @@ code {
    ===================================================================== */
 
 .session-card {
-    min-width: 0;
-    min-height: 0;
+    min-width: 340px;
+    min-height: 260px;
     display: flex;
     flex-direction: column;
-    border: none;
+    /* Alpha-only border — 0 by default (var(--l2-border-alpha) starts at
+       0), matching the previous hardcoded "border: none" exactly. Raising
+       it draws a plain white stroke; width/style are fixed, only opacity
+       is a Layer 2 knob (a border that appears/disappears rather than one
+       that also changes thickness is the simpler, more glass-like control). */
+    border: 1px solid rgba(255, 255, 255, var(--l2-border-alpha));
     /* Elliptical border-radius to compensate for asymmetric padding.
        Per the "nested rounded rectangle concentric formula": for each
        corner, subtract that direction's gap from the outer radius.
@@ -2501,30 +2545,39 @@ code {
        Cards read as rounder overall with a subtle flattening at the top
        that mirrors the titlebar's flat bottom edge above. All four
        corners share horizontal radius (20), so card sides read as a
-       coherent vertical stack. */
+       coherent vertical stack. This radius is a fixed geometric formula
+       tied to .app's own 30px radius, NOT a Layer 2 tunable — unlike the
+       other 2 card types (plan bar, ss-section), which share a plain
+       uncoupled 14px radius and have nothing to stay concentric with. */
     border-radius: 20px / 14px 14px 20px 20px;
     /* Whole-page gradient rule: transparency INCREASES toward the outside,
-       DECREASES toward the inside. Floor lowered from 0.88, and the card's
-       own backdrop-filter blur REMOVED — glass-effect.js's canvas now does
-       the actual glass/frosting work for the whole window (its own
-       frostiness/coreOpacity knobs), so a second blur+whiten pass here was
-       compounding: each layer (this gradient, its old backdrop-filter, plus
-       .app's own ::before/::after overlays) stacked on top of the canvas's
-       output and diluted it before it ever reached the screen — the same
-       shader values that looked strong in isolation read as "washed out"
-       once behind this card. Bubbles keep their own opaque
-       --user-bubble/--asst-bubble fill (0.88, unaffected by this), so chat
-       text legibility doesn't depend on this card fill at all; only the
-       card's own chrome (title halo, composer, empty-state text) does, and
-       those already carry text-shadow halos sized for a low-fill card. */
+       DECREASES toward the inside. Floor lowered from 0.88. This card's
+       own backdrop-filter (--l2-blur/--l2-saturate below) was originally
+       removed entirely because stacking it on top of glass-effect.js's
+       WebGL canvas compounded — each blur pass diluted the shader's output
+       before it reached the screen, and the two layers fighting for the
+       same "how frosted is this" job read as washed-out rather than
+       glassy. It's back now as a deliberate, tunable SECOND pass: Layer 1
+       (glass-effect.js) still owns the actual refraction/dispersion
+       physics against the real desktop; this backdrop-filter is a plain
+       frosted-glass composite ON TOP of that already-rendered result, not
+       a competing attempt at the same effect — so it no longer dilutes
+       Layer 1, it just softens what Layer 1 already produced. Bubbles
+       keep their own opaque --user-bubble/--asst-bubble fill (0.88,
+       unaffected by this), so chat text legibility doesn't depend on
+       this card fill at all; only the card's own chrome (title halo,
+       composer, empty-state text) does, and those already carry
+       text-shadow halos sized for a low-fill card. */
     background:
         radial-gradient(ellipse closest-side at center,
-                        rgba(255, 255, 255, 0.42) 0%,
-                        rgba(255, 255, 255, 0.34) 60%,
-                        rgba(255, 255, 255, 0.26) 100%);
+                        rgba(255, 255, 255, var(--l2-fill-a)) 0%,
+                        rgba(255, 255, 255, var(--l2-fill-b)) 60%,
+                        rgba(255, 255, 255, var(--l2-fill-c)) 100%);
+    backdrop-filter: blur(var(--l2-blur)) saturate(var(--l2-saturate));
+    -webkit-backdrop-filter: blur(var(--l2-blur)) saturate(var(--l2-saturate));
     box-shadow:
-        0 4px 16px rgba(20, 20, 30, 0.10),
-        0 1px 3px rgba(20, 20, 30, 0.06);
+        0 4px var(--l2-shadow-a-blur) var(--l2-shadow-a-spread) rgba(20, 20, 30, var(--l2-shadow-a)),
+        0 1px var(--l2-shadow-b-blur) var(--l2-shadow-b-spread) rgba(20, 20, 30, var(--l2-shadow-b));
     overflow: hidden;
     /* Isolate paint + layout so window-level repaints (drag) don't re-rasterize
        the card's content. Combined with overflow:hidden the card becomes its
@@ -2533,6 +2586,8 @@ code {
     animation: liquid-entrance 380ms var(--spring-soft) both;
     transition: box-shadow 200ms var(--ease-glass);
     position: relative;
+    -webkit-app-region: no-drag;
+    app-region: no-drag;
 }
 
 .session-card:hover {
@@ -2553,30 +2608,33 @@ code {
     align-items: center;
     gap: 8px;
     padding: 6px 10px;
-    /* No frost band and no hard separator — the title area conforms to the
-       card's own radial gradient (denser at top edge, transparent toward
-       the middle). Title readability comes from a stronger font + halo
-       rather than from a distinct band. */
-    background: transparent;
+    /* Adaptive plate — a low-alpha white fill + backdrop-filter:brightness()
+       lifts luma on dark desktops while staying nearly invisible on light.
+       This replaces the old crude 3-layer text-shadow on .session-card-title
+       which read as "cheap CSS glow." The plate covers the whole head strip
+       so title, pill, and close button all benefit. */
+    background: rgba(255, 255, 255, 0.22);
+    backdrop-filter: blur(6px) brightness(1.35);
+    -webkit-backdrop-filter: blur(6px) brightness(1.35);
+    /* Concentric with the card's own 20px/14px top radii minus 3px margin. */
+    border-radius: 14px 14px 0 0;
+    margin: 3px 3px 0;
 }
 
 .session-card-title {
     flex: 0 0 auto;
     /* Display-family stack + heavier weight + tighter tracking gives the
-       title a distinct "heading" character. Since the title area is on
-       the card's own gradient (no dedicated frost band), the font itself
-       has to carry the visual weight — hence bigger size, heavier weight,
-       and a triple-layer light halo that lifts letters off whatever
-       wallpaper shows through the top edge of the gradient. */
+       title a distinct "heading" character. Readability now comes from the
+       .session-card-head's adaptive plate (backdrop-filter:brightness) rather
+       than a crude text-shadow halo — the plate lifts contrast on any
+       background while the title itself stays clean/crisp. */
     font-family: "SF Pro Display", "Segoe UI Variable Display",
                  "Segoe UI Semibold", var(--sans);
     font-weight: 700;
     font-size: 16px;
     letter-spacing: -0.02em;
     color: var(--fg);
-    text-shadow: 0 0 3px rgba(255, 255, 255, 0.95),
-                 0 1px 4px rgba(255, 255, 255, 0.55),
-                 0 0 10px rgba(255, 255, 255, 0.25);
+    text-shadow: none;
 }
 
 .session-card-title-input {
@@ -2600,9 +2658,8 @@ code {
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-    /* Matches the title's contrast strategy: subtle light halo instead of
-       a solid backing, since it sits on the same card gradient. */
-    text-shadow: 0 1px 2px rgba(255, 255, 255, 0.55);
+    /* No text-shadow needed — the .session-card-head adaptive plate handles
+       contrast for all elements within the header area. */
 }
 
 .session-card-pill.working {
@@ -2619,14 +2676,18 @@ code {
     justify-content: center;
     border: none;
     border-radius: 50%;
-    /* Persistent subtle disc — always visible for quick close access.
-       The card's × is anchored to the top-right of the card head; the
-       window's persistent soft-red × lives in the titlebar strip above.
-       Different Y positions plus different resting colours make it
-       clear which × closes what. Deepens to red on hover to signal
-       destructive intent. */
-    background: rgba(0, 0, 0, 0.06);
-    color: var(--fg-mute);
+    /* Same glass treatment as the window's .tb-btn traffic-lights: a soft
+       white frost + backdrop-filter blur/saturate + the shared SVG
+       lens-bulge distortion, plus a contour ring (via the ::before rule
+       higher up in this file). Persistent soft-red tint marks it as the
+       close affordance from base; deepens to full red on hover. This
+       replaces the old flat rgba(0,0,0,0.06) disc that read as plastic
+       against the glass card body. */
+    position: relative;
+    background: rgba(232, 130, 130, 0.28);
+    color: rgba(190, 50, 50, 0.90);
+    backdrop-filter: blur(8px) saturate(130%) url(#lg-distort-circle);
+    -webkit-backdrop-filter: blur(8px) saturate(130%) url(#lg-distort-circle);
     font-size: 15px;
     line-height: 1;
     cursor: pointer;
@@ -2635,7 +2696,7 @@ code {
                 transform 120ms var(--spring);
 }
 .session-card-close:hover {
-    background: rgba(232, 130, 130, 0.85);
+    background: rgba(220, 130, 130, 0.90);
     color: #fff;
     transform: scale(1.08);
 }
@@ -2643,6 +2704,54 @@ code {
     outline: 2px solid rgba(232, 130, 130, 0.55);
     outline-offset: 2px;
 }
+
+/* Minimize (→ stage rail) / maximize (sole main-slot occupant) — same
+   22px disc as the close button, same glass treatment (frost + distort +
+   contour ring). Neutral tint since neither is destructive; the shared
+   ::before ring above gives all three buttons matching depth. Only
+   rendered when sessions.size > 1 (see renderer.js _syncCardControls);
+   a single session has nothing to minimize into or maximize over. */
+.session-card-min,
+.session-card-max {
+    flex: 0 0 auto;
+    width: 22px;
+    height: 22px;
+    padding: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border: none;
+    border-radius: 50%;
+    position: relative;
+    background: rgba(255, 255, 255, 0.16);
+    color: var(--fg-soft);
+    backdrop-filter: blur(8px) saturate(130%) url(#lg-distort-circle);
+    -webkit-backdrop-filter: blur(8px) saturate(130%) url(#lg-distort-circle);
+    cursor: pointer;
+    transition: background 160ms var(--ease-glass),
+                color 160ms var(--ease-glass),
+                transform 120ms var(--spring);
+}
+.session-card-min svg,
+.session-card-max svg {
+    display: block;
+    /* Tight drop-shadow to lift the glyph off dark refracted backdrops —
+       same idiom as .tb-btn svg. */
+    filter: drop-shadow(0 0 0.5px rgba(255, 255, 255, 0.65));
+}
+.session-card-min:hover,
+.session-card-max:hover {
+    background: rgba(255, 255, 255, 0.55);
+    color: var(--fg);
+    transform: scale(1.08);
+}
+.session-card-min:focus-visible,
+.session-card-max:focus-visible {
+    outline: 2px solid rgba(184, 175, 196, 0.55);
+    outline-offset: 2px;
+}
+.session-card-min.hidden,
+.session-card-max.hidden { display: none; }
 
 .session-card-body {
     flex: 1 1 auto;
@@ -2699,6 +2808,285 @@ code {
     outline: none;
     border-color: rgba(184, 175, 196, 0.50);
     box-shadow: 0 0 0 3px rgba(184, 175, 196, 0.10);
+}
+
+/* =====================================================================
+   Stage rail — left column of minimized sessions (Stage-Manager style).
+   Each thumbnail is the session's REAL card DOM node reparented in (not a
+   screenshot), scaled down via CSS zoom to a fixed ~96px height so
+   chat/activity keep rendering live while minimized. How many are visible
+   at once is NOT a hardcoded count — it falls out naturally from the
+   rail's real height (however tall .main is) divided by each thumbnail's
+   fixed height + gap; a shorter window fits fewer before scrolling, a
+   taller one fits more, without ever visually truncating the rail region
+   itself to some arbitrary fraction of the screen (that was the earlier,
+   wrong approach: a flat max-height cap on the list made the whole rail
+   look chopped off at "half the screen" regardless of how much real
+   vertical space was actually available). Collapses to zero width when
+   nothing is minimized — same "no dead stub, just gone" idiom as
+   .session-sidebar[data-collapsed]. Clicking a thumbnail promotes it back
+   to the main stage (see renderer.js).
+   ===================================================================== */
+
+.stage-rail {
+    flex: 0 0 auto;
+    /* 160px rail width — an additive delta on top of the 840px "main card
+       only" baseline (main.js grows the window by 174 = 160 + margin 10 +
+       gap 4 the moment a session is minimized into here). Bumped from the
+       original 132px so the Stage-Manager thumbnails render legibly (see
+       the .stage-rail-thumb .session-card zoom math below) AND leave room
+       on the RIGHT for the 3D-tilt's outward fan without shaving the card
+       body. If you change THIS value, you MUST update three things
+       together: (a) the zoom on `.stage-rail-thumb .session-card` (uses
+       exactly this width to fit-to-inner), (b) `AUTO_RESIZE_RAIL_DELTA`
+       in main.js (window-grow amount, this width + 10 margin + 4 gap),
+       and (c) `AUTO_RESIZE_TABLE`'s legacy 2-session row (baseline 840 +
+       new delta). Rail is either visible (this width) or fully collapsed
+       (0px via [data-empty="true"]) — no in-between. */
+    width: 160px;
+    display: flex;
+    flex-direction: column;
+    /* overflow: clip (not hidden) + overflow-clip-margin: 12px so the
+       Stage-Manager tilt's rightward fan and its box-shadow can paint a
+       few px past the rail's 132px width without getting shaved. `clip`
+       (unlike `hidden`) doesn't create a scroll container — cheaper AND
+       required for overflow-clip-margin to take effect. The 12px margin
+       covers the tilted card body (~1-2px protrusion max, per the CSS
+       transform math) plus the base 8px shadow blur radius, with a bit of
+       slack for the hover 10/26 shadow. Note: the data-empty state below
+       reverts to `overflow: hidden` so the collapse-to-zero-width
+       animation still visually hides everything at width 0. */
+    overflow: clip;
+    overflow-clip-margin: 12px;
+    transition: width 240ms var(--ease-glass, cubic-bezier(0.4, 0, 0.2, 1)),
+                margin 240ms var(--ease-glass, cubic-bezier(0.4, 0, 0.2, 1));
+    margin: 7px 0 10px 10px;
+    /* Position + z-index so any content painting inside overflow-clip-margin
+       (the fanned-out right edge and its shadow) sits above the neighbouring
+       .chat-region rather than under it. Both are static-flow siblings of
+       .main; without an explicit z-index the later-in-DOM chat-region wins
+       and swallows anything the rail paints beyond its own 132px box. */
+    position: relative;
+    z-index: 2;
+}
+.stage-rail[data-empty="true"] {
+    width: 0 !important;
+    margin: 7px 0 10px 0;
+    /* Empty state — full hide, no clip-margin escape hatch. This resets
+       both properties so the width→0 collapse animation truly hides the
+       thumbnails instead of leaving a 12px sliver visible mid-transition. */
+    overflow: hidden;
+    overflow-clip-margin: 0;
+}
+.stage-rail-list {
+    flex: 1 1 auto;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    overflow-y: auto;
+    padding: 2px 8px 2px 2px;
+    /* No hard max-height cap. The list naturally caps at the parent rail
+       column's height (which is `.main` minus vertical margins) thanks to
+       flex:1 + min-height:0 + overflow-y:auto — anything beyond scrolls
+       inside the rail. The old 594px cap was designed for the compact
+       840px default window (4 thumbnails × 140 + gaps), but on a
+       maximized/tall window it left the bottom half of the rail region
+       empty because the list stopped growing while its parent kept going.
+       Letting the list fill its parent means "as many thumbnails as fit,
+       rest scroll" at any window size. */
+
+    /* iPad-OS Stage-Manager 3D look: each thumb rotates around its LEFT
+       edge so its RIGHT edge fans out toward the viewer while its left
+       edge stays glued to the rail's outer side. Setting perspective HERE
+       (not on individual thumbs) means every card shares one vanishing
+       point, so their tilts look like one coherent stack instead of N
+       unrelated 3D toys. perspective-origin at 0% (left side) puts the
+       "camera" on the same vertical axis as the pivot, which is what
+       makes the fan look uniform top-to-bottom instead of getting weirder
+       near the top/bottom of the list. */
+    perspective: 900px;
+    perspective-origin: 0% 50%;
+    /* Right padding is 8px (up from the original 2px) — leaves breathing
+       room for the tiny rightward projection of a tilted card's right
+       edge under perspective (~1-2px of card body at low tilt, plus the
+       thumb's box-shadow blur radius). Without this the outer clip on
+       .stage-rail would shave the sharpest side and its shadow. Left
+       padding stays at 2px — the LEFT edge is now the pivot, so it can
+       sit flush against the rail's inner boundary. */
+}
+
+/* Wrapper around a reparented .session-card while it's minimized. The
+   card itself keeps its normal DOM/classes/listeners — this wrapper only
+   supplies the fixed thumbnail box + CSS zoom so a full-size interactive
+   card renders legibly at rail scale without reflowing its own CSS.
+   Height is deliberately NOT set here — it must equal exactly whatever
+   the zoomed card resolves to (auto does that), because a fixed height
+   independent of the zoom math is exactly what left a transparent gap
+   below the card previously (168px assumed vs. the ~98px the old zoom
+   value actually produced). */
+.stage-rail-thumb {
+    flex: 0 0 auto;
+    width: 100%;
+    border-radius: 14px;
+    overflow: hidden;
+    cursor: pointer;
+    border: 1px solid rgba(60, 80, 120, 0.14);
+    box-shadow: 0 2px 8px rgba(20, 20, 30, 0.08);
+    transition: box-shadow 200ms var(--ease-glass),
+                transform 220ms var(--spring, cubic-bezier(0.22, 1.2, 0.36, 1)),
+                opacity 220ms var(--ease-glass);
+    position: relative;
+    -webkit-app-region: no-drag;
+    app-region: no-drag;
+
+    /* iPad-OS Stage-Manager 3D — each thumb tilts around its LEFT edge so
+       its front face angles toward the USER'S RIGHT (toward the main-stage
+       column). `--tilt` and `--dim` are per-thumb parameters overridden
+       by :nth-child() below to give the stack a "top is crisp, deeper
+       cards recede" gradient. Base value is the "deep" state (further-
+       down cards); the top few are pulled up via the nth-child overrides.
+       Using variables (not hardcoded rotateY values) means the entrance
+       keyframe and the :hover rule can both read the same source of truth
+       without duplicating the ramp.
+       transform-origin at the LEFT edge pins that side of each card to
+       the rail's outer boundary, so the rightward fan points toward the
+       main chat area (mirroring iPad Stage Manager's left-side rail
+       where cards tilt AWAY from the rail column and INTO the stage).
+       The rail's own overflow-clip-margin (see .stage-rail) leaves a few
+       px of visual slack on the right so the fanned edge and its shadow
+       don't get shaved by the rail's clip.
+       Sign / geometry:
+         rotateY(+θ) around a left origin sends the right edge to
+         (w cos θ, 0, −w sin θ) — z is NEGATIVE, so the right edge
+         recedes INTO the screen. The card's front-face normal (0,0,1)
+         rotates to (sin θ, 0, cos θ) — the +X component tilts the face
+         toward the user's right, which is the Stage-Manager "cards
+         presenting themselves to the main stage" look.
+         Near/far foreshortening still holds: the left edge stays at z=0
+         (the near/pivot side, full size), while the right edge at
+         z=−w sinθ foreshortens to ~5% smaller at max tilt (18°). "Near"
+         is the LEFT edge here, not the right — right is the far side. */
+    --tilt: 18deg;
+    --dim: 0.72;
+    transform-origin: left center;
+    transform: rotateY(var(--tilt));
+    opacity: var(--dim);
+    will-change: transform;
+
+    /* Right-side fade — mask the thumb (card body + border + shadow) with
+       a left-to-right linear gradient so the "far" (receded) right edge
+       dissolves progressively into transparency. Reinforces the depth cue
+       that rotateY+perspective is already suggesting mathematically (the
+       right edge foreshortens ~5% smaller at max tilt); the fade makes
+       that recede READ as recede instead of just "the card is slightly
+       tilted". Solid up to 55% of the width, then fades linearly to fully
+       transparent at 100%. Hover clears the mask (see below): the previewed
+       card should be fully opaque since it's leaping toward the viewer,
+       not receding. Both `mask-image` and the -webkit- prefix are set for
+       Chromium's still-mixed prefix state on the mask longhand. */
+    mask-image: linear-gradient(to right, #000 55%, transparent 100%);
+    -webkit-mask-image: linear-gradient(to right, #000 55%, transparent 100%);
+
+    /* Plays once on first mount — CSS keyframe animations don't retrigger for
+       thumbnails already in the rail, so the visual only lands on the freshly
+       reparented card. Replaces the View Transition FLIP the +New path used
+       to run (renderer.js:sc-new-session), which had gotten expensive as the
+       rail accumulated cards (VT snapshots every backdrop-filter'd card up
+       front). This 180ms scale+fade covers the "old main card just got
+       demoted" beat without the whole pipeline stall.
+       animation-fill-mode intentionally omitted (default `none`): a `both`
+       fill would freeze the `to` keyframe's transform state after the
+       animation ends, which would then override .stage-rail-thumb:hover's
+       transform below. With fill-mode default, the element drops back to
+       its declared base styles once the animation completes, and hover
+       works normally. Note the keyframe now weaves `rotateY(var(--tilt))`
+       into both endpoints so it doesn't clobber the base 3D tilt mid-
+       animation (which would produce a snap from flat→tilted at t=180ms).
+    */
+    animation: stage-rail-thumb-enter 200ms cubic-bezier(0.22, 1.2, 0.36, 1);
+}
+/* Per-depth ramp — top card is nearly upright + full opacity, and every
+   card below tilts a bit more and dims a bit more. Values chosen to keep
+   card TEXT still legible on the top ~3 cards (below that they're more
+   "there's something happening back there" than "read this"). If you
+   change the ramp, keep it monotone-non-decreasing in |tilt| and monotone-
+   non-increasing in --dim, otherwise depth ordering visually inverts. */
+.stage-rail-thumb:nth-child(1) { --tilt: 8deg;  --dim: 1;    }
+.stage-rail-thumb:nth-child(2) { --tilt: 12deg; --dim: 0.94; }
+.stage-rail-thumb:nth-child(3) { --tilt: 15deg; --dim: 0.86; }
+.stage-rail-thumb:nth-child(4) { --tilt: 17deg; --dim: 0.78; }
+/* Fifth-and-beyond fall back to the base declaration (18deg / 0.72). */
+@keyframes stage-rail-thumb-enter {
+    from { opacity: 0;              transform: rotateY(var(--tilt)) scale(0.7); }
+    to   { opacity: var(--dim, 1);  transform: rotateY(var(--tilt)) scale(1);   }
+}
+.stage-rail-thumb:hover {
+    /* Hover pulls the card back to nearly-upright and full opacity — the
+       Stage-Manager pattern of "peek out from the stack to preview".
+       translateZ nudges the card toward the viewer for a hair of parallax
+       against its unhovered neighbors; kept small (14px) so it doesn't
+       fight the perspective-origin's own foreshortening. --dim=1 here
+       overrides any per-depth dim (nth-child sets --dim, hover sets it
+       again with equal specificity — hover wins because it's later in
+       the cascade). Positive tilt keeps the "face toward user's right"
+       orientation consistent with the base declaration above. */
+    --tilt: 3deg;
+    --dim: 1;
+    transform: rotateY(var(--tilt)) translateZ(14px) scale(1.02);
+    box-shadow: 0 10px 26px rgba(20, 20, 30, 0.20);
+    z-index: 2;   /* float above deeper siblings during the hover lift */
+    /* Clear the right-side fade on hover — the previewed card is leaping
+       toward the viewer, not receding, so the "dissolves on the far side"
+       mask would fight the metaphor. Setting mask-image to `none`
+       explicitly (rather than omitting it) is what overrides the base
+       declaration during hover. */
+    mask-image: none;
+    -webkit-mask-image: none;
+}
+.stage-rail-thumb::after {
+    /* Click-to-restore affordance — invisible until hover, avoids adding a
+       redundant always-on icon on top of the live card preview. */
+    content: '';
+    position: absolute; inset: 0;
+    background: rgba(255, 255, 255, 0);
+    transition: background 160ms var(--ease-glass);
+    pointer-events: none;
+}
+.stage-rail-thumb:hover::after {
+    background: rgba(255, 255, 255, 0.10);
+}
+/* The reparented .session-card fills the thumbnail box at native size,
+   then CSS zoom shrinks the whole rendered card (including text) down
+   to fit — zoom (unlike transform:scale) reflows layout at the zoomed
+   size rather than just visually scaling pixels, so text stays crisp and
+   the card's own min-width/min-height floors don't fight the thumbnail
+   box. Zoom value is EXACTLY .stage-rail-thumb's available inner width
+   (160px rail − 2px list left-padding − 8px list right-padding − 2×1px
+   thumb border = 148px) divided by the card's native 340px width —
+   148/340 = 0.4353. The right-padding is 8, NOT 2, because Stage-Manager
+   tilt fans the card's right edge outward; the extra 6px of right
+   padding keeps that fan inside the thumb's clip box even at max tilt.
+
+   Height is deliberately DECOUPLED from the main-stage card's 260px —
+   thumbnails are taller (378px native × 0.4353 zoom ≈ 164px rendered) so
+   more of each session's chat surface is visible in the rail, WITHOUT
+   changing the width or rail width. If you change rail width or padding,
+   recompute this zoom via the formula above; if you change the target
+   thumb height, only adjust `height:` here. */
+.stage-rail-thumb .session-card {
+    width: 340px;
+    height: 378px;
+    zoom: 0.4353;
+    /* Thumbnails are look-don't-touch — clicking anywhere restores the
+       session to the main stage rather than focusing composer/buttons. */
+    pointer-events: none;
+    animation: none;
+}
+.stage-rail-thumb .session-card.active {
+    box-shadow:
+        0 0 0 2px rgba(184, 175, 196, 0.45),
+        0 6px 22px rgba(20, 20, 30, 0.12);
 }
 
 /* Inline per-session confirmation card (UI3). */
@@ -2792,158 +3180,6 @@ code {
     color: #fff;
 }
 .scc-actions button.primary:hover { filter: brightness(1.05); }
-
-/* =====================================================================
-   Per-session activity groups — collapsible <details> blocks interleaved
-   between chat bubbles. Replaces the legacy global activity strip +
-   popover (one set of activity events per session pane).
-   ===================================================================== */
-
-.activity-group {
-    margin: 6px 4px;
-    border: none;
-    border-left: 3px solid rgba(184, 175, 196, 0.35);
-    border-radius: 10px;
-    background: rgba(255, 255, 255, 0.90);
-    backdrop-filter: blur(14px) saturate(115%);
-    -webkit-backdrop-filter: blur(14px) saturate(115%);
-    font-size: 12px;
-    color: #555;
-    position: relative;
-    overflow: hidden;
-    animation: liquid-entrance 200ms var(--spring-soft) both;
-}
-
-.activity-group-summary {
-    cursor: pointer;
-    user-select: none;
-    padding: 5px 10px;
-    list-style: none;
-    color: #666;
-    font-weight: 500;
-}
-
-.activity-group-summary::-webkit-details-marker {
-    display: none;
-}
-
-.activity-group-summary::before {
-    content: "▸";
-    display: inline-block;
-    width: 12px;
-    color: #888;
-    transition: transform 0.12s ease;
-}
-
-.activity-group[open] > .activity-group-summary::before {
-    transform: rotate(90deg);
-}
-
-.activity-group-summary:hover {
-    background: rgba(0, 0, 0, 0.03);
-}
-
-.activity-group-items {
-    padding: 6px 14px 10px 20px;
-    border-top: 1px solid rgba(0, 0, 0, 0.06);
-    background: rgba(0, 0, 0, 0.02);
-    max-height: 320px;
-    overflow-y: auto;
-    overflow-x: hidden;
-}
-
-.activity-item {
-    padding: 8px 12px;
-    border-top: 1px dashed rgba(0, 0, 0, 0.06);
-    cursor: pointer;
-    min-width: 0;
-}
-
-.activity-item:first-child {
-    border-top: 0;
-}
-
-.activity-item .ai-head {
-    display: flex;
-    gap: 6px;
-    align-items: baseline;
-    font-size: 12px;
-    min-width: 0;
-}
-
-.activity-item .ai-icon {
-    width: 14px;
-    flex: 0 0 auto;
-}
-
-.activity-item .ai-label {
-    flex: 1 1 auto;
-    min-width: 0;
-    color: #333;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-}
-
-.activity-item.expanded .ai-label {
-    white-space: normal;
-}
-
-.activity-item .ai-time {
-    flex: 0 0 auto;
-    color: #999;
-    font-size: 10px;
-    font-variant-numeric: tabular-nums;
-}
-
-.activity-item .ai-content {
-    display: block;
-    margin-top: 3px;
-    color: #666;
-    font-family: ui-monospace, SFMono-Regular, "Consolas", monospace;
-    font-size: 11px;
-    white-space: pre-wrap;
-    word-break: break-all;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    max-height: 4em;
-}
-
-.activity-item.expanded .ai-content {
-    max-height: 200px;
-    overflow-y: auto;
-}
-
-.activity-item .ai-result {
-    display: block;
-    margin-top: 4px;
-    padding-top: 4px;
-    border-top: 1px dotted rgba(0, 0, 0, 0.08);
-    color: #555;
-    font-family: ui-monospace, SFMono-Regular, "Consolas", monospace;
-    font-size: 11px;
-    white-space: pre-wrap;
-    word-break: break-all;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    max-height: 4em;
-}
-
-.activity-item.expanded .ai-result {
-    max-height: 200px;
-    overflow-y: auto;
-}
-
-/* JSON-rendered content/result (see renderJsonContent) — a block of
-   .ai-json-tree markup rather than preformatted text, so it needs
-   white-space:normal instead of pre-wrap. Height/scroll behavior stays
-   identical to the plain-text case above (same collapsed/expanded rules)
-   so expand always yields a scrollable box, never an unbounded one. */
-.activity-item .ai-content.ai-json,
-.activity-item .ai-result.ai-json {
-    white-space: normal;
-    text-overflow: clip;
-}
 
 /* ── List header: [+ Create task] [Delete] sit above the list ─── */
 .sched-list-header {
@@ -3284,14 +3520,580 @@ button.danger:hover:not(:disabled) {
    .active state's box-shadow ring + brighter top highlight (see .session-card
    rules above) already communicates "focused" without it. */
 
-/* Chat region — slightly transparent so desktop bleeds through */
-.chat-region {
+/* ============================================================ */
+/* Session sidebar — right-hand detail panel: plan bar,         */
+/* activity feed, and file r/w record. Sits to the right of     */
+/* .conversation inside .main, resizable via a left-edge width  */
+/* handle. Collapses to zero width (see [data-collapsed] below). */
+/* ============================================================ */
+
+.session-sidebar {
     position: relative;
-    z-index: 1;
+    flex: 0 0 auto;
+    /* Sets the panel's default typeface once here rather than on every
+       individual .ss-* rule below — font-family inherits, and every rule
+       that genuinely needs monospace (file paths, task ids) already
+       declares its own font-family override, so this only fills in the
+       rules that were silently falling back to the browser's absolute
+       default sans-serif (Arial on Windows) instead of matching the main
+       stage's SF Pro / Segoe UI Variable stack. There's no body/html-level
+       font-family anywhere in this file — every other area (chat bubbles,
+       session-card chrome) sets var(--sans) explicitly on itself; this
+       panel just never had that until now. */
+    font-family: var(--sans);
+    /* Legibility halo inherited by ALL text in the panel (text-shadow
+       inherits) — the detail panel sits over Layer 1 glass with
+       coreOpacity:0, so without this, any text landing on dark desktop
+       content shows up as near-invisible dark-on-dark. This was the "titles
+       invisible on black background" + "text hard to read" report. Base
+       font-size bumped to 12.5px so the whole panel reads a notch larger
+       and less strained; individual rules can still step up from here. */
+    text-shadow: var(--text-halo);
+    font-size: 12.5px;
+    /* Fixed 264px sidebar width — an additive delta on top of the 840px
+       "main card only" baseline (main.js grows the window by 278 = 264 +
+       margin 10 + gap 4 whenever this panel opens). Not a ratio-driven
+       width: the sidebar is either open (264px) or fully collapsed (0px
+       via [data-collapsed="true"]) — the main card owns the whole chat
+       column in either case, and its width is what the window's baseline
+       is sized to. */
+    width: 264px;
+    /* Fixed min-width — the old formula (max(200px, chat-region * 0.45))
+       created a feedback loop with the ResizeObserver on chat-region: when
+       the sidebar opened, its min-width computed to ~45% of the current
+       chat-region width, which was WIDER than the window's SIDEBAR_DELTA
+       could accommodate, so the sidebar squeezed the main card. That, in
+       turn, updated --chat-region-w, which lowered the min-width, which
+       let the sidebar shrink back, which grew chat-region back... a
+       convergent but visually messy oscillation. Fixed 220px means the
+       sidebar always opens at exactly its target 264px, the window's
+       +278px delta is exactly right, and the drag handle can still take
+       it down to 220 for narrower layouts. */
+    min-width: 220px;
+    max-width: 480px;
+    display: flex; flex-direction: column;
+    /* Fully transparent — the sidebar rides directly on whatever HandQ's
+       outer glass frame is showing (desktop-through-app). We do NOT layer
+       another white tint here: individual affordances (the plan/activity/
+       files cards) are what give the sidebar its shape. */
+    background: transparent;
+    border: 1px solid rgba(60, 80, 120, 0.14);
+    border-radius: 16px;
+    box-shadow: none;
+    margin: 7px 10px 10px 0;
+    overflow: hidden;
+    transition: width 240ms var(--ease-glass, cubic-bezier(0.4, 0, 0.2, 1));
+    color: var(--fg-soft, #3a3f48);
 }
-.conversation {
+.session-sidebar[data-collapsed="true"] {
+    /* Fully out of the layout: no rail, no gutter. When the user closes
+       the sidebar (or nothing has fired yet) it should not leave a visual
+       stub — the floating "reopen" button (see .ss-reopen) is the only
+       affordance the user needs to bring it back. */
+    width: 0 !important;
+    min-width: 0;
+    margin-right: 0;
+    border: 0;
+    overflow: hidden;
+}
+.session-sidebar[data-collapsed="true"] .ss-inner,
+.session-sidebar[data-collapsed="true"] .ss-header { display: none; }
+/* No rail-pulse rule anymore — activity hint lives on the floating reopen
+   button, not on a phantom edge strip. */
+
+/* Floating right-edge reopen button (appears when sidebar is closed AND
+   the active session has activity to show). Uses fixed positioning inside
+   .main so it sticks to the app's right gutter regardless of scroll. */
+.ss-reopen {
+    position: absolute;
+    top: 50%;
+    right: 10px;
+    transform: translate(120%, -50%);
+    opacity: 0;
+    pointer-events: none;
+    z-index: 12;
+    width: 30px;
+    height: 60px;
+    padding: 0;
+    border-radius: 16px 4px 4px 16px;
+    background: rgba(255, 255, 255, 0.85);
+    backdrop-filter: blur(14px) saturate(115%);
+    -webkit-backdrop-filter: blur(14px) saturate(115%);
+    border: 1px solid rgba(60, 80, 120, 0.14);
+    box-shadow: 0 3px 14px rgba(30, 40, 60, 0.10);
+    color: var(--fg-soft, #3a3f48);
+    cursor: pointer;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    transition: transform 240ms var(--ease-glass, cubic-bezier(0.4, 0, 0.2, 1)),
+                opacity 240ms var(--ease-glass, cubic-bezier(0.4, 0, 0.2, 1)),
+                background 150ms;
+    -webkit-app-region: no-drag;
+    app-region: no-drag;
+}
+.ss-reopen[data-visible="true"] {
+    transform: translate(0, -50%);
+    opacity: 1;
+    pointer-events: auto;
+}
+.ss-reopen:hover { background: rgba(255, 255, 255, 1); }
+/* Pulse dot — hidden by default (button is always available as a control),
+   only appears + pulses when the active session has real activity the user
+   hasn't seen yet. .has-activity is toggled by session-sidebar.js's
+   _updateActivityBadge to key the two-state (present control vs. urgent
+   attention) behavior off one CSS class. Colored with --tint (lavender)
+   instead of the previous #f0a020 amber to match the desaturated file-tree
+   palette below. */
+.ss-reopen-dot {
+    width: 6px; height: 6px; border-radius: 50%;
+    background: var(--tint);
+    box-shadow: 0 0 6px rgba(184, 175, 196, 0.55);
+    opacity: 0;
+    transition: opacity 200ms var(--ease-glass, cubic-bezier(0.4, 0, 0.2, 1));
+}
+.ss-reopen.has-activity .ss-reopen-dot {
+    opacity: 1;
+    animation: ss-pulse 1.6s ease-in-out infinite;
+}
+@keyframes ss-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+.main { position: relative; }   /* anchor for the absolute .ss-reopen */
+
+/* Left-edge width handle */
+.ss-width-handle {
+    position: absolute; left: 0; top: 0; bottom: 0;
+    width: 6px; cursor: ew-resize; z-index: 8;
+    -webkit-app-region: no-drag;
+    app-region: no-drag;
+}
+.ss-width-handle::after {
+    content: '';
+    position: absolute; left: 2px; top: 50%; transform: translateY(-50%);
+    width: 2px; height: 42px;
+    background: rgba(60, 80, 120, 0.15);
+    border-radius: 2px;
+    transition: background 180ms;
+}
+.ss-width-handle:hover::after,
+.ss-width-handle.dragging::after { background: rgba(90, 141, 255, 0.55); }
+
+.ss-header {
+    display: flex; align-items: center; gap: 8px;
+    padding: 6px 10px 6px 12px;
+    border-bottom: 1px solid rgba(60, 80, 120, 0.12);
+    font-size: 10px; letter-spacing: 1.2px; text-transform: uppercase;
+    color: var(--fg, #1a1d22);
+    font-weight: 700;
+    -webkit-app-region: no-drag;
+    app-region: no-drag;
+}
+.ss-header .ss-title {
+    flex: 0 0 auto;
+    /* Same adaptive plate as other titles — "SESSION DETAIL" was previously
+       naked text sitting on the transparent sidebar, invisible on dark
+       desktops. The plate hugs the label; the header strip stays glass. */
+    background: var(--l2-plate-strong);
+    backdrop-filter: blur(6px) brightness(1.4);
+    -webkit-backdrop-filter: blur(6px) brightness(1.4);
+    padding: 2px 8px; border-radius: 7px;
+    box-shadow: inset 0 0.5px 0 rgba(255, 255, 255, 0.55);
+}
+.ss-header .ss-name {
+    flex: 0 1 auto; min-width: 0;
+    font-size: 10.5px; text-transform: none; letter-spacing: 0;
+    color: var(--fg, #1a1d22); font-weight: 600;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    transition: opacity 200ms;
+    /* Content plate hugging the session name — adaptive brightness via
+       the plate selector group's backdrop-filter. The chip shrinks to text
+       width (flex:0 1 auto) so it doesn't stretch across the header. */
+    background: var(--l2-plate-strong);
+    padding: 2px 8px; border-radius: 7px;
+    box-shadow: inset 0 0.5px 0 rgba(255, 255, 255, 0.55);
+}
+.ss-collapse {
+    width: 22px; height: 22px; border-radius: 6px;
+    border: 1px solid transparent;
+    background: transparent;
+    color: var(--fg-mute, #6e737d);
+    cursor: pointer; font: inherit;
+    display: inline-flex; align-items: center; justify-content: center;
+    transition: background 150ms, border-color 150ms, color 150ms;
+}
+.ss-collapse:hover {
+    background: rgba(60, 80, 120, 0.10);
+    border-color: rgba(60, 80, 120, 0.22);
+    color: var(--fg-soft, #3a3f48);
+}
+.ss-collapse svg { display: block; }
+
+.ss-inner {
+    flex: 1; display: flex; flex-direction: column;
+    min-height: 0; transition: opacity 200ms;
+    /* container-type:size makes this box a query container for the `cqh`
+       unit used by .ss-planbar's max-height cap below — cqh resolves
+       against THIS box's actual height (not the viewport or an
+       intermediate ancestor), so "plan bar may grow to at most 30% of the
+       whole detail panel, then scrolls internally" is expressed directly.
+       Activity/Files below use plain flex-grow to split the remaining
+       space, so they don't need cqh — this container-type is here purely
+       for the plan bar's cap. Safe from layout circularity because
+       ss-inner's own size comes from flex:1 against its parent, never
+       from its own content. */
+    container-type: size;
+}
+
+/* Plan bar (top) — full task-plan queue, always fully expanded. Same
+   session-card-style translucent radial-gradient card look as the rest of
+   the detail panel (see .ss-section below) rather than a flat hairline
+   divider, so the whole right-hand panel reads as one visual family with
+   the tiled session cards on the main stage.
+   Content-sized (flex:0 0 auto, no fixed height) with a max-height CAP —
+   NOT the earlier fixed 15cqh slot. The fixed slot was wrong: when the
+   plan is short (e.g. one "Plan · 1/1 done" line) the slot still reserved
+   15% of the panel, leaving a big dead gap between the short plan card and
+   Activity below. Content-sizing means the bar is exactly as tall as its
+   card and no taller, so there's no gap; the max-height cap (30cqh) is
+   what prevents the OTHER failure mode — a very long completed-item list
+   growing tall enough to squeeze Activity — by making the plan list scroll
+   inside its own capped box past that point instead of pushing Activity
+   down. .ss-body below is flex:1 1 auto, so whatever height the plan bar
+   doesn't use flows to Activity/Files rather than becoming dead space. */
+.ss-planbar {
+    flex: 0 0 auto;
+    max-height: 30cqh;
+    overflow-y: auto;
+    padding: 4px 8px 0 8px;
+}
+.task-plan-panel,
+.agent-todo-panel {
     position: relative;
-    z-index: 1;
+    border: 1px solid rgba(255, 255, 255, var(--l2-border-alpha));
+    border-radius: 14px;
+    background:
+        radial-gradient(ellipse closest-side at center,
+                        rgba(255, 255, 255, var(--l2-fill-a)) 0%,
+                        rgba(255, 255, 255, var(--l2-fill-b)) 60%,
+                        rgba(255, 255, 255, var(--l2-fill-c)) 100%);
+    backdrop-filter: blur(var(--l2-blur)) saturate(var(--l2-saturate));
+    -webkit-backdrop-filter: blur(var(--l2-blur)) saturate(var(--l2-saturate));
+    box-shadow:
+        0 4px var(--l2-shadow-a-blur) var(--l2-shadow-a-spread) rgba(20, 20, 30, var(--l2-shadow-a)),
+        0 1px var(--l2-shadow-b-blur) var(--l2-shadow-b-spread) rgba(20, 20, 30, var(--l2-shadow-b)),
+        /* Inner stroke + locked top-light — thickness cues #3 & #4. A bright
+           inset line along the top edge implies one light direction (top) and
+           hints at the pane's cross-section, a soft dark inset at the bottom
+           reads as the far wall of that cross-section. Same on all shell
+           sections so the light model stays locked. */
+        inset 0 1px 0 rgba(255, 255, 255, 0.85),
+        inset 0 -1px 0 rgba(40, 44, 60, 0.06);
+    padding: 8px 10px;
+    margin-bottom: 6px;
+    -webkit-app-region: no-drag;
+    app-region: no-drag;
+}
+
+/* Middle: activity feed (larger share) + file r/w record (smaller, but a
+   guaranteed non-zero floor so it's never squeezed to nothing) — each its
+   own independently-scrollable session-card-styled panel, unlike the
+   previous single shared scroll region. Two separate scrollboxes are safe
+   here (unlike the old chat-inline activity groups) because .ss-body
+   itself doesn't scroll — there's no ambiguity about which scrollbar
+   owns a given wheel event, each section owns exactly its own area.
+   .ss-body flexes to fill whatever height the plan bar above didn't use
+   (flex:1 1 auto) — the plan bar is now content-sized/capped rather than
+   a fixed slot, so this reclaims the freed space instead of leaving it as
+   dead gap. Its two children split it ~55/45 (activity gets the larger
+   share) via flex-grow with equal shrink, each independently scrollable
+   so oversized content in one never spills into or squeezes the other. */
+.ss-body {
+    flex: 1 1 auto;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 4px 8px 6px 8px;
+}
+.ss-section {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    border: 1px solid rgba(255, 255, 255, var(--l2-border-alpha));
+    border-radius: 14px;
+    background:
+        radial-gradient(ellipse closest-side at center,
+                        rgba(255, 255, 255, var(--l2-fill-a)) 0%,
+                        rgba(255, 255, 255, var(--l2-fill-b)) 60%,
+                        rgba(255, 255, 255, var(--l2-fill-c)) 100%);
+    backdrop-filter: blur(var(--l2-blur)) saturate(var(--l2-saturate));
+    -webkit-backdrop-filter: blur(var(--l2-blur)) saturate(var(--l2-saturate));
+    box-shadow:
+        0 4px var(--l2-shadow-a-blur) var(--l2-shadow-a-spread) rgba(20, 20, 30, var(--l2-shadow-a)),
+        0 1px var(--l2-shadow-b-blur) var(--l2-shadow-b-spread) rgba(20, 20, 30, var(--l2-shadow-b)),
+        /* Inner stroke + locked top-light (thickness cues #3 & #4) — matches
+           the plan-bar panel so all shell sections read as the same material
+           under the same light. */
+        inset 0 1px 0 rgba(255, 255, 255, 0.85),
+        inset 0 -1px 0 rgba(40, 44, 60, 0.06);
+    overflow: hidden;
+    -webkit-app-region: no-drag;
+    app-region: no-drag;
+}
+/* Activity gets the larger share (~55%), files the rest (~45%), of
+   whatever vertical space .ss-body has after the plan bar. flex-grow
+   proportions with equal flex-shrink and a real min-height floor keep
+   both usable: neither can shrink to nothing when the panel is short, and
+   each has its own scrollbar (.ss-activity-list / .ss-files-list) so
+   overflow within one section never spills into or squeezes the other. */
+.ss-activity-section { flex: 55 1 0; min-height: 80px; }
+.ss-files-section { flex: 45 1 0; min-height: 80px; }
+.ss-section-head {
+    flex: 0 0 auto;
+    display: flex; align-items: center; gap: 10px;
+    margin: 6px 6px 0 6px;
+    padding: 6px 10px;
+    border-radius: 9px;
+    font-size: 11px; letter-spacing: 1.2px; text-transform: uppercase;
+    font-weight: 700;
+    color: var(--fg, #1a1d22);
+    /* Title band — adaptive plate hugging the module title. The
+       backdrop-filter:brightness() (applied via the plate selector group
+       above) ensures contrast on dark desktops without heavy opaque fill. */
+    background: var(--l2-plate-strong);
+    box-shadow: inset 0 0.5px 0 rgba(255, 255, 255, 0.55);
+}
+.ss-section-title { flex: 0 0 auto; }
+.ss-section-count {
+    letter-spacing: 0; text-transform: none; font-weight: 500;
+    color: var(--fg-soft, #3a3f48);
+}
+
+/* Activity list — flat chronological entries, newest first (see
+   session-sidebar.js's _renderActivityList). No per-turn grouping: the
+   detail panel isn't interleaved with chat bubbles, so there's no "next
+   bubble seals the group" boundary to key off. */
+.ss-activity-list {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    margin: 6px;
+    padding: 2px 8px;
+    /* Inset content plate — backs the text run, inset from the shell so the
+       glass frame (+ its top-light stroke) stays visible around it. The
+       module reads as glass; only the copy sits on a denser patch. */
+    background: var(--l2-plate);
+    border-radius: 10px;
+}
+.ss-activity-item {
+    padding: 6px 4px;
+    border-top: 1px dashed rgba(60, 80, 120, 0.12);
+    cursor: pointer;
+}
+.ss-activity-item:first-child { border-top: 0; }
+.ss-activity-item .aa-head {
+    display: flex; gap: 6px; align-items: baseline;
+    font-size: 12.5px; min-width: 0;
+}
+.ss-activity-item .aa-label {
+    flex: 1 1 auto; min-width: 0;
+    color: var(--fg, #1a1d22);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.ss-activity-item.expanded .aa-label { white-space: normal; }
+.ss-activity-item .aa-time {
+    flex: 0 0 auto; color: var(--fg-mute, #6e737d);
+    font-size: 10px; font-variant-numeric: tabular-nums;
+}
+.ss-activity-item .aa-result {
+    display: block; margin-top: 3px;
+    color: var(--fg-soft, #3a3f48);
+    /* Borrowed the chat-bubble typographic recipe (var(--sans) + inherited
+       font-weight 520 from html/body) — monospace at 11px was reading
+       thin/washed-out. SF Pro Text at 12px with the ambient 520 weight
+       gives the same "present, readable" feel as bubbles without going as
+       heavy as a hard bold. */
+    font-family: var(--sans);
+    font-size: 12px;
+    line-height: 1.45;
+    white-space: pre-wrap; word-break: break-all;
+    overflow: hidden; text-overflow: ellipsis;
+    max-height: 4em;
+    /* Indent the ↳ result under its action, with wrapped lines hanging past
+       the arrow so the result reads as a child of the action above it. The
+       arrow sits ~14px in; continuation lines align after it (~26px). */
+    padding-left: 26px;
+    text-indent: -12px;
+}
+.ss-activity-item .aa-content {
+    display: block; margin-top: 3px;
+    color: var(--fg-soft, #3a3f48);
+    font-family: var(--sans);
+    font-size: 12px;
+    line-height: 1.45;
+    white-space: pre-wrap; word-break: break-all;
+    overflow: hidden; text-overflow: ellipsis;
+    max-height: 4em;
+}
+.ss-activity-item.expanded .aa-content,
+.ss-activity-item.expanded .aa-result { max-height: 200px; overflow-y: auto; }
+.ss-activity-item .aa-content.ai-json,
+.ss-activity-item .aa-result.ai-json {
+    white-space: normal;
+    text-overflow: clip;
+}
+.ss-activity-empty {
+    text-align: center; padding: 16px 8px;
+    color: var(--fg-mute, #6e737d); font-size: 12px;
+    font-style: italic;
+}
+
+.ss-files-list {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    margin: 6px;
+    padding: 4px 8px;
+    /* Inset content plate — same treatment as the activity list. */
+    background: var(--l2-plate);
+    border-radius: 10px;
+}
+
+/* ── Files directory tree ─────────────────────────────────────────────
+   Folders (collapsible) + file leaves, rendered by _renderFilesList as a
+   single session-wide tree. Indentation is applied inline per-row
+   (paddingLeft = depth*8 + 2) by the JS, so these rules only carry the
+   shared per-row look. Vertical guide rails at each depth are painted by
+   a repeating linear-gradient background — one 1px column every 8px, so
+   any child row automatically inherits guides at all its ancestor depths
+   without per-row JS bookkeeping. Monospace for path-ish text. */
+.ss-tree-dir,
+.ss-file-row {
+    /* Ancestor guide rails — one 1px column of --l2-hairline every 8px
+       from the left edge, masked by depth so a row only shows rails up to
+       its own indent. The mask is a linear-gradient sized in ch of the
+       inline paddingLeft: for a row at depth D (paddingLeft = D*8+2),
+       ancestors sit at x = 2, 10, 18, … (2 + 8·k). We can't read the
+       inline padding-left from CSS, but we can just paint the pattern
+       across the whole row width — the row's actual content sits AFTER
+       the padding, so guides painted through the content column are
+       clipped by the content itself (kind-dot, text) drawn on top. */
+    background-image: repeating-linear-gradient(
+        to right,
+        var(--l2-hairline, rgba(60, 80, 120, 0.10)) 0px,
+        var(--l2-hairline, rgba(60, 80, 120, 0.10)) 1px,
+        transparent 1px,
+        transparent 8px
+    );
+    background-position: 2px 0;
+    background-repeat: repeat-y;
+    /* Mask the guides to only the row's padding zone. depth is exposed as
+       an inline CSS var by the JS (`--tree-depth`) so this mask width
+       tracks the actual indent — no guides bleed under the content. */
+    background-size: calc(var(--tree-depth, 0) * 8px + 2px) 100%;
+}
+.ss-tree-dir {
+    display: flex; align-items: center; gap: 4px;
+    padding: 3px 6px 3px 0;
+    font-family: var(--sans);
+    font-size: 12px;
+    color: var(--fg, #1a1d22);
+    cursor: pointer;
+    white-space: nowrap;
+    transition: color 150ms;
+}
+.ss-tree-dir:hover { color: var(--tint-strong); }
+.ss-tree-twist {
+    flex: 0 0 auto; width: 12px; text-align: center;
+    font-size: 9px; color: var(--fg-mute, #6e737d);
+}
+.ss-tree-folder {
+    flex: 1 1 auto; min-width: 0;
+    overflow: hidden; text-overflow: ellipsis;
+    font-weight: 600;
+}
+.ss-tree-leaf-wrap { display: block; }
+
+.ss-file-row {
+    display: flex; align-items: center; gap: 6px;
+    padding: 3px 6px 3px 0;
+    color: var(--fg-soft, #3a3f48);
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 11.5px;
+    cursor: pointer;
+    transition: color 150ms;
+}
+.ss-file-row:hover { color: var(--tint-strong); }
+.ss-file-row.new-flash {
+    animation: ss-row-flash 900ms cubic-bezier(0.22, 1.2, 0.36, 1);
+}
+@keyframes ss-row-flash {
+    /* background-color (not background shorthand) — the row's background-image
+       carries the vertical tree-guide rails and must not be reset during the
+       new-file flash. */
+    0%   { background-color: rgba(184, 175, 196, 0.28); border-radius: 6px; }
+    100% { background-color: transparent; }
+}
+/* File status dots — desaturated SF-style palette matching the lavender
+   theme. Blue/yellow/orange primaries read as playground colors on a
+   glass surface; muted slate/sepia/sage keep the dots functional (three
+   distinguishable hues) without breaking the monochromatic-lavender
+   aesthetic that the rest of the app carries. */
+.ss-kind-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; }
+.ss-kind-dot.read { background: #7a8fa8; box-shadow: 0 0 6px rgba(122, 143, 168, 0.35); }
+.ss-kind-dot.edit { background: #b8875f; box-shadow: 0 0 6px rgba(184, 135, 95, 0.40); }
+.ss-kind-dot.hit  { background: #7ea38a; box-shadow: 0 0 6px rgba(126, 163, 138, 0.35); }
+.ss-file-row .fp { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ss-file-row .ct {
+    flex: 0 0 auto;
+    font-size: 10px; color: var(--fg-mute, #6e737d);
+    background: rgba(60, 80, 120, 0.08); padding: 1px 6px; border-radius: 999px;
+}
+.ss-file-row.active { color: var(--tint-strong); font-weight: 600; }
+.ss-file-row.active .fp::after {
+    content: ' ← now'; font-size: 10px; color: var(--tint); font-weight: normal;
+}
+/* Per-file ↺ undo marker — only rendered on edited leaves. Subtle until
+   hover so a tree full of edits doesn't read as a wall of red buttons. */
+.ss-file-undo {
+    flex: 0 0 auto;
+    width: 18px; height: 18px; padding: 0;
+    border: none; border-radius: 5px;
+    background: transparent;
+    color: var(--fg-mute, #6e737d);
+    font-size: 13px; line-height: 1; cursor: pointer;
+    transition: background 150ms, color 150ms;
+}
+.ss-file-undo:hover { background: rgba(224, 85, 85, 0.16); color: #c04545; }
+
+/* Inline confirm strip shown under a file when its ↺ is clicked. */
+.ss-undo-confirm {
+    display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+    margin: 2px 6px 4px 0;
+    padding: 5px 8px;
+    background: rgba(224, 85, 85, 0.08);
+    border: 1px solid rgba(224, 85, 85, 0.28);
+    border-radius: 6px;
+    font-size: 11px;
+}
+.ss-undo-confirm .uc-msg { flex: 1 1 auto; min-width: 0; color: #c04545; }
+.ss-undo-confirm button {
+    flex: 0 0 auto;
+    padding: 2px 10px; border-radius: 5px; cursor: pointer;
+    font: inherit; font-size: 11px;
+    border: 1px solid rgba(224, 85, 85, 0.35);
+}
+.ss-undo-confirm .uc-yes { background: rgba(224, 85, 85, 0.85); color: #fff; border-color: transparent; }
+.ss-undo-confirm .uc-yes:hover { background: rgba(210, 70, 70, 0.95); }
+.ss-undo-confirm .uc-no { background: transparent; color: var(--fg-soft, #3a3f48); }
+.ss-undo-confirm .uc-no:hover { background: rgba(60, 80, 120, 0.10); }
+
+.ss-files-empty {
+    text-align: center; padding: 24px 8px;
+    color: var(--fg-soft, #3a3f48); font-size: 12px;
+    font-style: italic;
 }
 
 /* ============================================================ */

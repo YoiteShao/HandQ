@@ -217,3 +217,31 @@ class BaseTool(ABC):
             return str(p)
         base = self.ctx.working_directory if (self.ctx and self.ctx.working_directory) else None
         return str(Path(base) / p) if base else str(p)
+
+    def emit_file_touch(self, path: str, kind: str) -> None:
+        """Best-effort file-touch event to the session sidebar (nebula +
+        change list). Silent on missing ctx / interaction_manager /
+        rewind_store — the tool's own success is never affected by whether
+        the UI is wired.
+
+        Every tool that CAN identify a specific file the agent just touched
+        should call this on success — write/edit → ``edit``, read → ``read``,
+        grep/glob matches → ``hit``. Callers that don't know which files
+        were touched (shell running an arbitrary command) use the
+        workspace-mtime scan in shell_tool instead of this helper.
+        """
+        try:
+            if self.ctx is None or self.ctx.interaction_manager is None:
+                return
+            item_id = (
+                self.ctx.rewind_store.current_item_id
+                if self.ctx.rewind_store is not None else None
+            )
+            self.ctx.interaction_manager.notify_file_touch(
+                path=str(path or ""),
+                kind=str(kind or ""),
+                tool=self.name,
+                item_id=item_id,
+            )
+        except Exception:
+            pass
