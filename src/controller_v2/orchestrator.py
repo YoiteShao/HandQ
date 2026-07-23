@@ -1266,12 +1266,16 @@ class Orchestrator:
            explicitly asked for files. Verified paths (tool-output ground
            truth, not LLM self-report).
 
-        3. **Verification / Key findings** — audit-trail bullets folded into a
-           collapsed <details> block. These are the mechanical evidence and
-           discrete facts; they're not the answer, they're the audit line.
+        3. **Verification / Key findings** — audit-trail bullets under an
+           `### Audit trail` H3 subheading. These are the mechanical evidence
+           and discrete facts; they're not the answer, they're the audit line,
+           so they render as a section below the headline. (An earlier draft
+           folded this into `<details>`, but the Electron renderer HTML-
+           escapes every tag except fenced code, so the fold surfaced as
+           literal `<details>`/`<summary>` text.)
 
-        4. **Unresolved** — a failed tail's blockers, always surfaced (never
-           hidden inside <details>).
+        4. **Unresolved** — a failed tail's blockers, always surfaced as their
+           own section.
         """
         completed = self._task_channel.get_completed_results()
         if not completed:
@@ -1304,10 +1308,14 @@ class Orchestrator:
                 + "\n".join(f"- {a}" for a in artifacts)
             )
 
-        # 3. Audit trail folded into <details>. verification (mechanical, tool-
+        # 3. Audit trail under an H3 subheading. verification (mechanical, tool-
         #    grounded bullets) and key_findings (discrete facts) live here.
-        #    Rendered together in one collapsed block so the reply stays
-        #    scannable when the agent verifies many things.
+        #    Nested under the "## Task complete" / "## Task ended" header at
+        #    the top so the visual hierarchy reads as headline → detail; the
+        #    Electron renderer's Markdown parser (electron/renderer/renderer.js
+        #    `renderMarkdown`) HTML-escapes every tag except fenced code, so a
+        #    `<details>`/`<summary>` fold surfaces as literal text — this UI
+        #    just doesn't do collapsible sections.
         audit_parts: List[str] = []
         if last.verification:
             audit_parts.append(
@@ -1320,11 +1328,7 @@ class Orchestrator:
                 + "\n".join(f"- {f}" for f in last.key_findings)
             )
         if audit_parts:
-            sections.append(
-                "<details>\n<summary>Audit trail</summary>\n\n"
-                + "\n\n".join(audit_parts)
-                + "\n</details>"
-            )
+            sections.append("### Audit trail\n\n" + "\n\n".join(audit_parts))
 
         # 4. A failed tail's blockers are always surfaced, never folded.
         if not last.success and last.issues:

@@ -564,7 +564,14 @@ class FlowControllerV2:
             "ok": True,
             "mode": mode,
             "item_id": target,
-            "restored": report.restored_paths,
+            # List of dicts (not plain paths) so the UI can distinguish a
+            # content restore (leaf stays, ↺ suppressed) from an ABSENT
+            # restore (agent-created file was deleted; leaf must leave the
+            # tree). ``was_absent`` mirrors FileRewindResult.was_absent.
+            "restored": [
+                {"path": r.path, "was_absent": r.was_absent}
+                for r in report.results if r.restored
+            ],
             "conflicts": [
                 {"path": c.path, "conflict": c.conflict.value, "detail": c.detail}
                 for c in report.conflicts

@@ -218,7 +218,7 @@ class BaseTool(ABC):
         base = self.ctx.working_directory if (self.ctx and self.ctx.working_directory) else None
         return str(Path(base) / p) if base else str(p)
 
-    def emit_file_touch(self, path: str, kind: str) -> None:
+    def emit_file_touch(self, path: str, kind: str, reversible: bool = False) -> None:
         """Best-effort file-touch event to the session sidebar (nebula +
         change list). Silent on missing ctx / interaction_manager /
         rewind_store — the tool's own success is never affected by whether
@@ -229,6 +229,13 @@ class BaseTool(ABC):
         grep/glob matches → ``hit``. Callers that don't know which files
         were touched (shell running an arbitrary command) use the
         workspace-mtime scan in shell_tool instead of this helper.
+
+        ``reversible`` is True only when the caller has ALREADY invoked
+        ``ctx.rewind_store.capture_before(path)`` for this file — i.e. undo
+        can faithfully restore it. Write/edit/notebook_edit pass True; the
+        shell mtime-scan and read/grep/glob leave the default False. The
+        sidebar gates the per-file ↺ button on this flag so files it can't
+        actually restore never expose the affordance.
         """
         try:
             if self.ctx is None or self.ctx.interaction_manager is None:
@@ -242,6 +249,7 @@ class BaseTool(ABC):
                 kind=str(kind or ""),
                 tool=self.name,
                 item_id=item_id,
+                reversible=bool(reversible),
             )
         except Exception:
             pass

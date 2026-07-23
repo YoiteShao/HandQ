@@ -117,14 +117,16 @@ html[data-vt-scope="session"]::view-transition-new(*) {
     to { transform: rotate(360deg); }
 }
 .boot-title {
-    font-size: 15px;
-    font-weight: 600;
+    font-size: var(--fs-title3);
+    line-height: var(--lh-title3);
+    font-weight: var(--fw-semibold);
     color: #1a1d22;
 }
 .boot-phase {
-    font-size: 12px;
+    font-size: var(--fs-callout);
+    line-height: var(--lh-callout);
     color: #5b6473;
-    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-family: var(--mono);
     min-height: 16px;
     /* Long phase strings (e.g. "Importing src.infrastructure.long_term_memory")
        can overflow on a 280px card. Wrap rather than ellipsis so the user
@@ -133,15 +135,17 @@ html[data-vt-scope="session"]::view-transition-new(*) {
     word-break: break-word;
 }
 .boot-elapsed {
-    font-size: 11px;
+    font-size: var(--fs-subheadline);
+    line-height: var(--lh-subheadline);
     color: #98a0ad;
     font-variant-numeric: tabular-nums;
-    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-family: var(--mono);
 }
 .boot-hint {
     margin-top: 12px;
     padding: 8px 14px;
-    font-size: 12px;
+    font-size: var(--fs-callout);
+    line-height: var(--lh-callout);
     color: #3a3f48;
     background: rgba(255, 255, 255, 0.88);
     border: none;
@@ -155,7 +159,8 @@ html[data-vt-scope="session"]::view-transition-new(*) {
 .boot-error {
     margin-top: 10px;
     padding: 10px 14px;
-    font-size: 12px;
+    font-size: var(--fs-callout);
+    line-height: var(--lh-callout);
     color: #b85050;
     background: rgba(255, 230, 230, 0.85);
     border: 1px solid rgba(220, 130, 130, 0.50);
@@ -164,7 +169,7 @@ html[data-vt-scope="session"]::view-transition-new(*) {
     text-align: left;
     white-space: pre-wrap;
     word-break: break-word;
-    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-family: var(--mono);
 }
 .boot-error.hidden { display: none; }
 
@@ -315,8 +320,42 @@ html[data-vt-scope="session"]::view-transition-new(*) {
     --sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display",
             "Helvetica Neue", "Segoe UI Variable Text", "Segoe UI Variable",
             "Segoe UI", system-ui, "Inter", Roboto, sans-serif;
-    --mono: "SF Mono", ui-monospace, Menlo, Monaco, "Cascadia Mono",
-            Consolas, "Liberation Mono", monospace;
+    /* Per docs/macos_typography_complete_guide.md §12: `ui-monospace` first
+       so macOS gets the OS-optimized mono, then explicit SF Mono / Menlo /
+       Cascadia / Consolas fallbacks for older or non-Apple platforms. */
+    --mono: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Monaco,
+            "Cascadia Mono", Consolas, "Liberation Mono", monospace;
+
+    /* ==========================================================
+       macOS Text Style tokens — Apple HIG / WWDC20 / WWDC22 / WWDC24.
+       Each Text Style is split into --fs-* (font-size) + --lh-* (line-
+       height). Weight is decoupled into a small --fw-* alias set so the
+       "emphasized" variant of any style is a single-property swap at the
+       use-site (font-weight: var(--fw-semibold)) rather than a duplicated
+       token. letter-spacing / text-transform / italic / tabular-nums are
+       NOT part of the token — they remain per-rule so each surface can
+       still express its own detail (caps tracking, tabular time, etc.).
+
+       Sizes follow the macOS Text Style scale (docs §3, §12), not iOS —
+       macOS body is 13pt / Regular, not 17pt like iOS. Line-heights come
+       from docs §8.3's web/electron reference table.
+       ========================================================== */
+    --fs-largeTitle:  26px;  --lh-largeTitle:  34px;
+    --fs-title1:      22px;  --lh-title1:      30px;
+    --fs-title2:      17px;  --lh-title2:      24px;
+    --fs-title3:      15px;  --lh-title3:      22px;
+    --fs-body:        13px;  --lh-body:        19px;   /* headline shares size */
+    --fs-callout:     12px;  --lh-callout:     18px;
+    --fs-subheadline: 11px;  --lh-subheadline: 16px;
+    --fs-footnote:    10px;  --lh-footnote:    14px;   /* caption1/2 share size */
+
+    /* Weight aliases — macOS UI vocabulary (docs §6). Use these instead of
+       raw numbers at the call site so "why is this 600" reads as "semibold
+       emphasized" rather than an arbitrary weight. */
+    --fw-regular:  400;
+    --fw-medium:   500;
+    --fw-semibold: 600;
+    --fw-bold:     700;
 
     /* White glow halo that lifts dark text off an unpredictable backdrop.
        The right-hand detail panel sits over Layer 1's glass with
@@ -449,8 +488,16 @@ html, body {
     overflow: hidden;
     color: var(--fg);
     font-family: var(--sans);
-    font-size: 15px;
-    font-weight: 520;
+    /* macOS body Text Style — 13px / Regular. Per docs §10, macOS body is
+       intentionally denser than iOS (17pt), because macOS UI runs on mouse
+       + keyboard with sidebars, tables, toolbars, and high info density.
+       The old 15px / weight-520 base was heavier than macOS Regular and
+       optically closer to iOS body size — moving to 13px / 400 aligns the
+       whole app with system convention. Individual chrome and titles opt
+       up via the Text Style tokens (callout / title3 / etc.). */
+    font-size: var(--fs-body);
+    font-weight: var(--fw-regular);
+    line-height: var(--lh-body);
     letter-spacing: -0.005em;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
@@ -620,16 +667,19 @@ html, body {
 }
 
 .titlebar-brand {
-    /* Display-family + heavier weight + darker colour for legibility.
+    /* Callout emphasized (12px / bold). Old rule hard-coded the "SF Pro
+       Display" family for a display-heavy look, but per docs §5 Display
+       optical size is meant for 20pt+ — at 12px SF Text (via var(--sans))
+       renders with correct small-text tracking. Removing the hard family
+       stack also drops the Windows "Segoe UI Semibold" hop that skipped
+       Variable font axes on Segoe UI Variable Display.
        Single tight shadow provides emergency contrast on dark desktops
-       without the crude "white glow" of the old 3-layer recipe. The
-       titlebar is fully transparent, so this minimal shadow is the one
-       concession to readability that doesn't violate glass aesthetics. */
-    font-family: "SF Pro Display", "Segoe UI Variable Display",
-                 "Segoe UI Semibold", var(--sans);
-    font-weight: 700;
+       without the crude "white glow" of the old 3-layer recipe. */
+    font-family: var(--sans);
+    font-size: var(--fs-callout);
+    line-height: var(--lh-callout);
+    font-weight: var(--fw-bold);
     letter-spacing: 0.3px;
-    font-size: 12px;
     color: var(--fg);
     text-shadow: 0 0.5px 2px rgba(255, 255, 255, 0.55);
 }
@@ -907,8 +957,9 @@ html, body {
     border-radius: 10px;
     color: var(--fg);
     font: inherit;
-    font-size: 13px;
-    font-weight: 500;
+    font-size: var(--fs-body);
+    line-height: var(--lh-body);
+    font-weight: var(--fw-medium);
     cursor: pointer;
     text-align: left;
     transition: background 140ms var(--ease-glass);
@@ -1025,6 +1076,11 @@ html, body {
     backdrop-filter: blur(20px) saturate(120%);
     -webkit-backdrop-filter: blur(20px) saturate(120%);
     box-shadow: 0 2px 6px rgba(20, 20, 30, 0.10);
+    /* Chat-reading rhythm — the ambient html/body line-height is 19/13
+       (~1.46, macOS body default), but chat bubbles read better with a
+       looser 1.5 for multi-line paragraphs. Bumping only line-height keeps
+       font-size on the body token so the bubble text density matches the
+       rest of the UI. */
     line-height: 1.5;
     word-wrap: break-word;
     overflow-wrap: break-word;
@@ -1073,7 +1129,7 @@ html, body {
     align-self: center;
     max-width: 88%;
     padding: 3px 12px;
-    font-size: 12px;
+    font-size: var(--fs-callout);
     line-height: 1.4;
     background: rgba(0, 0, 0, 0.03);
     border: none;
@@ -1126,12 +1182,12 @@ html, body {
     margin: 0.5em 0;
 }
 
-.md-rendered .md-h1 { font-size: 18px; font-weight: 700; letter-spacing: -0.01em; }
-.md-rendered .md-h2 { font-size: 16px; font-weight: 700; }
-.md-rendered .md-h3 { font-size: 15px; font-weight: 600; }
-.md-rendered .md-h4 { font-size: 14px; font-weight: 600; }
-.md-rendered .md-h5 { font-size: 13px; font-weight: 600; color: var(--fg-soft); }
-.md-rendered .md-h6 { font-size: 12px; font-weight: 600; color: var(--fg-mute); text-transform: uppercase; letter-spacing: 0.5px; }
+.md-rendered .md-h1 { font-size: var(--fs-title2); line-height: var(--lh-title2); font-weight: var(--fw-bold); letter-spacing: -0.005em; }
+.md-rendered .md-h2 { font-size: var(--fs-title3); line-height: var(--lh-title3); font-weight: var(--fw-bold); }
+.md-rendered .md-h3 { font-size: var(--fs-body); line-height: var(--lh-body); font-weight: var(--fw-bold); }
+.md-rendered .md-h4 { font-size: var(--fs-body); line-height: var(--lh-body); font-weight: var(--fw-semibold); }
+.md-rendered .md-h5 { font-size: var(--fs-callout); line-height: var(--lh-callout); font-weight: var(--fw-semibold); color: var(--fg-soft); }
+.md-rendered .md-h6 { font-size: var(--fs-footnote); line-height: var(--lh-footnote); font-weight: var(--fw-bold); color: var(--fg-mute); text-transform: uppercase; letter-spacing: 0.5px; }
 
 .md-rendered .md-ul,
 .md-rendered .md-ol {
@@ -1152,7 +1208,7 @@ html, body {
 
 .md-rendered code {
     font-family: var(--mono);
-    font-size: 12.5px;
+    font-size: var(--fs-callout);
     background: rgba(15, 20, 30, 0.07);
     padding: 1px 5px;
     border-radius: 4px;
@@ -1167,7 +1223,7 @@ html, body {
     overflow-x: auto;
     max-width: 100%;
     font-family: var(--mono);
-    font-size: 12px;
+    font-size: var(--fs-callout);
     line-height: 1.5;
     border: 1px solid rgba(255, 255, 255, 0.10);
     box-shadow: 0 1px 0 rgba(255, 255, 255, 0.05) inset;
@@ -1204,7 +1260,8 @@ html, body {
 .md-rendered th, .md-rendered td {
     border: 1px solid var(--hairline);
     padding: 4px 8px;
-    font-size: 12.5px;
+    font-size: var(--fs-callout);
+    line-height: var(--lh-callout);
 }
 
 /* ---------- Tool-call cards ---------- */
@@ -1217,7 +1274,8 @@ html, body {
     border-radius: 10px;
     overflow: hidden;
     font-family: var(--mono);
-    font-size: 12px;
+    font-size: var(--fs-callout);
+    line-height: var(--lh-callout);
     box-shadow: none;
     position: relative;
     animation: liquid-entrance 280ms var(--spring-soft) both;
@@ -1237,15 +1295,16 @@ html, body {
 .tool-badge {
     background: var(--tint-strong);
     color: white;
-    font-size: 10px;
+    font-size: var(--fs-footnote);
+    line-height: var(--lh-footnote);
     padding: 2px 7px;
     border-radius: 999px;
     text-transform: uppercase;
     letter-spacing: 0.5px;
-    font-weight: 600;
+    font-weight: var(--fw-bold);
 }
-.tool-name  { font-weight: 600; }
-.tool-index { color: var(--fg-mute); margin-left: auto; font-size: 11px; }
+.tool-name  { font-weight: var(--fw-semibold); }
+.tool-index { color: var(--fg-mute); margin-left: auto; font-size: var(--fs-subheadline); }
 
 .tool-args {
     margin: 0;
@@ -1253,7 +1312,7 @@ html, body {
     overflow-x: auto;
     white-space: pre;
     font-family: var(--mono);
-    font-size: 12px;
+    font-size: var(--fs-callout);
     line-height: 1.45;
     background: rgba(255, 255, 255, 0.30);
     color: var(--tool-fg);
@@ -1347,8 +1406,9 @@ html, body {
     color: var(--fg);
     font: inherit;
     font-family: var(--sans);
-    font-size: 12px;
-    font-weight: 600;
+    font-size: var(--fs-callout);
+    line-height: var(--lh-callout);
+    font-weight: var(--fw-semibold);
     letter-spacing: 0.01em;
     cursor: pointer;
     box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.65),
@@ -1376,20 +1436,20 @@ html, body {
                 0 0 0 2px rgba(184, 175, 196, 0.35);
 }
 .shortcut-btn .sc-icon {
-    font-size: 13px;
+    font-size: var(--fs-body);
     line-height: 1;
 }
 .shortcut-btn .sc-label {
-    font-weight: 600;
-    font-size: 12px;
+    font-weight: var(--fw-semibold);
+    font-size: var(--fs-callout);
 }
 
 .ai-json-tree {
     margin: 0;
     padding: 0;
     list-style: none;
-    font-size: 11px;
-    line-height: 1.5;
+    font-size: var(--fs-subheadline);
+    line-height: var(--lh-subheadline);
 }
 .ai-json-tree .ai-json-tree {
     padding-left: 14px;
@@ -1401,7 +1461,7 @@ html, body {
 }
 .ai-json-key {
     color: #7a7285;
-    font-weight: 600;
+    font-weight: var(--fw-semibold);
 }
 .ai-json-str {
     color: #3a3f48;
@@ -1411,7 +1471,7 @@ html, body {
 }
 .ai-json-bool {
     color: #7a7285;
-    font-weight: 600;
+    font-weight: var(--fw-semibold);
 }
 .ai-json-null {
     color: var(--fg-mute);
@@ -1462,8 +1522,9 @@ html, body {
 }
 .overlay-header h2 {
     margin: 0;
-    font-size: 15px;
-    font-weight: 600;
+    font-size: var(--fs-title3);
+    line-height: var(--lh-title3);
+    font-weight: var(--fw-semibold);
     color: var(--fg);
     letter-spacing: -0.005em;
 }
@@ -1487,7 +1548,7 @@ html, body {
     margin: 10px 18px 0;
     padding: 10px 14px;
     border-radius: 10px;
-    font-size: 13px;
+    font-size: var(--fs-body);
     line-height: 1.4;
     border: 1px solid transparent;
 }
@@ -1521,10 +1582,11 @@ html, body {
 }
 .settings-form legend {
     padding: 0 6px;
-    font-weight: 600;
+    font-weight: var(--fw-semibold);
     color: var(--fg);
     font-family: var(--mono);
-    font-size: 12px;
+    font-size: var(--fs-callout);
+    line-height: var(--lh-callout);
 }
 .settings-form label {
     display: flex;
@@ -1535,16 +1597,17 @@ html, body {
 .settings-form label:last-child { margin-bottom: 0; }
 .settings-form label > span {
     font-family: var(--mono);
-    font-size: 12px;
+    font-size: var(--fs-callout);
+    line-height: var(--lh-callout);
     color: var(--fg);
-    font-weight: 600;
+    font-weight: var(--fw-semibold);
 }
 .settings-form label > span > em {
     font-family: var(--sans);
     font-style: normal;
-    font-weight: 400;
+    font-weight: var(--fw-regular);
     color: var(--fg-mute);
-    font-size: 11px;
+    font-size: var(--fs-subheadline);
 }
 .settings-form input,
 .settings-form select,
@@ -1561,7 +1624,7 @@ html, body {
 }
 .settings-form textarea {
     font-family: var(--mono);
-    font-size: 12px;
+    font-size: var(--fs-callout);
     line-height: 1.45;
     resize: vertical;
     min-height: 80px;
@@ -1623,14 +1686,14 @@ html, body {
 .settings-form small.help-text {
     display: block;
     margin-top: 4px;
-    font-size: 11.5px;
+    font-size: var(--fs-subheadline);
     line-height: 1.5;
     color: var(--fg-mute);
     font-style: normal;
-    font-weight: 400;
+    font-weight: var(--fw-regular);
 }
 .settings-form .help-text code {
-    font-size: 10.5px;
+    font-size: var(--fs-footnote);
     color: var(--fg-mute);
 }
 .settings-form .help-text strong { color: var(--fg); }
@@ -1664,7 +1727,8 @@ html, body {
     margin-bottom: -1px;
     color: var(--fg-mute);
     font: inherit;
-    font-size: 12px;
+    font-size: var(--fs-callout);
+    line-height: var(--lh-callout);
     cursor: pointer;
     transition: color 120ms, border-color 120ms;
 }
@@ -1672,7 +1736,7 @@ html, body {
 .model-tab.active {
     color: var(--fg);
     border-bottom-color: var(--tint);
-    font-weight: 600;
+    font-weight: var(--fw-semibold);
 }
 .model-tab-panel {
     padding: 10px 14px;
@@ -1702,7 +1766,8 @@ html, body {
     border-radius: 6px;
     cursor: pointer;
     font-family: var(--mono);
-    font-size: 12px;
+    font-size: var(--fs-callout);
+    line-height: var(--lh-callout);
     transition: background 120ms;
 }
 .model-check-list label:hover {
@@ -1748,7 +1813,7 @@ html, body {
     background: rgba(255, 255, 255, 0.30);
 }
 .settings-form .tool-group-name {
-    font-weight: 600;
+    font-weight: var(--fw-semibold);
     color: var(--fg);
     margin-bottom: 8px;
     display: flex;
@@ -1756,8 +1821,9 @@ html, body {
     gap: 8px;
 }
 .settings-form .tool-group-badge {
-    font-size: 11px;
-    font-weight: 500;
+    font-size: var(--fs-subheadline);
+    line-height: var(--lh-subheadline);
+    font-weight: var(--fw-medium);
     padding: 1px 6px;
     border-radius: 8px;
     background: rgba(184, 175, 196, 0.15);
@@ -1796,7 +1862,7 @@ html, body {
 .settings-actions button[type="submit"] {
     background: rgba(184, 175, 196, 0.18);
     color: var(--tint-strong);
-    font-weight: 600;
+    font-weight: var(--fw-semibold);
 }
 .settings-actions button:hover {
     background: rgba(0, 0, 0, 0.08);
@@ -1810,7 +1876,8 @@ html, body {
     cursor: pointer;
     text-align: center;
     font-family: var(--mono);
-    font-weight: 600;
+    font-size: var(--fs-callout);
+    font-weight: var(--fw-semibold);
     letter-spacing: 0.02em;
     background: rgba(245, 245, 245, 0.55);
 }
@@ -1825,10 +1892,10 @@ code {
     background: rgba(15, 20, 30, 0.06);
     padding: 1px 4px;
     border-radius: 3px;
-    font-size: 11px;
+    font-size: var(--fs-subheadline);
 }
 
-.muted { color: var(--fg-mute); font-size: 12px; }
+.muted { color: var(--fg-mute); font-size: var(--fs-callout); }
 
 .settings-section-header { cursor: pointer; display: flex; align-items: center; justify-content: space-between; user-select: none; }
 .settings-section-header .settings-chevron { transition: transform .2s ease; display: inline-block; }
@@ -1934,7 +2001,8 @@ code {
     background: transparent;
     color: #8a8d96;
     font-family: var(--mono, monospace);
-    font-size: 11px;
+    font-size: var(--fs-subheadline);
+    line-height: var(--lh-subheadline);
     border-radius: 6px;
     cursor: pointer;
     white-space: nowrap;
@@ -2076,7 +2144,10 @@ code {
 }
 .settings-loading-overlay.hidden { display: none; }
 .settings-loading-overlay .loading-text {
-    font: 600 17px/1.4 -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Helvetica Neue', sans-serif;
+    font-family: var(--sans);
+    font-size: var(--fs-title2);
+    line-height: var(--lh-title2);
+    font-weight: var(--fw-semibold);
     color: var(--fg-soft);
     letter-spacing: -0.2px;
     animation: settings-pulse 1.4s ease-in-out infinite;
@@ -2140,7 +2211,8 @@ code {
     margin-bottom: -1px;
     color: var(--fg-mute);
     font: inherit;
-    font-size: 12.5px;
+    font-size: var(--fs-callout);
+    line-height: var(--lh-callout);
     font-family: var(--sans);
     cursor: pointer;
     transition: color 120ms ease, background 120ms ease, border-color 120ms ease;
@@ -2152,7 +2224,7 @@ code {
 .admin-tab.active {
     color: var(--fg);
     border-bottom-color: var(--tint);
-    font-weight: 600;
+    font-weight: var(--fw-semibold);
 }
 .admin-tab:focus-visible {
     outline: none;
@@ -2165,7 +2237,8 @@ code {
     margin: 10px 18px 0;
     padding: 8px 14px;
     border-radius: 8px;
-    font-size: 12px;
+    font-size: var(--fs-callout);
+    line-height: var(--lh-callout);
     background: rgba(184, 175, 196, 0.10);
     border: 1px solid rgba(184, 175, 196, 0.30);
     color: var(--fg);
@@ -2195,7 +2268,7 @@ code {
     padding: 18px 20px;
 }
 .confirm-dialog-body {
-    font-size: 13.5px;
+    font-size: var(--fs-body);
     line-height: 1.5;
     color: var(--fg);
     margin-bottom: 14px;
@@ -2215,7 +2288,8 @@ code {
     padding: 6px 10px;
     font: inherit;
     font-family: var(--sans);
-    font-size: 12px;
+    font-size: var(--fs-callout);
+    line-height: var(--lh-callout);
     color: var(--fg);
     background: rgba(255, 255, 255, 0.55);
     border: 1px solid var(--hairline);
@@ -2233,7 +2307,8 @@ code {
     padding: 6px 14px;
     font: inherit;
     font-family: var(--sans);
-    font-size: 12px;
+    font-size: var(--fs-callout);
+    line-height: var(--lh-callout);
     color: var(--fg);
     background: rgba(255, 255, 255, 0.55);
     border: 1px solid var(--hairline);
@@ -2246,13 +2321,13 @@ code {
 .admin-pane-header > .help-text {
     flex: 1 1 240px;
     margin: 0;
-    font-size: 11.5px;
+    font-size: var(--fs-subheadline);
     color: var(--fg-mute);
 }
 
 .admin-count {
     margin-left: auto;
-    font-size: 11px;
+    font-size: var(--fs-subheadline);
     color: var(--fg-mute);
 }
 
@@ -2273,14 +2348,15 @@ code {
 }
 
 .admin-entry-summary {
-    font-weight: 600;
+    font-weight: var(--fw-semibold);
     margin: 0 0 4px 0;
     word-break: break-word;
     color: var(--fg);
 }
 
 .admin-entry-meta {
-    font-size: 11px;
+    font-size: var(--fs-subheadline);
+    line-height: var(--lh-subheadline);
     color: var(--fg-mute);
     margin: 0 0 6px 0;
     font-family: var(--mono);
@@ -2288,7 +2364,7 @@ code {
 
 .admin-entry-content {
     font-family: var(--mono);
-    font-size: 11.5px;
+    font-size: var(--fs-subheadline);
     line-height: 1.5;
     white-space: pre-wrap;
     word-break: break-word;
@@ -2312,7 +2388,8 @@ code {
     padding: 6px 14px;
     font: inherit;
     font-family: var(--sans);
-    font-size: 12px;
+    font-size: var(--fs-callout);
+    line-height: var(--lh-callout);
     color: var(--fg);
     background: rgba(255, 255, 255, 0.55);
     border: 1px solid var(--hairline);
@@ -2332,8 +2409,9 @@ code {
 .task-plan-header,
 .agent-todo-header {
     display: inline-block;
-    font-size: 12.5px;
-    font-weight: 700;
+    font-size: var(--fs-body);
+    line-height: var(--lh-body);
+    font-weight: var(--fw-bold);
     color: var(--fg);
     /* Title chip — adaptive plate; backdrop-filter:brightness() applied
        by the plate selector group ensures contrast on dark desktops. */
@@ -2359,7 +2437,7 @@ code {
     grid-template-columns: 16px 1fr;
     gap: 8px;
     align-items: start;
-    font-size: 12.5px;
+    font-size: var(--fs-callout);
     line-height: 1.45;
     color: var(--fg);
 }
@@ -2375,7 +2453,7 @@ code {
 .task-plan-item.tp-done .tp-glyph     { color: #2e8b57; }
 .task-plan-item.tp-done .tp-text      { color: var(--fg-mute); text-decoration: line-through; }
 .task-plan-item.tp-running .tp-glyph  { color: rgba(184, 175, 196, 0.95); }
-.task-plan-item.tp-running            { font-weight: 600; }
+.task-plan-item.tp-running            { font-weight: var(--fw-semibold); }
 .task-plan-item.tp-failed .tp-glyph   { color: #c0392b; }
 .task-plan-item.tp-interrupted .tp-glyph { color: #d08a1e; }
 .task-plan-item.tp-skipped .tp-glyph  { color: var(--fg-mute); opacity: 0.7; }
@@ -2391,13 +2469,13 @@ code {
 .agent-todo-item.at-completed .at-glyph { color: #2e8b57; }
 .agent-todo-item.at-completed .at-text  { color: var(--fg-mute); text-decoration: line-through; }
 .agent-todo-item.at-in_progress .at-glyph { color: rgba(184, 175, 196, 0.95); }
-.agent-todo-item.at-in_progress          { font-weight: 600; }
+.agent-todo-item.at-in_progress          { font-weight: var(--fw-semibold); }
 .agent-todo-item.at-pending .at-glyph,
 .agent-todo-item.at-pending .at-text     { color: var(--fg-mute); }
 
 .admin-stats-output {
     font-family: var(--mono);
-    font-size: 11.5px;
+    font-size: var(--fs-subheadline);
     line-height: 1.5;
     background: rgba(15, 20, 30, 0.05);
     border: 1px solid var(--hairline);
@@ -2418,14 +2496,15 @@ code {
 }
 .admin-tool-block h4 {
     margin: 0 0 6px 0;
-    font-size: 14px;
-    font-weight: 600;
+    font-size: var(--fs-body);
+    line-height: var(--lh-body);
+    font-weight: var(--fw-semibold);
     color: var(--fg);
 }
 .admin-tool-block .help-text {
     display: block;
     margin: 0 0 10px;
-    font-size: 11.5px;
+    font-size: var(--fs-subheadline);
     line-height: 1.5;
     color: var(--fg-mute);
 }
@@ -2436,8 +2515,9 @@ code {
 .admin-tool-block label > span {
     display: block;
     margin-bottom: 4px;
-    font-size: 12px;
-    font-weight: 600;
+    font-size: var(--fs-callout);
+    line-height: var(--lh-callout);
+    font-weight: var(--fw-semibold);
     color: var(--fg);
 }
 .admin-tool-block input,
@@ -2447,7 +2527,8 @@ code {
     padding: 8px 10px;
     font: inherit;
     font-family: var(--sans);
-    font-size: 12px;
+    font-size: var(--fs-callout);
+    line-height: var(--lh-callout);
     color: var(--fg);
     background: rgba(255, 255, 255, 0.55);
     border: 1px solid var(--hairline);
@@ -2487,7 +2568,7 @@ code {
     -webkit-backdrop-filter: blur(20px) saturate(180%);
     color: var(--tint-strong);
     border-color: rgba(184, 175, 196, 0.45);
-    font-weight: 600;
+    font-weight: var(--fw-semibold);
     box-shadow: 0 1px 0 rgba(255, 255, 255, 0.45) inset;
 }
 .admin-tool-block button.primary:hover {
@@ -2623,24 +2704,28 @@ code {
 
 .session-card-title {
     flex: 0 0 auto;
-    /* Display-family stack + heavier weight + tighter tracking gives the
-       title a distinct "heading" character. Readability now comes from the
-       .session-card-head's adaptive plate (backdrop-filter:brightness) rather
-       than a crude text-shadow halo — the plate lifts contrast on any
-       background while the title itself stays clean/crisp. */
-    font-family: "SF Pro Display", "Segoe UI Variable Display",
-                 "Segoe UI Semibold", var(--sans);
-    font-weight: 700;
-    font-size: 16px;
-    letter-spacing: -0.02em;
+    /* macOS title3, emphasized (semibold). Old rule was 16px/700 with a
+       hard "SF Pro Display" family stack; per docs §5 optical size, Display
+       is meant for 20pt+, so at 15px SF Text renders with proper small-
+       heading tracking. family folded back to var(--sans) so titlebar,
+       cards, and section heads all share one family and Display's optical
+       tuning doesn't leak below its intended range.
+       Readability comes from the .session-card-head's adaptive plate
+       (backdrop-filter:brightness) rather than a text-shadow halo. */
+    font-family: var(--sans);
+    font-size: var(--fs-title3);
+    line-height: var(--lh-title3);
+    font-weight: var(--fw-semibold);
+    letter-spacing: -0.01em;
     color: var(--fg);
     text-shadow: none;
 }
 
 .session-card-title-input {
     font: inherit;
-    font-weight: 600;
-    font-size: 13px;
+    font-size: var(--fs-body);
+    line-height: var(--lh-body);
+    font-weight: var(--fw-semibold);
     color: var(--fg);
     background: rgba(255, 255, 255, 0.6);
     border: 1px solid rgba(122, 114, 133, 0.4);
@@ -2653,7 +2738,8 @@ code {
 .session-card-pill {
     flex: 1 1 auto;
     min-width: 0;
-    font-size: 11.5px;
+    font-size: var(--fs-subheadline);
+    line-height: var(--lh-subheadline);
     color: var(--fg-soft);
     white-space: nowrap;
     overflow: hidden;
@@ -2676,16 +2762,35 @@ code {
     justify-content: center;
     border: none;
     border-radius: 50%;
-    /* Same glass treatment as the window's .tb-btn traffic-lights: a soft
-       white frost + backdrop-filter blur/saturate + the shared SVG
-       lens-bulge distortion, plus a contour ring (via the ::before rule
-       higher up in this file). Persistent soft-red tint marks it as the
-       close affordance from base; deepens to full red on hover. This
-       replaces the old flat rgba(0,0,0,0.06) disc that read as plastic
-       against the glass card body. */
+    /* Translucent-white close button. User's intent: "透明白色, 真正透明,
+       而不是灰色" — a button that reads as WHITE frost, not grey, even
+       when the desktop behind HandQ is dark. Every previous single-layer
+       attempt failed on this: alpha compositing a translucent white
+       against a dark backdrop necessarily produces grey (e.g. 16% white
+       on luma-30 desktop head-plate = luma 76 = medium grey, exactly
+       what the earlier neutral version looked like).
+       Multi-layer white stack — two `background` layers on the ELEMENT
+       (independent of backdrop-filter, which processes what's behind):
+         1. Bottom: rgba(255, 255, 255, 0.55) — 55% white base.
+         2. Top: rgba(255, 255, 255, 0.38) linear-gradient (via the
+            CSS multi-background trick — only gradients / images can
+            stack via comma-separated syntax; plain colours can't).
+       Compound effective opacity is 1 - (1-0.55)(1-0.38) = 0.72, so on
+       a luma-30 dark desktop the disc reads at ~192 (light off-white)
+       and on a luma-200 light desktop at ~240 (near pure white). The
+       remaining 28% transparency means backdrop-filter's blur + saturate
+       + circle-distort still show through — the glass identity is
+       preserved, just white-forward instead of grey-forward.
+       Text × is soft dark grey at 75% alpha — visible on the white disc
+       without dominating. Hover raises both layers to feel "solid white"
+       for the commit affordance; active bumps further. No red anywhere,
+       per user's earlier "no colour" preference — the close identity
+       comes from the × glyph and card-top-right position alone. */
     position: relative;
-    background: rgba(232, 130, 130, 0.28);
-    color: rgba(190, 50, 50, 0.90);
+    background:
+        linear-gradient(rgba(255, 255, 255, 0.38), rgba(255, 255, 255, 0.38)),
+        rgba(255, 255, 255, 0.55);
+    color: rgba(60, 60, 60, 0.75);
     backdrop-filter: blur(8px) saturate(130%) url(#lg-distort-circle);
     -webkit-backdrop-filter: blur(8px) saturate(130%) url(#lg-distort-circle);
     font-size: 15px;
@@ -2696,12 +2801,23 @@ code {
                 transform 120ms var(--spring);
 }
 .session-card-close:hover {
-    background: rgba(220, 130, 130, 0.90);
-    color: #fff;
+    /* Compound ~88% white — reads as "solidified" for the click commit
+       affordance while still not fully opaque (backdrop-filter's glass
+       edge distortion still shows through the remaining 12%). */
+    background:
+        linear-gradient(rgba(255, 255, 255, 0.60), rgba(255, 255, 255, 0.60)),
+        rgba(255, 255, 255, 0.70);
+    color: rgba(30, 30, 30, 0.90);
     transform: scale(1.08);
 }
+.session-card-close:active {
+    background:
+        linear-gradient(rgba(255, 255, 255, 0.75), rgba(255, 255, 255, 0.75)),
+        rgba(255, 255, 255, 0.75);
+    color: rgba(0, 0, 0, 0.90);
+}
 .session-card-close:focus-visible {
-    outline: 2px solid rgba(232, 130, 130, 0.55);
+    outline: 2px solid rgba(255, 255, 255, 0.65);
     outline-offset: 2px;
 }
 
@@ -2791,6 +2907,7 @@ code {
     border-radius: 14px;
     font: inherit;
     font-family: var(--sans);
+    font-size: var(--fs-body);
     line-height: 1.4;
     color: var(--fg);
     /* Frosted input — the composer is a text zone, so it gets frost. Fill
@@ -2858,8 +2975,21 @@ code {
        animation still visually hides everything at width 0. */
     overflow: clip;
     overflow-clip-margin: 12px;
-    transition: width 240ms var(--ease-glass, cubic-bezier(0.4, 0, 0.2, 1)),
-                margin 240ms var(--ease-glass, cubic-bezier(0.4, 0, 0.2, 1));
+    /* Width/margin transition — 200ms with spring-soft to approximate
+       Windows' OS-animated setBounds duration/curve when the panel
+       toggles. Two animations happen in parallel on toggle: this CSS
+       width transition AND Windows' native window resize (main.js's
+       `setBounds(..., true)`). Chat-region is a flex victim between
+       them — if the two clocks don't line up, chat-card width
+       "bulges then shrinks" mid-transition (looks like "两个动画各变各的").
+       Was 240ms ease-glass which noticeably over-ran Windows' ~180ms
+       resize. 200ms + spring-soft's decelerating curve gets close
+       enough that the chat card only drifts a few pixels.
+       Also see session-sidebar.js's _widthTransitionEndTs — the JS
+       side suppresses ResizeObserver-driven width writes during this
+       window so it doesn't interrupt the CSS transition mid-flight. */
+    transition: width 200ms var(--spring-soft, cubic-bezier(0.22, 1.2, 0.36, 1)),
+                margin 200ms var(--spring-soft, cubic-bezier(0.22, 1.2, 0.36, 1));
     margin: 7px 0 10px 10px;
     /* Position + z-index so any content painting inside overflow-clip-margin
        (the fanned-out right edge and its shadow) sits above the neighbouring
@@ -2972,7 +3102,13 @@ code {
     transform-origin: left center;
     transform: rotateY(var(--tilt));
     opacity: var(--dim);
-    will-change: transform;
+    /* will-change removed from the base declaration — a permanent
+       will-change: transform promotes every thumb to its own compositor
+       layer even when nothing is animating, which multiplied by the
+       mask-image + tilted transform + inner card is real GPU cost. The
+       :hover rule below re-adds will-change for the brief moment when
+       the transform IS animating (peek-out lift), which is when the
+       compositor layer actually earns its keep. */
 
     /* Right-side fade — mask the thumb (card body + border + shadow) with
        a left-to-right linear gradient so the "far" (receded) right edge
@@ -3036,6 +3172,12 @@ code {
     transform: rotateY(var(--tilt)) translateZ(14px) scale(1.02);
     box-shadow: 0 10px 26px rgba(20, 20, 30, 0.20);
     z-index: 2;   /* float above deeper siblings during the hover lift */
+    /* Promote to a compositor layer only during hover — the transform +
+       translateZ + scale are all animatable properties the compositor
+       can drive without repainting, provided the element is on its own
+       layer. Removed from the base declaration to keep the idle rail
+       cheap; the layer is created on hover-enter and dropped on leave. */
+    will-change: transform;
     /* Clear the right-side fade on hover — the previewed card is leaping
        toward the viewer, not receding, so the "dissolves on the far side"
        mask would fight the metaphor. Setting mask-image to `none`
@@ -3082,6 +3224,26 @@ code {
        session to the main stage rather than focusing composer/buttons. */
     pointer-events: none;
     animation: none;
+    /* Perf: kill inherited main-stage `.session-card` costs that don't
+       add anything at this zoom (0.4353×). Each of these was invisible
+       on a 148px-wide thumb but paid a per-frame GPU cost:
+         * backdrop-filter blur runs a full-frame downsample; at thumb
+           scale the "frosted glass" is unreadable, and multiple thumbs
+           each running it is a real hit — worst during View Transition
+           snapshot capture (rail thumbs are captured too on session
+           promote / minimize / maximize).
+         * transition: box-shadow re-rasterizes on every state change
+           (e.g. becoming .active) — the .active shadow below overrides
+           box-shadow directly, no interpolation needed.
+         * contain: layout paint style is redundant here because the
+           .stage-rail-thumb wrapper already provides overflow clip +
+           its own compositor layer.
+       These overrides are per-thumb-inner-card only; main-stage cards
+       (the parent .session-card rule) are unaffected. */
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+    transition: none;
+    contain: none;
 }
 .stage-rail-thumb .session-card.active {
     box-shadow:
@@ -3106,12 +3268,14 @@ code {
     background: rgba(255, 244, 240, 0.88);
 }
 .scc-title {
-    font-weight: 600;
-    font-size: 13px;
+    font-weight: var(--fw-semibold);
+    font-size: var(--fs-body);
+    line-height: var(--lh-body);
     color: var(--fg);
 }
 .scc-desc {
-    font-size: 12px;
+    font-size: var(--fs-callout);
+    line-height: var(--lh-callout);
     color: var(--fg);
     white-space: pre-wrap;
     word-break: break-word;
@@ -3123,8 +3287,9 @@ code {
     padding: 8px;
     border-radius: 8px;
     background: rgba(0, 0, 0, 0.05);
-    font-family: var(--mono, monospace);
-    font-size: 11px;
+    font-family: var(--mono);
+    font-size: var(--fs-subheadline);
+    line-height: var(--lh-subheadline);
     white-space: pre-wrap;
     word-break: break-word;
 }
@@ -3135,7 +3300,8 @@ code {
     display: flex;
     flex-direction: column;
     gap: 4px;
-    font-size: 11px;
+    font-size: var(--fs-subheadline);
+    line-height: var(--lh-subheadline);
     color: var(--fg-mute);
 }
 .scc-secret {
@@ -3154,6 +3320,8 @@ code {
     border-radius: 8px;
     font: inherit;
     font-family: var(--sans);
+    font-size: var(--fs-callout);
+    line-height: var(--lh-callout);
     color: var(--fg);
     background: rgba(255, 255, 255, 0.8);
 }
@@ -3168,7 +3336,8 @@ code {
     border: 1px solid rgba(0, 0, 0, 0.12);
     border-radius: 8px;
     font: inherit;
-    font-size: 12px;
+    font-size: var(--fs-callout);
+    line-height: var(--lh-callout);
     cursor: pointer;
     background: rgba(255, 255, 255, 0.7);
     color: var(--fg);
@@ -3189,7 +3358,8 @@ code {
 }
 .sched-list-header button {
     padding: 6px 14px;
-    font-size: 12px;
+    font-size: var(--fs-callout);
+    line-height: var(--lh-callout);
     border: 1px solid var(--hairline);
     border-radius: 8px;
     background: rgba(255, 255, 255, 0.55);
@@ -3240,23 +3410,24 @@ code {
     display: flex;
     align-items: center;
     gap: 12px;
-    font-size: 13px;
+    font-size: var(--fs-body);
+    line-height: var(--lh-body);
 }
 .sched-list-name {
-    font-weight: 600;
+    font-weight: var(--fw-semibold);
     flex: 0 0 auto;
     color: var(--fg);
 }
 .sched-list-schedule {
     flex: 1 1 auto;
     font-family: var(--mono);
-    font-size: 11px;
+    font-size: var(--fs-subheadline);
     color: var(--fg-mute);
 }
 .sched-list-status {
     flex: 0 0 auto;
-    font-size: 11px;
-    font-weight: 500;
+    font-size: var(--fs-subheadline);
+    font-weight: var(--fw-medium);
 }
 
 /* ── Bottom: detail of selected task ─────────────────────────── */
@@ -3275,19 +3446,21 @@ code {
 }
 .sched-detail h4 {
     margin: 0 0 14px 0;
-    font-size: 15px;
-    font-weight: 600;
+    font-size: var(--fs-title3);
+    line-height: var(--lh-title3);
+    font-weight: var(--fw-semibold);
 }
 .sched-detail-fields {
     display: grid;
     grid-template-columns: 96px 1fr;
     gap: 6px 14px;
     margin: 0 0 14px 0;
-    font-size: 12px;
+    font-size: var(--fs-callout);
+    line-height: var(--lh-callout);
 }
 .sched-detail-fields dt {
     color: var(--fg-mute);
-    font-weight: 500;
+    font-weight: var(--fw-medium);
 }
 .sched-detail-fields dd {
     margin: 0;
@@ -3300,7 +3473,7 @@ code {
     border: 1px solid var(--hairline);
     border-radius: 8px;
     font-family: var(--mono);
-    font-size: 11px;
+    font-size: var(--fs-subheadline);
     line-height: 1.5;
     white-space: pre-wrap;
     max-height: 160px;
@@ -3344,7 +3517,8 @@ button.danger:hover:not(:disabled) {
     border-radius: 8px;
     background: rgba(184, 175, 196, 0.10);
     border: 1px solid rgba(184, 175, 196, 0.30);
-    font-size: 12px;
+    font-size: var(--fs-callout);
+    line-height: var(--lh-callout);
 }
 .settings-toast.error {
     background: rgba(220, 130, 130, 0.10);
@@ -3377,7 +3551,8 @@ button.danger:hover:not(:disabled) {
 }
 .skills-list-header button {
     padding: 6px 14px;
-    font-size: 12px;
+    font-size: var(--fs-callout);
+    line-height: var(--lh-callout);
     border: 1px solid var(--hairline);
     border-radius: 8px;
     background: rgba(255, 255, 255, 0.55);
@@ -3392,10 +3567,10 @@ button.danger:hover:not(:disabled) {
     background: rgba(184, 175, 196, 0.20);
     color: var(--tint-strong);
     border-color: rgba(184, 175, 196, 0.45);
-    font-weight: 600;
+    font-weight: var(--fw-semibold);
 }
 .skills-list-header button.primary:hover { background: rgba(184, 175, 196, 0.30); }
-.skills-list-header .admin-count { font-size: 11px; color: var(--fg-mute); }
+.skills-list-header .admin-count { font-size: var(--fs-subheadline); color: var(--fg-mute); }
 
 .skills-grid {
     display: grid;
@@ -3424,8 +3599,9 @@ button.danger:hover:not(:disabled) {
 }
 .skill-card-badge {
     flex: 0 0 auto;
-    font-size: 10px;
-    font-weight: 600;
+    font-size: var(--fs-footnote);
+    line-height: var(--lh-footnote);
+    font-weight: var(--fw-bold);
     letter-spacing: 0.04em;
     text-transform: uppercase;
     padding: 2px 7px;
@@ -3448,8 +3624,9 @@ button.danger:hover:not(:disabled) {
 }
 .skill-card-name {
     font-family: var(--mono);
-    font-size: 13px;
-    font-weight: 600;
+    font-size: var(--fs-body);
+    line-height: var(--lh-body);
+    font-weight: var(--fw-semibold);
     color: var(--fg);
     word-break: break-all;
     flex: 1 1 auto;
@@ -3458,18 +3635,20 @@ button.danger:hover:not(:disabled) {
     display: inline-flex;
     align-items: center;
     gap: 5px;
-    font-size: 11px;
+    font-size: var(--fs-subheadline);
+    line-height: var(--lh-subheadline);
     color: var(--fg-mute);
     cursor: pointer;
     flex: 0 0 auto;
 }
 .skill-card-desc {
-    font-size: 12px;
+    font-size: var(--fs-callout);
     line-height: 1.4;
     color: var(--fg);
 }
 .skill-card-problem {
-    font-size: 11px;
+    font-size: var(--fs-subheadline);
+    line-height: var(--lh-subheadline);
     color: #b85050;
 }
 .skill-card-actions {
@@ -3479,7 +3658,8 @@ button.danger:hover:not(:disabled) {
 }
 .skill-card-actions button {
     padding: 4px 12px;
-    font-size: 11px;
+    font-size: var(--fs-subheadline);
+    line-height: var(--lh-subheadline);
     border: 1px solid var(--hairline);
     border-radius: 8px;
     background: rgba(255, 255, 255, 0.55);
@@ -3545,32 +3725,45 @@ button.danger:hover:not(:disabled) {
        inherits) — the detail panel sits over Layer 1 glass with
        coreOpacity:0, so without this, any text landing on dark desktop
        content shows up as near-invisible dark-on-dark. This was the "titles
-       invisible on black background" + "text hard to read" report. Base
-       font-size bumped to 12.5px so the whole panel reads a notch larger
-       and less strained; individual rules can still step up from here. */
+       invisible on black background" + "text hard to read" report.
+       Sidebar defaults to `callout` (12px) — one notch tighter than the
+       app-wide `body` (13px), matching the "detail/inspector column is
+       denser than the main stage" macOS convention. Individual .ss-*
+       rules step up or down as needed. */
     text-shadow: var(--text-halo);
-    font-size: 12.5px;
-    /* Fixed 264px sidebar width — an additive delta on top of the 840px
-       "main card only" baseline (main.js grows the window by 278 = 264 +
-       margin 10 + gap 4 whenever this panel opens). Not a ratio-driven
-       width: the sidebar is either open (264px) or fully collapsed (0px
-       via [data-collapsed="true"]) — the main card owns the whole chat
-       column in either case, and its width is what the window's baseline
-       is sized to. */
+    font-size: var(--fs-callout);
+    line-height: var(--lh-callout);
+    /* Default width — kept as a sensible fallback for the ~1 paint
+       between "sidebar element mounted" and "session-sidebar.js's first
+       _refreshSidebarWidth". Once JS runs, the sidebar's width is set
+       via inline style (higher specificity than this rule) and follows:
+         * Auto: card : sidebar = 4 : 2.5 ratio, recomputed live on
+           window resize / rail toggle via a ResizeObserver on .main.
+         * User drag: pinned to the released width for the rest of this
+           session (in-memory flag; not persisted across app restart).
+       So this 264px only matters at boot flash and if the JS never runs
+       (e.g. an older layout without session-sidebar.js loaded). */
     width: 264px;
-    /* Fixed min-width — the old formula (max(200px, chat-region * 0.45))
-       created a feedback loop with the ResizeObserver on chat-region: when
-       the sidebar opened, its min-width computed to ~45% of the current
-       chat-region width, which was WIDER than the window's SIDEBAR_DELTA
-       could accommodate, so the sidebar squeezed the main card. That, in
-       turn, updated --chat-region-w, which lowered the min-width, which
-       let the sidebar shrink back, which grew chat-region back... a
-       convergent but visually messy oscillation. Fixed 220px means the
-       sidebar always opens at exactly its target 264px, the window's
-       +278px delta is exactly right, and the drag handle can still take
-       it down to 220 for narrower layouts. */
+    /* Fixed min-width floor — the old formula (max(200px, chat-region *
+       0.45)) created a feedback loop with a ResizeObserver on chat-region:
+       when the sidebar opened, its min-width computed to ~45% of the
+       current chat-region width, which then shrunk chat-region, which
+       lowered the min-width, which let the sidebar shrink back, which
+       grew chat-region back... a convergent but visually messy oscillation.
+       220 is a fixed floor: below it, plan/activity/files chrome starts
+       stacking illegibly. The dynamic 4:2.5 ratio (see session-sidebar.js
+       _autoSidebarWidth) sizes the sidebar ABOVE this floor for any card
+       wider than ~350; the drag handle enforces the floor on manual
+       resize. */
     min-width: 220px;
-    max-width: 480px;
+    /* Ceiling for both the drag handle and the ratio-based auto width
+       (see session-sidebar.js _sidebarMaxWidth). Bumped from the old
+       480 so a 4:2.5 sidebar can grow past that on wide windows without
+       hitting a hard cap — with the card at ~1200px, the ratio would
+       otherwise want a 750px sidebar and clamp back down. Same rule
+       applies to user-dragged widths so they never exceed the ratio
+       ceiling either. */
+    max-width: 800px;
     display: flex; flex-direction: column;
     /* Fully transparent — the sidebar rides directly on whatever HandQ's
        outer glass frame is showing (desktop-through-app). We do NOT layer
@@ -3582,7 +3775,19 @@ button.danger:hover:not(:disabled) {
     box-shadow: none;
     margin: 7px 10px 10px 0;
     overflow: hidden;
-    transition: width 240ms var(--ease-glass, cubic-bezier(0.4, 0, 0.2, 1));
+    /* Width transition — 200ms with spring-soft to approximate Windows'
+       OS-animated setBounds curve. Two animations run in parallel on
+       toggle: this CSS transition (sidebar width) and Windows' native
+       window resize (main.js's `setBounds(..., true)`). Chat-region is a
+       flex victim between them — if the two clocks don't line up, the
+       chat card's width oscillates mid-transition (reads as "sidebar
+       and card animate on different timings"). Was 240ms ease-glass
+       which noticeably overran Windows' ~180ms resize. 200ms + spring-
+       soft gets close enough that the chat card only drifts a few px.
+       See session-sidebar.js's _widthTransitionEndTs for the JS-side
+       gate that suppresses ResizeObserver's own per-frame width writes
+       during this window so they don't retarget the transition. */
+    transition: width 200ms var(--spring-soft, cubic-bezier(0.22, 1.2, 0.36, 1));
     color: var(--fg-soft, #3a3f48);
 }
 .session-sidebar[data-collapsed="true"] {
@@ -3683,9 +3888,10 @@ button.danger:hover:not(:disabled) {
     display: flex; align-items: center; gap: 8px;
     padding: 6px 10px 6px 12px;
     border-bottom: 1px solid rgba(60, 80, 120, 0.12);
-    font-size: 10px; letter-spacing: 1.2px; text-transform: uppercase;
+    font-size: var(--fs-footnote); letter-spacing: 1.2px; text-transform: uppercase;
+    line-height: var(--lh-footnote);
     color: var(--fg, #1a1d22);
-    font-weight: 700;
+    font-weight: var(--fw-bold);
     -webkit-app-region: no-drag;
     app-region: no-drag;
 }
@@ -3702,8 +3908,9 @@ button.danger:hover:not(:disabled) {
 }
 .ss-header .ss-name {
     flex: 0 1 auto; min-width: 0;
-    font-size: 10.5px; text-transform: none; letter-spacing: 0;
-    color: var(--fg, #1a1d22); font-weight: 600;
+    font-size: var(--fs-footnote); text-transform: none; letter-spacing: 0;
+    line-height: var(--lh-footnote);
+    color: var(--fg, #1a1d22); font-weight: var(--fw-semibold);
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     transition: opacity 200ms;
     /* Content plate hugging the session name — adaptive brightness via
@@ -3856,8 +4063,9 @@ button.danger:hover:not(:disabled) {
     margin: 6px 6px 0 6px;
     padding: 6px 10px;
     border-radius: 9px;
-    font-size: 11px; letter-spacing: 1.2px; text-transform: uppercase;
-    font-weight: 700;
+    font-size: var(--fs-subheadline); letter-spacing: 1.2px; text-transform: uppercase;
+    line-height: var(--lh-subheadline);
+    font-weight: var(--fw-bold);
     color: var(--fg, #1a1d22);
     /* Title band — adaptive plate hugging the module title. The
        backdrop-filter:brightness() (applied via the plate selector group
@@ -3867,7 +4075,7 @@ button.danger:hover:not(:disabled) {
 }
 .ss-section-title { flex: 0 0 auto; }
 .ss-section-count {
-    letter-spacing: 0; text-transform: none; font-weight: 500;
+    letter-spacing: 0; text-transform: none; font-weight: var(--fw-medium);
     color: var(--fg-soft, #3a3f48);
 }
 
@@ -3895,7 +4103,7 @@ button.danger:hover:not(:disabled) {
 .ss-activity-item:first-child { border-top: 0; }
 .ss-activity-item .aa-head {
     display: flex; gap: 6px; align-items: baseline;
-    font-size: 12.5px; min-width: 0;
+    font-size: var(--fs-callout); line-height: var(--lh-callout); min-width: 0;
 }
 .ss-activity-item .aa-label {
     flex: 1 1 auto; min-width: 0;
@@ -3905,18 +4113,17 @@ button.danger:hover:not(:disabled) {
 .ss-activity-item.expanded .aa-label { white-space: normal; }
 .ss-activity-item .aa-time {
     flex: 0 0 auto; color: var(--fg-mute, #6e737d);
-    font-size: 10px; font-variant-numeric: tabular-nums;
+    font-size: var(--fs-footnote); font-variant-numeric: tabular-nums;
 }
 .ss-activity-item .aa-result {
     display: block; margin-top: 3px;
     color: var(--fg-soft, #3a3f48);
-    /* Borrowed the chat-bubble typographic recipe (var(--sans) + inherited
-       font-weight 520 from html/body) — monospace at 11px was reading
-       thin/washed-out. SF Pro Text at 12px with the ambient 520 weight
+    /* Borrowed the chat-bubble typographic recipe — mono at 11px was
+       reading thin/washed-out here. SF Pro Text at callout (12px / 1.45)
        gives the same "present, readable" feel as bubbles without going as
        heavy as a hard bold. */
     font-family: var(--sans);
-    font-size: 12px;
+    font-size: var(--fs-callout);
     line-height: 1.45;
     white-space: pre-wrap; word-break: break-all;
     overflow: hidden; text-overflow: ellipsis;
@@ -3931,7 +4138,7 @@ button.danger:hover:not(:disabled) {
     display: block; margin-top: 3px;
     color: var(--fg-soft, #3a3f48);
     font-family: var(--sans);
-    font-size: 12px;
+    font-size: var(--fs-callout);
     line-height: 1.45;
     white-space: pre-wrap; word-break: break-all;
     overflow: hidden; text-overflow: ellipsis;
@@ -3946,7 +4153,8 @@ button.danger:hover:not(:disabled) {
 }
 .ss-activity-empty {
     text-align: center; padding: 16px 8px;
-    color: var(--fg-mute, #6e737d); font-size: 12px;
+    color: var(--fg-mute, #6e737d);
+    font-size: var(--fs-callout); line-height: var(--lh-callout);
     font-style: italic;
 }
 
@@ -3998,7 +4206,8 @@ button.danger:hover:not(:disabled) {
     display: flex; align-items: center; gap: 4px;
     padding: 3px 6px 3px 0;
     font-family: var(--sans);
-    font-size: 12px;
+    font-size: var(--fs-callout);
+    line-height: var(--lh-callout);
     color: var(--fg, #1a1d22);
     cursor: pointer;
     white-space: nowrap;
@@ -4012,7 +4221,7 @@ button.danger:hover:not(:disabled) {
 .ss-tree-folder {
     flex: 1 1 auto; min-width: 0;
     overflow: hidden; text-overflow: ellipsis;
-    font-weight: 600;
+    font-weight: var(--fw-semibold);
 }
 .ss-tree-leaf-wrap { display: block; }
 
@@ -4020,8 +4229,9 @@ button.danger:hover:not(:disabled) {
     display: flex; align-items: center; gap: 6px;
     padding: 3px 6px 3px 0;
     color: var(--fg-soft, #3a3f48);
-    font-family: ui-monospace, "SF Mono", Menlo, monospace;
-    font-size: 11.5px;
+    font-family: var(--mono);
+    font-size: var(--fs-subheadline);
+    line-height: var(--lh-subheadline);
     cursor: pointer;
     transition: color 150ms;
 }
@@ -4048,12 +4258,12 @@ button.danger:hover:not(:disabled) {
 .ss-file-row .fp { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ss-file-row .ct {
     flex: 0 0 auto;
-    font-size: 10px; color: var(--fg-mute, #6e737d);
+    font-size: var(--fs-footnote); color: var(--fg-mute, #6e737d);
     background: rgba(60, 80, 120, 0.08); padding: 1px 6px; border-radius: 999px;
 }
-.ss-file-row.active { color: var(--tint-strong); font-weight: 600; }
+.ss-file-row.active { color: var(--tint-strong); font-weight: var(--fw-semibold); }
 .ss-file-row.active .fp::after {
-    content: ' ← now'; font-size: 10px; color: var(--tint); font-weight: normal;
+    content: ' ← now'; font-size: var(--fs-footnote); color: var(--tint); font-weight: normal;
 }
 /* Per-file ↺ undo marker — only rendered on edited leaves. Subtle until
    hover so a tree full of edits doesn't read as a wall of red buttons. */
@@ -4076,13 +4286,14 @@ button.danger:hover:not(:disabled) {
     background: rgba(224, 85, 85, 0.08);
     border: 1px solid rgba(224, 85, 85, 0.28);
     border-radius: 6px;
-    font-size: 11px;
+    font-size: var(--fs-subheadline);
+    line-height: var(--lh-subheadline);
 }
 .ss-undo-confirm .uc-msg { flex: 1 1 auto; min-width: 0; color: #c04545; }
 .ss-undo-confirm button {
     flex: 0 0 auto;
     padding: 2px 10px; border-radius: 5px; cursor: pointer;
-    font: inherit; font-size: 11px;
+    font: inherit; font-size: var(--fs-subheadline);
     border: 1px solid rgba(224, 85, 85, 0.35);
 }
 .ss-undo-confirm .uc-yes { background: rgba(224, 85, 85, 0.85); color: #fff; border-color: transparent; }
@@ -4092,7 +4303,8 @@ button.danger:hover:not(:disabled) {
 
 .ss-files-empty {
     text-align: center; padding: 24px 8px;
-    color: var(--fg-soft, #3a3f48); font-size: 12px;
+    color: var(--fg-soft, #3a3f48);
+    font-size: var(--fs-callout); line-height: var(--lh-callout);
     font-style: italic;
 }
 
@@ -4138,8 +4350,9 @@ button.danger:hover:not(:disabled) {
 .fc-title {
     flex: 1 1 auto;
     min-width: 0;
-    font-size: 12px;
-    font-weight: 600;
+    font-size: var(--fs-callout);
+    line-height: var(--lh-callout);
+    font-weight: var(--fw-semibold);
     color: var(--fg-soft);
     white-space: nowrap;
     overflow: hidden;
@@ -4147,7 +4360,8 @@ button.danger:hover:not(:disabled) {
 }
 .fc-hint {
     flex: 0 0 auto;
-    font-size: 10.5px;
+    font-size: var(--fs-footnote);
+    line-height: var(--lh-footnote);
     color: var(--fg-mute);
     font-family: var(--mono);
     margin-right: 4px;
@@ -4190,7 +4404,7 @@ button.danger:hover:not(:disabled) {
     resize: none;
     font: inherit;
     font-family: var(--sans);
-    font-size: 14px;
+    font-size: var(--fs-body);
     line-height: 1.5;
     color: var(--fg);
 }
@@ -4243,7 +4457,8 @@ button.danger:hover:not(:disabled) {
         0 2px 8px rgba(20, 20, 30, 0.08);
     padding: 4px;
     animation: liquid-entrance 200ms var(--spring-soft) both;
-    font-size: 13px;
+    font-size: var(--fs-body);
+    line-height: var(--lh-body);
     color: #1d1d1f;
 }
 .mention-dropdown.hidden { display: none; }
@@ -4272,7 +4487,7 @@ button.danger:hover:not(:disabled) {
 .mention-item-icon svg { width: 100%; height: 100%; }
 .mention-item-name {
     flex: 1 1 auto;
-    font-weight: 500;
+    font-weight: var(--fw-medium);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -4281,7 +4496,7 @@ button.danger:hover:not(:disabled) {
 .mention-item-parent {
     flex: 0 1 auto;
     color: #888;
-    font-size: 11px;
+    font-size: var(--fs-subheadline);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -4324,10 +4539,10 @@ button.danger:hover:not(:disabled) {
 .mention-chip-icon svg { width: 100%; height: 100%; }
 .mention-chip-label {
     flex: 1 1 auto;
-    font-weight: 500;
+    font-weight: var(--fw-medium);
     overflow: hidden;
     text-overflow: ellipsis;
-    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-family: var(--mono);
 }
 
 

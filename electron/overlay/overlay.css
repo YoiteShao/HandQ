@@ -47,6 +47,19 @@ html, body {
 :root {
     --rb-thickness: 10px;
     --rb-radius: 28px;
+
+    /* macOS Text Style tokens — duplicated here (rather than referencing
+       renderer/styles.css) because this overlay lives in an independent
+       BrowserWindow with no shared stylesheet. Kept to the small subset
+       actually used below (body / callout / weight aliases); if you add
+       more surfaces to this window, mirror additional tokens from
+       renderer/styles.css. See docs/macos_typography_complete_guide.md. */
+    --fs-body:      13px;  --lh-body:     19px;
+    --fs-callout:   12px;  --lh-callout:  18px;
+    --fw-regular:   400;
+    --fw-medium:    500;
+    --fw-semibold:  600;
+    --fw-bold:      700;
 }
 
 @keyframes rb-march {
@@ -109,8 +122,15 @@ html, body {
     background: rgba(15, 20, 30, 0.82);
     color: #f4f6fb;
     border-radius: 999px;
-    font: 500 13px/1 -apple-system, "Segoe UI Variable", "Segoe UI",
-          "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
+    /* macOS body (13px) with medium weight. Kept a wide CJK fallback list
+       because the desktop watermark can render Chinese labels; the SF /
+       Segoe UI / PingFang chain matches renderer/styles.css --sans plus
+       explicit CJK fonts for this window's cross-platform reach. */
+    font-family: -apple-system, "Segoe UI Variable", "Segoe UI",
+                 "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
+    font-size: var(--fs-body);
+    line-height: 1;
+    font-weight: var(--fw-medium);
     letter-spacing: 0.01em;
     box-shadow:
         0 8px 24px rgba(0, 0, 0, 0.45),
@@ -133,7 +153,10 @@ html, body {
     border-radius: 4px;
     background: rgba(255, 255, 255, 0.14);
     border: 1px solid rgba(255, 255, 255, 0.22);
-    font: 600 12px/1 ui-monospace, SFMono-Regular, Menlo, Consolas,
-          "Cascadia Mono", monospace;
+    font-family: ui-monospace, "SF Mono", SFMono-Regular, Menlo, Monaco,
+                 "Cascadia Mono", Consolas, monospace;
+    font-size: var(--fs-callout);
+    line-height: 1;
+    font-weight: var(--fw-semibold);
     letter-spacing: 0.02em;
 }

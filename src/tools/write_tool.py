@@ -209,8 +209,9 @@ class WriteTool(BaseTool):
 
             # Live file-touch event → session sidebar (nebula + change list).
             # Fires AFTER the atomic write + FileState update so the sidebar
-            # only lights up on writes that actually succeeded.
-            self.emit_file_touch(str(path_obj.absolute()), "edit")
+            # only lights up on writes that actually succeeded. reversible=True
+            # because capture_before ran above → undo can faithfully restore.
+            self.emit_file_touch(str(path_obj.absolute()), "edit", reversible=True)
 
             return ToolResult(
                 success=True,

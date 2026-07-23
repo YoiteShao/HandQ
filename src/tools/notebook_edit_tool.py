@@ -137,6 +137,19 @@ class NotebookEditTool(BaseTool):
             cells = _get_cells(nb)
             total_cells = len(cells)
 
+            # Pre-op snapshot for user-driven undo (Tier-1.3, RewindStore).
+            # Placed after _load_notebook succeeds — so a parse error above
+            # skips capture — and BEFORE any branch mutates + saves. Same
+            # first-write-wins pattern write/edit tools use. Without this,
+            # the sidebar's ↺ button would light up on notebook edits but
+            # rewind_item would find nothing to restore. No-op when the
+            # session has no store (ctx-less test fixtures).
+            rewind = getattr(self.ctx, "rewind_store", None) if self.ctx else None
+            if rewind is not None:
+                await loop.run_in_executor(
+                    None, lambda: rewind.capture_before(str(path_obj.absolute()))
+                )
+
             # --- DELETE mode ---
             if edit_mode == "delete":
                 if cell_number < 0 or cell_number >= total_cells:
@@ -151,7 +164,7 @@ class NotebookEditTool(BaseTool):
                 deleted_type = cells[cell_number].get("cell_type", "unknown")
                 del cells[cell_number]
                 await loop.run_in_executor(None, lambda: _save_notebook(path_obj, nb))
-                self.emit_file_touch(str(path_obj.absolute()), "edit")
+                self.emit_file_touch(str(path_obj.absolute()), "edit", reversible=True)
                 return ToolResult(
                     success=True,
                     output={
@@ -191,7 +204,7 @@ class NotebookEditTool(BaseTool):
                 new_cell = _make_cell(cell_type, new_source)
                 cells.insert(insert_at, new_cell)
                 await loop.run_in_executor(None, lambda: _save_notebook(path_obj, nb))
-                self.emit_file_touch(str(path_obj.absolute()), "edit")
+                self.emit_file_touch(str(path_obj.absolute()), "edit", reversible=True)
                 return ToolResult(
                     success=True,
                     output={
@@ -246,7 +259,7 @@ class NotebookEditTool(BaseTool):
                 target_cell.pop("execution_count", None)
 
             await loop.run_in_executor(None, lambda: _save_notebook(path_obj, nb))
-            self.emit_file_touch(str(path_obj.absolute()), "edit")
+            self.emit_file_touch(str(path_obj.absolute()), "edit", reversible=True)
             return ToolResult(
                 success=True,
                 output={

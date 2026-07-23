@@ -349,7 +349,9 @@ class EditTool(BaseTool):
                 output["warning"] = file_changed_warning
 
             # Live file-touch event → session sidebar (nebula + change list).
-            self.emit_file_touch(str(path_obj.absolute()), "edit")
+            # reversible=True because capture_before ran at edit_tool.py above,
+            # so undo can faithfully restore the pre-op content.
+            self.emit_file_touch(str(path_obj.absolute()), "edit", reversible=True)
 
             return ToolResult(
                 success=True,

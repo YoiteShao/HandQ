@@ -210,6 +210,7 @@ class InteractionManager:
         kind: str,
         tool: str,
         item_id: Optional[str] = None,
+        reversible: bool = False,
     ) -> None:
         """A file was read, edited, or matched by a scan — feeds the live
         session sidebar (nebula + change-list).
@@ -219,15 +220,21 @@ class InteractionManager:
         ``item_id`` ties the event to a task item so the sidebar can group
         edits by item for the ↺ Undo action; the caller passes
         ``ctx.rewind_store.current_item_id`` verbatim (``None`` is fine —
-        events between items simply drop out of the rewind grouping). Kept
-        out of the UIDelegate Protocol — delegates opt in by exposing a
-        same-named method, so tests with no delegate silently drop it."""
+        events between items simply drop out of the rewind grouping).
+        ``reversible`` is True only when the caller has already captured a
+        pre-op snapshot via ``rewind_store.capture_before`` — the sidebar
+        hides the per-file ↺ button unless this is True, so shell mtime hits
+        (no capture) and read/grep/glob (nothing to revert) never expose
+        undo the store can't fulfill. Kept out of the UIDelegate Protocol —
+        delegates opt in by exposing a same-named method, so tests with no
+        delegate silently drop it."""
         self._ui_call(
             "notify_file_touch",
             str(path or ""),
             str(kind or ""),
             str(tool or ""),
             str(item_id) if item_id else "",
+            bool(reversible),
         )
 
     def notify_agent_todo_changed(self, todos: list) -> None:

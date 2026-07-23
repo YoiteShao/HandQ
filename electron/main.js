@@ -14,7 +14,7 @@
 
 'use strict';
 
-const { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, globalShortcut, Notification, dialog, shell, screen, desktopCapturer } = require('electron');
+const { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, globalShortcut, Notification, dialog, shell, screen, desktopCapturer, clipboard } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -1165,11 +1165,86 @@ function createWindow() {
     mainWindow.setMenuBarVisibility(false);
 
     if (process.platform === 'win32') {
-        // Excludes this window from ANY screen capture (own-process
-        // desktopCapturer included) via SetWindowDisplayAffinity
-        // (WDA_EXCLUDEFROMCAPTURE) — fixes the glass effect sampling its own
-        // rendered pixels instead of the real desktop behind it.
-        try { mainWindow.setContentProtection(true); } catch (_) { /* ignore */ }
+        // Content protection state — starts ON to keep the glass effect
+        // working. When ON, SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)
+        // hides the window from ALL screen captures at the OS-display-
+        // subsystem level (BitBlt, Windows.Graphics.Capture, getUserMedia
+        // with chromeMediaSource:'desktop', etc.), including HandQ's own
+        // desktopCapturer used by glass-effect.js. Without it the glass
+        // shader would sample its OWN rendered pixels back into itself
+        // via desktopCapturer, producing a recursive/washed-out result.
+        //
+        // For screenshots use Ctrl+Shift+S — that goes through
+        // webContents.capturePage() which pulls pixels from Chromium's
+        // internal compositor BEFORE they hit the OS display subsystem,
+        // so WDA doesn't apply. Glass stays on, screenshot works.
+        //
+        // Fallback: Ctrl+Shift+P toggles WDA off for cases where the
+        // internal capturePage() path fails (older Electron builds, some
+        // driver issues) or when using external screen-recording tools.
+        // State resets on app restart to ON.
+        let contentProtected = true;
+        try { mainWindow.setContentProtection(contentProtected); } catch (_) { /* ignore */ }
+
+        // Window-scoped key handlers — `before-input-event` fires only
+        // when this window has focus, so shortcuts don't clash with the
+        // OS or other apps. preventDefault stops Chromium's default
+        // action (Ctrl+Shift+S = "Save Page As" in a normal browser).
+        mainWindow.webContents.on('before-input-event', (event, input) => {
+            if (!(input.control && input.shift && !input.alt && !input.meta)) return;
+            if (typeof input.key !== 'string') return;
+            const key = input.key.toLowerCase();
+
+            if (key === 'p') {
+                // Toggle content protection — escape hatch for external
+                // capture tools (OBS, XSplit) that also can't see the
+                // window while WDA is on. Logs each flip so it's easy
+                // to reason about whether glass is "safe" right now.
+                contentProtected = !contentProtected;
+                try { mainWindow.setContentProtection(contentProtected); } catch (_) {}
+                logLine('MAIN', 'content-protection toggled', { on: contentProtected });
+                event.preventDefault();
+                return;
+            }
+
+            if (key === 's') {
+                // In-app screenshot — pulls the current window contents
+                // via Chromium's internal compositor capture (bypasses
+                // OS display capture APIs, so it works even with WDA on).
+                // Result goes to the system clipboard as an image; paste
+                // with Ctrl+V into any image-aware app (chat, Photoshop,
+                // markdown editor, etc.). No file is written — pure
+                // clipboard so it doesn't leave leftover artifacts on
+                // disk that need pruning.
+                event.preventDefault();
+                mainWindow.webContents.capturePage().then((img) => {
+                    if (!img || img.isEmpty()) {
+                        logLine('MAIN', 'screenshot: capturePage returned empty');
+                        return;
+                    }
+                    clipboard.writeImage(img);
+                    const sz = img.getSize();
+                    logLine('MAIN', 'screenshot: copied to clipboard',
+                            { width: sz.width, height: sz.height });
+                    // Optional toast so the user knows it worked. Silent
+                    // (no ping) so it's non-intrusive during focused work.
+                    try {
+                        if (Notification.isSupported()) {
+                            const n = new Notification({
+                                title: 'HandQ',
+                                body: 'Screenshot copied to clipboard',
+                                silent: true,
+                            });
+                            n.show();
+                            setTimeout(() => { try { n.close(); } catch (_) {} }, 1600);
+                        }
+                    } catch (_) { /* ignore notification failures */ }
+                }).catch((err) => {
+                    logLine('MAIN', 'screenshot failed', { err: err && err.message });
+                });
+                return;
+            }
+        });
     }
 
     mainWindow.loadFile(path.join(__dirname, 'renderer', 'index.html'));
@@ -1644,7 +1719,13 @@ ipcMain.on('window:hide', () => {
 //     width  = 840
 //     height = 840
 //   + rail visible                → width += RAIL_DELTA    (160 + margin + gap 0)
-//   + sidebar visible             → width += SIDEBAR_DELTA (264 + margin + gap)
+//   + sidebar visible             → width += (sidebarWidth + 10 margin)
+//                                    Dynamic per-call. Renderer measures
+//                                    the actual sidebar (auto 4:2.5 ratio
+//                                    of card OR user's drag pin — see
+//                                    session-sidebar.js) and sends it in
+//                                    the payload. SIDEBAR_DELTA below is
+//                                    a legacy fallback only.
 //
 // The new Stage-Manager state machine keeps at most 1 card in the main
 // stage — any 2nd+ session drops into the rail — so the "rail visible"
@@ -1676,20 +1757,39 @@ ipcMain.on('window:hide', () => {
 // sent a bare session count instead of a descriptor).
 const AUTO_RESIZE_BASELINE = { w: 840, h: 720 };
 const AUTO_RESIZE_RAIL_DELTA    = 170;   // rail width 160 + margin 10 + gap 0
-const AUTO_RESIZE_SIDEBAR_DELTA = 278;   // sidebar 264 + margin 10 + gap 4
+// SIDEBAR_DELTA is a LEGACY fallback used only when a payload arrives
+// without a sidebarWidth (very old renderer builds, boot-race pre-first-
+// _refreshSidebarWidth). Real width is dynamic — see session-sidebar.js's
+// SIDEBAR_TO_CARD_RATIO — and the renderer sends it explicitly on every
+// _updateLayout so this constant almost never gets used. Value here is
+// the sensible-default sidebar width (264) + its 10px margin-right,
+// matching the old fixed-width behavior.
+const AUTO_RESIZE_SIDEBAR_DELTA = 274;   // fallback: sidebar 264 + margin 10 (dynamic in normal path)
 const AUTO_RESIZE_TABLE = [
     { w: 840,  h: 720 },   // 1 session (legacy payload only)
     { w: 1010, h: 720 },   // ≥2 sessions (legacy payload only — assumes rail)
 ];
 
 function _computeDesiredSize(layout) {
-    // layout: { sessions:int, sidebarOpen:bool, railOpen:bool }
+    // layout: { sessions:int, sidebarOpen:bool, sidebarWidth:number, railOpen:bool }
     const sidebarOpen = !!(layout && layout.sidebarOpen);
+    const sidebarWidth = Math.max(0, Number(layout && layout.sidebarWidth) || 0);
     const railOpen = !!(layout && layout.railOpen);
     let w = AUTO_RESIZE_BASELINE.w;
     let h = AUTO_RESIZE_BASELINE.h;
     if (railOpen) w += AUTO_RESIZE_RAIL_DELTA;
-    if (sidebarOpen) w += AUTO_RESIZE_SIDEBAR_DELTA;
+    if (sidebarOpen) {
+        // Sidebar extras = actual measured width + its 10px right margin
+        // against the window edge. Renderer sends the actual width because
+        // the sidebar is dynamic (4:2.5 ratio auto, or the user's drag
+        // pin — see session-sidebar.js). If renderer didn't send a width
+        // (very early boot / legacy payload) fall back to the fixed
+        // AUTO_RESIZE_SIDEBAR_DELTA so old shapes still resize sanely
+        // instead of getting a 10px near-zero window grow.
+        w += sidebarWidth > 0
+            ? Math.round(sidebarWidth + 10)
+            : AUTO_RESIZE_SIDEBAR_DELTA;
+    }
     return { w: w, h: h };
 }
 
@@ -1758,6 +1858,7 @@ ipcMain.on('window:auto-resize', (_event, payload) => {
         target = _computeDesiredSize({
             sessions: sessions,
             sidebarOpen: !!payload.sidebarOpen,
+            sidebarWidth: Number(payload.sidebarWidth) || 0,
             railOpen: !!payload.railOpen,
         });
     } else {

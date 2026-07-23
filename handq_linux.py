@@ -735,24 +735,16 @@ def _build_llm_services(config_path: Optional[str]) -> Tuple[List[Any], List[Any
     llm_cfg = cm.get_section("llm") or {}
     api_key = llm_cfg.get("API_KEY") or ""
 
-    raw_mt = llm_cfg.get("max_tokens")
-    try:
-        mt_int = int(raw_mt) if raw_mt is not None else 0
-    except (TypeError, ValueError):
-        mt_int = 0
-    max_tokens = mt_int if mt_int > 0 else None
-    mt_kwargs: Dict[str, Any] = {"max_tokens": max_tokens} if max_tokens is not None else {}
-
     models, helper_models = resolve_models_and_helper(llm_cfg)
     if not models:
         models = ["anthropic::claude-4-5-haiku"]
 
     consolidated = [
-        AnthropicStreamingService(api_key=api_key, model=m, max_retries=10, **mt_kwargs)
+        AnthropicStreamingService(api_key=api_key, model=m, max_retries=10)
         for m in models
     ]
     helper = [
-        AnthropicStreamingService(api_key=api_key, model=m, max_retries=10, **mt_kwargs)
+        AnthropicStreamingService(api_key=api_key, model=m, max_retries=10)
         for m in (helper_models or models)
     ]
     return consolidated, helper

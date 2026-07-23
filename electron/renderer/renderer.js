@@ -334,7 +334,6 @@
 
     const cfgLlmApiKey       = document.getElementById('cfg-llm-api-key');
     const cfgLlmApiKeyToggle = document.getElementById('cfg-llm-api-key-toggle');
-    const cfgLlmMaxTokens    = document.getElementById('cfg-llm-max-tokens');
     const cfgLlmAvailableModels = document.getElementById('cfg-llm-available-models');
     const cfgLlmAgentChecks     = document.getElementById('cfg-llm-agent-checks');
     const cfgLlmHelperChecks    = document.getElementById('cfg-llm-helper-checks');
@@ -1072,6 +1071,9 @@
     function _updateLayout() {
         // Rail collapses to zero width when nothing is minimized — same
         // "no dead stub" idiom as .session-sidebar[data-collapsed].
+        // Immediate DOM sync — attributes and class toggles must be
+        // current-tick so the DOM is consistent for the next paint. Only
+        // the window-resize IPC is deferred (see below).
         const railEmpty = !stageRailList || stageRailList.children.length === 0;
         if (stageRail) stageRail.dataset.empty = railEmpty ? 'true' : 'false';
 
@@ -1084,23 +1086,86 @@
             if (s.maxBtn) s.maxBtn.classList.toggle('hidden', !showControls);
         }
 
-        // Ask main to grow the window to fit the CURRENT visible layout:
-        // just the main card by default, plus rail if any session is
-        // minimized, plus sidebar if the detail panel is expanded. Baseline
-        // is "main card only" (~840 sq) — the two side panels are additive
-        // deltas that only reserve horizontal space when actually visible.
-        // sessions count reports the TOTAL open sessions (main + rail) so
-        // main.js's maximize-at-6 threshold still triggers correctly.
-        // Main is authoritative on display bounds + clamps.
+        // Defer the auto-resize IPC to next animation frame. Multiple
+        // triggers in the same tick (session move + sidebar toggle +
+        // active-focus change all firing on one user action) would each
+        // dispatch a separate window-resize IPC, and main.js would apply
+        // intermediates before landing on the settled state. Coalescing
+        // to one IPC per frame lets main see the final state directly.
+        _scheduleAutoResizeIpc();
+    }
+
+    // Ask main.js to grow / shrink the window to fit the CURRENT visible
+    // layout: baseline main-card, plus rail if any minimized session,
+    // plus sidebar if the detail panel is expanded. rAF-batched (see
+    // _updateLayout) and payload-deduplicated (skip if the last IPC we
+    // sent was identical to what we'd send now — many _updateLayout
+    // triggers change DOM state but NOT window-layout inputs, e.g.
+    // toggling a min/max button's hidden class doesn't affect any of
+    // {sessions, sidebarOpen, sidebarWidth, railOpen}).
+    let _autoResizeRafId = 0;
+    let _lastAutoResizeKey = null;
+    function _scheduleAutoResizeIpc() {
+        if (_autoResizeRafId) return;
+        _autoResizeRafId = requestAnimationFrame(() => {
+            _autoResizeRafId = 0;
+            _sendAutoResizeIpc();
+        });
+    }
+    function _sendAutoResizeIpc() {
+        // Read layout state directly here (not passed in) — the rAF gap
+        // between "_updateLayout called" and "IPC actually sent" means
+        // the state may have moved on again; reading fresh at send time
+        // means we send the SETTLED state, not a stale intermediate.
+        const railEmpty2 = !stageRailList || stageRailList.children.length === 0;
         const totalSessions = sessions.size;
         const sidebarEl = document.getElementById('session-sidebar');
         const sidebarOpen = !!(sidebarEl && sidebarEl.getAttribute('data-collapsed') !== 'true');
-        const railOpen = !railEmpty;
+        // Sidebar width is now dynamic (see session-sidebar.js's
+        // SIDEBAR_TO_CARD_RATIO / user drag pin), so main.js can't use a
+        // fixed AUTO_RESIZE_SIDEBAR_DELTA anymore — send the actual
+        // measured pixel width and let main add the 10px margin.
+        //
+        // Read `sidebarEl.style.width` (the TARGET set by
+        // _refreshSidebarWidth), NOT `getBoundingClientRect().width` (the
+        // currently-animating value). This IPC is rAF-batched, so by the
+        // time it fires the CSS width transition has already started —
+        // getBoundingClientRect returns the mid-animation width (say
+        // ~100px into a 0→512 transition), which would make main.js
+        // grow the window by only that mid value instead of the full
+        // target, leaving chat-card squeezed and the 4:2.5 ratio broken.
+        // Inline style.width is the authoritative post-animation target
+        // set synchronously in _setCollapsed's open path before the
+        // transition begins. Fall back to getBoundingClientRect only if
+        // no inline width is set (should not happen with the current
+        // session-sidebar.js, but keeps rare paths safe).
+        // When the sidebar is closed it's out of layout (width:0 via
+        // CSS), so 0 is what we report; main.js falls back to the legacy
+        // delta only if sidebarOpen is true AND sidebarWidth is
+        // 0/missing.
+        let sidebarWidth = 0;
+        if (sidebarOpen && sidebarEl) {
+            const inlineW = parseFloat(sidebarEl.style.width);
+            sidebarWidth = Number.isFinite(inlineW) && inlineW > 0
+                ? inlineW
+                : sidebarEl.getBoundingClientRect().width;
+        }
+        const railOpen = !railEmpty2;
+
+        // Payload dedup key — round sidebarWidth to the nearest px so
+        // sub-px jitter (from fractional flex distribution during window
+        // drag) doesn't defeat the cache. Everything else is discrete.
+        const key = totalSessions + '|' + (sidebarOpen ? 1 : 0) + '|' +
+                    Math.round(sidebarWidth) + '|' + (railOpen ? 1 : 0);
+        if (key === _lastAutoResizeKey) return;
+        _lastAutoResizeKey = key;
+
         if (window.windowControls && typeof window.windowControls.autoResize === 'function') {
             try {
                 window.windowControls.autoResize({
                     sessions: Math.max(1, totalSessions),
                     sidebarOpen: sidebarOpen,
+                    sidebarWidth: sidebarWidth,
                     railOpen: railOpen,
                 });
             } catch (_) { /* ignore */ }
@@ -1108,11 +1173,11 @@
     }
 
     // Re-layout the window whenever the sidebar toggles open/closed. This
-    // is the signal that lets the window grow by SIDEBAR_DELTA (+278px)
-    // when the sidebar auto-opens on first activity — without it, the
-    // sidebar would eat into the main card's width instead of pushing the
-    // window wider from the baseline. Fired from session-sidebar.js's
-    // _setCollapsed via a CustomEvent (decoupled — no direct import).
+    // is the signal that lets the window grow when the sidebar opens for
+    // the first time — without it, the sidebar would eat into the main
+    // card's width instead of pushing the window wider from the baseline.
+    // Fired from session-sidebar.js's _setCollapsed via a CustomEvent
+    // (decoupled — no direct import).
     window.addEventListener('session-sidebar-toggle', () => {
         try { _updateLayout(); } catch (_) { /* ignore */ }
     });
@@ -2778,8 +2843,14 @@
         _terminalBodyEl.appendChild(container);
 
         const terminal = new window.XTermLib.Terminal({
-            fontSize: 15,
-            fontFamily: '"SF Mono", ui-monospace, Menlo, Monaco, "Cascadia Mono", Consolas, "Liberation Mono", monospace',
+            /* Font — aligned with the app-wide typography scale. 13px matches
+               --fs-body (macOS body Text Style) and sits inside the doc's
+               "code editor / terminal" 12-14pt range (§11.2). fontFamily
+               mirrors the stylesheet's --mono token (ui-monospace first
+               so macOS gets the OS-optimized mono, then explicit fallbacks
+               for older / non-Apple platforms). */
+            fontSize: 13,
+            fontFamily: 'ui-monospace, "SF Mono", SFMono-Regular, Menlo, Monaco, "Cascadia Mono", Consolas, "Liberation Mono", monospace',
             theme: {
                 background: '#1e1e2e',
                 foreground: '#cdd6f4',
@@ -3310,13 +3381,17 @@
             // Live file activity → session sidebar (change list). Fired by
             // write/edit/read tools right after a successful op; the
             // sidebar accumulates per-session and re-renders when the
-            // event belongs to the active session.
+            // event belongs to the active session. `reversible` gates the
+            // per-file ↺ button — only true when the backend held a
+            // capture_before snapshot (write/edit/notebook_edit), never for
+            // shell mtime hits or read/grep/glob.
             if (window.SessionSidebar) {
                 window.SessionSidebar.ingestFileTouch(_resolveSid(evt), {
-                    path:    evt.path,
-                    touch:   evt.touch,
-                    tool:    evt.tool,
-                    item_id: evt.item_id,
+                    path:       evt.path,
+                    touch:      evt.touch,
+                    tool:       evt.tool,
+                    item_id:    evt.item_id,
+                    reversible: evt.reversible === true,
                 });
             }
         } else if (evt.kind === 'agent_todo') {
@@ -3393,6 +3468,43 @@
                 { path: evt.result.config_path });
             applyConfigToForm(evt.result.config);
             settingsStatus.textContent = 'loaded';
+            return;
+        }
+
+        // file_undo response — {ok, mode, item_id, restored:[{path,was_absent}],
+        // conflicts:[{path,conflict,detail}]}. Dispatch to the sidebar so it
+        // cleans up state (removes deleted files, suppresses ↺ on the ones we
+        // just reverted), then author the user-visible confirmation as a
+        // per-session system bubble + one activity feed row. Detected by the
+        // presence of the {interrupt|notice} mode — no other final response
+        // carries that shape.
+        if (evt.result && (evt.result.mode === 'interrupt' || evt.result.mode === 'notice')) {
+            const sid = _resolveSid(evt);
+            const restored = Array.isArray(evt.result.restored) ? evt.result.restored : [];
+            const conflicts = Array.isArray(evt.result.conflicts) ? evt.result.conflicts : [];
+            if (window.SessionSidebar) {
+                window.SessionSidebar.notifyFilesRestored(sid, restored, conflicts);
+            }
+            const lines = [];
+            if (restored.length) {
+                lines.push('↺ Reverted ' + restored.length + ' file(s) from task '
+                    + (evt.result.item_id || '') + '.');
+                if (evt.result.mode === 'interrupt') {
+                    lines.push('Agent turn was interrupted — awaiting your next instruction.');
+                }
+            } else {
+                lines.push('↺ Undo requested, but no files were reverted.');
+            }
+            if (conflicts.length) {
+                lines.push('⚠ ' + conflicts.length + ' file(s) could NOT be reverted:');
+                for (const c of conflicts) {
+                    lines.push('  • ' + (c.path || '?') + ' — ' + (c.conflict || '?')
+                        + (c.detail ? ' (' + c.detail + ')' : ''));
+                }
+            }
+            addSystemBubble(lines.join('\n'));
+            pushActivity('↺', 'Undo · ' + (evt.result.mode || ''),
+                'reverted ' + restored.length + '; ' + conflicts.length + ' conflicts');
             return;
         }
 
@@ -3840,7 +3952,7 @@
             );
             container.innerHTML = '';
             if (pool.length === 0) {
-                container.innerHTML = '<span style="color:var(--fg-mute);font-size:11px">Add models above first</span>';
+                container.innerHTML = '<span style="color:var(--fg-mute);font-size:var(--fs-subheadline)">Add models above first</span>';
                 continue;
             }
             for (const m of pool) {
@@ -3884,8 +3996,6 @@
 
         cfgLlmApiKey.value =
             (llm.API_KEY === undefined || llm.API_KEY === null) ? '' : String(llm.API_KEY);
-        cfgLlmMaxTokens.value =
-            (llm.max_tokens === undefined || llm.max_tokens === null) ? '' : String(llm.max_tokens);
 
         const resolved = resolveModelsAndHelper(llm);
         cfgLlmAvailableModels.value = modelsToText(resolved.pool);
@@ -3951,14 +4061,8 @@
 
         if ('api_key_env' in llm) delete llm.api_key_env;
         if ('api_key' in llm) delete llm.api_key;
+        if ('max_tokens' in llm) delete llm.max_tokens;
         llm.API_KEY = cfgLlmApiKey.value;
-
-        if (cfgLlmMaxTokens.value === '') {
-            delete llm.max_tokens;
-        } else {
-            const n = parseInt(cfgLlmMaxTokens.value, 10);
-            if (!Number.isNaN(n)) llm.max_tokens = n;
-        }
 
         // Model pool + checked subsets (new schema). Drop legacy fields.
         const pool = textToModels(cfgLlmAvailableModels.value);

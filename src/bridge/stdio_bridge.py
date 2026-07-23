@@ -656,6 +656,7 @@ class _StdioUI:
 
     def notify_file_touch(
         self, path: str, kind: str, tool: str, item_id: str = "",
+        reversible: bool = False,
     ) -> None:
         """Live file-touch event → renderer ``kind=file_touch``. Drives the
         per-session right-side sidebar (nebula + file-change list). Fired from
@@ -663,14 +664,18 @@ class _StdioUI:
         renderer accumulates them per session and updates the nebula orb +
         change list in place. Kind mapping: ``read`` blue, ``edit`` amber,
         ``hit`` green (grep-style scan). ``item_id`` is the task item the
-        touch happened inside — empty string between items."""
-        _ui_logger.debug("notify_file_touch: %s %s %s item=%s",
-                         kind, tool, _truncate(path, 80), item_id)
+        touch happened inside — empty string between items. ``reversible``
+        is True only when a pre-op rewind snapshot exists; the sidebar gates
+        the per-file ↺ button on this so files it can't restore (shell mtime
+        hits, read/grep/glob) never expose the affordance."""
+        _ui_logger.debug("notify_file_touch: %s %s %s item=%s reversible=%s",
+                         kind, tool, _truncate(path, 80), item_id, reversible)
         _emit({"type": "status", "kind": "file_touch",
                "path": str(path or ""),
                "touch": str(kind or ""),
                "tool": str(tool or ""),
-               "item_id": str(item_id or "")},
+               "item_id": str(item_id or ""),
+               "reversible": bool(reversible)},
               session_id=self._session_id)
 
     def show_coordinator_thinking(self) -> None:
@@ -1889,21 +1894,14 @@ class StdioBridge:
         llm_cfg = cfg.get("llm", {}) or {}
 
         api_key = llm_cfg.get("API_KEY") or ""
-        _mt_raw = llm_cfg.get("max_tokens")
-        try:
-            _mt_int = int(_mt_raw) if _mt_raw is not None else 0
-        except (TypeError, ValueError):
-            _mt_int = 0
-        max_tokens: Optional[int] = _mt_int if _mt_int > 0 else None
 
         models, _helper_models = resolve_models_and_helper(llm_cfg)
         if not models:
             models = ["anthropic::claude-4-5-haiku"]
 
-        _mt_kwargs: dict = {"max_tokens": max_tokens} if max_tokens is not None else {}
         self._shared_services = [
             AnthropicStreamingService(
-                api_key=api_key, model=m, max_retries=10, **_mt_kwargs,
+                api_key=api_key, model=m, max_retries=10,
             )
             for m in models
         ]
@@ -1911,7 +1909,7 @@ class StdioBridge:
         _helper_model_names = _helper_models or models
         self._shared_helper_services = [
             AnthropicStreamingService(
-                api_key=api_key, model=m, max_retries=10, **_mt_kwargs,
+                api_key=api_key, model=m, max_retries=10,
             )
             for m in _helper_model_names
         ]

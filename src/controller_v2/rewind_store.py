@@ -127,6 +127,13 @@ class FileRewindResult:
     restored: bool
     conflict: RewindConflict = RewindConflict.NONE
     detail: str = ""
+    # True when the pre-item snapshot kind was ABSENT — i.e. the file did not
+    # exist before the item started, and a successful "restore" DELETED it
+    # from disk. The UI needs this to distinguish "put content back" (leaf
+    # stays in the tree, ↺ button suppressed) from "file no longer exists"
+    # (leaf must be removed from the tree entirely). Meaningful only when
+    # restored=True.
+    was_absent: bool = False
 
 
 @dataclass
@@ -317,7 +324,10 @@ class RewindStore:
                     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
                     with open(path, "w", encoding="utf-8", newline="") as fh:
                         fh.write(before.content or "")
-                report.results.append(FileRewindResult(path=path, restored=True))
+                report.results.append(FileRewindResult(
+                    path=path, restored=True,
+                    was_absent=(before.kind == SnapshotKind.ABSENT),
+                ))
             except OSError as exc:
                 report.results.append(FileRewindResult(
                     path=path, restored=False,
