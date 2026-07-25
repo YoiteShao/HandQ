@@ -72,7 +72,9 @@ import logging
 import os
 import re
 import shutil
+import stat
 import sys
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional
@@ -268,6 +270,22 @@ class SkillRegistry:
 
     def names(self) -> List[str]:
         return sorted(n for n, e in self._entries.items() if e.enabled)
+
+    def debug_roster(self) -> List[str]:
+        """One-line-per-skill summary for boot diagnostics — the FULL set
+        (bundled + user, enabled + disabled), unlike ``list_all()`` which
+        hides bundled entries (that's a panel-visibility rule, not a
+        diagnostic one). Exists because the 2026-07-24 desktop-workflow
+        outage had no log line anywhere that answered "what skills did this
+        boot actually find" — every downstream symptom (empty [Available
+        Skills] menu, read_skill never called, reverse-push silently
+        skipped) had to be reverse-engineered from session traces instead of
+        read directly off one boot log line.
+        """
+        return [
+            f"{e.name} (origin={e.origin}, enabled={e.enabled}, standing={e.standing})"
+            for e in sorted(self._entries.values(), key=lambda x: x.name)
+        ]
 
     def get_skill(self, name: str) -> Optional[SkillEntry]:
         entry = self._entries.get(name)
@@ -705,31 +723,112 @@ def _bundled_skills_dir() -> Optional[Path]:
     return d if d.is_dir() else None
 
 
+def _rmtree_with_retry(path: Path, *, attempts: int = 3, delay_s: float = 0.1) -> None:
+    """``shutil.rmtree`` that also clears the Windows read-only bit on failure.
+
+    Root cause this exists for: ``shutil.copytree`` (used by
+    ``seed_bundled_skills`` to seed/refresh a target) preserves the SOURCE
+    directory's permission bits via ``copystat`` — and the repo's ``Skill/``
+    directories can themselves be read-only (e.g. certain git checkouts /
+    editors mark checked-out dirs `0o555`). The copy inherits that: its files
+    are writable, but the DIRECTORY ENTRY itself is not, so a later
+    ``rmdir`` on it raises ``PermissionError: Access is denied`` even though
+    every file inside deletes cleanly (confirmed: `os.remove` on the file
+    succeeds, only `os.rmdir` on the now-empty dir fails). ``onexc`` chmod's
+    the offending path to writable and retries the SAME operation — this is
+    the standard fix documented for `shutil.rmtree` on Windows. A short
+    sleep+retry wrapper around the whole call remains as a second-line
+    defense for the separate (rarer) case of a transient AV/indexer handle;
+    re-raises the last error if it still hasn't cleared after all attempts.
+    """
+    def _on_rm_error(func, target_path, exc_info):
+        try:
+            os.chmod(target_path, stat.S_IWRITE)
+            func(target_path)
+        except OSError:
+            raise exc_info[1]
+
+    last_exc: Optional[OSError] = None
+    for i in range(attempts):
+        try:
+            shutil.rmtree(path, onexc=_on_rm_error)
+            return
+        except OSError as exc:
+            last_exc = exc
+            if i < attempts - 1:
+                time.sleep(delay_s)
+    if last_exc is not None:
+        raise last_exc
+
+
+def _dir_contents_equal(a: Path, b: Path) -> bool:
+    """True iff *a* and *b* contain the same relative file paths with
+    byte-identical content (recursive). Used to skip a bundled-skill refresh
+    when the repo source hasn't actually changed since it was last seeded —
+    metadata (mtime, permission bits) is deliberately ignored, only content
+    and the set of files matter. Any read error is treated as "not equal"
+    (fail toward refreshing, never toward silently skipping a real change).
+    """
+    try:
+        a_files = sorted(p.relative_to(a) for p in a.rglob("*") if p.is_file())
+        b_files = sorted(p.relative_to(b) for p in b.rglob("*") if p.is_file())
+    except OSError:
+        return False
+    if a_files != b_files:
+        return False
+    try:
+        return all(
+            (a / rel).read_bytes() == (b / rel).read_bytes()
+            for rel in a_files
+        )
+    except OSError:
+        return False
+
+
 def seed_bundled_skills(dest_root: Optional[Path] = None) -> int:
-    """Copy shipped recipe skills into the user skill root if ABSENT.
+    """Copy shipped recipe skills into the user skill root, refreshing any
+    that are still ``origin: bundled`` AND whose content actually differs
+    from the shipped source (see ``_dir_contents_equal`` — an unconditional
+    rewrite on every boot, even when nothing shipped, would burn disk I/O
+    and the Windows-lock retry path for no reason on the overwhelmingly
+    common case where the repo content hasn't changed since last boot).
 
     Product-authored recipe skills (monitor-long-running, remote-handq-workflow,
     …) live in the repo/installed ``Skill/`` dir. The registry only scans user
     data (``%USERPROFILE%\\HandQ\\Skill``), so on boot we copy any bundled skill
-    the user does not already have. NEVER overwrites: a user edit or a same-named
-    user skill wins — seeding only fills gaps, so upgrades add new recipes
-    without clobbering customized ones. Returns the number of skills seeded.
+    the user does not already have, AND overwrite any existing target that is
+    still ``origin: bundled`` — the repo is the single source of truth for
+    bundled content, so shipping an improved recipe (new guidance, a fixed
+    caveat) reaches already-installed users on their next boot instead of
+    being stuck forever at whatever version first got seeded. Returns the
+    number of skills seeded or refreshed.
+
+    Bundled skills have NO supported edit path — the panel/IPC surface
+    rejects every write (set_enabled/update_skill/delete_skill/import_skill)
+    for ``origin: bundled`` (see SkillRegistry._bundled_immutable_result).
+    The only way a target's content diverges from the shipped source is a
+    user hand-editing the file directly, outside any supported flow — and
+    even then, unless they also strip/change the ``origin:`` line (which
+    they have no product-facing reason to know exists), this refresh will
+    overwrite that edit on the next boot. This is intentional: origin is the
+    single knob that means "authoritative content lives in the repo, not
+    here" — once True, it stays true.
+
+    A target whose ``origin`` is NOT ``bundled`` (a hand-created/imported
+    user skill with a colliding name, or one where the origin line was
+    itself edited away) is left untouched — seeding never overwrites those.
 
     When the bundled dir and the user dir resolve to the SAME path (dev mode
     where the install dir is the repo AND the user root points there), seeding
     is a no-op.
 
-    Historical-file backfill: a target that ALREADY exists (from before
-    ``origin: bundled`` existed in the shipped files) is compared byte-for-byte
-    against the shipped source with only the ``origin:`` line stripped from
-    both sides. An exact match proves the user never touched the file, so it
-    is safe to stamp ``origin: bundled`` onto it in place — this is the ONLY
-    write this function ever makes to an existing file. Any difference (the
-    user edited it, even trivially) leaves the file untouched: it keeps
-    reading as ``user``-owned, visible and editable in the panel, exactly as
-    before. This never runs on a target this function itself just created —
-    those are already byte-identical copies and get ``origin: bundled``
-    directly from the shipped source.
+    Historical-file backfill: a target that predates ``origin:`` entirely
+    (no frontmatter key at all) is compared byte-for-byte against the shipped
+    source (ignoring the ``origin:`` line) — an exact match proves the user
+    never touched the file, so it's safe to stamp ``origin: bundled`` onto it
+    AND refresh its content in the same pass. A target with no ``origin:``
+    key that differs from the shipped source keeps reading as user-owned,
+    visible and editable in the panel, exactly as before.
     """
     src = _bundled_skills_dir()
     if src is None:
@@ -755,9 +854,50 @@ def seed_bundled_skills(dest_root: Optional[Path] = None) -> int:
         if not src_md.is_file():
             continue
         target = dest / skill_dir.name
+        target_md = target / _SKILL_FILE
         if target.exists():
-            _backfill_bundled_origin_if_untouched(src_md, target / _SKILL_FILE)
-            continue  # user already has this name — never overwrite
+            existing_origin = _read_origin(target_md)
+            if existing_origin is None:
+                # No `origin:` key at all — predates the field. Backfill it
+                # (and refresh content in the same pass) only if untouched;
+                # otherwise leave the user-owned file exactly as-is.
+                _backfill_bundled_origin_if_untouched(src_md, target_md)
+                continue
+            if existing_origin != SKILL_ORIGIN_BUNDLED:
+                continue  # hand-created/imported user skill with this name
+            # Still bundled — the repo is authoritative, but skip the
+            # rmtree+copytree dance entirely when nothing actually changed.
+            # Without this check, EVERY boot rewrites EVERY bundled skill's
+            # files unconditionally, even when the repo content is byte-for-
+            # byte identical to last boot — pure wasted disk I/O plus a
+            # needless run through the Windows-lock retry path on every
+            # single startup, for the (usual) case where nothing shipped.
+            if _dir_contents_equal(skill_dir, target):
+                continue
+            # Copy to a sibling temp dir FIRST, then swap — an rmtree()
+            # immediately followed by copytree() to the same path can race a
+            # transient Windows lock on the just-deleted directory (see
+            # _rmtree_with_retry). Copy-then-swap also means we never have a
+            # moment where the target is both gone and being recreated at
+            # the same path.
+            tmp_target = dest / f".{skill_dir.name}.refresh-tmp"
+            try:
+                if tmp_target.exists():
+                    _rmtree_with_retry(tmp_target)
+                shutil.copytree(skill_dir, tmp_target)
+                _rmtree_with_retry(target)
+                tmp_target.rename(target)
+                seeded += 1
+            except OSError:
+                _logger.exception(
+                    "seed_bundled_skills: failed to refresh %s", skill_dir.name
+                )
+                if tmp_target.exists():
+                    try:
+                        _rmtree_with_retry(tmp_target)
+                    except OSError:
+                        pass
+            continue
         try:
             shutil.copytree(skill_dir, target)
             seeded += 1
@@ -766,8 +906,35 @@ def seed_bundled_skills(dest_root: Optional[Path] = None) -> int:
                 "seed_bundled_skills: failed to copy %s", skill_dir.name
             )
     if seeded:
-        _logger.info("seed_bundled_skills: seeded %d bundled recipe skill(s)", seeded)
+        _logger.info("seed_bundled_skills: seeded/refreshed %d bundled recipe skill(s)", seeded)
     return seeded
+
+
+def _read_origin(skill_md: Path) -> Optional[str]:
+    """Best-effort read of the raw ``origin:`` frontmatter value.
+
+    Returns ``None`` when the file is unreadable, has no frontmatter, or the
+    ``origin`` key is absent — the caller distinguishes "absent" (historical
+    pre-origin file, eligible for backfill) from "present but not bundled"
+    (leave alone). Does NOT use ``_coerce_origin`` — that fails safe to
+    ``"user"`` for anything unrecognised, which would collapse the "absent"
+    and "present-but-different" cases this function needs to tell apart.
+    """
+    try:
+        text = skill_md.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    match = _FRONTMATTER_RE.match(text)
+    if not match:
+        return None
+    try:
+        fm = yaml.safe_load(match.group(1)) or {}
+    except yaml.YAMLError:
+        return None
+    if not isinstance(fm, dict) or "origin" not in fm:
+        return None
+    raw = fm.get("origin")
+    return str(raw).strip() if raw is not None else None
 
 
 _ORIGIN_LINE_RE = re.compile(r"(?m)^origin:\s*\S+\s*\n?")

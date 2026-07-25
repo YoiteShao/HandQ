@@ -12,6 +12,36 @@ if TYPE_CHECKING:
     from ..controller_v2.session_context import SessionContext
 
 
+def _failure_summary(output: Any) -> str:
+    """Build a short failure note from a structured tool output dict.
+
+    Used only as a fallback when a failed ToolResult carries a structured
+    ``output`` (e.g. shell's {stdout, stderr, exit_code, ...}) but no explicit
+    ``error`` string. Without this, folding the whole dict into ``err`` via
+    ``str(output)`` both buries the useful stdout AND obscures why it failed;
+    keeping ``out`` for the stdout means we still owe the agent an explicit
+    "this failed, and here's why" signal. Prefers stderr/exit_code — the two
+    fields that actually say what went wrong.
+
+    Falls back to a generic marker so the returned string is never empty (the
+    caller relies on it being truthy to signal failure).
+    """
+    if isinstance(output, dict):
+        parts = []
+        code = output.get("exit_code")
+        if code is None:
+            code = output.get("returncode")
+        if code is not None:
+            parts.append(f"exited with code {code}")
+        stderr = (output.get("stderr") or "").strip()
+        if stderr:
+            # Keep it short — the full stderr is already in `out`.
+            parts.append(f"stderr: {stderr[:300]}")
+        if parts:
+            return "; ".join(parts)
+    return "command failed (see out for details)"
+
+
 @dataclass
 class ToolResult:
     """Tool execution result — carries the full execution context and outcome."""
@@ -82,7 +112,18 @@ class ToolResult:
         if self.success:
             d["out"] = self.output  # full output, no truncation
         else:
-            d["err"] = self.error or str(self.output)  # full error, no truncation
+            # Failure with a STRUCTURED payload (e.g. shell's {stdout, stderr,
+            # exit_code, ...}): keep the payload in `out` so useful stdout is
+            # never buried, AND set `err` so the failure signal is explicit.
+            # Folding the dict into str(output) (the old behaviour) both hid the
+            # stdout and demoted it to "error noise" — the 2026-07-24 QPM trace
+            # ignored a discovered qpm-cli path exactly this way. Info only
+            # grows: stdout stays, the failure reason is added alongside.
+            if self.output is not None and not isinstance(self.output, str):
+                d["out"] = self.output
+                d["err"] = self.error or _failure_summary(self.output)
+            else:
+                d["err"] = self.error or str(self.output)  # pure error: unchanged
         if self.diff_output is not None:
             d['diff_output'] = self.diff_output
         if self.lines_written is not None:
@@ -112,7 +153,13 @@ class ToolResult:
         if self.success:
             d["out"] = self.output
         else:
-            d["err"] = self.error or str(self.output)
+            # Same policy as to_obs_dict: structured failure output keeps `out`
+            # (stdout survives) and adds an explicit `err`; pure errors unchanged.
+            if self.output is not None and not isinstance(self.output, str):
+                d["out"] = self.output
+                d["err"] = self.error or _failure_summary(self.output)
+            else:
+                d["err"] = self.error or str(self.output)
         if self.diff_output is not None:
             d["diff"] = self.diff_output
         if self.lines_written is not None:

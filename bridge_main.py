@@ -653,6 +653,55 @@ if sys.platform != "win32":
 
 import asyncio  # noqa: E402
 
+# ---------------------------------------------------------------------------
+# comtypes typelib cache — redirect to a user-writable directory.
+#
+# pywinauto (imported transitively by src.tools.desktop_tool → src.tools.
+# tool_registry → src.controller_v2 → src.bridge.stdio_bridge) calls
+# comtypes.client.GetModule on the UIAutomationClient typelib
+# (GUID 944DE083-8FB8-45CF-BCB7-C477ACB2F897). comtypes writes / reads a
+# generated stub at
+#     <comtypes package dir>/gen/_<GUID>_<major>_<minor>_<lcid>.py
+# with the build machine's typelib header (major/minor/lcid/LIBFLAGS/…)
+# baked in. On a different Windows build the on-disk typelib doesn't
+# match and _tlib_version_checker raises
+#     ImportError: Typelib different than module
+# — the entire desktop_tool import chain then dies.
+#
+# Two things are broken in the shipped bundle:
+#   1. We must NOT ship pre-generated stubs from the build machine (see
+#      packaging/build.ps1: purge step wipes them from the Nuitka input).
+#   2. On the target machine comtypes needs a writable directory to place
+#      the freshly generated stubs. In the Nuitka standalone dist the
+#      install directory is read-only (Program Files / AppData\Local\
+#      Programs), so we point comtypes at %USERPROFILE%\HandQ\comtypes_gen
+#      before the first pywinauto import.
+#
+# Non-Windows: comtypes is Windows-only; skip silently.
+# ---------------------------------------------------------------------------
+if sys.platform == "win32":
+    try:
+        import comtypes.client as _comtypes_client  # noqa: E402
+
+        _comtypes_gen_dir = os.path.join(_user_handq_root(), "comtypes_gen")
+        os.makedirs(_comtypes_gen_dir, exist_ok=True)
+        # comtypes probes __path__ of the loaded comtypes.gen package to
+        # discover cached stubs, so the directory must also appear on that
+        # package's search path. GetModule() will still write new stubs into
+        # gen_dir regardless.
+        _comtypes_client.gen_dir = _comtypes_gen_dir
+        try:
+            import comtypes.gen as _comtypes_gen  # noqa: E402
+            if _comtypes_gen_dir not in _comtypes_gen.__path__:
+                _comtypes_gen.__path__.append(_comtypes_gen_dir)
+        except Exception:
+            pass
+        _boot_logger.info("comtypes gen_dir redirected to %s", _comtypes_gen_dir)
+    except Exception:
+        _boot_logger.exception(
+            "could not redirect comtypes gen_dir; UIA typelib may fail to import"
+        )
+
 
 def _timed_import(label: str, do_import):
     """Run a single import call wrapped in wall-clock timing.
@@ -730,11 +779,13 @@ def _get_desktop_query():
     return is_any_session_holding_desktop
 
 
-async def _run_with_long_term_memory() -> None:
-    """Initialise LongTermMemory + PersonalityMonitor + Scheduler before the
-    bridge starts and tear them down on exit. All three live for the
-    lifetime of the bridge process; a clean shutdown lets WAL flush, the
-    personality buffer drain, and the scheduler's JSON state reach disk.
+async def _run_boot_subsystems() -> None:
+    """Initialise Skills + LongTermMemory + PersonalityMonitor + Scheduler
+    before the bridge starts, and tear the latter three down on exit. All
+    three (LTM/Personality/Scheduler) live for the lifetime of the bridge
+    process; a clean shutdown lets WAL flush, the personality buffer drain,
+    and the scheduler's JSON state reach disk. Skill registry init is a
+    one-shot boot step with no teardown.
 
     The init failure path is non-fatal for each subsystem: a null LTM
     instance keeps the bridge available even when the SQLite db is
@@ -772,6 +823,15 @@ async def _run_with_long_term_memory() -> None:
     else:
         _skills_ms = int((time.monotonic() - _t_skills) * 1000)
         _boot_logger.info("SkillRegistry.init took %dms", _skills_ms)
+        # Full roster (bundled + user, enabled + disabled) — the 2026-07-24
+        # desktop-workflow outage had NO log line anywhere confirming which
+        # skills a given boot actually found; this makes "is X even loaded"
+        # a one-line grep instead of a multi-session forensic exercise.
+        roster = SkillRegistry.get().debug_roster()
+        _boot_logger.info(
+            "SkillRegistry roster: %d skill(s): %s",
+            len(roster), "; ".join(roster) if roster else "(none)",
+        )
         _emit_boot_progress("skills_init_done", took_ms=_skills_ms)
 
     # ── Personality data root ─────────────────────────────────────────
@@ -893,7 +953,7 @@ async def _run_with_long_term_memory() -> None:
 if __name__ == "__main__":
     _boot_logger.info("bridge entrypoint: starting asyncio loop")
     try:
-        asyncio.run(_run_with_long_term_memory())
+        asyncio.run(_run_boot_subsystems())
     except (KeyboardInterrupt, SystemExit):
         _boot_logger.info("bridge interrupted by KeyboardInterrupt/SystemExit")
         raise

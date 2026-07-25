@@ -559,32 +559,16 @@
         // remaining cards. Static per card lifetime.
         card.style.viewTransitionName = 'session-' + sid;
 
-        // Header: name · status pill · minimize · maximize · close.
+        // Header: name · status pill · close.
+        // (Minimize/maximize buttons were removed from the header — the user
+        // asked for a plainer session card. The _minimizeSession /
+        // _maximizeSession helpers below are kept as private functions since
+        // the stage-rail promote/demote flow may still call them through
+        // other code paths; only the header affordance is gone.)
         const head = el('div', 'session-card-head');
         const title = el('span', 'session-card-title', name);
         title.addEventListener('dblclick', () => _startRenameSession(sid));
         const pill = el('span', 'session-card-pill', 'idle');
-
-        // Minimize (→ rail) / maximize (sole main occupant) — hidden by
-        // _updateLayout until a 2nd concurrent session exists (a lone
-        // session has nothing to minimize into or maximize over).
-        const minBtn = el('button', 'session-card-min hidden');
-        minBtn.type = 'button';
-        minBtn.setAttribute('aria-label', 'Minimize session');
-        minBtn.title = 'Minimize to rail';
-        minBtn.innerHTML =
-            '<svg viewBox="0 0 12 12" width="12" height="12" aria-hidden="true">' +
-            '<line x1="2.5" y1="9" x2="9.5" y2="9" stroke="currentColor" ' +
-            'stroke-width="1.4" stroke-linecap="round"/></svg>';
-
-        const maxBtn = el('button', 'session-card-max hidden');
-        maxBtn.type = 'button';
-        maxBtn.setAttribute('aria-label', 'Maximize session');
-        maxBtn.title = 'Maximize — take the whole stage';
-        maxBtn.innerHTML =
-            '<svg viewBox="0 0 12 12" width="12" height="12" aria-hidden="true">' +
-            '<rect x="2.5" y="2.5" width="7" height="7" rx="1.3" ' +
-            'stroke="currentColor" stroke-width="1.3" fill="none"/></svg>';
 
         const cardClose = el('button', 'session-card-close', '×');
         cardClose.type = 'button';
@@ -592,8 +576,6 @@
         cardClose.title = 'Close session';
         head.appendChild(title);
         head.appendChild(pill);
-        head.appendChild(minBtn);
-        head.appendChild(maxBtn);
         head.appendChild(cardClose);
 
         // Body: the scroll container where chat bubbles + activity groups go.
@@ -635,8 +617,10 @@
         s.pillEl = pill;
         s.confirmEl = confirm;
         s.composerInput = ta;
-        s.minBtn = minBtn;
-        s.maxBtn = maxBtn;
+        // Min/max buttons removed from the card header — kept as null refs
+        // so _updateLayout's `if (s.minBtn)` guards continue to no-op.
+        s.minBtn = null;
+        s.maxBtn = null;
 
         // Clicking anywhere on a MAIN-slot card focuses it (jump aid + unread
         // clear); while minimized the card itself is pointer-events:none (see
@@ -650,14 +634,6 @@
         cardClose.addEventListener('click', (ev) => {
             ev.stopPropagation();
             closeSession(sid);
-        });
-        minBtn.addEventListener('click', (ev) => {
-            ev.stopPropagation();
-            _minimizeSession(sid);
-        });
-        maxBtn.addEventListener('click', (ev) => {
-            ev.stopPropagation();
-            _maximizeSession(sid);
         });
         form.addEventListener('submit', (ev) => {
             ev.preventDefault();
@@ -846,17 +822,32 @@
         }
         activeSid = sid;
         s.lastFocusedAt = ++_focusCounter;
-        if (s.card) {
-            s.card.classList.add('active');
-            try { s.card.scrollIntoView({ inline: 'nearest', block: 'nearest' }); }
-            catch (_) { /* ignore */ }
-        }
+        if (s.card) s.card.classList.add('active');
         s.unread = false;
         _repaintActivityForActive();
         if (window.SessionSidebar) {
             window.SessionSidebar.setActiveSession(sid, s.name || sid);
         }
-        try { if (s.composerInput) s.composerInput.focus(); } catch (_) { /* ignore */ }
+        // Defer the two forced-synchronous-layout operations (scrollIntoView +
+        // composer focus) to the next frame. Run inline here — as they were —
+        // each forces a full layout of a document full of backdrop-filter
+        // surfaces, and they sandwich setActiveSession's own sidebar rebuild
+        // (+ its getBoundingClientRect width recompute), so the switch path
+        // did "mutate → forced layout → rebuild → forced layout" = layout
+        // thrash (measured ~150-175ms of synchronous layout on the switch
+        // path via long-animation-frame; NOT the View Transition — disabling
+        // animations didn't change it). Batching both reads into one rAF, AFTER
+        // every mutation above has committed, collapses that to a single layout
+        // pass. The ~16ms delay before the composer takes focus is
+        // imperceptible; the guard drops stale rAFs so a rapid A→B→A switch
+        // only ever focuses the session that ended up active.
+        requestAnimationFrame(() => {
+            const cur = sessions.get(sid);
+            if (!cur || activeSid !== sid || !cur.card) return;
+            try { cur.card.scrollIntoView({ inline: 'nearest', block: 'nearest' }); }
+            catch (_) { /* ignore */ }
+            try { if (cur.composerInput) cur.composerInput.focus(); } catch (_) { /* ignore */ }
+        });
         window.__handqLog('INFO', 'focusMainSession', { sid });
     }
 

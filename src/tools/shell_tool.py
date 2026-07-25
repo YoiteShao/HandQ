@@ -343,6 +343,100 @@ def _apply_truncation(stdout: str, stderr: str) -> tuple[str, str, bool]:
     return stdout_out, stderr_out, truncated
 
 
+# ── Exit-code semantics ───────────────────────────────────────────────────────
+#
+# Mirrors claude-code's commandSemantics.ts: many commands use a non-zero exit
+# code to convey information, NOT failure. Treating "exit != 0" as a blanket
+# failure (and then burying the stdout in an err string) is exactly what misled
+# the 2026-07-24 QPM agent — a Get-ChildItem that scanned several dirs, listed
+# qpm-cli.exe successfully, but returned 1 because one subdir was inaccessible,
+# was presented as {"ok": false, ...} with the CLI path folded into `err`.
+#
+# `_interpret_exit_code` returns (is_error, note): is_error drives the tool's
+# success flag; note is an informational string appended to stdout (never
+# replacing it) so the agent understands the non-zero code without treating it
+# as failure.
+
+# Base command → semantic. Each takes (code, stdout, stderr) and returns
+# (is_error, note). Matched against the FIRST token of the (last) command
+# segment, lowercased, with .exe/.ps1 stripped — same normalization as
+# _segment_is_read_only.
+def _sem_listing(code: int, stdout: str, _stderr: str) -> tuple[bool, Optional[str]]:
+    # Get-ChildItem / ls / dir: code 1 with output = some paths were
+    # inaccessible (permissions), not a failure. code 1 with NO output, or
+    # code >= 2, is a real error (bad path, bad args).
+    if code >= 2:
+        return True, None
+    if code == 1:
+        if stdout.strip():
+            return False, "some paths were inaccessible (partial listing)"
+        return True, None
+    return False, None
+
+
+def _sem_search(code: int, _stdout: str, _stderr: str) -> tuple[bool, Optional[str]]:
+    # Select-String / findstr / grep / rg: 0 = matches, 1 = no matches (not an
+    # error), 2+ = real error.
+    if code >= 2:
+        return True, None
+    if code == 1:
+        return False, "no matches found"
+    return False, None
+
+
+def _sem_diff(code: int, _stdout: str, _stderr: str) -> tuple[bool, Optional[str]]:
+    # fc / diff: 0 = identical, 1 = differences found (not an error), 2+ = error.
+    if code >= 2:
+        return True, None
+    if code == 1:
+        return False, "files differ"
+    return False, None
+
+
+_COMMAND_SEMANTICS: Dict[str, Any] = {
+    "get-childitem": _sem_listing, "gci": _sem_listing, "ls": _sem_listing,
+    "dir": _sem_listing, "gci.exe": _sem_listing,
+    "select-string": _sem_search, "sls": _sem_search, "findstr": _sem_search,
+    "grep": _sem_search, "rg": _sem_search, "egrep": _sem_search, "fgrep": _sem_search,
+    "fc": _sem_diff, "diff": _sem_diff,
+}
+
+
+def _base_command_token(command: str) -> str:
+    """First token of the LAST pipeline/chain segment, normalized.
+
+    The last command in a pipe/chain determines the process exit code, so its
+    semantic is the one that applies. Best-effort — not for security decisions.
+    """
+    cmd = (command or "").strip()
+    if not cmd:
+        return ""
+    # Split on the coarse chain/pipe operators; take the last non-empty segment.
+    parts = re.split(r"\|\||&&|;|\||>>|>|<", cmd)
+    seg = next((p.strip() for p in reversed(parts) if p.strip()), cmd)
+    head = (seg.split() or [""])[0].lower().lstrip("./")
+    for suffix in (".exe", ".ps1", ".cmd", ".bat"):
+        if head.endswith(suffix):
+            head = head[: -len(suffix)]
+            break
+    return head
+
+
+def _interpret_exit_code(
+    command: str, code: int, stdout: str, stderr: str
+) -> tuple[bool, Optional[str]]:
+    """Interpret a shell exit code by command semantics.
+
+    Returns (is_error, note). Default (unknown command): is_error = code != 0.
+    Known informational-exit commands (listing/search/diff) map code 1 to
+    success-with-note. See module comment for rationale.
+    """
+    sem = _COMMAND_SEMANTICS.get(_base_command_token(command))
+    if sem is None:
+        return code != 0, None
+    return sem(code, stdout, stderr)
+
+
 # ── Shell resolution ──────────────────────────────────────────────────────────
 
 def _resolve_shell(shell: Optional[str]) -> list[str]:
@@ -1040,6 +1134,19 @@ class ShellTool(BaseTool):
                 # Truncation
                 stdout_text, stderr_text, truncated = _apply_truncation(stdout_text, stderr_text)
 
+                # Exit-code semantics: a non-zero code isn't always failure
+                # (Get-ChildItem partial listing, Select-String no-match, diff
+                # differs). is_error drives success; note is appended to stdout
+                # so the agent understands the code without treating it as a
+                # failure. See _interpret_exit_code.
+                is_error, exit_note = _interpret_exit_code(
+                    command, process.returncode, stdout_text, stderr_text
+                )
+                if exit_note:
+                    stdout_text = (
+                        stdout_text + f"\n[note: exit code {process.returncode} — {exit_note}]"
+                    )
+
                 # Scope warning
                 if _scope_warning:
                     stdout_text = stdout_text + _scope_warning
@@ -1060,12 +1167,12 @@ class ShellTool(BaseTool):
 
                 # Workspace-mtime scan: emit file_touch(edit) for every file
                 # under effective_cwd whose mtime landed after this command
-                # started. Only meaningful on success (a failed rm didn't
-                # touch anything worth showing) and skipped for demonstrably
-                # read-only commands (ls, grep) where the scan would just
-                # burn CPU. Runs in the executor so a big tree doesn't
-                # stall the event loop.
-                if (process.returncode == 0
+                # started. Only meaningful on a non-error result (a failed rm
+                # didn't touch anything worth showing) and skipped for
+                # demonstrably read-only commands (ls, grep) where the scan
+                # would just burn CPU. Runs in the executor so a big tree
+                # doesn't stall the event loop.
+                if (not is_error
                         and effective_cwd
                         and not looks_read_only(command)):
                     try:
@@ -1079,9 +1186,9 @@ class ShellTool(BaseTool):
                         pass
 
                 return ToolResult(
-                    success=process.returncode == 0,
+                    success=not is_error,
                     output=observation,
-                    error=stderr_text if process.returncode != 0 else None,
+                    error=stderr_text if is_error else None,
                     execution_time=time.time() - start_time,
                     exit_code=process.returncode,
                     tool_name=self.name,

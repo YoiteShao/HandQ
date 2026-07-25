@@ -1326,7 +1326,18 @@ class StdioBridge:
                 from src.infrastructure.skills import SkillRegistry
                 reg = SkillRegistry.get()
                 if msg_type == "skill_list":
-                    skills = await asyncio.to_thread(reg.list_all)
+                    # The panel's only skill-list surface, and its "refresh"
+                    # button is just this same call again — so reload() (a
+                    # full re-scan of the Skill root) has to happen HERE, not
+                    # behind a separate message the frontend doesn't send.
+                    # Without it, a file added/removed on disk out-of-band
+                    # (copying a new skill in, deleting one) never appears —
+                    # the registry only reflects what init() saw at boot plus
+                    # whatever the panel's own CRUD paths wrote in-memory.
+                    def _reload_and_list():
+                        reg.reload()
+                        return reg.list_all()
+                    skills = await asyncio.to_thread(_reload_and_list)
                     result = {"skills": skills}
                 elif msg_type == "skill_set_enabled":
                     name = str(msg.get("name") or "")

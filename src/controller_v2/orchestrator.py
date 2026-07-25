@@ -372,6 +372,38 @@ class Orchestrator:
                 self._on_reply_to_user(final_reply)
             return final_reply
 
+        # Pure halt: an interrupt with NO deferred actions is "stop what you're
+        # doing", not "do this instead". Enqueuing it as a TaskSpec (the old
+        # `else message` path below) created an item with no world-work, which
+        # the completion_guard then rejected on every turn — the 2026-07-23
+        # "stop now" spin (~79 min / 186 rejections). Here we abort without
+        # ever creating that item: clear the pending tail and interrupt the
+        # in-flight item if one exists; if the agent is already idle, this is a
+        # no-op and we just acknowledge. deferred-non-empty interrupts fall
+        # through to the redirect path below (abandon current + queue the new
+        # work), which is the correct "do this instead" behaviour.
+        if intent == "interrupt" and not deferred:
+            precise_ltm_task.cancel()
+            current = self._task_channel.get_current_item()
+            if current is not None:
+                await self._task_channel.replace_post_current([])
+                try:
+                    await self._task_channel.interrupt_agent(
+                        reason="User halted current task"
+                    )
+                except Exception as e:
+                    self.logger.warning(
+                        f"[Orchestrator] interrupt_agent (halt) failed: {e}",
+                        component="Orchestrator",
+                    )
+            else:
+                self.logger.info(
+                    "[Orchestrator] Pure-halt interrupt while idle — no in-flight "
+                    "item to stop; acknowledging without enqueuing.",
+                    component="Orchestrator",
+                )
+            return reply or ""
+
         # queue / interrupt: mechanically enqueue the request verbatim. The
         # agent owns decomposition, tool selection, and target discovery —
         # the Coordinator's only job is to get the work into the channel and,

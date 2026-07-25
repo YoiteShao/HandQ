@@ -178,6 +178,39 @@ if (-not $ElectronOnly) {
     } else {
         Ok 'C-compile cache: clcache (auto-managed by Nuitka under %LOCALAPPDATA%\Nuitka)'
     }
+
+    # ── Purge comtypes.gen typelib cache from the build environment ───────────
+    # comtypes bakes the BUILD machine's UIAutomationClient typelib headers
+    # (major/minor/lcid/LIBFLAGS/helpcontext) into
+    # `<site-packages>/comtypes/gen/_<GUID>_<major>_<minor>_<lcid>.py`.
+    # Nuitka's --include-package=comtypes then embeds those stale stubs into
+    # the standalone dist. On a target machine whose UIAutomationCore typelib
+    # differs by even one field, comtypes' _tlib_version_checker raises
+    # `ImportError: Typelib different than module` on the first pywinauto
+    # import — the entire desktop_tool chain fails to load.
+    #
+    # Fix: wipe the dev machine's cached stubs before Nuitka runs so nothing
+    # stale ships. comtypes will regenerate them at runtime on the target
+    # (bridge_main.py redirects comtypes.client.gen_dir to
+    # %USERPROFILE%\HandQ\comtypes_gen because the install dir is read-only).
+    # Side-effect on the build machine: the next local `import pywinauto`
+    # takes an extra ~1s to rebuild the stubs. Harmless.
+    $comtypesGen = & $pyCmd ($pyArgs.Split(' ') + @(
+        '-c',
+        "import comtypes, os, sys; sys.stdout.write(os.path.join(os.path.dirname(comtypes.__file__), 'gen'))"
+    )) 2>&1 | Select-Object -Last 1
+    if ($LASTEXITCODE -eq 0 -and $comtypesGen -and (Test-Path $comtypesGen)) {
+        $stale = Get-ChildItem $comtypesGen -File -ErrorAction SilentlyContinue |
+                 Where-Object { $_.Name -ne '__init__.py' }
+        if ($stale) {
+            $stale | Remove-Item -Force
+            Ok "Purged $($stale.Count) stale typelib stub(s) from $comtypesGen"
+        } else {
+            Ok "comtypes.gen already clean ($comtypesGen)"
+        }
+    } else {
+        Warn "Could not locate comtypes.gen (import failed or path missing) — skipping purge"
+    }
 }
 
 if (-not $BridgeOnly) {
@@ -469,6 +502,22 @@ if (-not $BridgeOnly) {
         Fail "Bridge dist missing at $BRIDGE_SRC\handq-bridge.exe.`nRun without -ElectronOnly to build it first."
     }
 
+    # Verify the bundled Skill/ source dir is in place — electron-builder's
+    # extraFiles copies $REPO_ROOT\Skill into the installed app root (see
+    # electron/package.json). Without this directory, seed_bundled_skills()
+    # (bridge_main.py) finds _bundled_skills_dir() missing and silently
+    # no-ops on every boot: the user's %USERPROFILE%\HandQ\Skill\ stays
+    # empty forever, and every bundled *-workflow skill (desktop-workflow,
+    # browser-workflow, ssh-workflow, ...) is invisible to the agent — no
+    # error, no warning, just an empty [Available Skills] menu. This was
+    # the root cause of a 2026-07-24 desktop-automation regression where
+    # read_skill was never called because the skill simply didn't exist on
+    # the installed machine.
+    if (-not (Test-Path "$REPO_ROOT\Skill")) {
+        Fail "Bundled Skill/ dir missing at $REPO_ROOT\Skill.`nBuild would ship with an empty skill set."
+    }
+    Ok "Bundled Skill/ source present ($((Get-ChildItem "$REPO_ROOT\Skill" -Directory).Count) skill dir(s)) — will be packaged via electron/package.json extraFiles"
+
     Push-Location $ELECTRON_DIR
     try {
         # Install node_modules if missing
@@ -491,6 +540,19 @@ if (-not $BridgeOnly) {
         Pop-Location
     }
     Ok 'electron-builder complete'
+
+    # Best-effort post-build check: only meaningful if an unpacked tree exists
+    # (default NSIS-only build produces just the installer exe, not a dir to
+    # inspect). Run `npm run dist:dir` in electron/ first if you want this to
+    # actually verify the packaged output rather than just note the caveat.
+    $unpackedSkill = "$REPO_ROOT\dist\installer\win-unpacked\Skill"
+    if (Test-Path $unpackedSkill) {
+        $n = (Get-ChildItem $unpackedSkill -Directory -ErrorAction SilentlyContinue).Count
+        if ($n -gt 0) { Ok "Verified: packaged win-unpacked\Skill\ has $n skill dir(s)" }
+        else { Warn "packaged win-unpacked\Skill\ exists but is EMPTY — check electron/package.json extraFiles" }
+    } else {
+        Warn "No win-unpacked\ tree to verify Skill/ packaging against (NSIS-only build). Run 'npm run dist:dir' in electron/ to check."
+    }
 }
 
 # ─────────────────────────────────────────────────────────────────────────────

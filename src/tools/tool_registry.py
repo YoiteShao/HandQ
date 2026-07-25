@@ -507,6 +507,24 @@ JSON/YAML/CSV processing, conditionals, loops, error handling, anything
 beyond 2-3 piped commands. Easier to debug than PS object pipelines.
   e.g.  python -c "import json; d=json.load(open('a.json')); print(d['x'][0])"
 
+CLI-FIRST FOR GUI APPS — before automating a GUI (clicking, CDP/DevTools,
+window scripting), check whether the same app ships a command-line or API
+entry point (`*-cli.exe`, a `--install`/`--download` flag, a REST/local
+socket, an SDK). A CLI path is scriptable, deterministic, and needs no
+rendering — it is almost always faster and more reliable than driving the
+UI. GUI automation is the LAST resort, not the first. (A package manager,
+installer, or IDE almost always has a CLI hiding next to the .exe.)
+
+SCRIPTS MUST REPORT A VERDICT — when you write a script that drives a GUI,
+a browser/CDP session, or any multi-step flow, print ONE explicit
+goal-outcome line at the end, e.g. `RESULT: goal_achieved=false
+reason=content_area_empty`. Do NOT rely on a stream of sub-step logs
+("connected", "nav ok", "found element") to judge success — every sub-step
+can succeed while the overall goal fails (the page never rendered, the click
+did nothing), and reading only "ok, ok, ok" will make you think you're one
+tweak away when the whole approach is a dead end. If the verdict says failed,
+change approach — don't re-tune the same dead path.
+
 MULTILINE `python -c "..."` IN POWERSHELL — the double-quoted arg is parsed
 by PowerShell first (backticks, $var, embedded quotes), then by python. Two
 safe patterns instead of hoping the quoting works:
@@ -2387,7 +2405,7 @@ Ending the loop: simply DON'T call schedule_wakeup on a turn — the loop ends."
         "web_search", "ask_human", "remote_handq", "schedule_",
     ]
     _MENU_FAMILY_LABELS: Dict[str, str] = {
-        "browser_":     "browser_*     Web page automation (Chromium)",
+        "browser_":     "browser_*     Web pages + any CDP-debuggable app (Chromium DOM automation)",
         "desktop_":     "desktop_*     Windows native app automation (UIA + screenshot/OCR)",
         "ssh":          "ssh           Remote batch execution on Linux hosts",
         "live_shell_":  "live_shell_*  Persistent interactive subprocesses",
@@ -2398,6 +2416,49 @@ Ending the loop: simply DON'T call schedule_wakeup on a turn — the loop ends."
         "remote_handq": "remote_handq  Delegate a task to a remote Linux HandQ daemon",
         "schedule_":    "schedule_*    Cron-style scheduling (schedule_create/list/delete) + schedule_wakeup (self-paced loop)",
     }
+
+    # Reverse-push map: which BUNDLED ``*-workflow`` skill teaches each tool
+    # family. When the agent CLAIMS a tool from one of these families, the
+    # PersistentAgent injects that skill's body once (see
+    # PersistentAgent._apply_self_extension), so the family's usage knowledge
+    # (action hierarchy, Electron/Chromium caveats, the "act on OCR text you
+    # already have" rule, …) arrives WITH the tools instead of waiting on the
+    # agent to voluntarily read_skill. Keyed by the same family prefix as
+    # _MENU_FAMILY_LABELS. Only families that ship a bundled workflow skill
+    # appear here; the push is additionally gated on origin==bundled at
+    # injection time, so a user-edited copy (origin flips to user) silently
+    # drops out and reverts to the pull (read_skill) model. Keeping this an
+    # explicit map — not a mechanical prefix→"<x>-workflow" transform — avoids
+    # guessing across the "_"→"-" and web_search→web-search boundaries.
+    _FAMILY_WORKFLOW_SKILL: Dict[str, str] = {
+        "browser_":     "browser-workflow",
+        "desktop_":     "desktop-workflow",
+        "ssh":          "ssh-workflow",
+        "email":        "email-workflow",
+        "teams":        "teams-workflow",
+        "web_search":   "web-search-workflow",
+        "remote_handq": "remote-handq-workflow",
+    }
+
+    @classmethod
+    def workflow_skill_for_tool(cls, tool_name: str) -> Optional[str]:
+        """Return the bundled ``*-workflow`` skill name that teaches *tool_name*'s
+        family, or ``None`` when the tool belongs to no workflow-backed family.
+
+        Matches the family-prefix rules used by the claimable-tool menu: keys
+        ending in ``_`` match by prefix (``desktop_click_at`` → ``desktop_``),
+        bare keys match the exact tool name (``ssh``).
+        """
+        name = (tool_name or "").strip()
+        if not name:
+            return None
+        for key, skill in cls._FAMILY_WORKFLOW_SKILL.items():
+            if key.endswith("_"):
+                if name.startswith(key):
+                    return skill
+            elif name == key:
+                return skill
+        return None
 
     @classmethod
     def claimable_tool_menu(cls) -> str:

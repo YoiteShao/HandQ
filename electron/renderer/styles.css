@@ -391,7 +391,6 @@ html[data-vt-scope="session"]::view-transition-new(*) {
 .boot-card::before,
 .boot-hint::before,
 .bubble::before,
-.overlay-card::before,
 .tool-card::before,
 .task-plan-panel::before,
 .agent-todo-panel::before,
@@ -1500,9 +1499,16 @@ html, body {
     max-height: 86vh;
     display: flex;
     flex-direction: column;
-    background: rgba(255, 255, 255, 0.92);
-    backdrop-filter: blur(20px) saturate(115%);
-    -webkit-backdrop-filter: blur(20px) saturate(115%);
+    /* Solid white "whiteboard" surface — these utility panels (Settings,
+       Memory admin, Scheduler, Skills) deliberately DON'T want the liquid-
+       glass treatment the chat surfaces have: they're dense forms/lists where
+       legibility beats aesthetics, and the user asked for an opaque board.
+       Opaque #fff also means the backdrop-filter blur underneath would be
+       completely invisible, so it's removed — that drops a full-window
+       backdrop blur pass (same compositor cost that drives the UI jank work)
+       for zero visual change. The contour glass-ring ::before is likewise
+       dropped for this class (see the ::before selector group above). */
+    background: #ffffff;
     border: none;
     border-radius: 18px;
     box-shadow: 0 20px 60px rgba(20, 20, 30, 0.16),
@@ -2136,9 +2142,10 @@ code {
     display: flex;
     align-items: center;
     justify-content: center;
-    background: rgba(255, 255, 255, 0.90);
-    backdrop-filter: blur(16px) saturate(115%);
-    -webkit-backdrop-filter: blur(16px) saturate(115%);
+    /* Solid white to match the whiteboard .overlay-card it covers — the card
+       is opaque now, so a translucent+blurred loading veil would only blur the
+       card's own white content (no visible effect) at a compositor cost. */
+    background: #ffffff;
     border-radius: inherit;
     z-index: 5;
 }
@@ -3973,6 +3980,17 @@ button.danger:hover:not(:disabled) {
     max-height: 30cqh;
     overflow-y: auto;
     padding: 4px 8px 0 8px;
+    /* .main sets -webkit-app-region: drag as the base region; individual
+       interactive blocks opt back out to no-drag. .ss-planbar's inner
+       panels (.task-plan-panel / .agent-todo-panel) do that, but the bar
+       itself — including its OWN overflow scrollbar and the padding
+       gutter around the panels — inherited the drag region, so dragging
+       the scrollbar thumb dragged the whole window instead of scrolling.
+       Marking the bar itself no-drag makes the scrollbar behave like a
+       normal scrollbar. Wheel scrolling was unaffected because wheel
+       events don't participate in the drag hit-test. */
+    -webkit-app-region: no-drag;
+    app-region: no-drag;
 }
 .task-plan-panel,
 .agent-todo-panel {

@@ -835,39 +835,17 @@
   // Full task-plan queue + (if present) the agent's own current sub-step.
   // Always fully expanded — no collapse/toggle — so the plan is readable
   // at a glance without an extra click.
+  // Order: Agent todo (top) → Plan (below). Agent todo reflects the
+  // currently-executing sub-agent's live checklist, which changes turn by
+  // turn and is what the user watches; Plan is the slower-moving parent
+  // queue and belongs below as reference context.
   function _renderPlanBar() {
     if (!dom.planBar) return;
     const s = activeSid ? bySid.get(activeSid) : null;
     dom.planBar.innerHTML = '';
-    if (!s || s.taskItems.length === 0) return;
+    if (!s || (s.taskItems.length === 0 && s.agentTodoItems.length === 0)) return;
 
-    const items = s.taskItems;
-    const doneCount = items.filter(it => it.status === 'done').length;
-    const failedCount = items.filter(it => it.status === 'failed').length;
-
-    const panel = document.createElement('div');
-    panel.className = 'task-plan-panel';
-
-    const header = document.createElement('div');
-    header.className = 'task-plan-header';
-    let summary = 'Plan · ' + doneCount + '/' + items.length + ' done';
-    if (failedCount) summary += ' · ' + failedCount + ' failed';
-    header.innerHTML = '<span class="tp-summary">' + _esc(summary) + '</span>';
-    panel.appendChild(header);
-
-    const list = document.createElement('div');
-    list.className = 'task-plan-items';
-    for (const it of items) {
-      const row = document.createElement('div');
-      row.className = 'task-plan-item tp-' + it.status;
-      row.innerHTML =
-        '<span class="tp-glyph">' + (PLAN_GLYPH[it.status] || '·') + '</span>' +
-        '<span class="tp-text">' + _esc(it.instruction) + '</span>';
-      list.appendChild(row);
-    }
-    panel.appendChild(list);
-    dom.planBar.appendChild(panel);
-
+    // Agent todo panel (rendered FIRST so it sits above Plan).
     if (s.agentTodoItems.length > 0) {
       const todoPanel = document.createElement('div');
       todoPanel.className = 'agent-todo-panel';
@@ -889,6 +867,36 @@
       }
       todoPanel.appendChild(todoList);
       dom.planBar.appendChild(todoPanel);
+    }
+
+    // Plan panel (rendered SECOND so it sits below Agent todo).
+    if (s.taskItems.length > 0) {
+      const items = s.taskItems;
+      const doneCount = items.filter(it => it.status === 'done').length;
+      const failedCount = items.filter(it => it.status === 'failed').length;
+
+      const panel = document.createElement('div');
+      panel.className = 'task-plan-panel';
+
+      const header = document.createElement('div');
+      header.className = 'task-plan-header';
+      let summary = 'Plan · ' + doneCount + '/' + items.length + ' done';
+      if (failedCount) summary += ' · ' + failedCount + ' failed';
+      header.innerHTML = '<span class="tp-summary">' + _esc(summary) + '</span>';
+      panel.appendChild(header);
+
+      const list = document.createElement('div');
+      list.className = 'task-plan-items';
+      for (const it of items) {
+        const row = document.createElement('div');
+        row.className = 'task-plan-item tp-' + it.status;
+        row.innerHTML =
+          '<span class="tp-glyph">' + (PLAN_GLYPH[it.status] || '·') + '</span>' +
+          '<span class="tp-text">' + _esc(it.instruction) + '</span>';
+        list.appendChild(row);
+      }
+      panel.appendChild(list);
+      dom.planBar.appendChild(panel);
     }
   }
 

@@ -24,7 +24,13 @@ for the ENTIRE rest of the task.
 Caveat: some apps (many Electron/Chromium-based ones) do not expose their
 content to UIA at all — snapshot returns only 1-2 elements (the outer window
 shell). If snapshot comes back nearly empty, that's a real signal — don't
-retry it expecting a different answer, move to screenshot+OCR as primary.
+retry it expecting a different answer. Before falling back to screenshot+OCR,
+check whether the app can be started with (or is already running with) a
+`--remote-debugging-port=<port>` flag — if so, prefer `browser_attach`
+(see browser-workflow skill) over screenshot+OCR: it drives the same DOM
+deterministically instead of guessing from pixels, and it is not limited to
+actual browser windows. Only move to screenshot+OCR as primary when no
+debug port is available.
 
 ## MECHANICAL RULE — before you decide "I need to find X icon", re-read the
 ## OCR/snapshot text you already have
@@ -91,6 +97,41 @@ old hwnd shows the exact same content it showed before your last click
 the same thing — instead call `desktop_list_windows` (or screenshot with
 `region="foreground"`/`"fullscreen"`, no hwnd) to find the NEW window's own
 hwnd, and target that one from here on.
+
+## ROW-LEVEL CONTROLS ARE OFTEN AN ICON, NOT THE ROW ITSELF
+
+Clicking a list/table ROW (its text label, its highlighted background)
+frequently only SELECTS it — a highlight-color change that shows up as
+`content_changed: true` / `effect: navigated` even though nothing you
+actually wanted happened (no detail panel, no expand). This is a common,
+easy-to-miss trap: the effect signal is being honest about a REAL pixel
+change, but that change is the selection highlight, not your goal.
+
+**The actual action is frequently a separate, unlabeled icon-only control**
+next to or inside the row: a chevron/arrow (expand/collapse), a plus/gear/
+three-dot overflow menu, a checkbox — none of which have OCR-able text, so
+they will NEVER show up as a text match no matter how carefully you re-read
+the OCR/snapshot output. This is the mirror-image case of the MECHANICAL
+RULE above (which is about preferring a TEXT label over hunting for an
+icon) — here there IS no text label, because the control genuinely is just
+a glyph.
+
+**TRIGGER:** you clicked a row (or its visible text) and got `effect:
+navigated`/`content_changed: true`, but re-checking the OCR/snapshot after
+shows the same layout, no new panel, no expanded content — i.e. the "change"
+was cosmetic (selection/hover), not the navigation you wanted. You've now
+tried this 2+ times, possibly at slightly different x/y within the same row.
+
+**ACTION:** stop retrying coordinates inside the row. Call
+`desktop_snapshot` (or `desktop_find_element` if snapshot came back empty
+for this app) and look specifically for a SEPARATE small control at the
+row's edges — most commonly a narrow zone at the far LEFT or far RIGHT of
+the row (chevron/arrow/caret), or directly on top of an icon-shaped glyph
+the OCR ignored (icons have no text, so they're invisible to OCR — you have
+to reason about their probable position, e.g. "before the label" or "at the
+row's right edge", not search OCR text for them). If snapshot lists an
+element there with a generic role (Button, TreeItem with an expand
+affordance), click ITS coordinates, not the row's.
 
 ## Tool Choice Hierarchy
 

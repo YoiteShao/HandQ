@@ -203,7 +203,24 @@ const STATE = {
     edgeOpacity: 0.23,   // white-tint mix strength at the rim (near-clear glass)
     coreOpacity: 0,      // white-tint mix strength at the interior (frosted body)
     glassAlpha: 0,       // tint mix strength (material color)
-    frostiness: 13,      // extra blur radius, px (0 = off)
+    frostiness: 13,      // extra blur radius, px (0 = off). This blurs the
+                         // DESKTOP seen through the glass, which is what makes
+                         // low-opacity surfaces (sidebar activity/files lists,
+                         // card empty states) readable — text sits on a smooth
+                         // frosted field instead of sharp, busy desktop content.
+                         // It DOES take the shader's expensive 5x5=25-tap
+                         // sampleBgAA path (there's no cheap "light frost" —
+                         // any value >= 0.4/dpr enters the full 25-tap loop),
+                         // but that cost is now gated by the idle-skip check on
+                         // the refresh timer below: a static desktop triggers
+                         // ZERO redraws, so this only costs while the desktop
+                         // behind the glass is actually changing (video, etc.)
+                         // or during a brief window-resize burst. The all-day
+                         // constant-grind that this being 25-tap used to cause
+                         // was the unconditional 200ms redraw, not frostiness
+                         // itself — see the refresh-timer gate. If resize bursts
+                         // still stutter, the next lever is a mipmap-LOD blur
+                         // (1-tap, GPU-generated) to replace the 25-tap loop.
     radius: 30,          // corner radius, px — matches .app's CSS radius
 };
 
@@ -389,6 +406,50 @@ async function initGlass() {
     let pendingRAF = 0;      // rAF handle coalescing multiple requests into one draw
     let needUpload = false;  // does the next draw need a fresh desktop texture?
 
+    // ── Idle-skip: cheap desktop-change detector ──────────────────────────
+    // The desktopCapturer stream produces frames at a CONSTANT rate even when
+    // the desktop is visually static (confirmed by measurement: video
+    // currentTime advances 100% of the time regardless of on-screen change),
+    // so "did a new frame decode?" can't tell us whether a redraw is actually
+    // needed. Instead we down-sample the current video frame into a tiny
+    // offscreen canvas and diff it against the previous sample. A near-zero
+    // diff means the desktop behind the glass hasn't meaningfully changed, so
+    // the previous full-window frame is still correct and we skip the
+    // expensive redraw entirely. Cost of the check itself is a 32×18 drawImage
+    // + a 576-pixel read (sub-millisecond) — negligible next to a full-window
+    // shader pass. This is what makes the "near-zero cost while idle" claim in
+    // the render-section comment below actually true (the old unconditional
+    // 200ms timer redrew the whole window ~5×/sec forever, even fully idle).
+    const SAMPLE_W = 32, SAMPLE_H = 18;
+    // Sum-of-absolute-R-channel-difference threshold below which two samples
+    // count as "same desktop". 576 pixels; static-desktop capture noise sums
+    // to well under this, while any real content change (cursor blink in a
+    // terminal, a moving window, video) blows past it. Tunable — raise if a
+    // static desktop still triggers redraws, lower if real changes are missed.
+    const SAMPLE_DIFF_THRESHOLD = 800;
+    let _sampleCanvas = null, _sampleCtx = null, _prevSample = null;
+    function _desktopChanged() {
+        try {
+            if (!_sampleCtx) {
+                _sampleCanvas = document.createElement('canvas');
+                _sampleCanvas.width = SAMPLE_W;
+                _sampleCanvas.height = SAMPLE_H;
+                _sampleCtx = _sampleCanvas.getContext('2d', { willReadFrequently: true });
+            }
+            _sampleCtx.drawImage(video, 0, 0, SAMPLE_W, SAMPLE_H);
+            const cur = _sampleCtx.getImageData(0, 0, SAMPLE_W, SAMPLE_H).data;
+            if (!_prevSample) { _prevSample = cur; return true; }
+            let diff = 0;
+            for (let i = 0; i < cur.length; i += 4) diff += Math.abs(cur[i] - _prevSample[i]);
+            _prevSample = cur;
+            return diff > SAMPLE_DIFF_THRESHOLD;
+        } catch (_) {
+            // If sampling fails for any reason, fall back to "assume changed"
+            // so the glass never silently freezes on a real update.
+            return true;
+        }
+    }
+
     if (window.glassCapture.onBoundsChanged) {
         window.glassCapture.onBoundsChanged((b) => {
             if (!b) return;
@@ -484,7 +545,21 @@ async function initGlass() {
     // each ~1/11 the upload). Window moves are handled separately and crisply
     // by onBoundsChanged above, so drag stays full-rate; this timer only keeps
     // the *content* behind the glass reasonably fresh.
-    setInterval(() => requestRender(true), DESKTOP_REFRESH_MS);
+    //
+    // Two gates guard the redraw so an idle app costs (almost) nothing:
+    //   • document.hidden — window minimized / occluded to the point the
+    //     compositor stops painting us: no point refreshing an invisible
+    //     surface. (Deliberately NOT keyed on window blur — HandQ's window is
+    //     translucent, so its glass backdrop is still visible when another app
+    //     has focus; pausing on blur would visibly freeze the glass.)
+    //   • _desktopChanged() — the tiny-sample diff above. A static desktop
+    //     produces no new redraws at all; only real on-screen change downstream
+    //     of the glass re-triggers the full-window pass.
+    setInterval(() => {
+        if (document.hidden) return;
+        if (!_desktopChanged()) return;
+        requestRender(true);
+    }, DESKTOP_REFRESH_MS);
 
     // First paint. The very first video frame may not have arrived yet, so also
     // schedule a couple of early uploads to fill the texture without waiting a

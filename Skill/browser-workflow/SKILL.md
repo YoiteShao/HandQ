@@ -19,18 +19,42 @@ no undo):
   it starts unauthenticated relative to whatever the user has open in their
   own everyday browser right now. Default choice for a fresh task with no
   reference to an existing window.
-- **`browser_attach`** — connects to the user's actual, already-running
-  Chrome/Edge (they started it with `--remote-debugging-port=9222`).
-  Use this whenever the task's own wording tells you the target depends on
-  a session that's ALREADY logged in / already open in the user's real
-  browser — this can be phrased many ways, not just a fixed Chinese idiom:
-  '刚才/正在/我现在打开的/接着我那个', "I'm already logged into it", "use
-  my existing session", "don't start a fresh one", a site that's SSO-gated
-  and the user says they're already authenticated, etc. Read the INTENT
-  (does this task depend on state that only exists in a browser window the
-  user already has open?), not a fixed keyword list. Requires user
-  approval (high-risk); in attach mode `browser_new_tab` opens tabs in the
-  background.
+- **`browser_attach`** — connects to ANY process exposing a Chrome DevTools
+  Protocol endpoint, not only the user's Chrome/Edge. Two distinct triggers:
+  1. **User's real browser** — the task's own wording tells you the target
+     depends on a session that's ALREADY logged in / already open in the
+     user's real browser — this can be phrased many ways, not just a fixed
+     Chinese idiom: '刚才/正在/我现在打开的/接着我那个', "I'm already logged
+     into it", "use my existing session", "don't start a fresh one", a site
+     that's SSO-gated and the user says they're already authenticated, etc.
+     Read the INTENT (does this task depend on state that only exists in a
+     browser window the user already has open?), not a fixed keyword list.
+  2. **A local desktop app that is Chromium-based under the hood.** Signal:
+     `desktop_snapshot`/UIA comes back nearly empty for it (see
+     desktop-workflow's Electron caveat), AND it can be started with — or is
+     already running with — a `--remote-debugging-port=<port>` flag. In this
+     case: launch/relaunch the app yourself with that flag (via `shell`),
+     make sure `browser.cdp_port` matches (or pass a `browser_credentials_file`
+     pointing at it), then `browser_attach` instead of the app's normal
+     launch path. Do NOT hand-write a websocket/CDP client script for this —
+     `browser_navigate`/`browser_snapshot`/`browser_click`/`browser_type`
+     already speak CDP through Playwright and handle selector waiting,
+     retries, and dropdown/tree interaction that raw `Runtime.evaluate` calls
+     don't. If `attach_browser` errors because `browser.attach_enabled` is
+     off, tell the user it needs to be set to `true` in `handq_config.yaml`
+     rather than falling back to a hand-rolled CDP script.
+
+  Requires user approval (high-risk); in attach mode `browser_new_tab` opens
+  tabs in the background.
+
+  `browser_launch` always spawns a SEPARATE, HandQ-owned Chromium/Edge
+  process — it can never reach another program's already-running window or
+  its in-memory state (open dialogs, a selected dropdown value, a loaded
+  app bundle behind a custom `file://`/`app://` scheme). If the task's
+  target is a process already running on this machine, `browser_attach` is
+  the only one of the two that can reach it — trying `browser_launch`
+  against it will look like it "worked" (a new window opens) while actually
+  landing on an unrelated, unauthenticated instance.
 
 **Why there's no undo:** `browser_launch` and `browser_attach` are mutually
 exclusive for the lifetime of one HandQ session. Once either mode is

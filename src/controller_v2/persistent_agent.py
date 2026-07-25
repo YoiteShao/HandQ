@@ -284,6 +284,12 @@ class PersistentAgent:
         # so becomes callable, starting the NEXT turn's request.
         self._hidden_tools: Set[str] = set()
 
+        # Bundled ``*-workflow`` skills already reverse-pushed this session
+        # (see _apply_self_extension). Push-once guard: claiming more tools of
+        # a family whose workflow skill is already in context must not re-inject
+        # the body. Keyed by skill name.
+        self._pushed_workflow_skills: Set[str] = set()
+
         # Skills follow the progressive-disclosure model (mirrors Claude Code):
         # there is no per-session skill injection state here. Every turn,
         # _build_messages renders the [Available Skills] menu + [Standing
@@ -475,6 +481,20 @@ class PersistentAgent:
         _produced_seen: set = set()
         _token_usage = TokenUsage()
 
+        # Fail-open backstop for the completion guards below. Each time a
+        # completion is REJECTED (format violation or speculative/no-grounding)
+        # we increment this; past the cap we stop rejecting and let the item
+        # end as failed. Rationale: a guard that returns the SAME rejection to
+        # the SAME model state can loop until the 999-iteration cap — the
+        # 2026-07-23 "stop now" trace spun 186 times / ~79 min this way, because
+        # an interrupt-spawned "stop now" item has no world-work to satisfy the
+        # guard and the model just re-emits its summary forever. This cap makes
+        # any such no-exit loop terminate in seconds regardless of WHY the item
+        # is unsatisfiable (deferred hallucination, bad intent, future paths) —
+        # it is a safety net, independent of upstream correctness.
+        _completion_guard_rejections = 0
+        _COMPLETION_GUARD_MAX_REJECTIONS = 3
+
         while iteration < self._max_item_iterations:
             iteration += 1
             self.current_iteration += 1
@@ -613,6 +633,34 @@ class PersistentAgent:
 
             # ── 5. Completion (no tool calls) ────────────────────────────────
             if turn_result.is_completion:
+                # Fail-open backstop: if the completion guards below have
+                # already rejected this item too many times, stop rejecting.
+                # A guard that keeps returning the same rejection to the same
+                # model state never converges (the 2026-07-23 "stop now" spin);
+                # ending the item as failed here bounds that to a few turns
+                # instead of ~999. Independent of WHY the item is
+                # unsatisfiable, so it also covers future no-exit paths.
+                if _completion_guard_rejections >= _COMPLETION_GUARD_MAX_REJECTIONS:
+                    self.logger.warning(
+                        f"[{iteration}] Completion guard rejected this item "
+                        f"{_completion_guard_rejections}x — failing open to break "
+                        f"the retry loop.",
+                        component="PersistentAgent",
+                    )
+                    return TaskResult(
+                        item_id=item.item_id,
+                        success=False,
+                        issues=[
+                            "Could not complete with tool-grounded evidence "
+                            f"after {_completion_guard_rejections} completion-guard "
+                            "rejections — ending to avoid a no-progress loop. This "
+                            "usually means the item had no actionable world-work "
+                            "(e.g. a bare stop/cancel directive)."
+                        ],
+                        final_answer=(turn_result.final_answer or turn_result.reasoning or "").strip(),
+                        iterations=iteration,
+                        token_usage=_token_usage,
+                    )
                 if tool_results:
                     stream_errors = [tr.error for tr in tool_results if tr.error]
                     error_summary = "; ".join(stream_errors) if stream_errors else "LLM stream interrupted"
@@ -691,6 +739,7 @@ class PersistentAgent:
                             "Re-emitting with the correct schema now.)"
                         ),
                     )
+                    _completion_guard_rejections += 1
                     continue
 
                 # Speculative-completion guard: an item that claims success
@@ -747,6 +796,7 @@ class PersistentAgent:
                             "now, not just report having claimed it.)"
                         ),
                     )
+                    _completion_guard_rejections += 1
                     continue
 
                 self.logger.info(
@@ -1724,6 +1774,22 @@ class PersistentAgent:
 
         tool = self.tools[tool_name]
 
+        # Activity-scoped desktop overlay: keep the takeover border visible
+        # while the agent is driving the desktop, and hide it (after a short
+        # grace) when it switches to a non-desktop tool. Both calls self-
+        # short-circuit when the desktop isn't approved/armed, so this is a
+        # no-op for tasks that never touch the desktop. Pure visual/timing —
+        # no effect on the ownership lock, approval gate, or revoke path.
+        ds = self._ctx.desktop_state if self._ctx is not None else None
+        if ds is not None:
+            try:
+                if tool_name.startswith("desktop_"):
+                    ds.keep_alive()
+                else:
+                    ds.schedule_idle_hide()
+            except Exception:
+                pass
+
         try:
             truncated_params = (
                 {k: (str(v)[:2000] + "..." if len(str(v)) > 2000 else str(v)) for k, v in parameters.items()}
@@ -2345,9 +2411,15 @@ class PersistentAgent:
         if menu:
             parts.append(
                 menu
-                + "\n\nWhen the current task matches one of the skills above, "
-                "call read_skill(name) to load its full instructions before you "
-                "act — like reading a file you need."
+                + "\n\nThese skills are recipes for doing the work correctly. "
+                "When the current task matches one of the skills above, calling "
+                "read_skill(name) BEFORE you act is a hard requirement, not an "
+                "option — load its full instructions and follow them, the same "
+                "as reading a file you cannot do the task without. A task that "
+                "looks simple is exactly when a skipped recipe costs the most. "
+                "(If you claim a tool family that has a workflow skill, that "
+                "skill's body is delivered to you automatically — you do not "
+                "need to read_skill it again; just follow it.)"
             )
         content = "\n\n".join(parts)
         return [
@@ -2522,6 +2594,13 @@ class PersistentAgent:
                 # fires only for genuinely-new names.
                 self._hidden_tools.difference_update(valid)
                 self._task_channel.activate_tools(valid)
+                # Reverse-push: deliver the family's bundled workflow skill WITH
+                # the tools, so its usage knowledge doesn't depend on the agent
+                # choosing to read_skill (the exact gap behind the 2026-07-23
+                # desktop stall — the tools were claimed, desktop-workflow never
+                # read). Runs on the tool-claim path AND the reasoning-JSON path
+                # since both funnel through here.
+                self._reverse_push_workflow_skills(valid)
             dropped = [n for n in claim if n not in valid]
             if dropped:
                 self.logger.debug(
@@ -2533,3 +2612,76 @@ class PersistentAgent:
         # Always regenerate — cheap, and covers the "release-only" /
         # "re-claim hidden tool" paths where the callback chain doesn't fire.
         self._regenerate_api_tools()
+
+    def _reverse_push_workflow_skills(self, claimed_tools: List[str]) -> None:
+        """Inject the bundled ``*-workflow`` skill body for any freshly-claimed
+        tool family, ONCE per session, as an out-of-band observation.
+
+        This is the push half of the progressive-disclosure model: read_skill
+        is the pull (agent asks), this is the push (claiming a workflow-backed
+        tool family delivers its recipe unprompted). Gated hard on
+        ``origin == bundled`` — product-shipped skills are trusted for
+        unconditional injection; user/auto skills are NOT pushed and stay on
+        the pull model (a user-edited copy of a bundled skill flips to
+        origin=user and thus silently drops out — fail-safe: revert to pull,
+        never inject unvetted text). Push-once via ``_pushed_workflow_skills``.
+        """
+        # Resolve claimed tools → distinct workflow skill names, skipping any
+        # already pushed this session.
+        wanted: List[str] = []
+        seen: Set[str] = set()
+        for tool_name in claimed_tools:
+            skill_name = ToolRegistry.workflow_skill_for_tool(tool_name)
+            if (
+                skill_name
+                and skill_name not in self._pushed_workflow_skills
+                and skill_name not in seen
+            ):
+                seen.add(skill_name)
+                wanted.append(skill_name)
+        if not wanted:
+            return
+
+        try:
+            from ..infrastructure.skills import SkillRegistry, SKILL_ORIGIN_BUNDLED
+            registry = SkillRegistry.get()
+        except Exception:
+            return
+
+        for skill_name in wanted:
+            # Mark pushed up front so a resolve/inject failure never retries
+            # every claim for the rest of the session.
+            self._pushed_workflow_skills.add(skill_name)
+            try:
+                entry = registry.get_skill(skill_name)  # enabled-only
+            except Exception:
+                continue
+            if entry is None or entry.origin != SKILL_ORIGIN_BUNDLED:
+                continue
+            body = (entry.body or "").rstrip()
+            if not body:
+                continue
+            obs = ToolResult(
+                success=True,
+                output={
+                    "skill": entry.name,
+                    "description": entry.description,
+                    "body": body,
+                    "auto_delivered": True,
+                },
+                tool_name="read_skill",
+                tool_parameters={"name": entry.name},
+            )
+            self._persist_event_observations(
+                [obs],
+                note=(
+                    f"(I just claimed tools from the '{entry.name}' family. Its "
+                    "workflow skill is delivered below — I will follow it before "
+                    "acting, the same as if I had read_skill'd it.)"
+                ),
+            )
+            self.logger.info(
+                f"[PersistentAgent] Reverse-pushed workflow skill "
+                f"'{entry.name}' on tool claim.",
+                component="PersistentAgent",
+            )

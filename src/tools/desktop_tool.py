@@ -247,6 +247,18 @@ _desktop_store_instance: Optional[Any] = None
 _SNAPSHOT_CACHE_TTL_S: float = 30.0
 
 
+# ── Takeover overlay idle grace ──────────────────────────────────────────────
+#
+# The purple takeover overlay is armed for the whole approved task, but should
+# only be VISIBLE while the agent is actively driving the desktop. When the
+# agent switches to a non-desktop tool (browser / shell / web_search / …) we
+# hide the overlay after this grace period rather than immediately, so a brief
+# "click → screenshot to verify → click" interleave doesn't strobe the border.
+# The overlay re-appears instantly on the next desktop action. Tuned to absorb
+# a typical between-desktop-action gap without lingering on genuine idle.
+_DESKTOP_IDLE_GRACE_S: float = 3.0
+
+
 def _snapshot_sig(state: Dict[str, Any]) -> Tuple[int, str, int]:
     """Build a 3-tuple sig from a _capture_state_before/after dict.
 
@@ -329,8 +341,7 @@ async def flush_desktop_store() -> Dict[str, int]:
 # full IPC contract.
 
 _takeover_active: bool = False
-_task_approved: bool = False
-# Once the user revokes (Ctrl+Shift+C), we set this for the rest of the
+_task_approved: bool = False# Once the user revokes (Ctrl+Shift+C), we set this for the rest of the
 # task so the YAML ``tool_desktop.auto_approve=true`` policy stops
 # silently re-approving. The runtime gate then forces a real confirmation
 # every desktop ToolCall until ``reset_takeover_state`` clears the flag
@@ -533,6 +544,14 @@ class DesktopState:
         self.snapshot_cache: Dict[int, Dict[str, Any]] = {}
         # OCR prewarm one-shot
         self.ocr_prewarm_started: bool = False
+        # Activity-scoped overlay timer. The takeover overlay (purple border)
+        # is armed for the whole task, but should only be VISIBLE while the
+        # agent is actually driving the desktop. When the agent switches to a
+        # non-desktop tool we arm a short grace timer; if it expires without
+        # further desktop activity we hide the overlay via end_takeover. A new
+        # desktop action (keep_alive) cancels the timer and re-shows. See
+        # ``keep_alive`` / ``schedule_idle_hide`` and _DESKTOP_IDLE_GRACE_S.
+        self._idle_timer: Optional[asyncio.TimerHandle] = None
         # lazy ScreenshotStore (constructed on first get_store)
         self._store: Optional[Any] = None
 
@@ -571,6 +590,7 @@ class DesktopState:
     def revoke_takeover(self) -> bool:
         if not self.task_approved and not self.takeover_active:
             return False
+        self._cancel_idle_timer()
         self.task_approved = False
         self.task_user_rescinded = True
         self.end_takeover("user_revoked")
@@ -580,12 +600,66 @@ class DesktopState:
         return self.task_user_rescinded
 
     def reset_takeover_state(self) -> None:
+        self._cancel_idle_timer()
         if self.takeover_active:
             self.end_takeover("task_ended")
         self.task_approved = False
         self.task_user_rescinded = False
         self.snapshot_cache.clear()
         self._release_global_takeover_if_owned()
+
+    # ── Activity-scoped overlay visibility (idle grace) ──────────────────
+
+    def keep_alive(self) -> None:
+        """Desktop was just touched — keep (or re-show) the overlay.
+
+        Cancels any pending idle-hide and, while the task is approved,
+        (re-)shows the takeover overlay. ``start_takeover`` is idempotent, so
+        this both keeps the border up during a run of desktop actions and
+        brings it back the instant the agent returns to the desktop after an
+        idle-hide. No-op when the task isn't approved (nothing to show).
+        """
+        self._cancel_idle_timer()
+        if self.task_approved:
+            self.start_takeover("desktop_activity")
+
+    def schedule_idle_hide(self) -> None:
+        """A non-desktop tool ran — arm the grace timer to hide the overlay.
+
+        Only meaningful when the overlay is currently visible. Uses an
+        "arm-if-none" policy: the first non-desktop tool after desktop
+        activity starts the clock and subsequent non-desktop tools do NOT
+        re-arm it, so a long run of browser/shell calls can't defer the hide
+        indefinitely — the overlay hides ``_DESKTOP_IDLE_GRACE_S`` after the
+        agent LEFT the desktop, not after its last non-desktop call.
+        """
+        if not self.takeover_active or self._idle_timer is not None:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._idle_timer = loop.call_later(
+            _DESKTOP_IDLE_GRACE_S, self._do_idle_hide
+        )
+
+    def _do_idle_hide(self) -> None:
+        """Grace expired with no further desktop activity — hide the overlay.
+
+        Ends the takeover (destroys the Electron overlay window + unregisters
+        Ctrl+Shift+C). The task stays approved, so the next desktop action
+        re-shows via ``keep_alive`` without re-prompting the user.
+        """
+        self._idle_timer = None
+        self.end_takeover("desktop_idle")
+
+    def _cancel_idle_timer(self) -> None:
+        if self._idle_timer is not None:
+            try:
+                self._idle_timer.cancel()
+            except Exception:
+                pass
+            self._idle_timer = None
 
     # ── Global ownership lock (multi-session concurrency) ────────────────
 
@@ -944,6 +1018,123 @@ def _capture_state_after(state_before: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+# ── Intra-window content-change probe ───────────────────────────────────────
+#
+# Why this exists: _capture_state_after (above) can only see WINDOW-LEVEL
+# changes — foreground switch, title text, a new top-level window. That is
+# blind to the single most common effect of a click in a MODERN app: the
+# content changing INSIDE the same window (an Electron/Chromium React view
+# swap, a list row expanding, a WPF panel navigating). A real 2026-07-23
+# trace (QPM3, an Electron app) burned ~10 minutes because every click on a
+# product row returned state_after={all false, new_windows:[]} whether the
+# click navigated or hit dead space — the LLM had no signal to tell "this
+# worked" from "this did nothing" and re-clicked the same row five ways.
+#
+# UIA snapshot does not help here: Chromium exposes almost nothing to UIA, so
+# the structured-elements path returns near-empty on exactly these apps. The
+# ONE signal that works across native AND Chromium windows is a pixel diff of
+# the window's client region before/after the action.
+#
+# Design: grab the rect into MEMORY (no disk), convert to a coarse GRID×GRID
+# grayscale thumbnail, and keep the raw bytes as a signature. Comparing two
+# signatures = counting cells that differ beyond a per-cell tolerance. The
+# aggressive downscale + tolerance + changed-cell-fraction threshold absorbs
+# cursor blink, caret flicker, and antialiasing noise while still catching a
+# genuine view change. Cost ~5-15 ms per grab. Best-effort throughout: any
+# failure returns None, and callers treat None as "couldn't tell" (never a
+# false "nothing changed").
+
+_CONTENT_PROBE_GRID = 32           # 32x32 grayscale cells (1024-byte signature)
+_CONTENT_PROBE_CELL_TOL = 16       # per-cell 0-255 delta below this = "same cell"
+_CONTENT_PROBE_CHANGE_FRAC = 0.06  # >6% of cells changed => window content changed
+
+
+def _content_signature(
+    rect: Optional[Tuple[int, int, int, int]],
+) -> Optional[bytes]:
+    """Coarse grayscale thumbnail of *rect* as a raw-byte signature.
+
+    Returns ``_CONTENT_PROBE_GRID**2`` bytes (one grayscale value per cell),
+    or ``None`` on any failure — mss/PIL unavailable, invalid rect, grab or
+    resize error. The probe is best-effort; a ``None`` here makes the caller
+    report "couldn't tell", never a false "nothing changed".
+    """
+    if not _MSS_AVAILABLE or rect is None:
+        return None
+    x1, y1, x2, y2 = rect
+    w, h = x2 - x1, y2 - y1
+    if w <= 0 or h <= 0:
+        return None
+    try:
+        with mss.mss() as sct:
+            raw = sct.grab({"left": x1, "top": y1, "width": w, "height": h})
+        img = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
+        img = img.convert("L").resize(
+            (_CONTENT_PROBE_GRID, _CONTENT_PROBE_GRID), Image.BILINEAR
+        )
+        return img.tobytes()
+    except Exception:
+        return None
+
+
+def _content_changed(
+    before: Optional[bytes], after: Optional[bytes],
+) -> Optional[bool]:
+    """Whether the window content materially changed between two signatures.
+
+    ``None`` when either signature is missing (probe unavailable) — the caller
+    must NOT interpret that as "unchanged". Otherwise compares cell-by-cell:
+    a cell counts as changed when its grayscale delta exceeds
+    ``_CONTENT_PROBE_CELL_TOL``; the window is "changed" when more than
+    ``_CONTENT_PROBE_CHANGE_FRAC`` of cells changed.
+    """
+    if not before or not after or len(before) != len(after) or not before:
+        return None
+    changed = 0
+    for b, a in zip(before, after):
+        if abs(b - a) > _CONTENT_PROBE_CELL_TOL:
+            changed += 1
+    return (changed / len(before)) > _CONTENT_PROBE_CHANGE_FRAC
+
+
+# One-line hint appended to a click result when NOTHING changed. This is the
+# signal the 2026-07-23 QPM trace never got: 5 dead clicks on the same
+# non-interactive row, each reported as bare success, because the tool could
+# not say "that click had no effect". With this, the LLM sees it after the
+# first dead click and can pivot instead of re-clicking.
+_CLICK_NO_EFFECT_HINT = (
+    "click delivered but no window or content change was detected — the target "
+    "may be non-interactive, or this app renders via Chromium/Electron (opaque "
+    "to UIA). Re-read the screenshot/OCR you already have before re-clicking the "
+    "same spot; if this is a Chromium app, prefer a CLI/API path if one exists."
+)
+
+
+def _click_effect(
+    state_after: Dict[str, Any], content_changed: Optional[bool],
+) -> str:
+    """Classify what a click actually DID, for the LLM to branch on.
+
+    - ``"navigated"``     — any top-level change (foreground/title/new window)
+                            OR the content probe saw the window change.
+    - ``"none_detected"`` — the probe ran and everything was flat: the click
+                            had no observable effect (caller attaches
+                            ``_CLICK_NO_EFFECT_HINT``).
+    - ``"unknown"``       — the probe was unavailable AND no top-level change,
+                            so we genuinely cannot tell — never a false claim.
+    """
+    top_level_changed = bool(
+        state_after.get("foreground_changed")
+        or state_after.get("title_changed")
+        or state_after.get("new_windows")
+    )
+    if top_level_changed or content_changed is True:
+        return "navigated"
+    if content_changed is False:
+        return "none_detected"
+    return "unknown"
+
+
 # ── Sensitive window filter ──────────────────────────────────────────────────
 
 def _load_sensitive_patterns() -> List["re.Pattern[str]"]:
@@ -1259,6 +1450,19 @@ _UIA_INTERACTABLE_TYPES: Tuple[str, ...] = (
 # ~80) while keeping the JSON payload bounded.
 _UIA_MAX_ELEMENTS: int = 100
 
+# Hard wall-clock ceiling on a single UIA enumeration. `_uia_enumerate`'s
+# `win.descendants()` walk has no internal timeout: on Electron/Chromium
+# windows the UIA provider can block on a cross-process node call forever
+# (the 2026-07-24 QPM snapshot hung ~11 min this way, wedging the whole item
+# in "pending"). Normal windows finish well under this (connect ≤2s +
+# descendants ≤~2s + per-node visibility checks ≤~3s ≈ 5-7s worst-case for a
+# busy native window), so 12s is ~2x headroom before we give up and fall
+# back to screenshot+OCR. NOTE: wait_for only frees the awaiting coroutine —
+# the wedged worker thread cannot be killed and keeps its executor slot until
+# the UIA call (maybe never) returns. Fine for the occasional hang; repeated
+# hangs on the same window would starve the default executor pool.
+_UIA_ENUMERATE_TIMEOUT_S: float = 12.0
+
 
 def _suggest_uia_selector(name: str, automation_id: str, control_type: str) -> str:
     """Pick the most stable selector hint for a follow-up pywinauto call.
@@ -1424,7 +1628,19 @@ def _uia_invoke_at_point(x: int, y: int) -> Optional[str]:
     if elem is None:
         return "no UIA element at coordinate"
     errors: List[str] = []
+    attempted = 0
     for method in ("invoke", "toggle", "select"):
+        # Guard with hasattr FIRST: pywinauto's UIAWrapper only exposes a
+        # pattern method when the underlying control actually supports that
+        # pattern. Blindly calling elem.toggle() on a control without a
+        # TogglePattern raises AttributeError on EVERY control — a phantom
+        # error that used to fill every click's uia_fallback_reason with
+        # "'UIAWrapper' object has no attribute 'toggle'" and told the LLM
+        # nothing. Only attempt (and only report) patterns the element really
+        # has, so the fallback reason reflects genuine invoke failures.
+        if not hasattr(elem, method):
+            continue
+        attempted += 1
         try:
             getattr(elem, method)()
             return None  # success
@@ -1435,6 +1651,8 @@ def _uia_invoke_at_point(x: int, y: int) -> Optional[str]:
         ctrl_type = elem.element_info.control_type or ""
     except Exception:
         pass
+    if attempted == 0:
+        return f"no invokable UIA pattern on {ctrl_type!r} element"
     return f"UIA patterns exhausted for {ctrl_type!r}: {'; '.join(errors)}"
 
 
@@ -2130,11 +2348,24 @@ class DesktopTool(BaseTool):
             self.state.snapshot_cache.pop(hwnd, None)
 
         loop = asyncio.get_event_loop()
-        # 1. Try UIA tree.
+        # 1. Try UIA tree. Bounded by _UIA_ENUMERATE_TIMEOUT_S: descendants()
+        # can block forever on Chromium/Electron UIA providers, so on timeout
+        # we abandon the wait and treat UIA as empty → screenshot+OCR fallback
+        # (the same path taken when UIA legitimately finds nothing). The worker
+        # thread may stay wedged; see _UIA_ENUMERATE_TIMEOUT_S note.
         try:
-            elements = await loop.run_in_executor(
-                None, _uia_enumerate, hwnd
+            elements = await asyncio.wait_for(
+                loop.run_in_executor(None, _uia_enumerate, hwnd),
+                timeout=_UIA_ENUMERATE_TIMEOUT_S,
             )
+        except asyncio.TimeoutError:
+            self.logger.warning(
+                f"snapshot: UIA enumerate exceeded {_UIA_ENUMERATE_TIMEOUT_S}s "
+                f"(hwnd={hwnd}) — likely a Chromium/Electron window opaque to "
+                f"UIA; falling back to screenshot+OCR.",
+                component="DesktopTool",
+            )
+            elements = []
         except Exception as exc:
             self.logger.warning(
                 f"snapshot: UIA enumerate raised: {exc}",
@@ -2605,6 +2836,12 @@ class DesktopTool(BaseTool):
 
         _ensure_dpi_aware()
         state_before = _capture_state_before()
+        # Content probe (see _content_signature rationale) — diff the foreground
+        # window before/after the click to catch intra-window navigation.
+        _probe_rect = _foreground_window_info().get("rect")
+        _sig_before = _content_signature(
+            tuple(_probe_rect) if _probe_rect else None
+        )
 
         # UIA path: only for left single-clicks (mirrors click_at logic).
         input_source: str
@@ -2649,6 +2886,12 @@ class DesktopTool(BaseTool):
         state_after = _capture_state_after(state_before)
         self.state.invalidate_on_state_change(state_after)
 
+        content_changed = _content_changed(
+            _sig_before,
+            _content_signature(tuple(_probe_rect) if _probe_rect else None),
+        )
+        effect = _click_effect(state_after, content_changed)
+
         # Combined result: the find metadata + the click outcome. Lets the
         # LLM verify the OCR/vision match without an extra screenshot.
         merged = {
@@ -2659,7 +2902,12 @@ class DesktopTool(BaseTool):
             "screenshot": out.get("screenshot"),
             "input_source": input_source,
             "state_after": state_after,
+            "effect": effect,
         }
+        if content_changed is not None:
+            merged["content_changed"] = content_changed
+        if effect == "none_detected":
+            merged["effect_hint"] = _CLICK_NO_EFFECT_HINT
         return ToolResult(
             success=True,
             output=merged,
@@ -2691,6 +2939,13 @@ class DesktopTool(BaseTool):
 
         _ensure_dpi_aware()
         state_before = _capture_state_before()
+        # Content probe (clicks only — see _content_signature rationale). Grab
+        # the foreground window rect NOW so we can diff it after the click and
+        # detect intra-window navigation that state_after is blind to.
+        _probe_rect = _foreground_window_info().get("rect")
+        _sig_before = _content_signature(
+            tuple(_probe_rect) if _probe_rect else None
+        )
         output: Dict[str, Any] = {"x": x, "y": y, "button": button, "double": double}
 
         # UIA path: only for left single-clicks (right/middle/double have no
@@ -2736,6 +2991,20 @@ class DesktopTool(BaseTool):
         state_after = _capture_state_after(state_before)
         self.state.invalidate_on_state_change(state_after)
         output["state_after"] = state_after
+
+        # Content-change probe + honest effect classification. The probe is
+        # best-effort: content_changed is None when it couldn't run, and then
+        # effect stays "unknown" rather than falsely claiming "nothing happened".
+        content_changed = _content_changed(
+            _sig_before,
+            _content_signature(tuple(_probe_rect) if _probe_rect else None),
+        )
+        if content_changed is not None:
+            output["content_changed"] = content_changed
+        effect = _click_effect(state_after, content_changed)
+        output["effect"] = effect
+        if effect == "none_detected":
+            output["effect_hint"] = _CLICK_NO_EFFECT_HINT
         return ToolResult(
             success=True,
             output=output,

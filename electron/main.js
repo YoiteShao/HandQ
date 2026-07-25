@@ -1128,19 +1128,20 @@ function createWindow() {
     const windowIcon = loadLogoImage();
 
     mainWindow = new BrowserWindow({
-        width: 840,
-        height: 720,
-        // Baseline is "only the main session card, ~800×680, no side
-        // panels reserved" — the Stage-Manager rail and detail sidebar are
-        // expected to appear/disappear on demand, and the window grows on
-        // top of this baseline when either arrives (see the layout-driven
-        // auto-resize handler further down).
-        //   chat-region padding (10+10) + 1 card 800    =  820 → default 840 wide
-        //   titlebar 28 + top pad 7 + card 680 + pad 10 =  725 → default 720 tall
-        //     (card ≈ 680 tall — comfortable chat viewport at ~800 wide
-        //      without the window itself feeling oversized on 900px-tall
-        //      laptop screens where the previous 840 default hit the task-
-        //      bar and read as cramped).
+        width: 672,
+        height: 576,
+        // Default launch size, in DIPs — the Stage-Manager rail and detail
+        // sidebar are expected to appear/disappear on demand, and the window
+        // grows on top of this baseline when either arrives (see the layout-
+        // driven auto-resize handler further down).
+        //
+        // Kept deliberately compact so the window doesn't dominate the screen
+        // on high-DPI displays: 672×576 DIP renders at 840×720 physical on a
+        // 125%-scaled display (the previous 840×720 DIP default rendered at
+        // 1050×900 there, which read as oversized). The main session card is
+        // flex and reflows to whatever width the window offers, so a smaller
+        // default just means a snugger chat column, not a broken layout — the
+        // effect is identical to the user dragging the window smaller.
         //
         // Min sizing keeps the main card usable (down to its own 340px
         // floor) even when the user shrinks the window aggressively. Rail
@@ -1715,9 +1716,9 @@ ipcMain.on('window:hide', () => {
 // each column's contribution is explicit and additive on top of a
 // "main card only" baseline:
 //
-//   baseline (main card only, 800 sq + chat-region padding + titlebar)
-//     width  = 840
-//     height = 840
+//   baseline (main card only) — DIP, matches the BrowserWindow default
+//     width  = 672
+//     height = 576
 //   + rail visible                → width += RAIL_DELTA    (160 + margin + gap 0)
 //   + sidebar visible             → width += (sidebarWidth + 10 margin)
 //                                    Dynamic per-call. Renderer measures
@@ -1755,7 +1756,7 @@ ipcMain.on('window:hide', () => {
 // AUTO_RESIZE_TABLE is retained ONLY for the legacy `window:auto-resize`
 // numeric payload (backwards compat with an older renderer build that
 // sent a bare session count instead of a descriptor).
-const AUTO_RESIZE_BASELINE = { w: 840, h: 720 };
+const AUTO_RESIZE_BASELINE = { w: 672, h: 576 };
 const AUTO_RESIZE_RAIL_DELTA    = 170;   // rail width 160 + margin 10 + gap 0
 // SIDEBAR_DELTA is a LEGACY fallback used only when a payload arrives
 // without a sidebarWidth (very old renderer builds, boot-race pre-first-
@@ -1766,8 +1767,8 @@ const AUTO_RESIZE_RAIL_DELTA    = 170;   // rail width 160 + margin 10 + gap 0
 // matching the old fixed-width behavior.
 const AUTO_RESIZE_SIDEBAR_DELTA = 274;   // fallback: sidebar 264 + margin 10 (dynamic in normal path)
 const AUTO_RESIZE_TABLE = [
-    { w: 840,  h: 720 },   // 1 session (legacy payload only)
-    { w: 1010, h: 720 },   // ≥2 sessions (legacy payload only — assumes rail)
+    { w: 672, h: 576 },   // 1 session (legacy payload only)
+    { w: 842, h: 576 },   // ≥2 sessions (legacy payload only — baseline + rail 170)
 ];
 
 function _computeDesiredSize(layout) {
