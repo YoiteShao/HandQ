@@ -619,6 +619,163 @@ html, body {
     z-index: 2;
 }
 
+/* ---------- Layer-1 CSS fallback (glass mode: veil) ---------- */
+/* Cheap replacement for the WebGL liquid-glass canvas (glass-effect.js),
+   mounted by glass-effect.js as <div id="glass-fallback"> in the SAME slot
+   the canvas would occupy (z-index:-1, behind the whole app). NOTE: the
+   Electron window is transparent, so backdrop-filter can't blur the real
+   OS desktop here — the veil look comes entirely from the translucent white
+   fill (alpha does the visual work). Its identity instead lives in the
+   pure-CSS colored rim below.
+   The veil alpha is driven live by --fallback-bg-alpha (Ctrl+Shift+G
+   "Background density" slider; default 0.45). */
+#glass-fallback {
+    position: fixed;
+    inset: 0;
+    z-index: -1;
+    pointer-events: none;
+    border-radius: 30px;   /* matches .app's radius */
+    overflow: hidden;      /* clip the traveling sheen (::after) to rounded corners */
+    background: rgba(255, 255, 255, var(--fallback-bg-alpha, 0.45));
+    /* Rim highlight ring — inset box-shadows are inherently edge-concentrated
+       and fade inward. Bright hairline at top (light-from-above) + a 1px
+       full-perimeter rim + a soft inner glow. Static, scales with
+       --fallback-edge. Lives on the element itself so both pseudo-elements are
+       free for the animated sheen below. */
+    box-shadow:
+        inset 0 0 0 1px rgba(255, 255, 255, calc(0.45 * var(--fallback-edge, 0))),
+        inset 0 1.5px 0 rgba(255, 255, 255, calc(0.65 * var(--fallback-edge, 0))),
+        inset 0 0 18px rgba(255, 255, 255, calc(0.16 * var(--fallback-edge, 0)));
+}
+
+/* Card family gets a REAL solid-ish fill ONLY in fallback mode. In webgl mode
+   the cards are pure glass (--l2-fill:* = 0) and get their look from
+   backdrop-filter blurring the WebGL canvas beneath. With the canvas gone that
+   blur has nothing to bite on, so cards would collapse into the background veil
+   and read as one flat sheet. Scoping this to body.glass-fallback (added by
+   glass-effect.js only in veil) restores a distinct card pane floating above
+   the veil, WITHOUT touching the webgl-mode appearance. Alpha is the "Card
+   density" slider (--fallback-card-alpha; default 0.60), independent of the
+   background so the two panes can be pulled apart. */
+body.glass-fallback .session-card,
+body.glass-fallback .task-plan-panel,
+body.glass-fallback .agent-todo-panel,
+body.glass-fallback .ss-section {
+    background: rgba(255, 255, 255, var(--fallback-card-alpha, 0.60));
+}
+
+/* Title/header plates dissolve in fallback mode. Every title band
+   (.session-card-head, the plan/todo headers, the sidebar section/detail
+   heads) normally carries a semi-opaque --l2-plate-strong fill + a
+   backdrop-filter:brightness() lift so the text is legible on the OTHERWISE
+   TRANSPARENT webgl-mode card. But the fallback card is already a dense
+   (~0.88) opaque surface, so those plates just stack a brighter rectangle on
+   top → the visible "色块". Dropping their fill/brightness/hairline here lets
+   the title text sit directly on the unified card — 浑然一体. Scoped to
+   body.glass-fallback, so webgl mode keeps its load-bearing plates untouched.
+   (Layer-2 only; the panel shells and card fills are handled above.) */
+/* Title/header AND content plates dissolve in fallback mode. Every title band
+   (.session-card-head, plan/todo headers, sidebar section/detail heads) and
+   every inset content plate (plan/todo item lists, activity + files lists)
+   normally carries a semi-opaque --l2-plate(-strong) fill + a
+   backdrop-filter:brightness() lift so text is legible on the OTHERWISE
+   TRANSPARENT webgl-mode card. But the fallback card is already a dense
+   (~0.88) opaque surface, so those plates just stack a brighter rectangle on
+   top → the visible "色块". Dropping their fill/brightness/hairline here lets
+   all the text sit directly on the unified card — 浑然一体. Scoped to
+   body.glass-fallback, so webgl mode keeps its load-bearing plates untouched.
+   (Layer-2 only; the panel shells and card fills are handled above.) */
+body.glass-fallback .session-card-head,
+body.glass-fallback .task-plan-header,
+body.glass-fallback .agent-todo-header,
+body.glass-fallback .ss-section-head,
+body.glass-fallback .ss-header .ss-title,
+body.glass-fallback .ss-header .ss-name,
+body.glass-fallback .task-plan-items,
+body.glass-fallback .agent-todo-items,
+body.glass-fallback .ss-activity-list,
+body.glass-fallback .ss-files-list {
+    background: transparent;
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+    box-shadow: none;
+}
+
+/* ---- Fallback edge glow (pure CSS, animated "liquid glass" rim) --------- */
+/* The veil surface is a SOLID white sheet — it fully hides the desktop — so an
+   edge highlight doesn't need to refract real desktop pixels (impossible
+   through a transparent window; that's why the WebGL layer exists). Instead we
+   paint a decorative rim on the veil's OWN surface, in two layers:
+     ::before — a STATIC, low-saturation iridescent ring (a faint pearlescent
+                sheen, not a hard rainbow), clipped to a thin outer band.
+     ::after  — a soft bright SPOT that continuously travels around the rounded-
+                rect border via offset-path/offset-distance.
+   Both layers' intensity scales with --fallback-edge (0 = off, 1 = full).
+   PERFORMANCE: the traveling spot animates ONLY offset-distance (a motion-path
+   position) — like transform, this is composited on the GPU and does NOT
+   repaint the gradient each frame, so it stays cheap (the whole point of veil
+   vs. the WebGL shader). The ring itself never animates.
+   HONEST LIMITS: the iridescence is a FAKE dispersion (fixed hue ramp, not
+   per-normal RGB separation) and the sheen is self-surface highlight, not real
+   refraction — the closest CSS can get to the WebGL edge at ~0 cost. */
+#glass-fallback::before,
+#glass-fallback::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    border-radius: inherit;   /* follow the 30px rounded corners */
+    pointer-events: none;
+}
+/* Static iridescent ring — desaturated pearlescent hue cycle, clipped to a thin
+   outer band via the transparent-border + exclude-mask trick (bg painted to
+   border-box, interior masked away → only the border band shows). Low alpha so
+   it reads as a soft sheen, not a saturated rainbow. */
+#glass-fallback::before {
+    border: 7px solid transparent;
+    background:
+        conic-gradient(from 0deg,
+            rgba(205, 220, 245, calc(0.28 * var(--fallback-edge, 0))),
+            rgba(245, 235, 220, calc(0.28 * var(--fallback-edge, 0))),
+            rgba(215, 240, 230, calc(0.28 * var(--fallback-edge, 0))),
+            rgba(240, 220, 238, calc(0.28 * var(--fallback-edge, 0))),
+            rgba(220, 218, 245, calc(0.28 * var(--fallback-edge, 0))),
+            rgba(205, 220, 245, calc(0.28 * var(--fallback-edge, 0)))) border-box;
+    -webkit-mask:
+        linear-gradient(#000 0 0) padding-box,
+        linear-gradient(#000 0 0);
+    -webkit-mask-composite: xor;
+    mask:
+        linear-gradient(#000 0 0) padding-box,
+        linear-gradient(#000 0 0);
+    mask-composite: exclude;
+}
+/* Traveling sheen — a soft radial bright spot that walks the rounded-rect
+   perimeter. offset-path is the same 30px-radius rect as the window; only
+   offset-distance animates (GPU-composited, no per-frame repaint). Sized small
+   so it reads as a glint sliding along the edge, brightening whatever slice of
+   the iridescent ring it passes over. */
+#glass-fallback::after {
+    width: 46%;
+    height: 46%;
+    inset: auto;   /* position via offset-path instead of inset */
+    background: radial-gradient(circle,
+        rgba(255, 255, 255, calc(0.55 * var(--fallback-edge, 0))) 0%,
+        rgba(210, 230, 255, calc(0.30 * var(--fallback-edge, 0))) 35%,
+        transparent 70%);
+    offset-path: inset(0 round 30px);
+    offset-rotate: 0deg;
+    offset-distance: 0%;
+    animation: fallback-sheen-travel 9s linear infinite;
+    will-change: offset-distance;
+}
+@keyframes fallback-sheen-travel {
+    to { offset-distance: 100%; }
+}
+/* Respect reduced-motion: park the sheen (still visible, just not moving). */
+@media (prefers-reduced-motion: reduce) {
+    #glass-fallback::after { animation: none; }
+}
+
 /* ---------- Custom title bar ---------- */
 
 .titlebar {
@@ -834,7 +991,11 @@ html, body {
 .titlebar-new-btn:hover {
     background: rgba(184, 175, 196, 0.65);
     color: #fff;
-    transform: scale(1.10);
+    /* Quarter-turn on hover — the + rotating toward × reads as the "add"
+       gesture rather than a bare scale-up. Rides the existing spring
+       `transform` transition (declared on the base rule), so this is a
+       free composite tween, no new paint. */
+    transform: scale(1.10) rotate(90deg);
 }
 .titlebar-new-btn:focus-visible {
     outline: 2px solid rgba(184, 175, 196, 0.5);
@@ -4091,10 +4252,16 @@ button.danger:hover:not(:disabled) {
     background: var(--l2-plate-strong);
     box-shadow: inset 0 0.5px 0 rgba(255, 255, 255, 0.55);
 }
+/* Files head carries an inline legend after the title. Allow wrap so that,
+   once the title + legend + count no longer fit on one line (narrow window),
+   the legend drops to a second row inside the same band instead of clipping.
+   row-gap gives the wrapped legend breathing room from the title line. */
+.ss-files-section .ss-section-head { flex-wrap: wrap; row-gap: 5px; }
 .ss-section-title { flex: 0 0 auto; }
 .ss-section-count {
     letter-spacing: 0; text-transform: none; font-weight: var(--fw-medium);
     color: var(--fg-soft, #3a3f48);
+    margin-left: auto;   /* pin the count to the right edge of the head */
 }
 
 /* Activity list — flat chronological entries, newest first (see
@@ -4117,6 +4284,38 @@ button.danger:hover:not(:disabled) {
     padding: 6px 4px;
     border-top: 1px dashed rgba(60, 80, 120, 0.12);
     cursor: pointer;
+    /* The row is click-to-expand but gave no hover feedback, unlike the
+       file rows in the sibling panel (.ss-file-row:hover shifts color).
+       This closes that affordance gap: a hairline tint + 2px inset nudge
+       says "this row is interactive". color/background/transform are all
+       cheap here — the item has NO backdrop-filter of its own (the frosted
+       plate lives on the parent .ss-activity-list), so nothing re-samples
+       a blur on hover. Kept to a token move, not a lift-and-glow. */
+    border-radius: 6px;
+    transition: background 140ms var(--ease-glass),
+                transform 140ms var(--ease-glass);
+}
+.ss-activity-item:hover {
+    background: rgba(184, 175, 196, 0.10);
+    transform: translateX(2px);
+}
+/* New activity slides in from the incremental-prepend path only (see
+   session-sidebar.js: dom.activityList.prepend attaches .aa-enter). The
+   full-rebuild path — session switch / mount — deliberately does NOT add
+   the class, so switching sessions never re-animates the whole list; only
+   a genuinely-just-arrived event moves. Pure opacity+transform composite,
+   one node at a time. The class is self-removing on animationend (JS) so
+   it can retrigger on the next arrival. */
+.ss-activity-item.aa-enter {
+    animation: aa-slide-in 260ms var(--spring-soft) both;
+}
+@keyframes aa-slide-in {
+    from { opacity: 0; transform: translateY(-6px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+@media (prefers-reduced-motion: reduce) {
+    .ss-activity-item.aa-enter { animation-duration: 1ms; }
+    .ss-activity-item:hover { transform: none; }
 }
 .ss-activity-item:first-child { border-top: 0; }
 .ss-activity-item .aa-head {
@@ -4273,12 +4472,51 @@ button.danger:hover:not(:disabled) {
 .ss-kind-dot.read { background: #7a8fa8; box-shadow: 0 0 6px rgba(122, 143, 168, 0.35); }
 .ss-kind-dot.edit { background: #b8875f; box-shadow: 0 0 6px rgba(184, 135, 95, 0.40); }
 .ss-kind-dot.hit  { background: #7ea38a; box-shadow: 0 0 6px rgba(126, 163, 138, 0.35); }
-.ss-file-row .fp { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.ss-file-row .ct {
-    flex: 0 0 auto;
-    font-size: var(--fs-footnote); color: var(--fg-mute, #6e737d);
-    background: rgba(60, 80, 120, 0.08); padding: 1px 6px; border-radius: 999px;
+/* shell mtime-scan touches — deliberately neutral grey so they read as
+   "incidental, not a real read/edit" and don't compete with the three
+   semantic hues above. */
+.ss-kind-dot.shell { background: #9a9aa2; box-shadow: 0 0 6px rgba(154, 154, 162, 0.30); }
+
+/* Colour legend — sits INSIDE the Files section head, right after the title,
+   so the dot hues have a visible meaning without spending a whole extra row.
+   It's one flex child of .ss-section-head: normally the head's own flex-wrap
+   drops the whole legend to a second line when title+legend+count won't fit.
+   The legend itself may ALSO wrap internally (flex-wrap:wrap) as a last resort
+   at very narrow widths, so its items never clip off the right edge.
+   text-transform:none overrides the uppercase the section head carries. */
+.ss-files-legend {
+    flex: 0 1 auto; min-width: 0;
+    display: flex; flex-wrap: wrap; align-items: center;
+    gap: 4px 12px;
+    margin-left: 4px;
+    font-size: var(--fs-caption, var(--fs-footnote));
+    letter-spacing: 0; text-transform: none; font-weight: var(--fw-medium);
+    color: var(--fg-mute, #6e737d);
 }
+.ss-files-legend .lg { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
+.ss-files-legend .ss-kind-dot { width: 7px; height: 7px; box-shadow: none; }
+
+/* Per-file classified count badges (read/edit/hit/shell): small coloured
+   dot + number, colours mirroring the legend above. Replaces the old single
+   "N×" total pill. */
+.ss-file-row .ss-ct-group {
+    flex: 0 0 auto;
+    display: inline-flex; align-items: center; gap: 7px;
+}
+.ss-file-row .ss-ct {
+    display: inline-flex; align-items: center; gap: 3px;
+    font-size: var(--fs-footnote); color: var(--fg-mute, #6e737d);
+    font-variant-numeric: tabular-nums;
+}
+.ss-ct-dot {
+    width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0;
+    display: inline-block;
+}
+.ss-ct-dot.read  { background: #7a8fa8; }
+.ss-ct-dot.edit  { background: #b8875f; }
+.ss-ct-dot.hit   { background: #7ea38a; }
+.ss-ct-dot.shell { background: #9a9aa2; }
+.ss-file-row .fp { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ss-file-row.active { color: var(--tint-strong); font-weight: var(--fw-semibold); }
 .ss-file-row.active .fp::after {
     content: ' ← now'; font-size: var(--fs-footnote); color: var(--tint); font-weight: normal;

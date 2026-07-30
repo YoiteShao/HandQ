@@ -72,12 +72,10 @@ import logging
 import os
 import re
 import shutil
-import stat
 import sys
-import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import yaml
 
@@ -100,9 +98,9 @@ _SLUG_STRIP_RE = re.compile(r"[^a-z0-9]+")
 
 # Origin marks who owns a skill's *content*, gating the auto-miner's write path.
 # ``auto`` = minted by triage from a recurring task; ``bundled`` = shipped
-# with HandQ itself and seeded into the user's Skill root by
-# seed_bundled_skills() — invisible to the panel and immutable via the
-# skill_* IPC surface (see SkillRegistry.list_all / _reject_if_bundled).
+# with HandQ itself and scanned in place from the install-dir ``Skill/`` root
+# (see _scan_two_roots) — invisible to the panel and immutable via the
+# skill_* IPC surface (see SkillRegistry.list_all / _bundled_immutable_result).
 # Anything else (missing key, ``user``, hand-created / imported / panel-
 # edited) = user-owned and OFF LIMITS to the auto-miner. Origin fails *safe
 # to user*: an ambiguous value must never green-light a clobber (see
@@ -165,6 +163,21 @@ class SkillEntry:
                    tool ALSO runs its provider's session-once setup via the
                    ``on_tools_changed`` bus — no separate ``activates_providers``
                    field is needed.
+      process_hints:   ``{process_name_lowercased: hint}`` — app-specific
+                   quirks that need to be re-surfaced every time that process
+                   is the acting target, not just once when the skill is
+                   read. ``read_skill`` puts the whole skill body in context
+                   ONE time; by turn 200 of a long task that text has scrolled
+                   far outside the model's effective attention (confirmed
+                   live 2026-07-26: the alpaca-workflow skill already
+                   documented "TAC's none_detected is expected", read at
+                   turn 1, but the agent still spent ~40 minutes rediscovering
+                   it near turn 200). desktop_tool.py's click handlers look up
+                   the foreground process here on EVERY none_detected result
+                   and append any match to that turn's ``effect_hint`` — so
+                   the knowledge reappears exactly when it's relevant, however
+                   deep into the task that is. Empty for skills with no
+                   process-specific behavior to pin.
     """
 
     name: str
@@ -176,6 +189,7 @@ class SkillEntry:
     standing: bool = False
     origin: str = SKILL_ORIGIN_USER
     allowed_tools: List[str] = field(default_factory=list)
+    process_hints: Dict[str, str] = field(default_factory=dict)
 
 
 class SkillRegistry:
@@ -189,39 +203,75 @@ class SkillRegistry:
 
     _instance: Optional["SkillRegistry"] = None
 
-    def __init__(self, root: Path, entries: Dict[str, SkillEntry]) -> None:
-        self._root = root
+    def __init__(
+        self,
+        user_root: Path,
+        entries: Dict[str, SkillEntry],
+        *,
+        bundled_root: Optional[Path] = None,
+    ) -> None:
+        # Two roots, merged into one flat registry:
+        #   * bundled_root — product-shipped recipes next to the bridge exe
+        #     (``<install_dir>/Skill``). Read directly, never copied. The
+        #     authoritative version of every ``origin: bundled`` skill.
+        #   * user_root — the user's own skills (``%USERPROFILE%\HandQ\Skill``).
+        #     All panel writes (create/edit/enable/delete) land here.
+        # A user skill shadows a bundled one of the same name (see
+        # ``_scan_two_roots``) — that's how a user disables/overrides a shipped
+        # recipe without the product ever mutating the bundled copy.
+        self._user_root = user_root
+        self._bundled_root = bundled_root
         self._entries: Dict[str, SkillEntry] = entries
 
     # ── Lifecycle ───────────────────────────────────────────────────────────
 
     @classmethod
-    def init(cls, root: Optional[Path] = None) -> "SkillRegistry":
-        """Scan the Skill root and build the singleton.
+    def init(
+        cls,
+        user_root: Optional[Path] = None,
+        *,
+        bundled_root: Optional[Path] = None,
+    ) -> "SkillRegistry":
+        """Scan the bundled + user Skill roots and build the singleton.
 
-        ``root`` lets tests point at an isolated directory; production
+        ``user_root`` lets tests point at an isolated directory; production
         boot calls ``init()`` with no argument and falls back to
-        :func:`_default_skills_root`. Re-init replaces the singleton —
-        useful for tests but not exposed via IPC.
+        :func:`_default_skills_root` (``%USERPROFILE%\\HandQ\\Skill``).
+        ``bundled_root`` defaults to :func:`_bundled_skills_dir` (the shipped
+        ``<install_dir>/Skill``); pass it explicitly in tests. Bundled skills
+        are read straight from their install location — never copied into the
+        user root — so a read-only or partially-written user dir can no longer
+        make a shipped skill vanish. Re-init replaces the singleton — useful
+        for tests but not exposed via IPC.
         """
-        scan_root = root if root is not None else _default_skills_root()
+        scan_user_root = user_root if user_root is not None else _default_skills_root()
+        scan_bundled_root = (
+            bundled_root if bundled_root is not None else _bundled_skills_dir()
+        )
         try:
-            scan_root.mkdir(parents=True, exist_ok=True)
+            scan_user_root.mkdir(parents=True, exist_ok=True)
         except OSError:
-            # Don't let a permission error kill boot — proceed with an
-            # empty registry. The user can fix the directory later.
+            # Don't let a permission error kill boot — the user root may be
+            # uncreatable, but bundled skills still load from the install dir.
+            # Proceed with whatever the bundled scan yields.
             _logger.exception(
-                "SkillRegistry.init: could not create %s; using empty registry",
-                scan_root,
+                "SkillRegistry.init: could not create %s; loading bundled only",
+                scan_user_root,
             )
-            cls._instance = cls(scan_root, {})
+            entries = _scan_two_roots(scan_bundled_root, scan_user_root)
+            cls._instance = cls(
+                scan_user_root, entries, bundled_root=scan_bundled_root
+            )
             return cls._instance
 
-        entries = _scan_skill_root(scan_root)
-        cls._instance = cls(scan_root, entries)
+        entries = _scan_two_roots(scan_bundled_root, scan_user_root)
+        cls._instance = cls(
+            scan_user_root, entries, bundled_root=scan_bundled_root
+        )
         _logger.info(
-            "SkillRegistry initialised: root=%s, %d skill(s) loaded%s",
-            scan_root,
+            "SkillRegistry initialised: bundled=%s user=%s, %d skill(s) loaded%s",
+            scan_bundled_root,
+            scan_user_root,
             len(entries),
             f" (with warnings: {sum(1 for e in entries.values() if e.problems)})"
             if any(e.problems for e in entries.values())
@@ -233,11 +283,13 @@ class SkillRegistry:
     def get(cls) -> "SkillRegistry":
         if cls._instance is None:
             _logger.debug("SkillRegistry.get() before init; returning empty instance")
-            return cls(_default_skills_root(), {})
+            return cls(
+                _default_skills_root(), {}, bundled_root=_bundled_skills_dir()
+            )
         return cls._instance
 
     def reload(self) -> None:
-        """Re-scan the Skill root.
+        """Re-scan both Skill roots.
 
         The panel's CRUD paths update entries in place (``_refresh_entry``) and
         don't need this; it stays for the "something changed the files out of
@@ -245,11 +297,12 @@ class SkillRegistry:
         a future ``/skill-reload``). Triage runs in-process and calls the write
         API directly, so its new skills are visible without an explicit reload.
         """
-        self._entries = _scan_skill_root(self._root)
+        self._entries = _scan_two_roots(self._bundled_root, self._user_root)
         _logger.info(
-            "SkillRegistry reloaded: %d skill(s) under %s",
+            "SkillRegistry reloaded: %d skill(s) (bundled=%s user=%s)",
             len(self._entries),
-            self._root,
+            self._bundled_root,
+            self._user_root,
         )
 
     # ── Read API ────────────────────────────────────────────────────────────
@@ -348,6 +401,31 @@ class SkillRegistry:
             e.name for e in self._entries.values() if e.enabled and e.standing
         )
 
+    def hints_for_process(self, process_name: str) -> List[Tuple[str, str]]:
+        """``[(skill_name, hint), ...]`` across every ENABLED skill whose
+        ``process_hints`` has a case-insensitive key match for *process_name*.
+
+        Agent-facing discovery (same enabled-only rule as :meth:`get_skill` /
+        :meth:`render_menu_block`) — a disabled skill's hints must not
+        re-surface just because desktop_tool happens to be looking at a
+        process name it mentions. Called on every none_detected click result
+        (see desktop_tool.py's ``_process_hint_suffix``) so this needs to
+        stay cheap: a flat scan over already-loaded, already-lowercased dict
+        keys, no I/O. Returns ``[]`` for an empty/unknown process name or no
+        match — never raises, since a lookup miss is the common case.
+        """
+        proc = (process_name or "").strip().lower()
+        if not proc:
+            return []
+        hits: List[Tuple[str, str]] = []
+        for e in sorted(self._entries.values(), key=lambda x: x.name):
+            if not e.enabled:
+                continue
+            hint = e.process_hints.get(proc)
+            if hint:
+                hits.append((e.name, hint))
+        return hits
+
     # ── Mutation / panel API (Skill control panel) ───────────────────────────
     #
     # These see the FULL set (enabled + disabled) and write SKILL.md files
@@ -375,6 +453,7 @@ class SkillRegistry:
                 "standing": e.standing,
                 "origin": e.origin,
                 "allowed_tools": list(e.allowed_tools),
+                "process_hints": dict(e.process_hints),
                 "body": e.body.strip(),
                 "source_path": e.source_path,
                 "problems": list(e.problems),
@@ -439,6 +518,7 @@ class SkillRegistry:
                       *, enabled: bool = True, standing: bool = False,
                       origin: str = SKILL_ORIGIN_USER,
                       allowed_tools: Optional[Iterable[str]] = None,
+                      process_hints: Optional[Dict[str, str]] = None,
                       ) -> Dict[str, object]:
         name = (name or "").strip()
         description = (description or "").strip()
@@ -446,16 +526,18 @@ class SkillRegistry:
             return {"ok": False, "reason": "invalid_name", "name": name}
         if not description:
             return {"ok": False, "reason": "missing_description"}
-        if name in self._entries or (self._root / name).exists():
+        if name in self._entries or (self._user_root / name).exists():
             return {"ok": False, "reason": "exists", "name": name}
-        skill_md = self._root / name / _SKILL_FILE
+        skill_md = self._user_root / name / _SKILL_FILE
         allowed_list = _coerce_str_list(list(allowed_tools) if allowed_tools else None)
+        hints_dict = _coerce_process_hints(process_hints or {})
         try:
             skill_md.parent.mkdir(parents=True, exist_ok=True)
             skill_md.write_text(
                 _render_skill_md(name, description, body or "", enabled=enabled,
                                  standing=standing, origin=origin,
-                                 allowed_tools=allowed_list),
+                                 allowed_tools=allowed_list,
+                                 process_hints=hints_dict),
                 encoding="utf-8",
             )
         except OSError as exc:
@@ -469,6 +551,7 @@ class SkillRegistry:
         description: Optional[str] = None, body: Optional[str] = None,
         standing: Optional[bool] = None, origin: Optional[str] = None,
         allowed_tools: Optional[Iterable[str]] = None,
+        process_hints: Optional[Dict[str, str]] = None,
     ) -> Dict[str, object]:
         entry = self._entries.get(name)
         if entry is None:
@@ -481,7 +564,7 @@ class SkillRegistry:
             if new_name and new_name != name:
                 if not _NAME_PATTERN.match(new_name):
                     return {"ok": False, "reason": "invalid_name", "name": new_name}
-                if new_name in self._entries or (self._root / new_name).exists():
+                if new_name in self._entries or (self._user_root / new_name).exists():
                     return {"ok": False, "reason": "exists", "name": new_name}
                 final_name = new_name
         final_desc = entry.description if description is None else description.strip()
@@ -490,21 +573,27 @@ class SkillRegistry:
         final_body = entry.body if body is None else body
         final_standing = entry.standing if standing is None else standing
         final_origin = entry.origin if origin is None else origin
-        # allowed_tools: None means "preserve"; an explicit list (even empty)
-        # replaces. This lets callers add / change / clear the grant.
+        # allowed_tools / process_hints: None means "preserve"; an explicit
+        # value (even empty) replaces. This lets callers add / change / clear
+        # the grant or the hints independently.
         final_allowed = (
             entry.allowed_tools if allowed_tools is None
             else _coerce_str_list(list(allowed_tools))
         )
+        final_hints = (
+            entry.process_hints if process_hints is None
+            else _coerce_process_hints(process_hints)
+        )
         old_dir = Path(entry.source_path).parent
-        new_md = self._root / final_name / _SKILL_FILE
+        new_md = self._user_root / final_name / _SKILL_FILE
         try:
             new_md.parent.mkdir(parents=True, exist_ok=True)
             new_md.write_text(
                 _render_skill_md(final_name, final_desc, final_body,
                                  enabled=entry.enabled, standing=final_standing,
                                  origin=final_origin,
-                                 allowed_tools=final_allowed),
+                                 allowed_tools=final_allowed,
+                                 process_hints=final_hints),
                 encoding="utf-8",
             )
             if final_name != name and old_dir.exists() and old_dir != new_md.parent:
@@ -570,15 +659,20 @@ class SkillRegistry:
         allowed_tools = _coerce_str_list(
             fm.get("allowed-tools", fm.get("allowed_tools"))
         )
+        process_hints = _coerce_process_hints(
+            fm.get("process-hints", fm.get("process_hints"))
+        )
         raw_name = str(fm.get("name", "") or "").strip() or path.parent.name
         name = slugify_skill_name(raw_name)
         if name in self._entries:
             return self.update_skill(name, description=description, body=body,
                                      standing=standing, origin=SKILL_ORIGIN_USER,
-                                     allowed_tools=allowed_tools)
+                                     allowed_tools=allowed_tools,
+                                     process_hints=process_hints)
         return self.create_skill(name, description, body, enabled=True,
                                  standing=standing, origin=SKILL_ORIGIN_USER,
-                                 allowed_tools=allowed_tools)
+                                 allowed_tools=allowed_tools,
+                                 process_hints=process_hints)
 
     def _refresh_entry(self, skill_md: Path, dir_name: str) -> None:
         """Re-parse one SKILL.md and replace its in-memory entry.
@@ -602,7 +696,8 @@ class SkillRegistry:
 def _render_skill_md(name: str, description: str, body: str, *,
                      enabled: bool = True, standing: bool = False,
                      origin: str = SKILL_ORIGIN_USER,
-                     allowed_tools: Optional[List[str]] = None) -> str:
+                     allowed_tools: Optional[List[str]] = None,
+                     process_hints: Optional[Dict[str, str]] = None) -> str:
     """Serialize a canonical SKILL.md.
 
     Only writes ``enabled: false`` when the skill is disabled — an enabled
@@ -611,8 +706,11 @@ def _render_skill_md(name: str, description: str, body: str, *,
     is standing (missing key == not standing) and ``origin: auto``/``origin:
     bundled`` only for triage-minted / product-shipped skills (missing key ==
     user-owned, the protective default). ``allowed-tools`` is written only
-    when non-empty (missing == none). ``description`` is flattened to a
-    single line so it can't break the YAML block.
+    when non-empty (missing == none), same for ``process-hints`` (rendered as
+    a YAML mapping block — hint text is a full sentence, too long for the
+    inline-list style ``allowed-tools`` uses). ``description`` is flattened to
+    a single line so it can't break the YAML block; each process-hint value is
+    flattened the same way for the same reason.
     """
     desc_line = " ".join(str(description).split())
     lines = ["---", f"name: {name}", f"description: {desc_line}"]
@@ -626,6 +724,21 @@ def _render_skill_md(name: str, description: str, body: str, *,
         lines.append("origin: bundled")
     if allowed_tools:
         lines.append("allowed-tools: [" + ", ".join(allowed_tools) + "]")
+    if process_hints:
+        # Dump the WHOLE mapping in one yaml.safe_dump call, not per-value —
+        # per-value dumping of a plain multi-word string appends a stray
+        # "\n..." document-end marker (confirmed: yaml.safe_dump('a b c')
+        # returns 'a b c\n...\n', not 'a b c\n'), which would corrupt the
+        # frontmatter block on the very next parse.
+        flat_hints = {
+            proc: " ".join(str(hint).split())
+            for proc, hint in process_hints.items()
+        }
+        block = yaml.safe_dump(
+            {"process-hints": flat_hints},
+            default_flow_style=False, allow_unicode=True, sort_keys=False,
+        )
+        lines.extend(block.rstrip("\n").splitlines())
     lines.append("---")
     lines.append("")
     lines.append(str(body).strip())
@@ -723,249 +836,48 @@ def _bundled_skills_dir() -> Optional[Path]:
     return d if d.is_dir() else None
 
 
-def _rmtree_with_retry(path: Path, *, attempts: int = 3, delay_s: float = 0.1) -> None:
-    """``shutil.rmtree`` that also clears the Windows read-only bit on failure.
+def _scan_two_roots(
+    bundled_root: Optional[Path], user_root: Path
+) -> Dict[str, SkillEntry]:
+    """Merge-scan the bundled + user Skill roots into one ``{name: entry}`` map.
 
-    Root cause this exists for: ``shutil.copytree`` (used by
-    ``seed_bundled_skills`` to seed/refresh a target) preserves the SOURCE
-    directory's permission bits via ``copystat`` — and the repo's ``Skill/``
-    directories can themselves be read-only (e.g. certain git checkouts /
-    editors mark checked-out dirs `0o555`). The copy inherits that: its files
-    are writable, but the DIRECTORY ENTRY itself is not, so a later
-    ``rmdir`` on it raises ``PermissionError: Access is denied`` even though
-    every file inside deletes cleanly (confirmed: `os.remove` on the file
-    succeeds, only `os.rmdir` on the now-empty dir fails). ``onexc`` chmod's
-    the offending path to writable and retries the SAME operation — this is
-    the standard fix documented for `shutil.rmtree` on Windows. A short
-    sleep+retry wrapper around the whole call remains as a second-line
-    defense for the separate (rarer) case of a transient AV/indexer handle;
-    re-raises the last error if it still hasn't cleared after all attempts.
+    Bundled skills (shipped next to the bridge exe) are scanned first, then
+    user skills are layered on top: a user skill of the same name SHADOWS the
+    bundled one. That is the whole override mechanism — a user disables or
+    rewrites a shipped recipe by dropping a same-named skill in their own root;
+    the product never mutates the bundled copy, so it can't be corrupted by a
+    read-only or half-written user dir (the failure this design replaces).
+
+    ``bundled_root`` is Optional because :func:`_bundled_skills_dir` returns
+    None when no shipped ``Skill/`` exists (a build without bundled recipes).
+    When the two roots resolve to the SAME directory (dev mode: install dir ==
+    repo AND the user root points there) we scan only once — otherwise every
+    skill would collide with itself and log a spurious warning.
     """
-    def _on_rm_error(func, target_path, exc_info):
+    entries: Dict[str, SkillEntry] = {}
+    same_root = False
+    if bundled_root is not None:
         try:
-            os.chmod(target_path, stat.S_IWRITE)
-            func(target_path)
-        except OSError:
-            raise exc_info[1]
-
-    last_exc: Optional[OSError] = None
-    for i in range(attempts):
-        try:
-            shutil.rmtree(path, onexc=_on_rm_error)
-            return
-        except OSError as exc:
-            last_exc = exc
-            if i < attempts - 1:
-                time.sleep(delay_s)
-    if last_exc is not None:
-        raise last_exc
-
-
-def _dir_contents_equal(a: Path, b: Path) -> bool:
-    """True iff *a* and *b* contain the same relative file paths with
-    byte-identical content (recursive). Used to skip a bundled-skill refresh
-    when the repo source hasn't actually changed since it was last seeded —
-    metadata (mtime, permission bits) is deliberately ignored, only content
-    and the set of files matter. Any read error is treated as "not equal"
-    (fail toward refreshing, never toward silently skipping a real change).
-    """
-    try:
-        a_files = sorted(p.relative_to(a) for p in a.rglob("*") if p.is_file())
-        b_files = sorted(p.relative_to(b) for p in b.rglob("*") if p.is_file())
-    except OSError:
-        return False
-    if a_files != b_files:
-        return False
-    try:
-        return all(
-            (a / rel).read_bytes() == (b / rel).read_bytes()
-            for rel in a_files
-        )
-    except OSError:
-        return False
-
-
-def seed_bundled_skills(dest_root: Optional[Path] = None) -> int:
-    """Copy shipped recipe skills into the user skill root, refreshing any
-    that are still ``origin: bundled`` AND whose content actually differs
-    from the shipped source (see ``_dir_contents_equal`` — an unconditional
-    rewrite on every boot, even when nothing shipped, would burn disk I/O
-    and the Windows-lock retry path for no reason on the overwhelmingly
-    common case where the repo content hasn't changed since last boot).
-
-    Product-authored recipe skills (monitor-long-running, remote-handq-workflow,
-    …) live in the repo/installed ``Skill/`` dir. The registry only scans user
-    data (``%USERPROFILE%\\HandQ\\Skill``), so on boot we copy any bundled skill
-    the user does not already have, AND overwrite any existing target that is
-    still ``origin: bundled`` — the repo is the single source of truth for
-    bundled content, so shipping an improved recipe (new guidance, a fixed
-    caveat) reaches already-installed users on their next boot instead of
-    being stuck forever at whatever version first got seeded. Returns the
-    number of skills seeded or refreshed.
-
-    Bundled skills have NO supported edit path — the panel/IPC surface
-    rejects every write (set_enabled/update_skill/delete_skill/import_skill)
-    for ``origin: bundled`` (see SkillRegistry._bundled_immutable_result).
-    The only way a target's content diverges from the shipped source is a
-    user hand-editing the file directly, outside any supported flow — and
-    even then, unless they also strip/change the ``origin:`` line (which
-    they have no product-facing reason to know exists), this refresh will
-    overwrite that edit on the next boot. This is intentional: origin is the
-    single knob that means "authoritative content lives in the repo, not
-    here" — once True, it stays true.
-
-    A target whose ``origin`` is NOT ``bundled`` (a hand-created/imported
-    user skill with a colliding name, or one where the origin line was
-    itself edited away) is left untouched — seeding never overwrites those.
-
-    When the bundled dir and the user dir resolve to the SAME path (dev mode
-    where the install dir is the repo AND the user root points there), seeding
-    is a no-op.
-
-    Historical-file backfill: a target that predates ``origin:`` entirely
-    (no frontmatter key at all) is compared byte-for-byte against the shipped
-    source (ignoring the ``origin:`` line) — an exact match proves the user
-    never touched the file, so it's safe to stamp ``origin: bundled`` onto it
-    AND refresh its content in the same pass. A target with no ``origin:``
-    key that differs from the shipped source keeps reading as user-owned,
-    visible and editable in the panel, exactly as before.
-    """
-    src = _bundled_skills_dir()
-    if src is None:
-        return 0
-    dest = dest_root if dest_root is not None else _default_skills_root()
-    try:
-        if src.resolve() == dest.resolve():
-            return 0
-    except OSError:
-        pass
-    try:
-        dest.mkdir(parents=True, exist_ok=True)
-    except OSError:
-        _logger.exception("seed_bundled_skills: cannot create %s", dest)
-        return 0
-    seeded = 0
-    try:
-        candidates = [p for p in src.iterdir() if p.is_dir() and not p.name.startswith(".")]
-    except OSError:
-        return 0
-    for skill_dir in candidates:
-        src_md = skill_dir / _SKILL_FILE
-        if not src_md.is_file():
-            continue
-        target = dest / skill_dir.name
-        target_md = target / _SKILL_FILE
-        if target.exists():
-            existing_origin = _read_origin(target_md)
-            if existing_origin is None:
-                # No `origin:` key at all — predates the field. Backfill it
-                # (and refresh content in the same pass) only if untouched;
-                # otherwise leave the user-owned file exactly as-is.
-                _backfill_bundled_origin_if_untouched(src_md, target_md)
-                continue
-            if existing_origin != SKILL_ORIGIN_BUNDLED:
-                continue  # hand-created/imported user skill with this name
-            # Still bundled — the repo is authoritative, but skip the
-            # rmtree+copytree dance entirely when nothing actually changed.
-            # Without this check, EVERY boot rewrites EVERY bundled skill's
-            # files unconditionally, even when the repo content is byte-for-
-            # byte identical to last boot — pure wasted disk I/O plus a
-            # needless run through the Windows-lock retry path on every
-            # single startup, for the (usual) case where nothing shipped.
-            if _dir_contents_equal(skill_dir, target):
-                continue
-            # Copy to a sibling temp dir FIRST, then swap — an rmtree()
-            # immediately followed by copytree() to the same path can race a
-            # transient Windows lock on the just-deleted directory (see
-            # _rmtree_with_retry). Copy-then-swap also means we never have a
-            # moment where the target is both gone and being recreated at
-            # the same path.
-            tmp_target = dest / f".{skill_dir.name}.refresh-tmp"
-            try:
-                if tmp_target.exists():
-                    _rmtree_with_retry(tmp_target)
-                shutil.copytree(skill_dir, tmp_target)
-                _rmtree_with_retry(target)
-                tmp_target.rename(target)
-                seeded += 1
-            except OSError:
-                _logger.exception(
-                    "seed_bundled_skills: failed to refresh %s", skill_dir.name
-                )
-                if tmp_target.exists():
-                    try:
-                        _rmtree_with_retry(tmp_target)
-                    except OSError:
-                        pass
-            continue
-        try:
-            shutil.copytree(skill_dir, target)
-            seeded += 1
-        except OSError:
-            _logger.exception(
-                "seed_bundled_skills: failed to copy %s", skill_dir.name
+            same_root = (
+                user_root.exists()
+                and bundled_root.exists()
+                and bundled_root.resolve() == user_root.resolve()
             )
-    if seeded:
-        _logger.info("seed_bundled_skills: seeded/refreshed %d bundled recipe skill(s)", seeded)
-    return seeded
+        except OSError:
+            same_root = False
+        entries = _scan_skill_root(bundled_root)
+    if same_root:
+        # Single physical dir behind both roots — the bundled scan already
+        # covers everything; scanning user_root again would self-collide.
+        return entries
+    user_entries = _scan_skill_root(user_root)
+    # User shadows bundled on name collision — explicit override, no warning
+    # (the within-root "first wins" collision rule in _scan_skill_root does
+    # not apply across roots; this is intentional layering, not a clash).
+    for name, entry in user_entries.items():
+        entries[name] = entry
+    return entries
 
-
-def _read_origin(skill_md: Path) -> Optional[str]:
-    """Best-effort read of the raw ``origin:`` frontmatter value.
-
-    Returns ``None`` when the file is unreadable, has no frontmatter, or the
-    ``origin`` key is absent — the caller distinguishes "absent" (historical
-    pre-origin file, eligible for backfill) from "present but not bundled"
-    (leave alone). Does NOT use ``_coerce_origin`` — that fails safe to
-    ``"user"`` for anything unrecognised, which would collapse the "absent"
-    and "present-but-different" cases this function needs to tell apart.
-    """
-    try:
-        text = skill_md.read_text(encoding="utf-8")
-    except OSError:
-        return None
-    match = _FRONTMATTER_RE.match(text)
-    if not match:
-        return None
-    try:
-        fm = yaml.safe_load(match.group(1)) or {}
-    except yaml.YAMLError:
-        return None
-    if not isinstance(fm, dict) or "origin" not in fm:
-        return None
-    raw = fm.get("origin")
-    return str(raw).strip() if raw is not None else None
-
-
-_ORIGIN_LINE_RE = re.compile(r"(?m)^origin:\s*\S+\s*\n?")
-
-
-def _backfill_bundled_origin_if_untouched(src_md: Path, target_md: Path) -> None:
-    """Stamp ``origin: bundled`` onto *target_md* iff it is byte-identical to
-    *src_md* apart from the ``origin:`` frontmatter line itself.
-
-    Pre-existing installs seeded a bundled skill before ``origin: bundled``
-    was added to the shipped files — this repairs those files in place, once,
-    the first time this runs after upgrading. Any read/write failure is
-    swallowed (best-effort — worst case the file just stays user-owned).
-    """
-    if not target_md.is_file():
-        return
-    try:
-        src_text = src_md.read_text(encoding="utf-8")
-        target_text = target_md.read_text(encoding="utf-8")
-    except OSError:
-        return
-    if _ORIGIN_LINE_RE.sub("", src_text) != _ORIGIN_LINE_RE.sub("", target_text):
-        return  # user has touched this file — leave it as user-owned
-    if _ORIGIN_LINE_RE.search(target_text):
-        return  # already stamped (or stamped with a non-bundled value; leave it)
-    try:
-        target_md.write_text(src_text, encoding="utf-8")
-    except OSError:
-        _logger.exception(
-            "seed_bundled_skills: failed to backfill origin for %s", target_md
-        )
 
 
 def _scan_skill_root(root: Path) -> Dict[str, SkillEntry]:
@@ -1067,6 +979,10 @@ def _load_skill_file(skill_md: Path, *, dir_name: str) -> Optional[SkillEntry]:
     allowed_tools = _coerce_str_list(
         fm.get("allowed-tools", fm.get("allowed_tools"))
     )
+    # process-hints: {process.exe: "hint text"} — see SkillEntry docstring.
+    process_hints = _coerce_process_hints(
+        fm.get("process-hints", fm.get("process_hints"))
+    )
 
     # Invariant: standing implies enabled. A standing skill that is somehow
     # disabled (only reachable by hand-editing the file — the panel can't
@@ -1117,6 +1033,7 @@ def _load_skill_file(skill_md: Path, *, dir_name: str) -> Optional[SkillEntry]:
         standing=standing,
         origin=origin,
         allowed_tools=allowed_tools,
+        process_hints=process_hints,
     )
     return entry
 
@@ -1142,6 +1059,32 @@ def _coerce_str_list(raw: object) -> List[str]:
         if it and it not in seen:
             seen.add(it)
             out.append(it)
+    return out
+
+
+def _coerce_process_hints(raw: object) -> Dict[str, str]:
+    """Interpret the frontmatter ``process-hints`` value.
+
+    Only a YAML mapping is meaningful here (``{process.exe: "hint text"}``) —
+    unlike ``allowed-tools``, there's no sensible flat-list or scalar
+    shorthand for a name→text mapping. Missing / null / non-mapping → ``{}``
+    (fails empty, mirrors ``_coerce_str_list``'s empty-list default — a
+    skill with no process hints is just a skill with no process hints, not
+    an error). Keys are lowercased so lookup at click time
+    (``foreground process_name`` is already lowercased by callers) doesn't
+    depend on how the hand-authored YAML capitalized ``TAC.exe`` vs
+    ``tac.exe``. Non-string values are skipped individually rather than
+    invalidating the whole mapping — one bad entry shouldn't cost every
+    other hint in the skill.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    out: Dict[str, str] = {}
+    for key, value in raw.items():
+        proc = str(key).strip().lower()
+        hint = str(value).strip() if value is not None else ""
+        if proc and hint:
+            out[proc] = hint
     return out
 
 

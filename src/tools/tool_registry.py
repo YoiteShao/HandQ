@@ -1525,7 +1525,7 @@ EXAMPLES
                 BrowserWaitForTool, BrowserScreenshotTool,
                 BrowserVisionQueryTool, BrowserVideoContextTool,
                 BrowserFetchJsonTool, BrowserRequestUserLoginTool,
-                BrowserCloseTabTool,
+                BrowserCloseTabTool, BrowserEvaluateTool,
             )
             _browser_props = BrowserTool.parameter_schema.get("properties", {})
             for _name, _cls, _desc, _req, _opt in (
@@ -1534,9 +1534,16 @@ EXAMPLES
                     "Idempotent — safe to call repeatedly. Returns the first tab_id.",
                     [], []),
                 ("browser_attach", BrowserAttachTool,
-                    "Attach to the user's already-running Chrome (advanced; "
-                    "requires config gate). Use ONLY when the task needs "
-                    "existing browser state ('刚才/正在' in the user's request).",
+                    "Attach over CDP to either (a) the user's already-running "
+                    "Chrome/Edge — requires browser.attach_enabled in config; "
+                    "use ONLY when the task needs existing browser state "
+                    "('刚才/正在' in the user's request) — or (b) any OTHER "
+                    "app already listening on a CDP debug port (an Electron "
+                    "app you launched with --remote-debugging-port, e.g. a "
+                    "vendor tool that desktop_snapshot showed as UIA-blind) — "
+                    "the latter only needs an approved desktop takeover, not "
+                    "the config gate, and gives deterministic DOM access "
+                    "instead of screenshot/OCR guessing.",
                     [], ["browser_credentials_file"]),
                 ("browser_new_tab", BrowserNewTabTool,
                     "Open a new tab. Optionally set background=true so the "
@@ -1601,6 +1608,15 @@ EXAMPLES
                 ("browser_close_tab", BrowserCloseTabTool,
                     "Close one tab by tab_id.",
                     ["tab_id"], []),
+                ("browser_evaluate", BrowserEvaluateTool,
+                    "Run raw JavaScript in the page and return its value. "
+                    "LAST RESORT — prefer browser_click/browser_type/"
+                    "browser_extract/browser_snapshot for anything they "
+                    "cover; use this only for app-specific DOM shapes those "
+                    "can't express (e.g. a framework component with no "
+                    "stable selector). Runs through the same session/tab as "
+                    "every other browser_* tool — no separate CDP wiring needed.",
+                    ["expression"], ["tab_id", "timeout_ms"]),
             ):
                 _register_atomic(
                     _name, tool_class=_cls, description=_desc,
@@ -1622,6 +1638,7 @@ EXAMPLES
                 DesktopFindElementTool, DesktopFindAndClickTool,
                 DesktopClickAtTool, DesktopTypeTextTool, DesktopDragTool,
                 DesktopScrollTool, DesktopHotkeyTool, DesktopKeyPressTool,
+                DesktopRunUiaTool,
             )
             _desktop_props = DesktopTool.parameter_schema.get("properties", {})
             # Safety facts a caller of these specific actions needs even
@@ -1688,6 +1705,16 @@ EXAMPLES
                 ("desktop_key_press", DesktopKeyPressTool,
                     "Press a single key by name (e.g. 'enter', 'esc', 'tab').",
                     ["key"], []),
+                ("desktop_run_uia", DesktopRunUiaTool,
+                    "Invoke a specific UIA pattern (invoke/toggle/select/value) "
+                    "directly at a point, bypassing mouse-click simulation "
+                    "entirely. LAST RESORT — prefer desktop_click_at (which "
+                    "already tries UIA-first automatically); use this when you "
+                    "know a mouse-simulated click is being swallowed by a "
+                    "custom renderer but the underlying control DOES expose a "
+                    "UIA pattern (confirmed via desktop_snapshot) and you need "
+                    "a SPECIFIC one, not click_at's automatic fallthrough.",
+                    ["pattern"], ["x", "y", "text"]),
             ):
                 _register_atomic(
                     _name, tool_class=_cls, description=_desc,
@@ -1699,6 +1726,7 @@ EXAMPLES
                             "desktop_click_at", "desktop_type_text",
                             "desktop_find_and_click", "desktop_hotkey",
                             "desktop_key_press", "desktop_drag", "desktop_scroll",
+                            "desktop_run_uia",
                         ) else ""
                     ),
                 )
@@ -2469,6 +2497,17 @@ Ending the loop: simply DON'T call schedule_wakeup on a turn — the loop ends."
         registered tool on THIS platform. Because Windows-only families are not
         registered on Linux, they never appear here — the menu can never
         advertise a tool the agent cannot claim.
+
+        For families backed by a bundled ``*-workflow`` skill, the line names
+        that skill explicitly. The menu only shows family PREFIXES, never the
+        individual claimable leaf names (``desktop_click_at`` etc.), so without
+        this pointer an agent that wants to claim a desktop tool has no way to
+        learn the real names except to guess — and a wrong guess
+        (``desktop_click``) used to lead nowhere. Naming the skill closes that
+        loop: read_skill("<family>-workflow") yields the exact names + recipe.
+        (Reinforced by two other channels: a fuzzy claim still reverse-pushes
+        the skill body, and claim_tool's unknown-name error carries a difflib
+        "did you mean?" hint — see self_extension_tool._suggest_for_unknown.)
         """
         cls.initialize()
         present: set = set()
@@ -2483,11 +2522,15 @@ Ending the loop: simply DON'T call schedule_wakeup on a turn — the loop ends."
                 elif name == key:
                     present.add(key)
                     break
-        lines = [
-            "  " + cls._MENU_FAMILY_LABELS[key]
-            for key in cls._MENU_FAMILY_ORDER
-            if key in present
-        ]
+        lines: List[str] = []
+        for key in cls._MENU_FAMILY_ORDER:
+            if key not in present:
+                continue
+            label = cls._MENU_FAMILY_LABELS[key]
+            skill = cls._FAMILY_WORKFLOW_SKILL.get(key)
+            if skill:
+                label += f' — read_skill("{skill}") for exact tool names + recipe'
+            lines.append("  " + label)
         return "\n".join(lines)
 
     @classmethod

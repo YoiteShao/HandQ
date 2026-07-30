@@ -252,110 +252,26 @@ let _crashDialogShown = false;
 // would hijack the system-wide copy shortcut for the entire duration of the
 // task, which is too aggressive a tradeoff.
 
-let takeoverOverlay = null;
-const TAKEOVER_REVOKE_ACCELERATOR = 'Control+Shift+C';
+// The overlay controller is extracted into takeover-overlay.js so its
+// session-id plumbing can be unit-tested without booting Electron. We inject
+// the Electron surfaces and the bridge writer / logger here. See that module's
+// header for the full IPC contract.
+const { createTakeoverOverlay } = require('./takeover-overlay');
 
-function showTakeoverOverlay() {
-    if (takeoverOverlay && !takeoverOverlay.isDestroyed()) {
-        // Backend's _start_takeover is idempotent but a duplicate event
-        // could still arrive on edge cases. Don't double-create.
-        return;
-    }
-    logLine('OVERLAY', 'show takeover overlay');
+const takeoverOverlayController = createTakeoverOverlay({
+    BrowserWindow,
+    globalShortcut,
+    writeToBridge: (obj) => writeToBridge(obj),
+    logLine,
+    overlayHtmlPath: path.join(__dirname, 'overlay', 'overlay.html'),
+});
 
-    try {
-        takeoverOverlay = new BrowserWindow({
-            frame: false,
-            transparent: true,
-            alwaysOnTop: true,
-            focusable: false,
-            skipTaskbar: true,
-            fullscreen: true,
-            hasShadow: false,
-            resizable: false,
-            movable: false,
-            minimizable: false,
-            maximizable: false,
-            closable: false,
-            backgroundColor: '#00000000',
-            // Overlay is purely presentational — no preload, no IPC.
-            webPreferences: {
-                contextIsolation: true,
-                sandbox: true,
-                nodeIntegration: false,
-            },
-        });
-    } catch (err) {
-        logLine('OVERLAY', 'create BrowserWindow failed',
-                { err: err && err.message });
-        takeoverOverlay = null;
-        return;
-    }
-
-    // Forward mouse events so the agent's clicks reach the underlying app.
-    try {
-        takeoverOverlay.setIgnoreMouseEvents(true, { forward: true });
-    } catch (err) {
-        logLine('OVERLAY', 'setIgnoreMouseEvents failed',
-                { err: err && err.message });
-    }
-    // "screen-saver" beats most fullscreen apps; fall back silently if the
-    // platform rejects the level.
-    try {
-        takeoverOverlay.setAlwaysOnTop(true, 'screen-saver');
-    } catch (_) { /* ignore */ }
-
-    takeoverOverlay.loadFile(path.join(__dirname, 'overlay', 'overlay.html'))
-        .catch((err) => {
-            logLine('OVERLAY', 'loadFile failed', { err: err && err.message });
-        });
-
-    // Hold off on setting visibleOnAllWorkspaces; default behaviour follows the
-    // user's active virtual desktop, which is what we want.
-
-    takeoverOverlay.on('closed', () => {
-        takeoverOverlay = null;
-    });
-
-    // Register the revoke hotkey. Registration can fail if another app
-    // already owns the combo — log it but continue showing the overlay so
-    // the user still sees the indicator.
-    try {
-        const ok = globalShortcut.register(TAKEOVER_REVOKE_ACCELERATOR, () => {
-            logLine('OVERLAY', 'revoke hotkey fired');
-            writeToBridge({ type: 'user_input', kind: 'desktop_takeover_revoked' });
-        });
-        if (!ok) {
-            logLine('OVERLAY', 'revoke hotkey register returned false',
-                    { accelerator: TAKEOVER_REVOKE_ACCELERATOR });
-        }
-    } catch (err) {
-        logLine('OVERLAY', 'revoke hotkey register error',
-                { err: err && err.message });
-    }
+function showTakeoverOverlay(sessionId) {
+    takeoverOverlayController.show(sessionId);
 }
 
 function hideTakeoverOverlay() {
-    // Always free the shortcut even if the window object is already gone.
-    try {
-        if (globalShortcut.isRegistered(TAKEOVER_REVOKE_ACCELERATOR)) {
-            globalShortcut.unregister(TAKEOVER_REVOKE_ACCELERATOR);
-        }
-    } catch (err) {
-        logLine('OVERLAY', 'revoke hotkey unregister error',
-                { err: err && err.message });
-    }
-    if (!takeoverOverlay || takeoverOverlay.isDestroyed()) {
-        takeoverOverlay = null;
-        return;
-    }
-    logLine('OVERLAY', 'hide takeover overlay');
-    try {
-        takeoverOverlay.destroy();
-    } catch (err) {
-        logLine('OVERLAY', 'destroy failed', { err: err && err.message });
-    }
-    takeoverOverlay = null;
+    takeoverOverlayController.hide();
 }
 
 // --- global hotkey (toggle window visibility) --------------------------------
@@ -601,7 +517,7 @@ function spawnBridge() {
         // to react (e.g. show a status pill) — both can happen.
         if (evtType === 'status' && evt && typeof evt.kind === 'string') {
             if (evt.kind === 'desktop_takeover_started') {
-                try { showTakeoverOverlay(); }
+                try { showTakeoverOverlay(evt.session_id); }
                 catch (err) {
                     logLine('OVERLAY', 'showTakeoverOverlay threw',
                             { err: err && err.message });

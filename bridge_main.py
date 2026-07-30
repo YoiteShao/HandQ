@@ -806,14 +806,11 @@ async def _run_boot_subsystems() -> None:
     _emit_boot_progress("skills_init_start")
     _t_skills = time.monotonic()
     try:
-        # Seed product-authored recipe skills (monitor-long-running,
-        # remote-handq-workflow, …) into the user skill root if absent —
-        # never overwriting user edits — then scan.
-        try:
-            from src.infrastructure.skills import seed_bundled_skills
-            seed_bundled_skills()
-        except Exception:
-            _boot_logger.exception("seed_bundled_skills failed; continuing")
+        # Bundled recipe skills (monitor-long-running, remote-handq-workflow, …)
+        # are scanned in place from the install-dir Skill/ root and merged with
+        # the user's own Skill root — no copy step, so a read-only or partially
+        # written user dir can't make a shipped skill vanish (see
+        # skills._scan_two_roots).
         SkillRegistry.init()
     except Exception as exc:
         _boot_logger.exception(

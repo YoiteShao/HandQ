@@ -45,6 +45,49 @@ def _normalize_names(names: Any) -> List[str]:
     return [str(n).strip() for n in names if str(n).strip()]
 
 
+def _suggest_for_unknown(unknown: List[str], known: "set[str]") -> str:
+    """Build an actionable 'did you mean?' clause for unknown claim names.
+
+    The [Available Tools] menu the agent sees only lists FAMILY prefixes
+    (``desktop_*``), never the individual claimable leaf names. So when a model
+    guesses a plausible-but-wrong name (``desktop_click`` for the real
+    ``desktop_click_at``), the bare "unknown name" error used to send it back to
+    a menu that doesn't contain the answer — a dead end that, in the 2026-07-25
+    flash-meta stall, made the agent abandon the whole desktop family and
+    hand-roll its own automation for 6 hours.
+
+    Two complementary hints per unknown name:
+      1. difflib close matches against the real tool names (catches typos /
+         near-misses like desktop_click → desktop_click_at).
+      2. the full same-family roster (prefix before the first ``_``), so even a
+         name difflib can't rank still surfaces every real sibling to pick from.
+    """
+    import difflib
+
+    known_sorted = sorted(known)
+    clauses: List[str] = []
+    for name in unknown:
+        close = difflib.get_close_matches(name, known_sorted, n=3, cutoff=0.6)
+        # Family roster: everything sharing the prefix up to and including the
+        # first underscore (desktop_click → 'desktop_'). Bare names with no
+        # underscore contribute no family and rely on the difflib hint alone.
+        family_hint = ""
+        if "_" in name:
+            prefix = name.split("_", 1)[0] + "_"
+            family = [k for k in known_sorted if k.startswith(prefix)]
+            if family:
+                shown = family[:12]
+                more = "" if len(family) <= 12 else f", … (+{len(family) - 12} more)"
+                family_hint = f"; '{prefix}' family: {', '.join(shown)}{more}"
+        if close:
+            clauses.append(f"'{name}' → did you mean: {', '.join(close)}?{family_hint}")
+        elif family_hint:
+            clauses.append(f"'{name}' is not a tool{family_hint}")
+        else:
+            clauses.append(f"'{name}' matches no known tool")
+    return " | ".join(clauses)
+
+
 def _tool_registry():
     # Deferred import: tool_registry.py imports THIS module to register
     # ClaimToolTool/ReleaseToolTool, so importing ToolRegistry at module
@@ -85,16 +128,37 @@ class ClaimToolTool(BaseTool):
                 pass
 
         output = {"claimed": valid}
+        error: Optional[str] = None
         if unknown:
             output["unknown"] = unknown
+            # Always attach did-you-mean guidance when ANY name is unknown —
+            # even on a partial success where some names claimed fine. The
+            # [Available Tools] menu only shows family prefixes, so "call an
+            # exact name from the menu" is not actionable on its own; the
+            # difflib + family-roster hint is what actually lets the agent
+            # recover to the real leaf name instead of giving up on the family.
+            suggestion = _suggest_for_unknown(unknown, known)
+            # Put it in `output` directly (not just `error`) — on a partial
+            # claim (some valid names present) success=True below, and
+            # to_obs_dict/to_tool_result_dict used to only serialize `error`
+            # on the failure branch, silently dropping this hint. Confirmed
+            # 2026-07-26 flash-meta: 10/10 guessed desktop_* leaf names were
+            # wrong, the hint was computed but never reached the agent, so it
+            # abandoned the whole desktop family instead of correcting itself.
+            output["hint"] = suggestion
+            if valid:
+                error = (
+                    f"Claimed {valid}. Unknown name(s) not claimed: {unknown}. "
+                    f"{suggestion}"
+                )
+            else:
+                error = (
+                    f"Unknown tool name(s), not claimed: {unknown}. {suggestion}"
+                )
         return ToolResult(
             success=bool(valid),
             output=output,
-            error=(
-                f"Unknown tool name(s), not claimed: {unknown}. "
-                f"Call an exact name from the [Available Tools] menu."
-                if not valid and unknown else None
-            ),
+            error=error,
             execution_time=time.time() - start,
             tool_name=self.name, tool_parameters=params,
         )

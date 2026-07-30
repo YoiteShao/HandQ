@@ -32,6 +32,20 @@ _IS_WINDOWS = sys.platform == "win32"
 _DEFAULT_TIMEOUT_SECONDS: int = 120
 _MAX_TIMEOUT_SECONDS: int = 600
 
+# Cap on how long we wait for a killed process to actually exit before giving
+# up on the wait (the kill signal itself is unconditional and already sent by
+# this point). On Windows, a process blocked in kernel-mode I/O against an
+# unresponsive UNC/SMB share can survive `taskkill /F` / TerminateProcess
+# until that I/O itself resolves — which can take minutes, unrelated to any
+# tool-level timeout. Without this cap, the caller (PersistentAgent's
+# iteration loop, awaiting the tool call) blocks indefinitely, which in turn
+# never reaches `acknowledge_interrupt()` — permanently starving every
+# subsequent `TaskChannel.interrupt_agent()` call for the rest of the session.
+# Confirmed live 2026-07-30: a hung UNC `Get-ChildItem` survived two user
+# interrupts; the session had to be destroyed. We give up WAITING, not
+# killing — the signal was already sent.
+_KILL_WAIT_TIMEOUT_SECONDS: float = 10.0
+
 # ── Output truncation ─────────────────────────────────────────────────────────
 _TRUNCATION_TOTAL_CHARS: int = 15_000
 _TRUNCATION_HEAD_CHARS: int = 5_000
@@ -1252,10 +1266,7 @@ async def _kill_process_tree_graceful(process: asyncio.subprocess.Process) -> No
     except Exception:
         pass
 
-    try:
-        await process.wait()
-    except Exception:
-        pass
+    await _wait_after_kill(process)
 
 
 async def _kill_process_tree(process: asyncio.subprocess.Process) -> None:
@@ -1285,7 +1296,36 @@ async def _kill_process_tree(process: asyncio.subprocess.Process) -> None:
             except Exception:
                 pass
 
+    await _wait_after_kill(process)
+
+
+async def _wait_after_kill(process: asyncio.subprocess.Process) -> None:
+    """Bounded wait for a process we just sent a kill signal to.
+
+    The kill signal is unconditional and already sent by the time this runs —
+    this only bounds how long we block waiting to OBSERVE the exit. A process
+    wedged in uninterruptible kernel-mode I/O (Windows: an unresponsive
+    UNC/SMB share; POSIX: a hard-mounted NFS path) can survive the kill for as
+    long as that I/O takes to resolve — minutes, unrelated to the tool's own
+    timeout. Giving up on WAITING (never on killing, which already happened)
+    keeps the caller from blocking indefinitely.
+
+
+    Confirmed live 2026-07-30: a hung UNC `Get-ChildItem` outlived two user
+    interrupts and the session had to be destroyed — the unbounded
+    ``await process.wait()`` that used to be here was the reason the agent's
+    iteration loop never reached its next boundary, which in turn never
+    called ``TaskChannel.acknowledge_interrupt()``, permanently starving
+    every later ``interrupt_agent()`` call for the rest of the session.
+    """
     try:
-        await process.wait()
+        await asyncio.wait_for(process.wait(), timeout=_KILL_WAIT_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        logger.warning(
+            "ShellTool: process %s did not exit within %.0fs of being killed "
+            "— giving up on the wait (kill signal was already sent); it may "
+            "still be wedged in kernel-mode I/O.",
+            process.pid, _KILL_WAIT_TIMEOUT_SECONDS,
+        )
     except Exception:
         pass

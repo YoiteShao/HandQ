@@ -86,7 +86,30 @@ class ConversationTurn:
         return "tool_calls" in self.assistant_message
 
     def total_obs_chars(self) -> int:
-        return sum(len(obs.to_obs_json(i + 1)) for i, obs in enumerate(self.observations))
+        """Char-cost of this turn as it actually rides in the request body.
+
+        Historically summed ONLY ``observations`` (tool_results) — but the
+        assistant message paired with them can be the larger half: its
+        ``tool_calls[].function.arguments`` carries the FULL call payload
+        (e.g. ``write``'s entire file content, a `shell` heredoc script),
+        and ``thinking_blocks`` is replayed verbatim every subsequent turn
+        per Anthropic's extended-thinking protocol. A turn dominated by
+        several 10-40KB ``write`` calls could look tiny by this metric while
+        actually being the biggest contributor to the request body — which
+        is exactly what let the 2026-07-26 flash-meta session's PTL recovery
+        (compact → hard-drop → LTM-drop → elide) shrink `_turns` repeatedly
+        while the request kept getting rejected as "too long": every
+        recovery step measures (and trims) only the half it can see.
+        """
+        obs_chars = sum(len(obs.to_obs_json(i + 1)) for i, obs in enumerate(self.observations))
+        asst = self.assistant_message or {}
+        asst_chars = len(str(asst.get("content") or ""))
+        for tc in (asst.get("tool_calls") or []):
+            fn = tc.get("function") or {}
+            asst_chars += len(str(fn.get("arguments") or ""))
+        for block in (asst.get("thinking_blocks") or []):
+            asst_chars += len(str(block.get("thinking") or block.get("data") or ""))
+        return obs_chars + asst_chars
 
 
 @dataclass

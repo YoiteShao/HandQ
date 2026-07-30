@@ -178,7 +178,7 @@ _GLOBAL_DESKTOP_OWNER: Optional["DesktopState"] = None
 # concurrently would fight over cursor position.
 _INPUT_ACTIONS = frozenset({
     "hover_at", "find_and_click", "click_at", "type_text",
-    "drag", "scroll", "hotkey", "key_press",
+    "drag", "scroll", "hotkey", "key_press", "run_uia",
 })
 
 # Actions that only observe current desktop/window state — no mouse/keyboard
@@ -1097,17 +1097,187 @@ def _content_changed(
     return (changed / len(before)) > _CONTENT_PROBE_CHANGE_FRAC
 
 
+# ── Covering-window info ─────────────────────────────────────────────────────
+#
+# Why this exists: click_at / find_and_click / run_uia fire at a target
+# (x, y) on the assumption that the intended window is actually what's
+# there. When a dialog, dropdown, tooltip, or unrelated window is currently
+# on top at that exact point — most commonly a stale error dialog the agent
+# hasn't dismissed yet — the synthetic click / UIA invoke lands on THAT
+# window instead. state_after's foreground/new_windows delta can't catch
+# this ahead of time (it only observes AFTER the click already fired), and
+# pyautogui has no concept of "what's currently under this point" at all.
+#
+# Confirmed live in the 2026-07-27 xPCATApp flash-meta trace: an "XMLS"
+# button was re-clicked 5+ times because a stale "Choose raw program files"
+# error dialog kept reopening on top of it, with no signal telling the agent
+# it was stuck — it only learned that after repeatedly cancelling the same
+# dialog and reasoning back over ~10 turns of scrollback.
+#
+# EARLIER DESIGN (superseded): a first pass compared the covering window
+# against `foreground_hwnd` and REFUSED the click outright on a mismatch.
+# Dropped after review for two independent reasons, both confirmed against
+# the real trace and this module's own established patterns:
+#
+#   1. foreground_hwnd is not a trustworthy "intended target" proxy. Across
+#      the SAME trace this fix is meant to address, every desktop_list_windows
+#      call from turn 27 onward — spanning the dialog, xPCATApp's own main
+#      window, and everything else — reports foreground=false for ALL
+#      windows (consistent with the cross-integrity-level UIPI block already
+#      recorded separately: see the elevation-blindspot finding). A guard
+#      keyed on foreground_hwnd degrades to a no-op (target_hwnd=0 → skip)
+#      in exactly the scenario it exists to catch.
+#   2. A hard refusal with no override forces the agent back to hand-rolled
+#      shell/pywinauto scripts the moment the guard is ever wrong in either
+#      direction — false-negative (foreground unreliable) or false-positive
+#      (a legitimate, non-error covering window: native right-click/combo-box
+#      dropdown menus and tooltips are their own non-activated top-level
+#      windows in Win32; the underlying app's window correctly stays
+#      "foreground" the whole time). That is the exact failure mode this
+#      whole change set is trying to reduce, not add another way into it.
+#
+# CURRENT DESIGN: report, don't block — the same philosophy already proven
+# by `_click_effect`'s navigated/none_detected/unknown classification below.
+# `_covering_window_info` doesn't compare against anything or decide
+# anything; it just answers "what top-level window is physically at this
+# point right now", unconditionally, as a plain fact attached to the click's
+# own result. The agent decides what that fact means. A point covered by the
+# SAME window the click already targets simply carries no extra information
+# and callers skip attaching it (see the `is_target` check at each call site).
+#
+# WindowFromPoint asks Windows directly "what's visually on top here right
+# now" — the OS's own z-order truth, not a guess HandQ has to construct.
+# GetAncestor(GA_ROOT) walks up from whatever control WindowFromPoint hits
+# to its owning top-level window, so a click on a child control INSIDE the
+# clicked window (a button nested inside a panel nested inside the main
+# window) reports that same top-level window, not a spurious "different"
+# one.
+#
+# Best-effort throughout: any failure (win32 unavailable, invalid point,
+# transient API error) returns None — a missing signal is reported as
+# missing, never guessed at.
+
+_GA_ROOT = 2  # winuser.h GA_ROOT
+
+
+def _root_window_at_point(x: int, y: int) -> Optional[int]:
+    """Return the top-level window hwnd currently covering screen point
+    (x, y), or ``None`` on any failure (win32 unavailable, no window at
+    that point, or a transient API error).
+    """
+    if not _WIN32_AVAILABLE:
+        return None
+    try:
+        hwnd = win32gui.WindowFromPoint((x, y))
+        if not hwnd:
+            return None
+        import ctypes
+        root = ctypes.windll.user32.GetAncestor(hwnd, _GA_ROOT)
+        return int(root) if root else int(hwnd)
+    except Exception:
+        return None
+
+
+def _covering_window_info(x: int, y: int, target_hwnd: int = 0) -> Optional[Dict[str, Any]]:
+    """Describe the top-level window currently covering screen point (x, y).
+
+    Returns ``None`` when the signal is unavailable (win32 missing, no
+    window resolved) OR when the covering window IS *target_hwnd* — in the
+    common case (clicking inside the window you already know you're
+    clicking) there is nothing informative to report. Never refuses or
+    blocks anything; purely descriptive. See module comment above for why
+    this replaced an earlier refuse-on-mismatch design.
+    """
+    covering = _root_window_at_point(x, y)
+    if covering is None or (target_hwnd and covering == target_hwnd):
+        return None
+    title = ""
+    proc = ""
+    if _WIN32_AVAILABLE:
+        try:
+            title = win32gui.GetWindowText(covering) or ""
+            _, pid = win32process.GetWindowThreadProcessId(covering)
+            proc = _process_name_for_pid(pid)
+        except Exception:
+            pass
+    return {"hwnd": covering, "title": title, "process": proc}
+
+
+# ── Failsafe diagnostic ──────────────────────────────────────────────────────
+#
+# Why this exists: pyautogui.FailSafeException fires when its OWN internal
+# cursor-position check believes the mouse is at a screen corner — but the
+# 2026-07-27 xPCATApp trace caught this firing at (380, 570) and (200, 100)
+# on a confirmed 2560x1440 single monitor, nowhere near any corner of that
+# screen or of the window being clicked. The exception carries no detail
+# about WHY it fired, yet the old message asserted "mouse hit corner" as
+# flat fact. The agent took that claim at face value and permanently
+# disabled the failsafe check (pyautogui.FAILSAFE = False) rather than ever
+# finding the real cause — removing a safety mechanism (the corner-yank
+# abort a human can use to interrupt a runaway automation) as a side effect
+# of trusting an unverified error string.
+#
+# This can't fix pyautogui's internal check, but it can stop stating an
+# unconfirmed cause as fact and instead surface what's actually knowable at
+# the moment of failure — the actual cursor position and target — so a
+# human or a future diagnosis pass has real data instead of a guess.
+
+def _failsafe_diagnostic(target_x: int, target_y: int) -> str:
+    """Best-effort snapshot of cursor/screen state at the moment PyAutoGUI's
+    failsafe fired, for the error message. Never raises — any read failure
+    degrades to "unavailable" rather than interrupting error handling.
+    """
+    cursor = "unavailable"
+    screen = "unavailable"
+    try:
+        cursor = str(pyautogui.position())
+    except Exception:
+        pass
+    try:
+        screen = str(pyautogui.size())
+    except Exception:
+        pass
+    return f"target=({target_x}, {target_y}), cursor_at_exception={cursor}, screen_size={screen}"
+
+
+def _failsafe_error_text(action: str, target_x: int, target_y: int) -> str:
+    """Shared, honest failsafe error message for click_at / find_and_click.
+
+    Does NOT assert "mouse hit corner" as a confirmed cause — only that
+    PyAutoGUI's own failsafe check fired. See module comment above for why
+    that distinction matters.
+    """
+    diag = _failsafe_diagnostic(target_x, target_y)
+    return (
+        f"{action}: PyAutoGUI raised its failsafe exception before this "
+        f"click executed. This does NOT necessarily mean the mouse was at "
+        f"a screen corner — treat that as unconfirmed. Diagnostic: {diag}. "
+        "If this recurs at coordinates nowhere near a real screen corner, "
+        "it may be an internal PyAutoGUI timing/state issue rather than a "
+        "genuine corner hit; do not assume moving the mouse away will fix "
+        "it, and avoid disabling the failsafe check as a workaround — it "
+        "is the only way a human can abort a runaway automation."
+    )
+
+
+
 # One-line hint appended to a click result when NOTHING changed. This is the
 # signal the 2026-07-23 QPM trace never got: 5 dead clicks on the same
 # non-interactive row, each reported as bare success, because the tool could
 # not say "that click had no effect". With this, the LLM sees it after the
 # first dead click and can pivot instead of re-clicking.
-_CLICK_NO_EFFECT_HINT = (
-    "click delivered but no window or content change was detected — the target "
-    "may be non-interactive, or this app renders via Chromium/Electron (opaque "
-    "to UIA). Re-read the screenshot/OCR you already have before re-clicking the "
-    "same spot; if this is a Chromium app, prefer a CLI/API path if one exists."
-)
+#
+# The actual hint text is built by DesktopTool._no_effect_hint(hwnd) (below,
+# in the class body) rather than being a static string: a real incident
+# (2026-07-26, xPCAT flash-meta) showed the static version wasn't enough —
+# the agent still spent 5 sequential none_detected clicks (~8 minutes)
+# rediscovering "this window is UIA-blind" one click at a time, because the
+# hint always said the same generic "try something else" regardless of
+# whether desktop_snapshot had already been called on this hwnd. Scaling the
+# hint by ``self.state.snapshot_cache`` lets it name the single cheapest next
+# step (call desktop_snapshot once) on the FIRST none_detected, then switch
+# to a stronger "this is confirmed non-UIA, stop retrying" message once that
+# snapshot already ran.
 
 
 def _click_effect(
@@ -1119,7 +1289,7 @@ def _click_effect(
                             OR the content probe saw the window change.
     - ``"none_detected"`` — the probe ran and everything was flat: the click
                             had no observable effect (caller attaches
-                            ``_CLICK_NO_EFFECT_HINT``).
+                            ``DesktopTool._no_effect_hint``).
     - ``"unknown"``       — the probe was unavailable AND no top-level change,
                             so we genuinely cannot tell — never a false claim.
     """
@@ -1522,10 +1692,18 @@ def _uia_enumerate(hwnd: int) -> List[Dict[str, Any]]:
                 continue
             name = (ei.name or "").strip()
             auto_id = (ei.automation_id or "").strip()
-            # Need at least one identifier — purely anonymous nodes
-            # are decoration / layout containers.
-            if not name and not auto_id:
-                continue
+            # NOTE: no "continue" here when both are empty. ctrl_type was
+            # already filtered to _UIA_INTERACTABLE_TYPES above, so an
+            # anonymous element reaching this point is NOT a decorative /
+            # layout container (those never have an interactable control
+            # type and were already excluded) — it's a genuine icon-only
+            # button/control, common in custom-rendered engineering GUIs
+            # that never set AutomationProperties.Name. Dropping it here
+            # (as this used to do) means desktop_snapshot never shows the
+            # agent that a clickable candidate exists at all, forcing blind
+            # screenshot-and-guess exploration instead of a targeted
+            # desktop_hover_at/click on a visible, if unlabeled, candidate.
+            unlabeled = not name and not auto_id
             r = ei.rectangle  # has .left .top .right .bottom
             if r is None:
                 continue
@@ -1535,20 +1713,25 @@ def _uia_enumerate(hwnd: int) -> List[Dict[str, Any]]:
             cx = (x1 + x2) // 2
             cy = (y1 + y2) // 2
             # Dedup on (name, type, centre): same control discovered via
-            # multiple parent paths is common in UIA.
+            # multiple parent paths is common in UIA. Unlabeled elements at
+            # distinct centres still dedup correctly since cx/cy are part
+            # of the key.
             key = (name, ctrl_type, cx, cy)
             if key in seen:
                 continue
             seen.add(key)
-            elements.append({
+            entry: Dict[str, Any] = {
                 "role": ctrl_type,
-                "text": name,
+                "text": name if name else f"(unlabeled {ctrl_type.lower()})",
                 "automation_id": auto_id,
                 "x": cx, "y": cy,
                 "rect": [x1, y1, x2, y2],
                 "enabled": enabled,
                 "selector": _suggest_uia_selector(name, auto_id, ctrl_type),
-            })
+            }
+            if unlabeled:
+                entry["unlabeled"] = True
+            elements.append(entry)
         except Exception:
             continue
     return elements
@@ -1654,6 +1837,37 @@ def _uia_invoke_at_point(x: int, y: int) -> Optional[str]:
     if attempted == 0:
         return f"no invokable UIA pattern on {ctrl_type!r} element"
     return f"UIA patterns exhausted for {ctrl_type!r}: {'; '.join(errors)}"
+
+
+def _uia_invoke_single_pattern(x: int, y: int, method: str) -> Optional[str]:
+    """Try EXACTLY ONE named UIA pattern (invoke/toggle/select) at (x, y).
+
+    Unlike :func:`_uia_invoke_at_point` (which tries all three in order and
+    stops at the first that works — the right default for click_at, where
+    the agent doesn't know or care which pattern fires), this is for
+    ``desktop_run_uia``'s explicit-pattern mode: the agent has already
+    confirmed via desktop_snapshot which pattern the control exposes and
+    wants exactly that one attempted, no silent fallthrough to a different
+    pattern that might have a different semantic effect on this control.
+    """
+    try:
+        elem = Desktop(backend="uia").from_point(x, y)
+    except Exception as exc:
+        return f"UIA from_point: {exc}"
+    if elem is None:
+        return "no UIA element at coordinate"
+    if not hasattr(elem, method):
+        ctrl_type = ""
+        try:
+            ctrl_type = elem.element_info.control_type or ""
+        except Exception:
+            pass
+        return f"{ctrl_type!r} element has no {method!r} pattern"
+    try:
+        getattr(elem, method)()
+        return None
+    except Exception as exc:
+        return f"{method}: {exc}"
 
 
 def _has_focused_control(retries: int = 5, delay: float = 0.1) -> bool:
@@ -1824,6 +2038,7 @@ class DesktopTool(BaseTool):
                     "scroll",
                     "hotkey",
                     "key_press",
+                    "run_uia",
                 ],
                 "description": (
                     "Desktop action to perform. Mouse / keyboard actions "
@@ -2010,6 +2225,22 @@ class DesktopTool(BaseTool):
                     "apps, games) or when you need exact coordinate-level input."
                 ),
             },
+            "pattern": {
+                "type": "string",
+                "enum": ["invoke", "toggle", "select", "value"],
+                "description": (
+                    "[run_uia] Which UIA pattern to invoke at (x, y): "
+                    "'invoke' for buttons, 'toggle' for checkboxes, 'select' "
+                    "for list/tab/tree items, 'value' to set the FOCUSED "
+                    "element's text via ValuePattern.SetValue (requires "
+                    "'text', ignores x/y). Default 'invoke'. LAST RESORT — "
+                    "prefer click_at (which already tries UIA-first "
+                    "automatically); use this when you've confirmed via "
+                    "desktop_snapshot that a control exposes a SPECIFIC "
+                    "pattern and want exactly that one attempted, not "
+                    "click_at's automatic invoke→toggle→select fallthrough."
+                ),
+            },
         },
         "required": ["action"],
         "additionalProperties": False,
@@ -2067,6 +2298,7 @@ class DesktopTool(BaseTool):
             "scroll":       self._action_scroll,
             "hotkey":       self._action_hotkey,
             "key_press":    self._action_key_press,
+            "run_uia":      self._action_run_uia,
         }
         handler = dispatch.get(action)
         if handler is None:
@@ -2836,6 +3068,7 @@ class DesktopTool(BaseTool):
 
         _ensure_dpi_aware()
         state_before = _capture_state_before()
+        covering_window = _covering_window_info(x, y, state_before.get("foreground_hwnd", 0))
         # Content probe (see _content_signature rationale) — diff the foreground
         # window before/after the click to catch intra-window navigation.
         _probe_rect = _foreground_window_info().get("rect")
@@ -2861,9 +3094,7 @@ class DesktopTool(BaseTool):
                     )
                 except pyautogui.FailSafeException:
                     return self._error(
-                        params, start,
-                        "find_and_click: PyAutoGUI failsafe triggered (mouse hit "
-                        "corner). Move the mouse away from screen corners and retry.",
+                        params, start, _failsafe_error_text("find_and_click", x, y),
                     )
                 input_source = "mouse"
         else:
@@ -2876,9 +3107,7 @@ class DesktopTool(BaseTool):
                 )
             except pyautogui.FailSafeException:
                 return self._error(
-                    params, start,
-                    "find_and_click: PyAutoGUI failsafe triggered (mouse hit "
-                    "corner). Move the mouse away from screen corners and retry.",
+                    params, start, _failsafe_error_text("find_and_click", x, y),
                 )
             input_source = "mouse"
 
@@ -2906,8 +3135,10 @@ class DesktopTool(BaseTool):
         }
         if content_changed is not None:
             merged["content_changed"] = content_changed
+        if covering_window is not None:
+            merged["covering_window"] = covering_window
         if effect == "none_detected":
-            merged["effect_hint"] = _CLICK_NO_EFFECT_HINT
+            merged["effect_hint"] = self._no_effect_hint(state_before.get("foreground_hwnd", 0))
         return ToolResult(
             success=True,
             output=merged,
@@ -2939,6 +3170,7 @@ class DesktopTool(BaseTool):
 
         _ensure_dpi_aware()
         state_before = _capture_state_before()
+        covering_window = _covering_window_info(x, y, state_before.get("foreground_hwnd", 0))
         # Content probe (clicks only — see _content_signature rationale). Grab
         # the foreground window rect NOW so we can diff it after the click and
         # detect intra-window navigation that state_after is blind to.
@@ -2947,6 +3179,8 @@ class DesktopTool(BaseTool):
             tuple(_probe_rect) if _probe_rect else None
         )
         output: Dict[str, Any] = {"x": x, "y": y, "button": button, "double": double}
+        if covering_window is not None:
+            output["covering_window"] = covering_window
 
         # UIA path: only for left single-clicks (right/middle/double have no
         # UIA equivalent and must always use pyautogui).
@@ -2965,9 +3199,7 @@ class DesktopTool(BaseTool):
                     )
                 except pyautogui.FailSafeException:
                     return self._error(
-                        params, start,
-                        "click_at: PyAutoGUI failsafe triggered (mouse hit corner). "
-                        "Move the mouse away from screen corners and retry.",
+                        params, start, _failsafe_error_text("click_at", x, y),
                     )
                 output["input_source"] = "mouse"
         else:
@@ -2978,9 +3210,7 @@ class DesktopTool(BaseTool):
                 )
             except pyautogui.FailSafeException:
                 return self._error(
-                    params, start,
-                    "click_at: PyAutoGUI failsafe triggered (mouse hit corner). "
-                    "Move the mouse away from screen corners and retry.",
+                    params, start, _failsafe_error_text("click_at", x, y),
                 )
             output["input_source"] = "mouse"
 
@@ -3004,7 +3234,7 @@ class DesktopTool(BaseTool):
         effect = _click_effect(state_after, content_changed)
         output["effect"] = effect
         if effect == "none_detected":
-            output["effect_hint"] = _CLICK_NO_EFFECT_HINT
+            output["effect_hint"] = self._no_effect_hint(state_before.get("foreground_hwnd", 0))
         return ToolResult(
             success=True,
             output=output,
@@ -3257,7 +3487,173 @@ class DesktopTool(BaseTool):
             execution_time=time.time() - start,
         )
 
+    # ── run_uia ───────────────────────────────────────────────────────────────
+    #
+    # Raw UIA-pattern escape hatch. LAST RESORT: click_at already tries UIA
+    # first automatically (invoke → toggle → select fallthrough) before
+    # falling back to a simulated mouse click. This exists for the narrower
+    # case where the agent has confirmed via desktop_snapshot that a control
+    # exposes a SPECIFIC pattern and wants exactly that one attempted — e.g.
+    # a control that responds to 'select' but where 'invoke' would have a
+    # different (unwanted) effect, or a focused edit whose value should be
+    # set directly rather than simulated via mouse+keyboard. Runs through the
+    # SAME safety/consistency machinery as every other input action
+    # (sensitive-window guard, takeover ownership lock, state_after signal)
+    # instead of the agent dropping to `shell` + raw ctypes/SendInput/
+    # PostMessage with none of that — the failure mode observed in the
+    # 2026-07-26 Alpaca TAC incident, where ~40 minutes were spent
+    # hand-rolling low-level Win32 input primitives before reaching the
+    # vendor's own COM automation surface.
+
+    async def _action_run_uia(
+        self, params: Dict[str, Any], start: float, **kwargs: Any,
+    ) -> ToolResult:
+        if not _WIN32_AVAILABLE:
+            return self._error(params, start, "run_uia requires pywin32/pywinauto.")
+        guard = await self._input_action_guard()
+        if guard:
+            return self._error(params, start, guard)
+
+        pattern = (kwargs.get("pattern") or "invoke").strip().lower()
+        if pattern not in ("invoke", "toggle", "select", "value"):
+            return self._error(
+                params, start,
+                f"run_uia: unknown pattern {pattern!r}. Valid: invoke, toggle, select, value.",
+            )
+
+        _ensure_dpi_aware()
+        state_before = _capture_state_before()
+
+        if pattern == "value":
+            text = kwargs.get("text")
+            if text is None:
+                return self._error(params, start, "run_uia pattern='value' requires 'text'.")
+            err = await asyncio.get_event_loop().run_in_executor(
+                None, _uia_set_focused_value, str(text),
+            )
+            out_extra: Dict[str, Any] = {"text_chars": len(str(text))}
+        else:
+            try:
+                x = int(kwargs["x"]); y = int(kwargs["y"])
+            except (KeyError, TypeError, ValueError):
+                return self._error(
+                    params, start,
+                    "run_uia requires integer 'x' and 'y' (get from desktop_snapshot) "
+                    "unless pattern='value'.",
+                )
+            covering_window = _covering_window_info(x, y, state_before.get("foreground_hwnd", 0))
+            err = await asyncio.get_event_loop().run_in_executor(
+                None, _uia_invoke_single_pattern, x, y, pattern,
+            )
+            out_extra = {"x": x, "y": y}
+            if covering_window is not None:
+                out_extra["covering_window"] = covering_window
+
+        if err is not None:
+            return self._error(params, start, f"run_uia: {err}")
+
+        await asyncio.sleep(0.1)
+        state_after = _capture_state_after(state_before)
+        self.state.invalidate_on_state_change(state_after)
+        return ToolResult(
+            success=True,
+            output={"pattern": pattern, "state_after": state_after, **out_extra},
+            tool_name=self.name,
+            tool_parameters=params,
+            execution_time=time.time() - start,
+        )
+
     # ── helpers ───────────────────────────────────────────────────────────────
+
+    def _no_effect_hint(self, hwnd: int) -> str:
+        """Escalating hint for a ``none_detected`` click, scaled by what this
+        session already knows about *hwnd* — see the module-level comment
+        above the (now-removed) static ``_CLICK_NO_EFFECT_HINT`` constant for
+        why a byte-identical hint on every none_detected click wasn't enough.
+
+        Three tiers, cheapest diagnostic first:
+          1. Never snapshotted this hwnd this task → suggest the ONE call
+             that answers "is this app UIA-visible at all" for free (no
+             mouse movement, no takeover risk) before trying anything else.
+          2. Already snapshotted AND it came back UIA-rich → the click
+             itself is probably targeting the wrong sub-element (a nested
+             icon, not the row), not a fundamentally wrong approach.
+          3. Already snapshotted AND it came back UIA-poor/OCR-fallback →
+             none_detected is now KNOWN to be uninformative on this window;
+             stop retrying clicks and point at the concrete alternatives.
+
+        Whichever tier fires, ``_process_hint_suffix`` is appended so any
+        skill-provided knowledge about this SPECIFIC process (e.g. "TAC's
+        none_detected is expected — verify device state") re-surfaces on
+        every occurrence, not just once at read_skill time.
+        """
+        cached = self.state.snapshot_cache.get(hwnd)
+        if cached is None:
+            base = (
+                "click delivered but no window or content change was detected. "
+                "Before retrying or switching approach, call desktop_snapshot on "
+                "this window ONCE — it tells you in one call whether this app is "
+                "UIA-visible at all (rich element list) or not (1-2 elements = "
+                "Electron/custom-rendered, and every future click here will also "
+                "report none_detected regardless of whether it worked)."
+            )
+        else:
+            snap_out = cached.get("output") or {}
+            element_count = int(snap_out.get("element_count") or 0)
+            source = snap_out.get("source") or "uia"
+            if source == "uia" and element_count > 2:
+                base = (
+                    "click delivered but no change was detected, and this window DID "
+                    "show a rich UIA tree — the target is likely a nested icon-only "
+                    "control, not the region you clicked. Re-check desktop_snapshot's "
+                    "element list for a control at this exact position rather than "
+                    "retrying nearby coordinates."
+                )
+            else:
+                base = (
+                    "click delivered but no change was detected — already confirmed this "
+                    "window is NOT UIA-visible (desktop_snapshot returned few/no elements "
+                    "or fell back to OCR). none_detected here is uninformative about "
+                    "whether the click worked; do not keep retrying click_at/"
+                    "find_and_click on this target. Check the app's documented/skill-"
+                    "provided behavior for this process, verify via the app's own state "
+                    "(not UIA), or use a CLI/API/CDP path — browser_attach works for any "
+                    "Electron app listening on a debug port, not just actual browsers."
+                )
+        return base + self._process_hint_suffix(hwnd)
+
+    def _process_hint_suffix(self, hwnd: int) -> str:
+        """Append any skill-provided ``process_hints`` for *hwnd*'s owning
+        process to a hint string, so app-specific knowledge (e.g. "TAC's
+        none_detected is expected — verify device state") re-surfaces every
+        time it's relevant instead of only once at read_skill time.
+
+        Confirmed live 2026-07-26: the alpaca-workflow skill already
+        documented TAC's none_detected quirk, read once at turn 1, but the
+        agent still spent ~40 minutes rediscovering it near turn 200 — by
+        then the skill text had scrolled far outside effective attention.
+        Best-effort throughout: any failure (win32 unavailable, PID lookup
+        race, registry not initialised) returns "" rather than raising,
+        since a missing hint is far better than a broken click result.
+        """
+        if not _WIN32_AVAILABLE or not hwnd:
+            return ""
+        try:
+            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+            process_name = _process_name_for_pid(pid)
+        except Exception:
+            return ""
+        if not process_name:
+            return ""
+        try:
+            from ..infrastructure.skills import SkillRegistry
+            hits = SkillRegistry.get().hints_for_process(process_name)
+        except Exception:
+            return ""
+        if not hits:
+            return ""
+        lines = [f"[{skill_name} skill] {hint}" for skill_name, hint in hits]
+        return "\n\nKnown behavior for this app:\n" + "\n".join(lines)
 
     async def _input_action_guard(self) -> Optional[str]:
         """Pre-flight gate every input action runs.
@@ -3435,3 +3831,9 @@ class DesktopKeyPressTool(_DesktopAtomic):
     _action = "key_press"
     def __init__(self, ctx=None) -> None:
         super().__init__(ctx=ctx, name="desktop_key_press")
+
+
+class DesktopRunUiaTool(_DesktopAtomic):
+    _action = "run_uia"
+    def __init__(self, ctx=None) -> None:
+        super().__init__(ctx=ctx, name="desktop_run_uia")

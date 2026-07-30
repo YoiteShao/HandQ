@@ -133,6 +133,32 @@ row's right edge", not search OCR text for them). If snapshot lists an
 element there with a generic role (Button, TreeItem with an expand
 affordance), click ITS coordinates, not the row's.
 
+## MECHANICAL RULE — snapshot before the FIRST input action on a new foreground process
+
+**TRIGGER:** you are about to send the first `desktop_click_at` /
+`desktop_find_and_click` / `desktop_type_text` / `desktop_hotkey` call this
+task against a foreground process you have not yet called `desktop_snapshot`
+on.
+
+**ACTION:** call `desktop_snapshot` first. One call tells you which of two
+worlds you're in:
+  - Rich element list (UIA-visible) → `click_at`/`find_and_click`'s `effect`
+    field is trustworthy; proceed normally.
+  - 1-2 elements or OCR fallback (UIA-blind — common for Electron/Chromium
+    and some custom-rendered native apps) → EVERY future click on this
+    process will report `effect: none_detected` REGARDLESS of whether the
+    click worked. Do not spend multiple clicks re-discovering this — one
+    snapshot call already told you. From here: prefer OCR-text matching
+    (`find_and_click` already falls back to this), the app's own CLI/API if
+    one exists, or `browser_attach` if the process is listening on a CDP
+    debug port (works for any Electron app, not just actual browsers — see
+    the browser-workflow skill).
+
+**Why this matters:** a real incident spent 5 sequential clicks (~8 minutes)
+on the same button rediscovering "this is Electron" one `none_detected`
+result at a time, when a single `desktop_snapshot` call up front gives the
+same answer immediately and for free (no mouse movement, no takeover risk).
+
 ## Tool Choice Hierarchy
 
 Re-check before each desktop action:

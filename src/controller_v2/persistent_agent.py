@@ -2594,19 +2594,34 @@ class PersistentAgent:
                 # fires only for genuinely-new names.
                 self._hidden_tools.difference_update(valid)
                 self._task_channel.activate_tools(valid)
-                # Reverse-push: deliver the family's bundled workflow skill WITH
-                # the tools, so its usage knowledge doesn't depend on the agent
-                # choosing to read_skill (the exact gap behind the 2026-07-23
-                # desktop stall — the tools were claimed, desktop-workflow never
-                # read). Runs on the tool-claim path AND the reasoning-JSON path
-                # since both funnel through here.
-                self._reverse_push_workflow_skills(valid)
             dropped = [n for n in claim if n not in valid]
             if dropped:
                 self.logger.debug(
                     f"[PersistentAgent] claim_tool ignored unknown name(s): {dropped}",
                     component="PersistentAgent",
                 )
+            # Reverse-push: deliver the family's bundled workflow skill WITH
+            # the tools, so its usage knowledge doesn't depend on the agent
+            # choosing to read_skill (the exact gap behind the 2026-07-23
+            # desktop stall — the tools were claimed, desktop-workflow never
+            # read). Runs on the tool-claim path AND the reasoning-JSON path
+            # since both funnel through here.
+            #
+            # Crucially, this runs on the FULL claim list (valid + dropped), not
+            # just the valid names. A claim of a fuzzy/wrong name like
+            # "desktop_click" (real name: desktop_click_at) fails the exact-name
+            # match above, but the agent's INTENT — "I want to drive the desktop"
+            # — is already unambiguous, and that is exactly the moment its
+            # workflow recipe (with the correct tool names + action hierarchy)
+            # is most valuable. workflow_skill_for_tool() matches by family
+            # prefix, so "desktop_click" → "desktop_" → desktop-workflow still
+            # resolves. The 2026-07-25 6-hour flash-meta stall was caused by this
+            # gap: the agent claimed desktop_click/desktop_type (all wrong names),
+            # got no skill and no correction, concluded desktop tools were
+            # unavailable, and hand-rolled screenshot/click/OCR for the rest of
+            # the task. Push-once per skill + origin==bundled gating make it safe
+            # to run on the unfiltered list.
+            self._reverse_push_workflow_skills(claim)
         if release:
             self._hidden_tools.update(release)
         # Always regenerate — cheap, and covers the "release-only" /
@@ -2614,8 +2629,17 @@ class PersistentAgent:
         self._regenerate_api_tools()
 
     def _reverse_push_workflow_skills(self, claimed_tools: List[str]) -> None:
-        """Inject the bundled ``*-workflow`` skill body for any freshly-claimed
-        tool family, ONCE per session, as an out-of-band observation.
+        """Inject the bundled ``*-workflow`` skill body for any claimed tool
+        family, ONCE per session, as an out-of-band observation.
+
+        ``claimed_tools`` is the RAW claim list — it may contain names that
+        failed the exact-name match in the caller (e.g. a fuzzy "desktop_click"
+        for the real "desktop_click_at"). That is intentional:
+        ``workflow_skill_for_tool`` resolves by family PREFIX, so a wrong leaf
+        name in the right family still maps to the correct workflow skill, and
+        a wrong name is precisely when the agent most needs the recipe (it
+        reveals the intended family but not the real tool names). Names in no
+        workflow-backed family resolve to None and are skipped.
 
         This is the push half of the progressive-disclosure model: read_skill
         is the pull (agent asks), this is the push (claiming a workflow-backed

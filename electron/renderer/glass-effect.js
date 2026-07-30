@@ -224,6 +224,95 @@ const STATE = {
     radius: 30,          // corner radius, px — matches .app's CSS radius
 };
 
+// ── Layer-1 mode switch (test/preview only — NOT persisted) ───────────────
+// The WebGL glass above is the app's most expensive surface (full-window
+// 25-tap blur on every desktop change/resize). This switch lets it be turned
+// off in favor of a cheap CSS fallback (see #glass-fallback in styles.css) so
+// its performance/look can be A/B-tested live from the Ctrl+Shift+G panel.
+//
+// DELIBERATELY session-only: the mode and the density sliders live in memory +
+// CSS vars, nothing is written to localStorage. Every launch boots to 'webgl'
+// (the shipping default) and a reload discards whatever was tried — so
+// experimenting in the panel never changes what real users get.
+//   webgl — the desktopCapturer + shader canvas (default; current behavior)
+//   veil  — translucent white CSS panel: high transparency, ~zero GPU cost,
+//           with a pure-CSS colored rim (see #glass-fallback in styles.css)
+const GLASS_MODES = ['webgl', 'veil'];
+// veil is now the shipping default layer-1 (WebGL is opt-in via the panel).
+// These are the tuned values: near-clear background, dense cards, mid rim.
+const GLASS_BG_ALPHA_DEFAULT = 0.05;    // background veil white-fill alpha (near-clear)
+const GLASS_CARD_ALPHA_DEFAULT = 0.88;  // card white-fill alpha (dense, legible)
+// Edge-glow intensity (0..1) seeded when entering veil. Drives the rim +
+// traveling sheen in styles.css (#glass-fallback::before/::after).
+const FALLBACK_EDGE_VEIL = 0.55;
+
+let _glassMode = 'veil';                // current mode (in-memory; resets to this on reload)
+let _glassRunning = false;              // is the WebGL layer live?
+let _teardownGlass = null;              // fn to stop+remove it (set inside initGlass)
+let _glassRequestRedraw = () => {};     // repointed at the live closure's requestRender;
+                                        // a no-op while the WebGL layer is down so the
+                                        // tuning-panel sliders don't throw.
+
+function getGlassMode() { return _glassMode; }
+
+// Seed the fallback density CSS vars to their defaults once at startup. The
+// panel sliders then override them live; nothing is persisted. Edge is seeded
+// to the veil default too (veil is the boot mode) so the rim is correct from
+// frame 1 — applyGlassMode() will re-assert it, but this avoids a flash.
+function applyFallbackDensity() {
+    const root = document.documentElement.style;
+    root.setProperty('--fallback-bg-alpha', String(GLASS_BG_ALPHA_DEFAULT));
+    root.setProperty('--fallback-card-alpha', String(GLASS_CARD_ALPHA_DEFAULT));
+    root.setProperty('--fallback-edge', String(FALLBACK_EDGE_VEIL));
+}
+
+function mountFallback() {
+    let el = document.getElementById('glass-fallback');
+    if (!el) {
+        el = document.createElement('div');
+        el.id = 'glass-fallback';
+        document.body.prepend(el);   // same slot the WebGL canvas would occupy
+    }
+}
+
+function unmountFallback() {
+    const el = document.getElementById('glass-fallback');
+    if (el) el.remove();
+}
+
+async function applyGlassMode(mode) {
+    if (!GLASS_MODES.includes(mode)) mode = 'webgl';
+    _glassMode = mode;
+    _logToFile('INFO', 'applyGlassMode', { mode });
+
+    if (mode === 'webgl') {
+        // Leave fallback mode: drop the card fill override + the veil.
+        document.body.classList.remove('glass-fallback');
+        unmountFallback();
+        if (!_glassRunning) await initGlass();
+        return;
+    }
+
+    // Any non-webgl mode: ensure the expensive WebGL layer is fully torn down,
+    // then enter fallback mode. The body class is what switches the card family
+    // over to a solid fill (see styles.css) so cards read as a distinct pane
+    // above the background veil.
+    if (_glassRunning && _teardownGlass) _teardownGlass();
+    document.body.classList.add('glass-fallback');
+    mountFallback();
+    // Seed the colored-rim intensity. The panel's "Edge glow" slider can
+    // override it afterward.
+    document.documentElement.style.setProperty('--fallback-edge', String(FALLBACK_EDGE_VEIL));
+}
+
+// Live-apply a mode for testing. In-memory only — nothing is persisted, so a
+// reload returns to the shipping 'webgl' default.
+function setGlassMode(mode) {
+    applyGlassMode(mode).catch((e) => {
+        _logToFile('ERROR', 'applyGlassMode failed', { mode, message: e && e.message });
+    });
+}
+
 async function initGlass() {
     if (!window.glassCapture) { _logToFile('WARN', 'window.glassCapture missing, aborting'); return; }
 
@@ -405,6 +494,8 @@ async function initGlass() {
     // whole effect un-rendered.
     let pendingRAF = 0;      // rAF handle coalescing multiple requests into one draw
     let needUpload = false;  // does the next draw need a fresh desktop texture?
+    let disposed = false;    // set by _teardownGlass — stops any in-flight draw or
+                             // timer callback from touching a torn-down GL context.
 
     // ── Idle-skip: cheap desktop-change detector ──────────────────────────
     // The desktopCapturer stream produces frames at a CONSTANT rate even when
@@ -452,6 +543,8 @@ async function initGlass() {
 
     if (window.glassCapture.onBoundsChanged) {
         window.glassCapture.onBoundsChanged((b) => {
+            if (disposed) return;   // torn down — the preload bridge has no `off`,
+                                    // so guard the callback rather than unsubscribe.
             if (!b) return;
             bounds = b;
             if (b.displayId !== currentDisplayId) switchDisplay(b);
@@ -484,6 +577,7 @@ async function initGlass() {
     // the window sits idle (the common case for an all-day app).
 
     function renderOnce(uploadTexture) {
+        if (disposed) return;
         if (!bounds) return;
 
         gl.clearColor(0, 0, 0, 0);
@@ -555,7 +649,8 @@ async function initGlass() {
     //   • _desktopChanged() — the tiny-sample diff above. A static desktop
     //     produces no new redraws at all; only real on-screen change downstream
     //     of the glass re-triggers the full-window pass.
-    setInterval(() => {
+    const _refreshTimer = setInterval(() => {
+        if (disposed) return;
         if (document.hidden) return;
         if (!_desktopChanged()) return;
         requestRender(true);
@@ -569,7 +664,29 @@ async function initGlass() {
     setTimeout(() => requestRender(true), 150);
     console.log('[glass] active (unified edge-to-core, event-driven + ' + DESKTOP_REFRESH_MS + 'ms refresh), cap:', capW + 'x' + capH);
 
-    installTuningPanel(() => requestRender(false));
+    // Point the (already-installed) tuning panel's redraw at this live closure,
+    // and expose the teardown so applyGlassMode() can stop the whole layer when
+    // switching to a CSS fallback mode. The panel itself is installed once from
+    // init() regardless of mode, so Ctrl+Shift+G works even when we boot with
+    // the WebGL layer off.
+    _glassRequestRedraw = () => requestRender(false);
+    _glassRunning = true;
+    _teardownGlass = () => {
+        disposed = true;
+        clearInterval(_refreshTimer);
+        if (pendingRAF) { cancelAnimationFrame(pendingRAF); pendingRAF = 0; }
+        window.removeEventListener('resize', resize);
+        try { stream.getTracks().forEach((t) => t.stop()); } catch (_) {}
+        try { video.pause(); video.srcObject = null; } catch (_) {}
+        canvas.remove();
+        _glassRequestRedraw = () => {};
+        window.__glassState = undefined;
+        window.__glassRedraw = undefined;
+        window.__glassRedrawSync = undefined;
+        _glassRunning = false;
+        _teardownGlass = null;
+        _logToFile('INFO', 'glass torn down');
+    };
 
     // Exposed for the Playwright screenshot driver (and any future scripted
     // testing) to programmatically set params and force a redraw without
@@ -604,7 +721,12 @@ async function initGlass() {
 //     and repaints immediately — no WebGL redraw involved, so no
 //     requestRedraw() call for these.
 // Mirrors the existing Ctrl+Shift+L debug-log-panel pattern in renderer.js.
-function installTuningPanel(requestRedraw) {
+// Installed ONCE from init() regardless of the active glass mode, so the
+// Ctrl+Shift+G hotkey works even when we boot with the WebGL layer off (the
+// mode selector below is the only way back to it). Layer-1 sliders redraw via
+// the _glassRequestRedraw indirection, which is a no-op while the WebGL layer
+// is down and gets repointed at the live closure when it's up.
+function installTuningPanel() {
     const LAYER1_FIELDS = [
         { key: 'edgeThickness', label: 'Edge thickness (px)', min: 4, max: 100, step: 1 },
         { key: 'refraction',    label: 'Refraction strength', min: 0, max: 100, step: 1 },
@@ -644,15 +766,15 @@ function installTuningPanel(requestRedraw) {
         return Number.isFinite(v) ? v : 0;
     }
 
-    function addSectionHeading(text) {
+    function addSectionHeading(text, container) {
         const h = document.createElement('div');
         h.textContent = text;
         h.style.cssText = 'font-weight:600;margin-top:14px;margin-bottom:4px;' +
             'padding-top:10px;border-top:1px solid rgba(255,255,255,0.15);';
-        panelEl.appendChild(h);
+        (container || panelEl).appendChild(h);
     }
 
-    function addSlider(label, min, max, step, initialValue, onInput) {
+    function addSlider(label, min, max, step, initialValue, onInput, container) {
         const row = document.createElement('label');
         row.style.cssText = 'display:block;margin-top:8px;';
         const valueSpan = document.createElement('span');
@@ -674,7 +796,63 @@ function installTuningPanel(requestRedraw) {
         });
 
         row.appendChild(input);
-        panelEl.appendChild(row);
+        (container || panelEl).appendChild(row);
+    }
+
+    function addModeSelector(onChange) {
+        // Radio-style row of buttons for the Layer-1 mode switch. Reflects the
+        // in-memory mode and, on click, applies it live + calls onChange so the
+        // panel can rebuild the mode-specific controls below.
+        const wrap = document.createElement('div');
+        wrap.style.cssText = 'display:flex;flex-wrap:wrap;gap:4px;margin-top:4px;';
+        const btns = {};
+        function refresh() {
+            const cur = getGlassMode();
+            GLASS_MODES.forEach((m) => {
+                const on = m === cur;
+                btns[m].style.background = on ? 'rgba(120,170,255,0.85)' : 'rgba(255,255,255,0.12)';
+                btns[m].style.fontWeight = on ? '600' : '400';
+            });
+        }
+        GLASS_MODES.forEach((m) => {
+            const b = document.createElement('button');
+            b.type = 'button';
+            b.textContent = m;
+            b.style.cssText =
+                'flex:1 0 auto;padding:4px 8px;border:none;border-radius:6px;' +
+                'color:#fff;cursor:pointer;font:inherit;';
+            b.addEventListener('click', () => {
+                setGlassMode(m);
+                refresh();
+                if (onChange) onChange(m);
+            });
+            btns[m] = b;
+            wrap.appendChild(b);
+        });
+        panelEl.appendChild(wrap);
+        const hint = document.createElement('div');
+        hint.textContent = 'test only — not saved; reload returns to webgl';
+        hint.style.cssText = 'margin-top:4px;opacity:0.6;font-size:10px;';
+        panelEl.appendChild(hint);
+        refresh();
+    }
+
+    // Sliders for the veil fallback: background veil alpha, card fill alpha, and
+    // the colored-rim edge glow — all independent. They write CSS custom
+    // properties live for preview — NOT persisted (session only, like the
+    // mode). Appended into the given container.
+    function addDensityControls(container) {
+        const FIELDS = [
+            { cssVar: '--fallback-bg-alpha',   label: 'Background density', dflt: GLASS_BG_ALPHA_DEFAULT },
+            { cssVar: '--fallback-card-alpha', label: 'Card density',       dflt: GLASS_CARD_ALPHA_DEFAULT },
+            { cssVar: '--fallback-edge',       label: 'Edge glow',          dflt: 0 },
+        ];
+        FIELDS.forEach((f) => {
+            const cur = currentCssVar(f.cssVar);
+            addSlider(f.label, 0, 1, 0.01, Number.isFinite(cur) ? cur : f.dflt, (v) => {
+                document.documentElement.style.setProperty(f.cssVar, String(v));
+            }, container);
+        });
     }
 
     function buildPanel() {
@@ -693,20 +871,42 @@ function installTuningPanel(requestRedraw) {
         title.style.cssText = 'font-weight:600;margin-bottom:8px;';
         panelEl.appendChild(title);
 
-        addSectionHeading('Layer 1 — base glass (WebGL edge)');
-        LAYER1_FIELDS.forEach((f) => {
-            addSlider(f.label, f.min, f.max, f.step, STATE[f.key], (v) => {
-                STATE[f.key] = v;
-                requestRedraw();
-            });
-        });
+        addSectionHeading('Layer 1 — mode');
 
-        addSectionHeading('Layer 2 — card readability (CSS)');
-        LAYER2_FIELDS.forEach((f) => {
-            addSlider(f.label, f.min, f.max, f.step, currentCssVar(f.cssVar), (v) => {
-                document.documentElement.style.setProperty(f.cssVar, String(v) + (f.unit || ''));
-            });
-        });
+        // Mode-specific controls live in their own container that is rebuilt
+        // whenever the mode changes, so the panel only ever shows the knobs that
+        // apply to the CURRENT mode (webgl → WebGL-edge sliders; veil →
+        // fallback density + edge-glow sliders). This avoids the confusing
+        // "WebGL sliders always showing even in veil mode" state.
+        const modeControls = document.createElement('div');
+
+        function renderModeControls() {
+            modeControls.textContent = '';   // clear previous mode's controls
+            const mode = getGlassMode();
+            if (mode === 'webgl') {
+                addSectionHeading('Layer 1 — base glass (WebGL edge)', modeControls);
+                LAYER1_FIELDS.forEach((f) => {
+                    addSlider(f.label, f.min, f.max, f.step, STATE[f.key], (v) => {
+                        STATE[f.key] = v;
+                        _glassRequestRedraw();
+                    }, modeControls);
+                });
+                addSectionHeading('Layer 2 — card readability (CSS)', modeControls);
+                LAYER2_FIELDS.forEach((f) => {
+                    addSlider(f.label, f.min, f.max, f.step, currentCssVar(f.cssVar), (v) => {
+                        document.documentElement.style.setProperty(f.cssVar, String(v) + (f.unit || ''));
+                    }, modeControls);
+                });
+            } else {
+                // veil
+                addSectionHeading('Layer 1 — ' + mode + ' density', modeControls);
+                addDensityControls(modeControls);
+            }
+        }
+
+        addModeSelector(renderModeControls);
+        panelEl.appendChild(modeControls);
+        renderModeControls();
 
         document.body.appendChild(panelEl);
         return panelEl;
@@ -743,8 +943,17 @@ function init() {
     // failure here means the whole effect never renders, and the stack is what
     // pinpoints where. (A temporal-dead-zone ReferenceError from mis-ordered
     // `let`s vs. an early call site is exactly the kind of bug that hid here.)
-    _logToFile('INFO', 'init starting');
-    initGlass().catch((e) => {
+    _logToFile('INFO', 'init starting', { mode: getGlassMode() });
+    // Push persisted fallback densities into CSS vars before anything mounts,
+    // so a fallback boot is at the right opacity from frame 1.
+    applyFallbackDensity();
+    // Install the tuning panel FIRST and unconditionally — it hosts the mode
+    // selector, which is the only way to switch back to 'webgl' when we boot in
+    // a CSS fallback mode (initGlass() no longer runs in that case).
+    installTuningPanel();
+    // Apply the persisted mode. applyGlassMode() calls initGlass() itself when
+    // the mode is 'webgl', so the WebGL layer only spins up on demand.
+    applyGlassMode(getGlassMode()).catch((e) => {
         console.warn('[glass] init failed:', e);
         _logToFile('ERROR', 'init failed', { message: e && e.message, stack: e && e.stack });
     });

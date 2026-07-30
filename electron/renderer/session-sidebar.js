@@ -38,6 +38,63 @@
   // ── Constants ─────────────────────────────────────────────────────────
   const TOUCH_RANK = { hit: 1, read: 2, edit: 3 };
 
+  // Per-file classified counts are bucketed by these categories, in this
+  // fixed render order (so a file's inline count badges never reorder
+  // between renders). `write` folds into `edit` per product decision — the
+  // wire still carries tool='write' but we don't give it its own colour.
+  const COUNT_CATS = ['read', 'edit', 'hit', 'shell'];
+
+  // Map one file_touch event to its count category. Keys off evt.tool (the
+  // emitting tool's name — reliably on the wire) rather than evt.touch,
+  // because touch collapses write/edit/shell all into "edit"; only tool
+  // disambiguates them. This is what keeps shell's workspace-mtime scan
+  // (tool='shell', touch='edit') from inflating the real edit count.
+  function _toolCategory(tool, touch) {
+    switch (String(tool || '')) {
+      case 'read':          return 'read';
+      case 'write':         return 'edit';   // write folds into edit
+      case 'edit':
+      case 'notebook_edit': return 'edit';
+      case 'grep':
+      case 'glob':          return 'hit';
+      case 'shell':         return 'shell';
+      default: break;
+    }
+    // Fallback for payloads without a recognised tool: use the touch kind.
+    // shell-style edits with no tool can't be told apart here, so they land
+    // in edit — acceptable since a missing tool field is not the common path.
+    switch (String(touch || '')) {
+      case 'read': return 'read';
+      case 'edit': return 'edit';
+      case 'hit':  return 'hit';
+      default:     return 'edit';
+    }
+  }
+
+  // Human-readable hover labels for each count category (title= on the badge).
+  const CAT_LABEL = {
+    read:  'read',
+    edit:  'edited / written',
+    hit:   'found (grep/glob)',
+    shell: 'shell-touched',
+  };
+
+  // Build the inline classified-count badges for one file: a small coloured
+  // dot + number per category that actually occurred, in COUNT_CATS order.
+  // Colours mirror the top-of-list legend (.ss-ct-dot reuses the kind-dot
+  // palette), so no emoji are needed to tell categories apart.
+  function _renderCountBadges(counts) {
+    if (!counts) return '';
+    let out = '<span class="ss-ct-group">';
+    for (const cat of COUNT_CATS) {
+      const n = counts[cat] || 0;
+      if (n <= 0) continue;
+      out += '<span class="ss-ct" title="' + CAT_LABEL[cat] + '">' +
+             '<i class="ss-ct-dot ' + cat + '"></i>' + n + '</span>';
+    }
+    return out + '</span>';
+  }
+
   // Monotonic touch counter — stamped onto each file on every touch so the
   // Files tree can sort "most-recently-touched first" (LRU-style) without
   // relying on Date.now() (which ties when several files are touched in the
@@ -52,7 +109,7 @@
   // ── Per-session state ─────────────────────────────────────────────────
   // sid -> {
   //   name: str,
-  //   filesByPath: Map<path, {kind, visits, firstSeenTs, count, isNew, lastItemId, lastTouchSeq}>,
+  //   filesByPath: Map<path, {kind, visits, firstSeenTs, count, counts, isNew, lastItemId, lastTouchSeq}>,
   //   filesByItem: Map<itemId, {order: string[], rows: Map<path, {kind, count, lastKind, isNew}>}>
   //   itemFirstSeen: Map<itemId, ts>,   // for item-block sort
   //   taskItems: Array<{id, instruction, status}>,
@@ -268,6 +325,18 @@
           const empty = dom.activityList.querySelector('.ss-activity-empty');
           if (empty) empty.remove();
           record.dom = _buildActivityItem(record);
+          // Slide-in only on genuine arrival (this incremental path), never
+          // on the full-rebuild path (_renderActivityList on session switch),
+          // so switching sessions doesn't re-animate the whole list. Class is
+          // self-removing so the next arrival retriggers it; CSS honors
+          // prefers-reduced-motion by collapsing the duration.
+          record.dom.classList.add('aa-enter');
+          record.dom.addEventListener('animationend', function onEnter(e) {
+            if (e.animationName === 'aa-slide-in') {
+              record.dom.classList.remove('aa-enter');
+              record.dom.removeEventListener('animationend', onEnter);
+            }
+          });
           dom.activityList.prepend(record.dom);
         }
         _updateActivityCount(s);
@@ -475,6 +544,7 @@
     let f = s.filesByPath.get(path);
     if (!f) {
       f = { kind: kind, visits: 0, firstSeenTs: Date.now(), count: 0, isNew: true,
+            counts: { read: 0, edit: 0, hit: 0, shell: 0 },
             lastItemId: itemId || '', lastTouchSeq: 0,
             reversible: reversible, restored: false };
       s.filesByPath.set(path, f);
@@ -486,9 +556,15 @@
       // capture_before) — undo should be offered again for the new item.
       if (reversible && kind === 'edit') f.restored = false;
       f.isNew = true;
+      // Older buckets (pre-classified-counts sessions) may lack f.counts.
+      if (!f.counts) f.counts = { read: 0, edit: 0, hit: 0, shell: 0 };
     }
     f.visits += 1;
     f.count += 1;
+    // Classified count — read/edit/hit/shell, bucketed by the emitting tool
+    // (see _toolCategory) so the inline badges can show real per-kind
+    // frequency instead of one opaque total.
+    f.counts[_toolCategory(evt.tool, kind)] += 1;
     f.lastTouchSeq = ++_touchSeq;   // bump so the Files tree sorts this file to the front
     // Track the most recent task item that touched this file — the backend's
     // file_undo is per-item (rewind_item reverts every file captured under
@@ -1226,7 +1302,7 @@
       el.innerHTML =
         '<span class="ss-kind-dot ' + f.kind + '"></span>' +
         '<span class="fp" title="' + _esc(path) + '">' + _esc(_midTruncate(leaf.name, 30)) + '</span>' +
-        '<span class="ct">' + f.count + '×</span>' +
+        _renderCountBadges(f.counts) +
         undoMark;
       el.addEventListener('click', (ev) => {
         // The ↺ button has its own handler (below); a click anywhere else

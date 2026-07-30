@@ -111,6 +111,15 @@ class ToolResult:
             return d
         if self.success:
             d["out"] = self.output  # full output, no truncation
+            if self.error:
+                # Partial-success guidance (e.g. claim_tool's did-you-mean
+                # hint when some names claimed and some didn't) used to be
+                # silently dropped here: `error` was only ever serialized on
+                # the failure branch below, so a tool that sets both
+                # success=True AND error=<non-fatal note> had that note
+                # vanish before the agent ever saw it. Mirrors the "info
+                # only grows" policy the failure branch already follows.
+                d["note"] = self.error
         else:
             # Failure with a STRUCTURED payload (e.g. shell's {stdout, stderr,
             # exit_code, ...}): keep the payload in `out` so useful stdout is
@@ -152,6 +161,10 @@ class ToolResult:
             return d
         if self.success:
             d["out"] = self.output
+            if self.error:
+                # Same policy as to_obs_dict: a non-fatal note on an
+                # otherwise-successful result must still reach the agent.
+                d["note"] = self.error
         else:
             # Same policy as to_obs_dict: structured failure output keeps `out`
             # (stdout survives) and adds an explicit `err`; pure errors unchanged.

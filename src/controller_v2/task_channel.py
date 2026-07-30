@@ -17,6 +17,7 @@ tool. What lives here is only what the two loops must SHARE:
 """
 import asyncio
 import collections
+import logging
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import AbstractSet, Any, Callable, Deque, Dict, Iterable, List, Optional, Set
@@ -24,11 +25,30 @@ from typing import AbstractSet, Any, Callable, Deque, Dict, Iterable, List, Opti
 from ..models.token_usage import TokenUsage
 from .agent_utils import ProgressConcern, TurnDigest
 
+_logger = logging.getLogger("handq.controller_v2.task_channel")
 
 # Canonical interrupt tag — used by PersistentAgent when writing TaskResult.issues
 # and by TaskChannel's own rendering to distinguish an interrupted item from an
 # ordinary failure.
 INTERRUPTED_BY_COORDINATOR = "Interrupted by coordinator"
+
+# Cap on how long interrupt_agent() waits for a PRIOR interrupt to be
+# acknowledged before arming this one anyway. There is exactly ONE ack slot
+# for the whole session (see _interrupt_acked below) — the protocol assumes
+# the agent loop always reaches its next iteration boundary (where
+# acknowledge_interrupt() is called) promptly. But a tool call wedged in
+# blocking I/O (a hung UNC/SMB read, an unresponsive SSH host, ...) can keep
+# the agent loop from getting there for an unbounded time. Without this cap,
+# EVERY subsequent interrupt_agent() call for the rest of the session hangs
+# too — which hangs Orchestrator.on_user_message itself (this is awaited
+# directly on the coordinator's per-turn call chain), leaving the user with
+# no reply at all and no way to recover except destroying the session.
+# Confirmed live 2026-07-30: a hung UNC `Get-ChildItem` outlived two
+# interrupts this way. This does not fix the underlying hang (that's the
+# tool's job — see shell_tool.py's _KILL_WAIT_TIMEOUT_SECONDS) — it only
+# ensures one wedged tool call cannot ALSO take the interrupt mechanism
+# itself hostage for the remainder of the session.
+_INTERRUPT_ACK_TIMEOUT_SECONDS: float = 30.0
 
 # Cap on how many completed TaskResults are rendered into the coordinator
 # context. _results itself stays append-only (other readers depend on the full
@@ -318,8 +338,31 @@ class TaskChannel:
         self._notify_tasks_changed()
 
     async def interrupt_agent(self, reason: str = "") -> None:
-        """Send interrupt signal to agent. Waits for ack before returning."""
-        await self._interrupt_acked.wait()
+        """Send interrupt signal to agent. Waits (bounded) for ack before returning.
+
+        Normally the wait is momentary — the agent's iteration loop reaches
+        its next boundary and calls acknowledge_interrupt() almost
+        immediately. Bounded by _INTERRUPT_ACK_TIMEOUT_SECONDS so a loop
+        wedged inside a single unresponsive tool call (see shell_tool.py's
+        own bounded kill-wait) cannot ALSO hang every future
+        interrupt_agent() call for the rest of the session — see the
+        module-level comment on the constant. On timeout we give up WAITING
+        but still arm this interrupt (latest reason wins over whatever prior
+        interrupt was never acked) so it fires the moment the agent loop
+        does reach a boundary, instead of silently doing nothing.
+        """
+        try:
+            await asyncio.wait_for(
+                self._interrupt_acked.wait(),
+                timeout=_INTERRUPT_ACK_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            _logger.warning(
+                "[TaskChannel] interrupt_agent: prior interrupt still "
+                "unacknowledged after %.0fs — arming this interrupt anyway "
+                "(reason=%r) instead of hanging indefinitely.",
+                _INTERRUPT_ACK_TIMEOUT_SECONDS, reason,
+            )
         self._interrupt_acked.clear()
         self._interrupt_reason = reason
         self._interrupt_event.set()

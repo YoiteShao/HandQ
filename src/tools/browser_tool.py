@@ -839,6 +839,83 @@ async def evaluate_fetch(
     }
 
 
+# ── evaluate() result sanitization ───────────────────────────────────────────
+
+def _json_safe(value: Any) -> Any:
+    """Coerce a Playwright ``page.evaluate`` return value into something
+    ``ToolResult`` can carry as JSON.
+
+    Playwright already converts JS primitives/arrays/plain objects to their
+    Python equivalents and JS ``undefined``/unserializable values (functions,
+    DOM nodes, JS ``Error`` objects) to Python ``None`` — so this is a
+    defensive net for the rare non-JSON-safe leftover (e.g. a JS ``Date``
+    surviving as-is), not the primary conversion path. Recurses through
+    dict/list; anything else that isn't already a JSON primitive is
+    stringified rather than raised, since a diagnostic string beats losing
+    the whole tool result to a serialization error.
+    """
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return str(value)
+
+
+# ── Non-browser CDP target detection ─────────────────────────────────────────
+#
+# attach_browser's ``browser.attach_enabled`` gate exists to protect the
+# user's PERSONAL Chrome/Edge session (real cookies, SSO, saved logins) —
+# attaching there is a genuine privacy-sensitive action that needs an
+# explicit opt-in. But the same gate also fires when the CDP target is an
+# Electron app the AGENT ITSELF just launched with --remote-debugging-port
+# (e.g. a Qualcomm flashing tool, QPM3) purely to get deterministic DOM
+# access instead of screenshot/OCR guessing — there is no user-privacy risk
+# there, since the desktop takeover approval already covers "agent may drive
+# this app's UI". Confirmed live 2026-07-26 (xPCAT flash-meta incident): the
+# gate refused an already-launched, already-approved xPCAT instance, and the
+# agent responded by hand-rolling a raw websocket CDP client via `shell` —
+# with none of this tool's session lifecycle, tab bookkeeping, or page_state
+# signal. This helper lets attach_browser tell the two cases apart.
+_BROWSER_PROCESS_NAMES = frozenset({"chrome.exe", "msedge.exe", "chromium.exe"})
+
+
+async def _process_behind_cdp_port(host: str, port: int) -> Optional[str]:
+    """Best-effort lowercased process name of whatever is LISTENing on
+    *host:port*, or None if it can't be determined.
+
+    Uses psutil.net_connections() (psutil is already a hard project dep —
+    see desktop_tool.py). Runs in a thread since psutil's connection
+    enumeration is a blocking syscall. None is the conservative answer for
+    every failure mode (psutil unavailable, permission denied, no matching
+    LISTEN entry, race where the process exited) — callers MUST treat None
+    as "unknown", never as "safe to bypass the browser gate", since an
+    unidentified target could still be the user's real browser.
+    """
+    def _scan() -> Optional[str]:
+        try:
+            import psutil
+            for conn in psutil.net_connections(kind="tcp"):
+                if (
+                    conn.status == psutil.CONN_LISTEN
+                    and conn.laddr
+                    and conn.laddr.port == port
+                    and conn.pid
+                ):
+                    try:
+                        return psutil.Process(conn.pid).name().lower()
+                    except Exception:
+                        return None
+        except Exception:
+            return None
+        return None
+    try:
+        return await asyncio.get_event_loop().run_in_executor(None, _scan)
+    except Exception:
+        return None
+
+
 # ── Phase 5b: attach auto-setup helpers ──────────────────────────────────────
 # These keep the bat-script path opaque to end users. attach_browser walks:
 #   1. probe CDP port → reachable: connect transparently
@@ -1142,6 +1219,17 @@ class BrowserTool(BaseTool):
                     "values containing dots or digits."
                 ),
             },
+            "expression": {
+                "type": "string",
+                "description": (
+                    "[evaluate] Raw JavaScript, run in the page's context via "
+                    "page.evaluate(). Return a value if you need one back "
+                    "(e.g. 'document.title' or a function body). LAST RESORT — "
+                    "prefer click/type/extract/snapshot for anything they cover; "
+                    "use this only for app-specific DOM shapes those can't "
+                    "express (a framework component with no stable selector)."
+                ),
+            },
             "mode": {
                 "type": "string",
                 "enum": ["text", "html", "attr", "list"],
@@ -1429,6 +1517,7 @@ class BrowserTool(BaseTool):
             "request_user_login": self._action_request_user_login,
             "new_tab":            self._action_new_tab,
             "close_tab":          self._action_close_tab,
+            "evaluate":           self._action_evaluate,
         }
         handler = dispatch.get(action)
         if handler is None:
@@ -1634,12 +1723,27 @@ class BrowserTool(BaseTool):
     async def _action_attach_browser(
         self, params: Dict[str, Any], start: float, **kwargs: Any,
     ) -> ToolResult:
-        """Connect to the user's running Chrome / Edge over CDP.
+        """Connect to the user's running Chrome/Edge, OR to any other app
+        already listening on a CDP debug port, over CDP.
 
-        Pre-conditions:
-          * ``browser.attach_enabled: true`` in handq_config.yaml.
-          * The user has started Chrome / Edge with
-            ``--remote-debugging-port=9222`` (see scripts/start_chrome_with_debug.bat).
+        Two gates, chosen by what's actually on the other end of the port
+        (see ``_process_behind_cdp_port``):
+
+          * Target is chrome.exe/msedge.exe/chromium.exe (or unidentifiable —
+            fail conservative): the ORIGINAL gate applies —
+            ``browser.attach_enabled: true`` in handq_config.yaml, since this
+            grants access to the user's real cookies/SSO/saved logins.
+          * Target is any other process (an Electron app launched with
+            ``--remote-debugging-port``, e.g. a vendor flashing tool): no
+            privacy risk, so instead this requires an approved desktop
+            takeover (``ctx.desktop_state.is_task_approved()``) — the same
+            consent that already covers driving that app's UI via
+            desktop_click_at etc. attach_enabled does not apply here.
+
+        Common pre-conditions (both branches):
+          * The port is actually reachable (auto-setup below for the
+            browser branch; the caller must have already launched the
+            non-browser target with its debug flag).
           * No active session — call ``flush_browser_pool`` from the bridge
             or wait for new_session to free the slot.
 
@@ -1658,8 +1762,6 @@ class BrowserTool(BaseTool):
         # of the per-session user-data-dir model — but we still keep
         # per-session BrowserSessionHolder lifecycle so close() detaches
         # cleanly with that flow's destroy.
-        # Read attach_enabled from config. Best-effort — when config can't
-        # be read we conservatively REFUSE rather than silently allow.
         try:
             from ..infrastructure.config_manager import ConfigManager
             cm = ConfigManager()
@@ -1669,13 +1771,6 @@ class BrowserTool(BaseTool):
                 params, start,
                 f"attach_browser: cannot read config to verify attach_enabled: {exc}",
             )
-        if not bool(browser_cfg.get("attach_enabled", False)):
-            return self._error(
-                params, start,
-                "attach_browser is disabled. Set browser.attach_enabled: true in "
-                "handq_config.yaml AND start Chrome with "
-                "--remote-debugging-port=9222 before retrying.",
-            )
 
         if self.holder.session is not None:
             return self._error(
@@ -1684,7 +1779,9 @@ class BrowserTool(BaseTool):
                 "Start a new HandQ session (which flushes the pool) and retry.",
             )
 
-        # Resolve CDP URL. Priority: credentials_file > config.cdp_url > config.cdp_port.
+        # Resolve CDP URL BEFORE the attach_enabled check — which of the two
+        # gates applies depends on what's actually listening at that URL, so
+        # we need the URL first. Priority: credentials_file > cdp_url > cdp_port.
         creds_file: Optional[str] = kwargs.get("browser_credentials_file")
         cdp_url, source = self._resolve_cdp_url(creds_file, browser_cfg)
         if not cdp_url:
@@ -1695,13 +1792,63 @@ class BrowserTool(BaseTool):
                 "set browser.cdp_port in handq_config.yaml.",
             )
 
-        # ── Phase 5b: auto-setup ──────────────────────────────────────────────
-        # Make the debug port reachable transparently. The user does NOT need
-        # to know about start_chrome_with_debug.bat — we run it for them.
-        # See _ensure_cdp_reachable for the full decision tree.
-        setup_err = await self._ensure_cdp_reachable(cdp_url)
-        if setup_err is not None:
-            return self._error(params, start, setup_err)
+        # ── Branch: personal browser vs. an app the agent already launched ──
+        host, port = _parse_cdp_url(cdp_url)
+        process_name = await _process_behind_cdp_port(host, port)
+        is_non_browser_target = (
+            process_name is not None and process_name not in _BROWSER_PROCESS_NAMES
+        )
+
+        if is_non_browser_target:
+            # No user-privacy gate needed — but the agent must already hold
+            # an approved desktop takeover for THIS task, since attaching is
+            # functionally equivalent to driving that app's UI (just via DOM
+            # instead of mouse/keyboard), and takeover approval is the
+            # consent boundary for "agent may operate this app" regardless
+            # of which tool does the operating.
+            desktop_state = getattr(self.ctx, "desktop_state", None) if self.ctx else None
+            if desktop_state is None or not desktop_state.is_task_approved():
+                return self._error(
+                    params, start,
+                    f"attach_browser: target at {cdp_url} is {process_name!r}, "
+                    "not a browser — attaching to it needs an approved desktop "
+                    "takeover (same consent as desktop_click_at), not "
+                    "browser.attach_enabled. Call a desktop_* action first to "
+                    "trigger the approval prompt, or ask the user directly via "
+                    "ask_human if no desktop action is otherwise needed.",
+                )
+            # Approved takeover already covers "agent may operate this app's
+            # UI" — skip attach_enabled AND the Chrome/Edge-specific
+            # auto-setup below (the bat script + kill/restart dance is
+            # meaningless for a non-browser target the caller launched
+            # itself; if the port isn't reachable that's just a plain error).
+            if not await _probe_cdp_port(host, port):
+                return self._error(
+                    params, start,
+                    f"attach_browser: {cdp_url} ({process_name}) is not "
+                    "reachable. Launch it with --remote-debugging-port="
+                    f"{port} first (e.g. via shell), then retry.",
+                )
+        else:
+            # Either confirmed chrome.exe/msedge.exe/chromium.exe, or the
+            # process couldn't be identified — fail conservative and treat
+            # an unidentified target as "might be the user's real browser".
+            if not bool(browser_cfg.get("attach_enabled", False)):
+                return self._error(
+                    params, start,
+                    "attach_browser is disabled. Set browser.attach_enabled: true in "
+                    "handq_config.yaml AND start Chrome with "
+                    "--remote-debugging-port=9222 before retrying.",
+                )
+
+            # ── Phase 5b: auto-setup ─────────────────────────────────────────
+            # Make the debug port reachable transparently. The user does NOT
+            # need to know about start_chrome_with_debug.bat — we run it for
+            # them. See _ensure_cdp_reachable for the full decision tree.
+            # Chrome/Edge-specific: never runs for the non-browser branch above.
+            setup_err = await self._ensure_cdp_reachable(cdp_url)
+            if setup_err is not None:
+                return self._error(params, start, setup_err)
 
         try:
             pw = await async_playwright().start()
@@ -3711,6 +3858,61 @@ class BrowserTool(BaseTool):
             execution_time=time.time() - start,
         )
 
+    # ── evaluate ──────────────────────────────────────────────────────────────
+    #
+    # Raw JS escape hatch. LAST RESORT: prefer click/type/extract/snapshot for
+    # anything they cover. Exists so an app-specific DOM shape those can't
+    # express (a framework component with no stable selector, a custom event
+    # dispatch) still runs through the EXISTING session/tab lifecycle instead
+    # of the agent dropping to `shell` + a hand-rolled websocket CDP client —
+    # the failure mode from the 2026-07-26 xPCAT flash-meta incident, where
+    # attach_browser being gated forced a from-scratch `Runtime.evaluate`
+    # reimplementation with none of this tool's safety/consistency machinery.
+
+    async def _action_evaluate(
+        self, params: Dict[str, Any], start: float, **kwargs: Any,
+    ) -> ToolResult:
+        sess = self.holder.session
+        if sess is None:
+            return self._error(
+                params, start,
+                "No browser session. Call browser_launch or browser_attach first.",
+            )
+
+        page = self._resolve_tab(sess, kwargs.get("tab_id"))
+        if page is None:
+            return self._error(params, start, f"Unknown tab_id: {kwargs.get('tab_id')!r}")
+
+        expression = (kwargs.get("expression") or "").strip()
+        if not expression:
+            return self._error(
+                params, start,
+                "evaluate requires 'expression' (JavaScript, evaluated in the "
+                "page's context; return a value if you need one back).",
+            )
+        timeout_ms = int(kwargs.get("timeout_ms") or _DEFAULT_ACTION_TIMEOUT_MS)
+
+        try:
+            result = await asyncio.wait_for(
+                page.evaluate(expression), timeout=timeout_ms / 1000,
+            )
+        except asyncio.TimeoutError:
+            return self._error(params, start, f"evaluate: timed out after {timeout_ms} ms.")
+        except Exception as exc:
+            return self._error(params, start, f"evaluate failed ({type(exc).__name__}): {exc}")
+
+        page_state = await self._capture_page_state(page)
+        out: Dict[str, Any] = {"result": _json_safe(result)}
+        if page_state:
+            out["page_state"] = page_state
+        return ToolResult(
+            success=True,
+            output=out,
+            tool_name=self.name,
+            tool_parameters=params,
+            execution_time=time.time() - start,
+        )
+
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     async def _set_window_bounds(
@@ -3990,6 +4192,12 @@ class BrowserRequestUserLoginTool(_BrowserAtomic):
     _action = "request_user_login"
     def __init__(self, ctx=None) -> None:
         super().__init__(ctx=ctx, name="browser_request_user_login")
+
+
+class BrowserEvaluateTool(_BrowserAtomic):
+    _action = "evaluate"
+    def __init__(self, ctx=None) -> None:
+        super().__init__(ctx=ctx, name="browser_evaluate")
 
 
 class BrowserCloseTabTool(_BrowserAtomic):

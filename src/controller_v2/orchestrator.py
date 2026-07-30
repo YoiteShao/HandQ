@@ -367,7 +367,7 @@ class Orchestrator:
                     f"was lost",
                     component="Orchestrator",
                 )
-            final_reply = reply or "I'm here. Send me a task when you're ready."
+            final_reply = reply or "LLM Service no response."
             if self._on_reply_to_user and not self._last_response_streamed:
                 self._on_reply_to_user(final_reply)
             return final_reply
