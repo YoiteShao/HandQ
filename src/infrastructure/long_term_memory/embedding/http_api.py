@@ -176,6 +176,17 @@ class HttpApiEmbedder(EmbeddingProvider):
         try:
             self._http = httpx.AsyncClient(
                 verify=self._verify_ssl, timeout=self._timeout,
+                # trust_env=False: do NOT honour HTTP(S)_PROXY / system proxy
+                # env vars. The QGenie gateway is an INTERNAL address
+                # (10.x.x.x); routing embedding calls through a corporate
+                # proxy makes them fail (APIConnectionError / RemoteProtocol
+                # / ReadTimeout), which silently degraded LTM recall to
+                # BM25-only. Diagnosed live 2026-07-30: with the default
+                # trust_env=True the SDK embed call died in ~2.8s; with
+                # trust_env=False the same call returned a 1024-dim vector.
+                # The bare chat path tolerated the proxy intermittently,
+                # which is why only dense recall was affected.
+                trust_env=False,
             )
             self._client = AsyncOpenAI(
                 api_key=self._api_key,
