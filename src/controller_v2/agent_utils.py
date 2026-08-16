@@ -47,8 +47,13 @@ INFRA_TOOL_NAMES: frozenset = frozenset({
 # real 2026-07-17 trace declared success after only read_skill + claim_tool
 # ("SSH ... auto-probing verified") without ever calling ssh — the offline
 # analyzer caught it; the online guard had missed claim_tool/release_tool.
+#
+# notify_user is here for the same reason: TELLING the user to press a button is
+# not the button being pressed. The tool's own output says so explicitly, but
+# the guard must not be able to accept "I informed the user" as evidence the
+# world changed.
 BOOKKEEPING_ONLY_TOOLS: frozenset = frozenset({
-    "todo_write", "read_skill", "claim_tool", "release_tool",
+    "todo_write", "read_skill", "claim_tool", "release_tool", "notify_user",
 })
 
 TOOL_NAME_ALIASES: Dict[str, str] = {
@@ -80,6 +85,12 @@ class ConversationTurn:
     """One LLM turn: assistant response paired with its tool results."""
     assistant_message: Dict[str, Any]
     observations: List[ToolResult] = field(default_factory=list)
+    # User messages received BEFORE this turn (mid-task instructions/
+    # corrections), oldest first. Rendered as one role:"user" message in
+    # _build_messages at its natural position (joined if more than one
+    # arrived between turns). Participates in compression normally (no
+    # special immunity).
+    user_interjection: List[str] = field(default_factory=list)
 
     @property
     def has_tool_calls(self) -> bool:
@@ -109,7 +120,10 @@ class ConversationTurn:
             asst_chars += len(str(fn.get("arguments") or ""))
         for block in (asst.get("thinking_blocks") or []):
             asst_chars += len(str(block.get("thinking") or block.get("data") or ""))
-        return obs_chars + asst_chars
+        total = obs_chars + asst_chars
+        for msg in self.user_interjection:
+            total += len(msg)
+        return total
 
 
 @dataclass
@@ -159,15 +173,29 @@ class ProgressConcern:
 def resolve_obs_budget(context_window: int) -> int:
     """Scale observation budget to the model's context window capacity.
 
-    chars_per_token = 3.5 reflects real mixed content (text + code + JSON).
-    utilization = 0.85 leaves 15% headroom.
+    ``chars_per_token = 2.0`` is calibrated for the mixed CJK content HandQ
+    actually carries. The previous 3.5 was an English-text figure: Chinese runs
+    roughly 1–1.5 chars per token, so a Chinese-heavy history (HandQ's own
+    prompts, Chinese task instructions, Chinese tool output) costs ~2-3x the
+    tokens the old estimate predicted. That gap is invisible until the request
+    is rejected, because every budget check in the agent is denominated in
+    chars. 2.0 stays slightly optimistic for pure CJK and slightly pessimistic
+    for pure ASCII — deliberately, since over-estimating capacity is the
+    failure mode that costs a turn and under-estimating only costs some
+    history depth.
+
+    NOTE there is deliberately NO absolute floor. A floor larger than what the
+    window can hold is not a safety net, it is a guaranteed rejection: the old
+    ``max(budget, 300_000)`` would hand a hypothetical 100k-token model a
+    300,000-char budget it could never satisfy. The computed value already IS
+    the floor. The 20k guard below only rejects degenerate/absurd inputs.
     """
-    chars_per_token = 3.5
+    chars_per_token = 2.0
     utilization = 0.85
     fixed_overhead_tokens = 10_000
     available_tokens = int((context_window - fixed_overhead_tokens) * utilization)
     budget = int(available_tokens * chars_per_token)
-    return max(budget, 300_000)
+    return max(budget, 20_000)
 
 
 # ── Formatting helpers ───────────────────────────────────────────────────────
@@ -202,16 +230,86 @@ def _smart_truncate(text: str, limit: int = 120) -> str:
     return f"{text[:half]}...{text[-half:]}"
 
 
-def failed_approach_signature(tr: ToolResult) -> Optional[str]:
+# ── GUI approach signatures (desktop_* / browser_*) ─────────────────────────
+#
+# Why these tools need their own branch: failed_approach_signature returned
+# None for every name outside its whitelist, so ``_failed_approaches`` never
+# recorded a single desktop_* / browser_* failure and the ANTI-REPEAT GUARD was
+# structurally blind to GUI dead ends. The 2026-08-01 Alpaca trace hit the
+# IDENTICAL PyAutoGUI-failsafe error 7 times across 48 minutes, the IDENTICAL
+# capture error 12 times across 46 minutes, and re-issued
+# desktop_click_at(x=328, y=605) with byte-identical params on two consecutive
+# turns — and the guard never said a word. Note the asymmetry this fixes:
+# repeated_call_signature below already has a generic fallback, so GUI
+# SUCCESSES were tracked while GUI FAILURES were not — exactly backwards.
+
+# Parameters that select a capture / injection PATH rather than an aim point.
+# These MUST stay in the signature: region='foreground' and region='fullscreen'
+# are structurally different approaches, and collapsing them would make the
+# guard say "stop using this tool" when the real fix was to switch this one
+# argument — which is precisely how that trace finally escaped its 14-minute
+# capture-failure loop.
+_GUI_PATH_KEYS: tuple = ("region", "use_uia_pattern")
+
+# Parameters naming WHAT the call aimed at, in priority order. The first one
+# present becomes the signature's target, so "find Connect" and "find Boot MD
+# EDL" stay distinct dead paths instead of merging into one.
+_GUI_TARGET_KEYS: tuple = ("description", "selector", "url", "text", "keys")
+
+
+def _gui_approach_signature(name: str, params: Dict[str, Any]) -> str:
+    """Return a signature for a failed ``desktop_*`` / ``browser_*`` call.
+
+    Coordinates are deliberately EXCLUDED. Every hard error these tools raise
+    — PyAutoGUI failsafe, "cannot determine foreground window", a capture /
+    BitBlt failure, a refused sensitive-window guard — is independent of the
+    exact pixel aimed at, so keying on x/y would let one dead approach
+    re-register as novel on every click and defeat the point of tracking it.
+    """
+    bits: List[str] = [name]
+    action = str(params.get("action") or "")
+    if action and not name.endswith(action):
+        bits.append(action)
+    if params.get("hwnd"):
+        # Presence, not value: the hwnd path runs through PrintWindow instead
+        # of mss, and that is the structural difference worth keying on. Exact
+        # handles churn — they change every time the target app restarts — and
+        # would fragment one dead path into many.
+        bits.append("hwnd=set")
+    for key in _GUI_PATH_KEYS:
+        val = params.get(key)
+        if val not in (None, ""):
+            bits.append(f"{key}={val}")
+    for key in _GUI_TARGET_KEYS:
+        val = params.get(key)
+        if val not in (None, ""):
+            bits.append(_smart_truncate(_normalize_numeric(str(val)), 80))
+            break
+    return ":".join(bits)
+
+
+def failed_approach_signature(
+    tr: ToolResult, script_index: Optional[Dict[str, str]] = None,
+) -> Optional[str]:
     """Return a compact, stable signature for a failed ToolResult.
 
     Used to detect when the same approach is retried after already failing.
     Returns None for results that should not be tracked.
+
+    ``script_index`` maps a written script's basename → the semantic
+    fingerprint of its CONTENT (see :func:`script_semantic_fingerprint`). When a
+    shell command runs an indexed script, the signature keys on that fingerprint
+    instead of the command text — see the module comment above
+    ``script_semantic_fingerprint`` for why filenames are worthless here.
     """
     params = tr.tool_parameters or {}
     name = tr.tool_name or ""
     if name == "bash" or name == "shell":
-        cmd = _normalize_numeric(params.get("command", "").strip())
+        raw = params.get("command", "").strip()
+        script_sig = _script_run_signature(raw, script_index)
+        if script_sig:
+            return script_sig
+        cmd = _normalize_numeric(raw)
         return f"bash:{_smart_truncate(cmd)}" if cmd else None
     if name == "ssh":
         action = params.get("action", "")
@@ -226,7 +324,203 @@ def failed_approach_signature(tr: ToolResult) -> Optional[str]:
     if name in ("glob", "grep"):
         pattern = _normalize_numeric(params.get("pattern", ""))
         return f"{name}:{_smart_truncate(pattern)}" if pattern else None
+    if name.startswith(("desktop_", "browser_")) or name in ("desktop", "browser"):
+        return _gui_approach_signature(name, params)
     return None
+
+
+# ── Generated-script identity ────────────────────────────────────────────────
+#
+# A shell signature keyed on the command text is blind to the dominant loop
+# shape in agent-written automation: write a script, run it once, read a partial
+# failure, write a NEW script with a NEW NAME, run that once, repeat.
+#
+# 2026-08-03 flash-meta run: 55 files written, 33 of them `cdp_*.py`, each
+# executed exactly once. Nine near-duplicate SPINOR drivers
+# (`cdp_spinor_download` → `_proper` → `_debug` → `_final` → `_reconnect`), five
+# UFS variants, four reboot-verify variants. Every turn therefore carried a
+# brand-new action signature, the ANTI-REPEAT GUARD saw novelty forever, and it
+# never fired again after turn 140 — while the last 60 turns changed nothing.
+#
+# Two scripts are "the same approach" when they act on the same things, so the
+# fingerprint is taken over the distinctive STRING LITERALS in the body (CSS
+# selectors, control names, API methods, paths) rather than the filename or the
+# surrounding code. Rewording a print() or renaming the file does not move the
+# fingerprint; genuinely targeting a different control does.
+#
+# The literal must CONTAIN a letter (so pure punctuation / numbers are skipped)
+# but may START with a selector sigil — ``.p-treetable-toggler`` and
+# ``#device-list`` are precisely the tokens worth keying on, and requiring an
+# alpha first char would drop every CSS class/id selector.
+_SCRIPT_LITERAL_RE = re.compile(r"""['"]([\w.#][\w \-./#\[\]=:*]{2,60})['"]""")
+
+# Literals that appear in almost every generated script and carry no information
+# about WHAT it targets. Left in, they would pull unrelated scripts together.
+_SCRIPT_NOISE_LITERALS: frozenset = frozenset({
+    "utf-8", "utf8", "ascii", "replace", "ignore", "strict",
+    "localhost", "http", "https", "get", "post", "json", "text/plain",
+    "true", "false", "none", "null", "error", "warning", "info", "debug",
+    "windows-1252", "cp1252", "\\n", "\\r\\n",
+})
+
+_SCRIPT_SUFFIXES: tuple = (".py", ".ps1", ".psm1", ".sh", ".bash", ".js", ".bat", ".cmd")
+# How many literals feed the hash. Enough to characterise a script, few enough
+# that appending one more probe line does not move the fingerprint.
+_SCRIPT_FINGERPRINT_LITERALS: int = 24
+# Below this a script has too little distinctive content to fingerprint
+# meaningfully; fall back to the command text rather than collapse unrelated
+# one-liners together.
+_SCRIPT_FINGERPRINT_MIN_LITERALS: int = 3
+
+
+def _is_structural_literal(lit: str) -> bool:
+    """True for literals that identify WHAT a script targets, not free prose.
+
+    Structural = a selector/path/identifier: it carries a sigil
+    (``. # / \\ [ ] : =``) or is a single whitespace-free token. Multi-word
+    prose ("DONE v2", "Clicking the gear", a status message) is excluded, which
+    is exactly what makes "rewording a print() does not move the fingerprint"
+    true — the tweak-and-rerun loop rewords prints and prose constantly while
+    the CSS selectors, API methods and paths it targets stay put.
+    """
+    if any(sig in lit for sig in (".", "#", "/", "\\", "[", "]", ":", "=")):
+        return True
+    return " " not in lit and "\t" not in lit
+
+
+def script_semantic_fingerprint(content: str) -> str:
+    """Fingerprint a generated script by WHAT IT TARGETS, not what it is called.
+
+    Returns '' when the body has too few distinctive literals to characterise —
+    the caller then keeps the command-text signature rather than merging
+    unrelated scripts.
+    """
+    if not content:
+        return ""
+    lits = set()
+    for m in _SCRIPT_LITERAL_RE.finditer(content):
+        lit = _normalize_numeric(m.group(1)).strip().lower()
+        # Require a letter (skip "===", pure numbers), reject known noise, and
+        # keep only structural target literals so prose churn is ignored.
+        if (lit and lit not in _SCRIPT_NOISE_LITERALS
+                and any(c.isalpha() for c in lit)
+                and _is_structural_literal(lit)):
+            lits.add(lit)
+    if len(lits) < _SCRIPT_FINGERPRINT_MIN_LITERALS:
+        return ""
+    top = sorted(lits)[:_SCRIPT_FINGERPRINT_LITERALS]
+    return hashlib.blake2b(
+        "|".join(top).encode("utf-8", "replace"), digest_size=8,
+    ).hexdigest()
+
+
+def indexable_script_path(tr: ToolResult) -> Optional[str]:
+    """Basename of the script a ``write`` created, or None if not a script."""
+    if (tr.tool_name or "") not in ("write", "edit"):
+        return None
+    path = str((tr.tool_parameters or {}).get("path") or "")
+    if not path:
+        return None
+    base = path.replace("\\", "/").rsplit("/", 1)[-1].strip().lower()
+    return base if base.endswith(_SCRIPT_SUFFIXES) else None
+
+
+def _script_run_signature(
+    command: str, script_index: Optional[Dict[str, str]],
+) -> Optional[str]:
+    """``script:<fingerprint>`` when *command* runs a script we have indexed."""
+    if not command or not script_index:
+        return None
+    lowered = command.replace("\\", "/").lower()
+    for base, fingerprint in script_index.items():
+        if base and fingerprint and base in lowered:
+            return f"script:{fingerprint}"
+    return None
+
+
+# ── Shared preconditions that whole tool families depend on ──────────────────
+#
+# The ANTI-REPEAT GUARD keys on the TOOL, so a dead dependency shared by several
+# tools reads as several independent, still-untried approaches.
+#
+# 2026-08-03, turns 38-42, verbatim from the agent's own reasoning:
+#   "The ANTI-REPEAT GUARD blocks `desktop_click_at:use_uia_pattern=False`."
+#   "`desktop_find_and_click` is NOT blocked - this is a different tool"
+#   "`desktop_find_and_click` also relies on PyAutoGUI internally for mouse
+#    clicks, so it might hit the same failsafe issue"
+#   "Since the ANTI-REPEAT GUARD only blocks the specific `desktop_click_at`
+#    variant, I have a few paths forward..."
+# It wrote down that the substitute shares the broken dependency, and used it
+# anyway, because the guard's unit of blocking was a name. Modelling the
+# DEPENDENCY as the thing that fails closes that: one failure greys out every
+# tool that needs it.
+_CAPABILITY_SIGNATURES: Dict[str, tuple] = {
+    "pointer_injection": (
+        "failsafe", "pyautogui", "sendinput", "cursor_at_exception",
+    ),
+    "foreground_window": (
+        "cannot determine foreground window", "getforegroundwindow",
+        "no foreground window",
+    ),
+    "uia_tree": (
+        "uia blacklist", "snapshot enumerate exceeded", "uia call",
+        "not uia-visible",
+    ),
+}
+
+# Which tools each capability gates. Prefixes match by startswith.
+_CAPABILITY_DEPENDENTS: Dict[str, tuple] = {
+    "pointer_injection": (
+        "desktop_click_at", "desktop_find_and_click", "desktop_drag",
+        "desktop_scroll", "desktop_hover_at", "desktop_type_text",
+        "desktop_hotkey", "desktop_key_press",
+    ),
+    "foreground_window": (
+        "desktop_click_at", "desktop_find_and_click", "desktop_find_element",
+        "desktop_type_text", "desktop_screenshot", "desktop_snapshot",
+        "desktop_hotkey", "desktop_key_press", "desktop_scroll", "desktop_drag",
+    ),
+    "uia_tree": (
+        "desktop_snapshot", "desktop_find_element", "desktop_find_and_click",
+    ),
+}
+
+_CAPABILITY_ADVICE: Dict[str, str] = {
+    "pointer_injection": (
+        "Synthetic pointer/keyboard input is not reaching this desktop. Every "
+        "tool above shares that one dependency, and hand-rolled SendInput / "
+        "PostMessage / SetForegroundWindow in a script shares it too — swapping "
+        "between them cannot help. Drive the app through a non-input channel: "
+        "its own automation API or SDK, a CLI, a config file, or CDP for "
+        "Electron/Chromium apps. If a human press is genuinely required, use "
+        "notify_user to ask for it."
+    ),
+    "foreground_window": (
+        "This session has no foreground window (RDP / VNC / service session). "
+        "Activating, maximizing or re-aiming will not create one. Anything that "
+        "needs focus or screen coordinates is unavailable for the whole "
+        "session — do not spend further turns on it."
+    ),
+    "uia_tree": (
+        "This window exposes no usable UIA tree (Electron/Chromium or a "
+        "custom-rendered surface). Element lookups against it will keep "
+        "failing, and 'none_detected' from it is uninformative rather than "
+        "negative. Use CDP for Chromium-based apps, or the app's own API."
+    ),
+}
+
+
+def failed_capabilities(tr: ToolResult) -> List[str]:
+    """Capabilities implicated by a failed ToolResult's error text."""
+    if tr.success:
+        return []
+    blob = f"{tr.error or ''} {tr.output if tr.output is not None else ''}".lower()
+    if not blob.strip():
+        return []
+    return [
+        cap for cap, needles in _CAPABILITY_SIGNATURES.items()
+        if any(n in blob for n in needles)
+    ]
 
 
 # ── Tools whose repetition is bookkeeping/orientation, not task progress ─────
@@ -249,7 +543,9 @@ _OBSERVE_ONLY_TOOLS: frozenset = frozenset({
 })
 
 
-def repeated_call_signature(tr: ToolResult) -> Optional[str]:
+def repeated_call_signature(
+    tr: ToolResult, script_index: Optional[Dict[str, str]] = None,
+) -> Optional[str]:
     """Stable signature for a SUCCESSFUL tool call, for redundant-repeat detection.
 
     Mirrors ``failed_approach_signature`` but for successes, and keyed on the
@@ -269,7 +565,13 @@ def repeated_call_signature(tr: ToolResult) -> Optional[str]:
         return name  # re-observing the same surface — key on tool alone
     params = tr.tool_parameters or {}
     if name in ("bash", "shell"):
-        cmd = _normalize_numeric(params.get("command", "").strip())
+        raw = params.get("command", "").strip()
+        # Same reasoning as in failed_approach_signature: a re-run of an
+        # equivalent generated script is a repeat even under a new filename.
+        script_sig = _script_run_signature(raw, script_index)
+        if script_sig:
+            return script_sig
+        cmd = _normalize_numeric(raw)
         return f"bash:{_smart_truncate(cmd)}" if cmd else None
     if name == "ssh":
         action = params.get("action", "")
@@ -403,6 +705,19 @@ class IterationAdvisor:
         # trust the model + faithful history + prompt, not a mechanical nag).
         self._successful_call_counts: Dict[str, int] = {}
 
+        # basename → semantic fingerprint of every script the agent has WRITTEN
+        # this item, so a `shell` call that runs one is signed by what the script
+        # targets rather than by its (freshly-invented) filename. See
+        # script_semantic_fingerprint for the 33-one-shot-scripts loop this
+        # exists to make visible.
+        self._script_index: Dict[str, str] = {}
+
+        # capability → number of failures attributed to it this item. A dead
+        # SHARED DEPENDENCY (pointer injection, foreground window, UIA tree) is
+        # the unit the agent kept routing around by switching tool names; see
+        # _CAPABILITY_SIGNATURES.
+        self._failed_capabilities: Dict[str, int] = {}
+
         # Stall-block cooldowns (soft agent reminder + hard mechanical concern
         # recording), so neither fires every turn while stuck. Decremented once
         # per turn in record_progress_signal, and reset when info gain ends an
@@ -432,6 +747,8 @@ class IterationAdvisor:
         self._no_info_gain_streak = 0
         self._turn_saw_info_gain = False
         self._successful_call_counts.clear()
+        self._script_index.clear()
+        self._failed_capabilities.clear()
         self._turns_since_todo_write = 0
         self._turns_since_todo_reminder = 0
         self._turn_saw_todo_write = False
@@ -467,14 +784,30 @@ class IterationAdvisor:
         if tr.tool_name == "wait_interval":
             return
 
+        # Index every script the agent writes BEFORE any signature is computed,
+        # so the very first run of a freshly-written script is already keyed on
+        # its content rather than its name.
+        script_base = indexable_script_path(tr)
+        if script_base:
+            fingerprint = script_semantic_fingerprint(
+                str((tr.tool_parameters or {}).get("content") or "")
+            )
+            if fingerprint:
+                self._script_index[script_base] = fingerprint
+
         self._success_history.append(tr.success)
 
         if not tr.success:
             if (tr.tool_name == "write"
                     and "Parameter error for tool 'write'" in (tr.error or "")):
                 self._last_error_hint = "write_param_error"
+            # Attribute the failure to any shared dependency it implicates, so
+            # switching to a sibling tool that needs the same thing is no longer
+            # invisible to the guard.
+            for cap in failed_capabilities(tr):
+                self._failed_capabilities[cap] = self._failed_capabilities.get(cap, 0) + 1
             if tr.tool_name and tr.tool_name not in INFRA_TOOL_NAMES:
-                sig = failed_approach_signature(tr)
+                sig = failed_approach_signature(tr, self._script_index)
                 if sig:
                     prev = self._failed_approaches.get(sig, 0)
                     self._failed_approaches[sig] = prev + 1
@@ -492,7 +825,7 @@ class IterationAdvisor:
         # output-novelty info-gain below so the stall streak can build. This
         # is the fix for the "re-run an already-succeeded schedule_create /
         # desktop_screenshot forever" loop the output hash alone can't see.
-        repeat_sig = repeated_call_signature(tr)
+        repeat_sig = repeated_call_signature(tr, self._script_index)
         is_redundant_repeat = False
         if repeat_sig is not None:
             prev = self._successful_call_counts.get(repeat_sig, 0)
@@ -509,7 +842,11 @@ class IterationAdvisor:
         ).hexdigest()
         if h not in self._seen_obs_hashes:
             self._seen_obs_hashes.add(h)
-            if not is_redundant_repeat:
+            # write/edit is authoring, not observing — producing a new script
+            # variant is not information gain (running it and getting novel
+            # output IS). Without this, "write cdp_vN.py (new content hash) +
+            # run it (same output)" resets the stall streak every cycle.
+            if not is_redundant_repeat and tr.tool_name not in ("write", "edit"):
                 self._turn_saw_info_gain = True
 
     @staticmethod
@@ -615,6 +952,43 @@ class IterationAdvisor:
                 "tool, command, or decomposition:\n" + "\n".join(lines)
             )
 
+        # 1b. Dead-capability guard — the fix for switching tool NAMES to route
+        #     around a broken shared dependency. When a capability (pointer
+        #     injection, foreground window, UIA tree) has failed 2+ times, name
+        #     EVERY tool that depends on it, so the agent cannot treat a sibling
+        #     that needs the same thing as an untried path. This is the guard the
+        #     2026-08-03 run defeated by hopping desktop_click_at →
+        #     desktop_find_and_click while noting they share PyAutoGUI.
+        dead_caps = sorted(
+            [(cap, cnt) for cap, cnt in self._failed_capabilities.items() if cnt >= 2],
+            key=lambda x: -x[1],
+        )
+        if dead_caps:
+            cap_lines: List[str] = []
+            for cap, cnt in dead_caps:
+                dependents = ", ".join(_CAPABILITY_DEPENDENTS.get(cap, ()))
+                advice = _CAPABILITY_ADVICE.get(cap, "")
+                cap_lines.append(
+                    f"  [{cap}] failed {cnt}x. This blocks ALL of: {dependents}. "
+                    f"{advice}"
+                )
+            parts.append(
+                "DEAD-CAPABILITY GUARD — a shared dependency is failing, not just "
+                "one tool. Switching to another tool in the SAME list below will "
+                "hit the identical wall (including any SendInput / PostMessage / "
+                "CDP-over-shell workaround you might write that leans on it):\n"
+                + "\n".join(cap_lines)
+            )
+
+        # 1c. Redundant-repeat signatures (successful calls repeated 3+×)
+        redundant = sorted(
+            [(sig, cnt) for sig, cnt in self._successful_call_counts.items() if cnt >= _REDUNDANT_REPEAT_HARD],
+            key=lambda x: -x[1],
+        )[:3]
+        if redundant:
+            sigs = ", ".join(f"{sig} ({cnt}×)" for sig, cnt in redundant)
+            parts.append(f"⚠ Redundant: {sigs} — switch approach.")
+
         # 2. Stall block — exactly one of two mutually-exclusive messages.
         #    The specific write_param_error fix takes precedence (immediately
         #    actionable, ungated) over the generic soft-stall bail-out. The
@@ -675,6 +1049,10 @@ class IterationAdvisor:
             "consecutive_failures": self._count_consecutive_failures(),
             "failed_approaches_count": len(self._failed_approaches),
             "max_redundant_repeat": self._max_repeat_count(),
+            "dead_capabilities": sorted(
+                c for c, n in self._failed_capabilities.items() if n >= 2
+            ),
+            "scripts_indexed": len(self._script_index),
         }
 
     # ── Internal ────────────────────────────────────────────────────────────
@@ -693,6 +1071,207 @@ class IterationAdvisor:
             return 1.0
         window = self._success_history[-10:]
         return sum(window) / len(window)
+
+
+# ── Completion audit ────────────────────────────────────────────────────────
+#
+# Why this exists: the 2026-08-01 flash-meta trace SHIPPED a fabricated
+# delivery. Ten background shell tasks were launched (bg_1..bg_10) and not one
+# was ever observed in a terminal state — every poll came back
+# ``status="running", exit_code=null``. The agent then wrote item_end
+# verification bullets quoting a downloader's exact output:
+#     "xPCAT UFS flat build download: DEVICE_NO_ERROR (0),
+#      progress 4.96%->99.94%->100% at 13:37:37"
+# Those strings appear NOWHERE in any tool output from that session. The only
+# real input behind them was "bg_10 has been running 105 seconds". Ten minutes
+# later the agent contradicted its own delivery ("boot_a … not correctly
+# written") — but by then the item was already recorded as success.
+#
+# The two existing completion guards structurally cannot catch this. They check
+# the SHAPE of the completion turn — was it valid JSON, did any world-touching
+# tool run — and both were satisfied: plenty of real shell calls ran. What was
+# wrong was the CONTENT of the claim relative to the observation history, and no
+# component was keeping that history. This class keeps it.
+#
+# Two independent mechanical checks (no LLM in the trigger path):
+#   1. unresolved background work — a task launched this item and never once
+#      observed done/killed cannot back a completion. "Still running" is not
+#      "succeeded".
+#   2. unsourced claims — a distinctive token in a `verification` bullet that
+#      appeared in no tool output AND in nothing the user supplied was not
+#      observed; it was invented.
+
+# Token classes distinctive enough that quoting one you never observed is
+# fabrication rather than coincidence. Deliberately NOT bare integers: "0",
+# "1", "exit 0" occur in nearly every output and would false-positive on every
+# honest completion.
+_PERCENT_RE = re.compile(r"\d+(?:\.\d+)?\s?%")              # 4.96%, 99.94 %
+_SNAKE_RE = re.compile(r"\b[A-Z][A-Z0-9]{2,}(?:_[A-Z0-9]+)+\b")  # DEVICE_NO_ERROR
+# Clock times, with an optional AM/PM suffix. A 12-hour reading is registered
+# under BOTH its literal and its 24-hour equivalent: an agent that reads
+# "1:37:37 PM" out of a log and writes "13:37:37" in a verification bullet is
+# reformatting, not fabricating, and must not trip the guard. A timestamp
+# matching neither form was genuinely never observed.
+_CLOCK_RE = re.compile(r"\b(\d{1,2}):(\d{2}):(\d{2})(?:\s*([AaPp])[.\s]?[Mm])?")
+
+# Background-task states that count as "observed to have finished". Mirrors
+# shell_tool.BackgroundTask.status ("running" | "done" | "killed").
+_BG_TERMINAL_STATES: frozenset = frozenset({"done", "killed"})
+
+
+def _claim_tokens(text: str) -> Set[str]:
+    """Extract the canonicalised distinctive tokens from *text*."""
+    found: Set[str] = set()
+    for rx in (_PERCENT_RE, _SNAKE_RE):
+        for match in rx.findall(text or ""):
+            found.add(re.sub(r"\s+", "", match).upper())
+    for hh, mm, ss, meridiem in _CLOCK_RE.findall(text or ""):
+        hour = int(hh)
+        found.add(f"{hour:02d}:{mm}:{ss}")
+        if meridiem:
+            shifted = (hour % 12) + (12 if meridiem.lower() == "p" else 0)
+            found.add(f"{shifted:02d}:{mm}:{ss}")
+    return found
+
+
+class CompletionAudit:
+    """Per-item observation ledger backing the completion-audit guard.
+
+    Fed the same ToolResults as IterationAdvisor, plus the background-task
+    completion observations that arrive out-of-band via
+    PersistentAgent._poll_completed_background_tasks (those never pass through
+    the per-turn advisor loop, so wiring only one of the two would let a task
+    that DID finish still read as unresolved).
+
+    Every method is best-effort and never raises: a broken ledger must not be
+    able to block a legitimate completion.
+    """
+
+    def __init__(self) -> None:
+        self._bg_launched: Dict[str, str] = {}
+        self._bg_resolved: Set[str] = set()
+        self._sourced: Set[str] = set()
+
+    def reset_for_item(self, instruction: str = "") -> None:
+        """Start a fresh ledger for one item.
+
+        The item's own instruction seeds the sourced set: identifiers the USER
+        supplied (``MEMORY_TYPE_UFS``, a build id, a target time) are
+        legitimately quotable in verification even though no tool emitted them.
+        Without this seed the guard would false-positive on every task whose
+        instruction names a constant.
+        """
+        self._bg_launched.clear()
+        self._bg_resolved.clear()
+        self._sourced = _claim_tokens(instruction)
+
+    def record_tool_result(self, tr: ToolResult) -> None:
+        """Fold one tool result into the ledger."""
+        try:
+            self._sourced |= _claim_tokens(self._result_text(tr))
+            self._track_background(tr)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _result_text(tr: ToolResult) -> str:
+        parts: List[str] = []
+        if tr.output is not None:
+            parts.append(str(tr.output))
+        if tr.error:
+            parts.append(str(tr.error))
+        if getattr(tr, "exit_code", None) is not None:
+            parts.append(f"exit_code={tr.exit_code}")
+        return "\n".join(parts)
+
+    def _track_background(self, tr: ToolResult) -> None:
+        """Record launches and terminal observations of background tasks.
+
+        Keyed off the ``task_id`` present in every background-shaped shell
+        output — the launch result, a status poll, a kill, the ``tasks`` list,
+        and the out-of-band completion observation all carry it, so one branch
+        covers all five shapes.
+        """
+        out = tr.output if isinstance(tr.output, dict) else {}
+        records: List[Dict[str, Any]] = []
+        if out.get("task_id"):
+            records.append(out)
+        listed = out.get("tasks")
+        if isinstance(listed, list):
+            records.extend(
+                e for e in listed if isinstance(e, dict) and e.get("task_id")
+            )
+        for rec in records:
+            task_id = str(rec.get("task_id"))
+            status = str(rec.get("status") or "")
+            if status in _BG_TERMINAL_STATES or rec.get("exit_code") is not None:
+                self._bg_resolved.add(task_id)
+            elif status == "running":
+                self._bg_launched.setdefault(
+                    task_id, str(rec.get("command") or "")[:70]
+                )
+
+    @property
+    def unresolved_background(self) -> List[tuple]:
+        """[(task_id, command)] launched this item, never seen finishing."""
+        return sorted(
+            (tid, cmd) for tid, cmd in self._bg_launched.items()
+            if tid not in self._bg_resolved
+        )
+
+    def unsourced_claims(self, verification: Optional[List[str]]) -> List[tuple]:
+        """[(claim, [missing_tokens])] for bullets quoting unobserved values."""
+        hits: List[tuple] = []
+        for claim in (verification or []):
+            missing = sorted(_claim_tokens(claim) - self._sourced)
+            if missing:
+                hits.append((claim, missing))
+        return hits
+
+    def audit(self, verification: Optional[List[str]]) -> Optional[str]:
+        """Return a rejection message when this completion is not observable.
+
+        None means the completion may proceed. The caller (PersistentAgent's
+        completion-guard block) is responsible for the fail-open cap, so a
+        false positive here costs a few corrective turns, never an infinite
+        loop.
+        """
+        problems: List[str] = []
+
+        pending = self.unresolved_background
+        if pending:
+            listed = "; ".join(
+                f"{tid} ({cmd})" if cmd else tid for tid, cmd in pending
+            )
+            problems.append(
+                f"{len(pending)} background task(s) were launched this item and "
+                f"never observed finishing: {listed}. A task last seen "
+                f"status='running' has NOT succeeded — elapsed time is not an "
+                f"exit code. Before completing, either poll it with "
+                f"shell(task_id='<id>') until status is 'done'/'killed' and "
+                f"read the exit_code, or kill it with "
+                f"shell(task_id='<id>', kill=True), or return an error JSON "
+                f"stating the work did not finish."
+            )
+
+        unsourced = self.unsourced_claims(verification)
+        if unsourced:
+            lines = "\n".join(
+                f"  - {claim[:120]!r} cites {', '.join(toks)}"
+                for claim, toks in unsourced[:5]
+            )
+            problems.append(
+                "These verification bullets quote values that appear in NO tool "
+                "output from this item and in nothing the user gave you, so they "
+                f"were never observed:\n{lines}\n"
+                "Cite the actual tool result that produced each value, or delete "
+                "the claim. A number you inferred from elapsed time must not be "
+                "restated as something a tool reported."
+            )
+
+        if not problems:
+            return None
+        return "Completion audit failed. " + " ".join(problems)
 
 
 # ── TurnOutcome ────────────────────────────────────────────────────────────
@@ -821,7 +1400,10 @@ class TurnOutcome:
 
         # Fallback: the LLM returned something that isn't a JSON object with
         # a `reasoning` key — most commonly pure markdown prose ignoring the
-        # completion contract. Do NOT stash the raw content as `final_answer`
+        # completion contract, but ALSO the empty-string case (all output
+        # tokens landed in a thinking block, zero in the visible completion
+        # text — confirmed live 2026-08-06, stop_reason=end_turn out_tokens>0
+        # raw_len=0). Do NOT stash the raw content as `final_answer`
         # here (that would silently let a schema-violating completion succeed
         # and bypass the corrective retry). Instead flag ``format_violation``
         # and carry the FULL raw content back as `reasoning`. The item_loop
@@ -835,6 +1417,16 @@ class TurnOutcome:
         # writes it into the JSONL turn record (its own MAX_OUTPUT_LEN cap
         # applies there), and notify_decision_made surfaces it to the UI so a
         # rejected summary is not silently lost.
+        #
+        # format_violation is UNCONDITIONALLY True here — reaching this
+        # return means parsing already failed to find a JSON dict with a
+        # `reasoning` key, regardless of whether raw_content is empty or
+        # non-empty prose. `bool(raw_content)` was wrong: an empty completion
+        # (raw_len=0) evaluated to False, silently skipping the corrective
+        # retry and letting a blank turn stand as the item's "final" result
+        # (item_end recorded success=True with reasoning stuck at the
+        # "Failed to parse LLM response." placeholder below, while the
+        # session itself crashed) — confirmed live 2026-08-06.
         return cls(
             reasoning=raw_content if raw_content else "Failed to parse LLM response.",
             final_answer=None,
@@ -842,9 +1434,12 @@ class TurnOutcome:
             truncation_note=(
                 "Completion output was not valid JSON with a `reasoning` key; "
                 f"raw_len={len(raw_content)}; item_loop will request a retry."
-                if raw_content else None
+                if raw_content else
+                "Completion output was empty (all output tokens went into a "
+                "thinking block, none into visible completion text); "
+                "item_loop will request a retry."
             ),
-            format_violation=bool(raw_content),
+            format_violation=True,
         )
 
 

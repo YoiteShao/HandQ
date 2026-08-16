@@ -191,7 +191,13 @@ def _try_connect(hostname: str, username: str, port: int,
             kw["allow_agent"] = False
         client.connect(**kw)
         return True
-    except _paramiko.AuthenticationException:
+    except _paramiko.SSHException:
+        # Covers AuthenticationException (bad key/password) as well as the
+        # bare SSHException("No authentication methods available") paramiko
+        # raises when there's nothing to try at all (no key, no agent, no
+        # password) — that case is not a subclass of AuthenticationException,
+        # so callers relying on it to fall through to keyring/password prompt
+        # would otherwise see it misclassified as a network error upstream.
         return False
     finally:
         try:

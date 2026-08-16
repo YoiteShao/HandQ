@@ -10,14 +10,27 @@
 //     reason:"input_action", session_id:"..."} when the agent performs a
 //     desktop input action. We show a fullscreen rainbow-border overlay and
 //     register Ctrl+Shift+C as a process-wide revoke hotkey.
-//   * On {type:"status", kind:"desktop_takeover_ended", ...} we hide the
-//     overlay and free the hotkey.
+//   * On {type:"status", kind:"desktop_takeover_ended", session_id:"..."} we
+//     hide the overlay and free the hotkey — but only if session_id matches
+//     the session we're currently bound to (see "latest-wins" below).
 //
 // The revoke hotkey sends {type:"user_input", kind:"desktop_takeover_revoked",
 // session_id}. The session_id is MANDATORY: the bridge's _resolve_session_id
 // rejects any session-scoped user_input without one ("user_input: missing
 // session_id") and the envelope would never reach the desktop_takeover_revoked
-// handler. We capture it from the started event that triggered the overlay.
+// handler.
+//
+// Latest-wins session binding: docs/desktop_tool.md §11.2 requires
+// started/ended to be treated as level-triggered (latest-wins). Desktop
+// input is a single OS-level exclusive resource, so at most one overlay
+// window ever exists — but WHICH session's revoke the hotkey targets must
+// track whichever session most recently sent `started`, even if that
+// second `started` arrives while the first session's overlay/hotkey is
+// still up (show() no-ops on the window but still rebinds the session). A
+// bare `hide(sessionId)` for a session that is no longer the current one is
+// a stale/superseded event and must NOT tear down the newer session's
+// overlay — only an unqualified hide() (no sessionId — bridge exit, app
+// quit) forces teardown unconditionally.
 
 'use strict';
 
@@ -49,11 +62,23 @@ function createTakeoverOverlay(deps) {
     // Module-level singleton in the original main.js — kept here as closure
     // state so main.js holds exactly one overlay window at a time.
     let takeoverOverlay = null;
+    // Which session the visible overlay (and its revoke hotkey) currently
+    // act on. Rebound on every show(), even when the window itself isn't
+    // recreated — see the "latest-wins" note in the module header.
+    let currentSessionId = null;
 
     function show(sessionId) {
+        const rebind = currentSessionId !== sessionId;
+        currentSessionId = sessionId;
         if (takeoverOverlay && !takeoverOverlay.isDestroyed()) {
             // Backend's _start_takeover is idempotent but a duplicate event
-            // could still arrive on edge cases. Don't double-create.
+            // could still arrive on edge cases. Don't double-create the
+            // window — but do log a rebind so a later hotkey-misroute is
+            // traceable.
+            if (rebind) {
+                logLine('OVERLAY', 'takeover overlay rebound to new session',
+                        { session_id: sessionId });
+            }
             return;
         }
         logLine('OVERLAY', 'show takeover overlay', { session_id: sessionId });
@@ -118,12 +143,15 @@ function createTakeoverOverlay(deps) {
         try {
             const ok = globalShortcut.register(accelerator, () => {
                 logLine('OVERLAY', 'revoke hotkey fired',
-                        { session_id: sessionId });
-                // session_id is mandatory — see module header.
+                        { session_id: currentSessionId });
+                // session_id is mandatory — see module header. Read the
+                // live binding, not the sessionId this closure captured at
+                // registration time, so a later rebind (show() for a new
+                // session while the window/hotkey stay up) is honoured.
                 writeToBridge({
                     type: 'user_input',
                     kind: 'desktop_takeover_revoked',
-                    session_id: sessionId,
+                    session_id: currentSessionId,
                 });
             });
             if (!ok) {
@@ -136,7 +164,18 @@ function createTakeoverOverlay(deps) {
         }
     }
 
-    function hide() {
+    function hide(sessionId) {
+        if (sessionId !== undefined && sessionId !== currentSessionId) {
+            // Stale/superseded `ended` — a more recent show() has already
+            // rebound the overlay to a different session. That session is
+            // still using the overlay; ignore this one rather than tearing
+            // it down out from under it.
+            logLine('OVERLAY', 'ignoring stale hide for superseded session', {
+                session_id: sessionId,
+                current_session_id: currentSessionId,
+            });
+            return;
+        }
         // Always free the shortcut even if the window object is already gone.
         try {
             if (globalShortcut.isRegistered(accelerator)) {
@@ -146,6 +185,7 @@ function createTakeoverOverlay(deps) {
             logLine('OVERLAY', 'revoke hotkey unregister error',
                     { err: err && err.message });
         }
+        currentSessionId = null;
         if (!takeoverOverlay || takeoverOverlay.isDestroyed()) {
             takeoverOverlay = null;
             return;

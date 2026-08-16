@@ -613,7 +613,16 @@ def _new_client(
         except _paramiko.AuthenticationException as exc:
             last_error = exc
             _is_auth_failure = True
-        except (_paramiko.SSHException, OSError) as exc:
+        except _paramiko.SSHException as exc:
+            last_error = exc
+            # Bare SSHException (no dedicated subclass) raised when there were
+            # literally no credentials to try — no keys, no agent, no password.
+            # Retrying with backoff can't change that outcome, unlike other
+            # SSHException causes (banner errors, transient negotiation drops)
+            # which remain retryable below.
+            if "No authentication methods available" in str(exc):
+                _is_auth_failure = True
+        except OSError as exc:
             last_error = exc
 
         if not connected and password:

@@ -194,16 +194,47 @@ const DESKTOP_REFRESH_MS = 200;     // max ~5fps desktop-content refresh when bu
 // Corner radius intentionally stays at HandQ's existing 30px (matches
 // `.app { border-radius: 30px }` in styles.css) rather than the demo's own
 // 14px default, which was only sized for its own smaller demo window.
+// Layer-1 tuning parameters. Values are the SHIPPING DEFAULTS the app boots
+// into; Ctrl+Shift+G's Layer-1 sliders overwrite these in memory for A/B and
+// a reload restores them.
+//
+// Retuned 2026-08-02 toward the macOS Sonoma / iOS 26 "liquid glass" look
+// (whose telltales are: a THIN visible edge — not the wide 100px belt we
+// used to have — a small but present chromatic dispersion at that edge, and
+// a hint of interior wash so the surface reads as "material" rather than
+// "hole cut out of the window"). Previous values grew organically while
+// veil was default and no one was actually looking at the shader in
+// isolation; they read as either "invisible edge" or "very heavy frost"
+// depending on the desktop behind. The values below are conservative
+// starting points, all still reachable from the Ctrl+Shift+G sliders — the
+// point is to land somewhere Apple-adjacent by default, not to freeze the
+// look forever.
 const STATE = {
-    edgeThickness: 100,   // px — width of the bend band inward from the rim
-    refraction: 100,       // peak displacement magnitude at the rim
-    dispersion: 1,     // px — peak per-channel spectral spread at the rim
-                          // (independent of refraction — see shader comment)
-    glowStrength: 0,   // additive, color-tinted glow intensity at the rim
-    edgeOpacity: 0.23,   // white-tint mix strength at the rim (near-clear glass)
-    coreOpacity: 0,      // white-tint mix strength at the interior (frosted body)
-    glassAlpha: 0,       // tint mix strength (material color)
-    frostiness: 13,      // extra blur radius, px (0 = off). This blurs the
+    edgeThickness: 32,    // px — width of the bend band inward from the rim.
+                          // macOS liquid glass has a NARROW visible edge, not
+                          // a wide gradient into the interior. 32 keeps the
+                          // rim readable at 30px corner radius without
+                          // consuming the card body.
+    refraction: 80,        // peak displacement magnitude at the rim.
+                          // Was 100 (max). 80 leaves headroom for a bigger
+                          // rim on hover / active state without hitting the
+                          // ceiling.
+    dispersion: 3,        // px — peak per-channel spectral spread at the rim.
+                          // Was 1 (near-zero). The chromatic prism at rim
+                          // corners is Apple's most-copied liquid-glass tell.
+                          // 3 gives a visible-but-restrained fringe.
+    glowStrength: 0.06,   // additive, color-tinted glow intensity at the rim.
+                          // Was 0. Small values read as "light-emitting"
+                          // material; 0 reads as "cut hole".
+    edgeOpacity: 0.32,    // white-tint mix strength at the rim.
+                          // Was 0.23. Bumped so the rim is legibly present
+                          // over any desktop backdrop, not just dark ones.
+    coreOpacity: 0.08,    // white-tint mix strength at the interior.
+                          // Was 0. Small nonzero gives the glass "body" —
+                          // matches Apple's practice of implying a material
+                          // rather than showing pure passthrough.
+    glassAlpha: 0,        // material tint mix strength (kept neutral).
+    frostiness: 13,       // extra blur radius, px (0 = off). This blurs the
                          // DESKTOP seen through the glass, which is what makes
                          // low-opacity surfaces (sidebar activity/files lists,
                          // card empty states) readable — text sits on a smooth
@@ -234,19 +265,23 @@ const STATE = {
 // CSS vars, nothing is written to localStorage. Every launch boots to 'webgl'
 // (the shipping default) and a reload discards whatever was tried — so
 // experimenting in the panel never changes what real users get.
-//   webgl — the desktopCapturer + shader canvas (default; current behavior)
+//   webgl — the desktopCapturer + shader canvas (default; real desktop blur)
 //   veil  — translucent white CSS panel: high transparency, ~zero GPU cost,
 //           with a pure-CSS colored rim (see #glass-fallback in styles.css)
 const GLASS_MODES = ['webgl', 'veil'];
-// veil is now the shipping default layer-1 (WebGL is opt-in via the panel).
-// These are the tuned values: near-clear background, dense cards, mid rim.
+// Alpha values for the veil-mode fallback surface (only consulted when
+// _glassMode is 'veil'). webgl mode ignores these — the shader provides
+// its own frost via u_frostiness / u_coreOpacity.
 const GLASS_BG_ALPHA_DEFAULT = 0.05;    // background veil white-fill alpha (near-clear)
 const GLASS_CARD_ALPHA_DEFAULT = 0.88;  // card white-fill alpha (dense, legible)
 // Edge-glow intensity (0..1) seeded when entering veil. Drives the rim +
 // traveling sheen in styles.css (#glass-fallback::before/::after).
 const FALLBACK_EDGE_VEIL = 0.55;
 
-let _glassMode = 'veil';                // current mode (in-memory; resets to this on reload)
+let _glassMode = 'webgl';               // shipping default — real desktop blur via shader.
+                                        // Kept as a `let` so the Ctrl+Shift+G panel can flip
+                                        // to 'veil' at runtime for A/B without reloading.
+                                        // Every reload boots back to this value.
 let _glassRunning = false;              // is the WebGL layer live?
 let _teardownGlass = null;              // fn to stop+remove it (set inside initGlass)
 let _glassRequestRedraw = () => {};     // repointed at the live closure's requestRender;
@@ -255,10 +290,28 @@ let _glassRequestRedraw = () => {};     // repointed at the live closure's reque
 
 function getGlassMode() { return _glassMode; }
 
+// Ask main to match content protection (WDA) to the active glass mode. webgl
+// MUST have it on (the desktopCapturer shader samples the real screen and would
+// otherwise recursively capture its own output); veil is a pure-CSS surface
+// with no self-capture concern, so releasing protection lets the window show up
+// in ordinary OS screenshots/recordings. Guarded — the bridge method is absent
+// on older preloads, and it's a no-op off win32 anyway.
+function requestContentProtection(on) {
+    try {
+        if (window.glassCapture && typeof window.glassCapture.setContentProtection === 'function') {
+            window.glassCapture.setContentProtection(on);
+        }
+    } catch (e) {
+        _logToFile('WARN', 'requestContentProtection failed', { on, message: e && e.message });
+    }
+}
+
 // Seed the fallback density CSS vars to their defaults once at startup. The
-// panel sliders then override them live; nothing is persisted. Edge is seeded
-// to the veil default too (veil is the boot mode) so the rim is correct from
-// frame 1 — applyGlassMode() will re-assert it, but this avoids a flash.
+// panel sliders then override them live; nothing is persisted. Values only
+// take effect if the user switches to 'veil' mode from Ctrl+Shift+G — the
+// shipping default is 'webgl', which unmounts the fallback element entirely.
+// Seeded up front so if the mode DOES flip, the vars are already in place
+// and there's no first-paint flash.
 function applyFallbackDensity() {
     const root = document.documentElement.style;
     root.setProperty('--fallback-bg-alpha', String(GLASS_BG_ALPHA_DEFAULT));
@@ -289,6 +342,9 @@ async function applyGlassMode(mode) {
         // Leave fallback mode: drop the card fill override + the veil.
         document.body.classList.remove('glass-fallback');
         unmountFallback();
+        // Re-assert content protection BEFORE the capture spins up, so the very
+        // first frame the shader samples already excludes our own window.
+        requestContentProtection(true);
         if (!_glassRunning) await initGlass();
         return;
     }
@@ -298,6 +354,9 @@ async function applyGlassMode(mode) {
     // over to a solid fill (see styles.css) so cards read as a distinct pane
     // above the background veil.
     if (_glassRunning && _teardownGlass) _teardownGlass();
+    // Veil is pure CSS — no self-capture risk — so release content protection,
+    // making the window visible in ordinary OS screenshots/recordings.
+    requestContentProtection(false);
     document.body.classList.add('glass-fallback');
     mountFallback();
     // Seed the colored-rim intensity. The panel's "Edge glow" slider can
@@ -519,6 +578,72 @@ async function initGlass() {
     // static desktop still triggers redraws, lower if real changes are missed.
     const SAMPLE_DIFF_THRESHOLD = 800;
     let _sampleCanvas = null, _sampleCtx = null, _prevSample = null;
+    // Text-legibility luma bridge — the ONE piece of ground truth this file
+    // has that CSS doesn't: an actual sample of the real desktop pixels
+    // behind the glass. Previously text legibility was solved two other
+    // ways, both wrong in a way that shows up as "white text on a white
+    // desktop" or "black text on a black desktop":
+    //   1. A fixed dark --fg color assumed the plate under it was always
+    //      light. True whenever the plate was still there, but broke the
+    //      moment any panel dropped its plate for a lighter treatment.
+    //   2. mix-blend-mode: difference computes `|desktop - text|` per
+    //      channel — correct ONLY if what's actually painted under the
+    //      text is the true, unmodified desktop color. It never was: the
+    //      shader tints everything it touches (coreOpacity mix, saturation
+    //      lift, tintColor blend — see the fragment shader above), so a
+    //      "white" desktop reaches the text layer as some off-white the
+    //      shader produced, and |off-white − white| can land anywhere
+    //      from near-zero (invisible text) to a saturated color, not a
+    //      clean black/white flip.
+    // Fixing this needs a real measurement, not a smarter blend formula:
+    // sample what's actually behind the glass, average its luminance, and
+    // pick a text color from that number directly.
+    //
+    // SCOPE: this whole sampler lives inside initGlass(), which only runs
+    // in webgl mode (see applyGlassMode). In veil mode there is no video
+    // element to sample — html.desktop-is-dark simply never gets toggled,
+    // so every --label token stays on its light-desktop (default) value.
+    // Currently fine since webgl is the shipping default (see _glassMode
+    // above), but if veil ever becomes reachable again as a real fallback
+    // rather than a dev-panel A/B choice, it will need either its own
+    // (cheaper) sampling path or an explicit "assume dark" opt-out.
+    //
+    // Published as a DISCRETE class (html.desktop-is-dark), not a continuous
+    // --desktop-luma number for CSS to threshold itself — CSS custom
+    // properties have no native conditional ("if > 0.5 then A else B")
+    // without registering @property + a discrete-step @property animation,
+    // which is more machinery than a one-line JS comparison buys back.
+    // Hysteresis (two thresholds, not one) stops the class from flapping
+    // when the sampled luma sits right at the boundary — e.g. a slightly
+    // patterned grey desktop that averages to ~0.5 would otherwise toggle
+    // every refresh tick as sub-pixel sampling noise nudges it either side
+    // of a single cutoff. Once dark, luma has to climb above 0.58 to flip
+    // back to light, and vice versa at 0.42.
+    const LUMA_TO_LIGHT = 0.58;
+    const LUMA_TO_DARK = 0.42;
+    let _lumaRafId = 0;
+    let _isDarkDesktop = false;
+    function _publishDesktopLuma(sample) {
+        if (_lumaRafId) return;
+        _lumaRafId = requestAnimationFrame(() => {
+            _lumaRafId = 0;
+            let sum = 0;
+            const n = sample.length / 4;
+            for (let i = 0; i < sample.length; i += 4) {
+                // Rec. 601 luma. Matches the shader's own `dot(color,
+                // vec3(0.299,0.587,0.114))` (see fragment shader above) so
+                // the CSS-side threshold and the shader's internal luma
+                // concept agree on what "bright" means.
+                sum += 0.299 * sample[i] + 0.587 * sample[i + 1] + 0.114 * sample[i + 2];
+            }
+            const luma = (sum / n) / 255;
+            const nextDark = _isDarkDesktop ? (luma < LUMA_TO_LIGHT) : (luma <= LUMA_TO_DARK);
+            if (nextDark !== _isDarkDesktop) {
+                _isDarkDesktop = nextDark;
+                document.documentElement.classList.toggle('desktop-is-dark', _isDarkDesktop);
+            }
+        });
+    }
     function _desktopChanged() {
         try {
             if (!_sampleCtx) {
@@ -527,8 +652,25 @@ async function initGlass() {
                 _sampleCanvas.height = SAMPLE_H;
                 _sampleCtx = _sampleCanvas.getContext('2d', { willReadFrequently: true });
             }
-            _sampleCtx.drawImage(video, 0, 0, SAMPLE_W, SAMPLE_H);
+            // Crop the sample to the window's own on-screen region (same
+            // ratio math as the shader's u_crop, applied to the video's
+            // native pixel space) rather than the whole display. Without
+            // this, luma was measured against the display's overall
+            // average brightness while the shader tints/labels only the
+            // window's own patch of desktop — e.g. a light desktop patch
+            // under a mostly-dark monitor would read as "dark" and flip
+            // titlebar text to white on a light backdrop (the reported
+            // "HandQ logo text turned white and unreadable" bug).
+            let sx = 0, sy = 0, sw = video.videoWidth, sh = video.videoHeight;
+            if (bounds && bounds.displayWidth && bounds.displayHeight) {
+                sx = (bounds.x / bounds.displayWidth) * video.videoWidth;
+                sy = (bounds.y / bounds.displayHeight) * video.videoHeight;
+                sw = (bounds.width / bounds.displayWidth) * video.videoWidth;
+                sh = (bounds.height / bounds.displayHeight) * video.videoHeight;
+            }
+            _sampleCtx.drawImage(video, sx, sy, sw, sh, 0, 0, SAMPLE_W, SAMPLE_H);
             const cur = _sampleCtx.getImageData(0, 0, SAMPLE_W, SAMPLE_H).data;
+            _publishDesktopLuma(cur);
             if (!_prevSample) { _prevSample = cur; return true; }
             let diff = 0;
             for (let i = 0; i < cur.length; i += 4) diff += Math.abs(cur[i] - _prevSample[i]);
@@ -799,6 +941,18 @@ function installTuningPanel() {
         (container || panelEl).appendChild(row);
     }
 
+    function addCheckbox(label, initialChecked, onChange, container) {
+        const row = document.createElement('label');
+        row.style.cssText = 'display:flex;align-items:center;gap:6px;margin-top:8px;cursor:pointer;';
+        const input = document.createElement('input');
+        input.type = 'checkbox';
+        input.checked = !!initialChecked;
+        input.addEventListener('change', () => onChange(input.checked));
+        row.appendChild(input);
+        row.appendChild(document.createTextNode(label));
+        (container || panelEl).appendChild(row);
+    }
+
     function addModeSelector(onChange) {
         // Radio-style row of buttons for the Layer-1 mode switch. Reflects the
         // in-memory mode and, on click, applies it live + calls onChange so the
@@ -908,6 +1062,78 @@ function installTuningPanel() {
         panelEl.appendChild(modeControls);
         renderModeControls();
 
+        // Text legibility — now driven by a real measurement (see
+        // _publishDesktopLuma above) instead of an A/B toggle. There's
+        // nothing left to switch between: the mix-blend-mode candidate
+        // this used to A/B against is gone (it produced wrong results
+        // whenever the shader's own tint meant the "real" desktop color
+        // never reached the text layer unmodified — the literal bug this
+        // measurement approach exists to fix). Kept as a live readout
+        // rather than deleted outright, since "is the sampler working"
+        // is exactly the kind of thing worth being able to check from
+        // this panel while developing.
+        addSectionHeading('Text legibility');
+        const lumaStatus = document.createElement('div');
+        lumaStatus.style.cssText = 'font-size:11px;opacity:0.85;';
+        function refreshLumaStatus() {
+            const dark = document.documentElement.classList.contains('desktop-is-dark');
+            lumaStatus.textContent = 'Desktop sampled as: ' + (dark ? 'dark (light text)' : 'light (dark text)');
+        }
+        refreshLumaStatus();
+        panelEl.appendChild(lumaStatus);
+        const lumaObserver = new MutationObserver(refreshLumaStatus);
+        lumaObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['class'] });
+        const hint2 = document.createElement('div');
+        hint2.textContent = 'Sampled from the real desktop behind the glass every refresh tick. Flips --label/-secondary/-tertiary between light and dark-mode alpha ladders — see :root in styles.css.';
+        hint2.style.cssText = 'margin-top:4px;opacity:0.6;font-size:10px;';
+        panelEl.appendChild(hint2);
+
+        // Win11 acrylic — system-level frosted glass. Session-only, no
+        // persistence.
+        //
+        // The team's launch-time default was reverted because on some
+        // Win11 builds the panel appeared fully opaque. The actual cause,
+        // confirmed later: at the reverted-time the CSS veil was still
+        // painted on TOP of acrylic at its default 0.05 alpha, and dark-
+        // system-theme Windows tints acrylic grey — so "acrylic + light
+        // grey veil" composed to a solid greyish rectangle. The fix has
+        // two moves this toggle does together: main.js flips nativeTheme.
+        // themeSource to 'light' so Windows tints acrylic white (matching
+        // HandQ's light palette instead of fighting it), and we dial the
+        // CSS veil to 0 (acrylic IS the frost — keeping a white wash on
+        // top just dulls the blur).
+        //
+        // Both moves reverse when the toggle goes off: veil restored to
+        // whatever the sliders were showing before, themeSource back to
+        // 'system' so the window follows the OS theme again.
+        if (window.glassCapture && typeof window.glassCapture.setBackgroundMaterial === 'function') {
+            addSectionHeading('Window frost (Win11 acrylic)');
+            const veilRoot = document.documentElement.style;
+            let savedBgAlpha = null;
+            addCheckbox(
+                'system frosted glass (setBackgroundMaterial: acrylic)',
+                false,
+                (checked) => {
+                    if (checked) {
+                        savedBgAlpha = getComputedStyle(document.documentElement)
+                            .getPropertyValue('--fallback-bg-alpha').trim() || String(GLASS_BG_ALPHA_DEFAULT);
+                        veilRoot.setProperty('--fallback-bg-alpha', '0');
+                        window.glassCapture.setBackgroundMaterial('acrylic');
+                    } else {
+                        window.glassCapture.setBackgroundMaterial('none');
+                        veilRoot.setProperty('--fallback-bg-alpha',
+                            savedBgAlpha != null ? savedBgAlpha : String(GLASS_BG_ALPHA_DEFAULT));
+                        savedBgAlpha = null;
+                    }
+                    _glassRequestRedraw();
+                },
+            );
+            const hint3 = document.createElement('div');
+            hint3.textContent = 'System DWM desktop blur. Forces this window to light theme so the acrylic tints white, and hides the CSS veil while active. Turn OFF to restore the transparent + veil layer.';
+            hint3.style.cssText = 'margin-top:4px;opacity:0.6;font-size:10px;';
+            panelEl.appendChild(hint3);
+        }
+
         document.body.appendChild(panelEl);
         return panelEl;
     }
@@ -951,6 +1177,13 @@ function init() {
     // selector, which is the only way to switch back to 'webgl' when we boot in
     // a CSS fallback mode (initGlass() no longer runs in that case).
     installTuningPanel();
+    // Text legibility no longer needs a boot-time class flip — it's driven
+    // continuously by _publishDesktopLuma's real measurement of the desktop
+    // behind the glass (see that function + the --label token comments in
+    // styles.css's :root). html.desktop-is-dark starts unset (light-text
+    // assumption) and corrects itself within one refresh tick of glass
+    // startup once the first frame is sampled.
+
     // Apply the persisted mode. applyGlassMode() calls initGlass() itself when
     // the mode is 'webgl', so the WebGL layer only spins up on demand.
     applyGlassMode(getGlassMode()).catch((e) => {

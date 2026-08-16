@@ -157,7 +157,18 @@ class ToolResult:
         """
         d: dict = {"ok": self.success}
         if self.superseded_note is not None:
-            d["out"] = self.superseded_note  # heavy output elided to save context
+            # Heavy output elided to save context — but NEVER the failure
+            # reason. Eliding a failed observation down to {ok:false, out:"…
+            # elided…"} tells the agent "something failed here, cause unknown",
+            # which is exactly the state that makes it re-walk a dead path. It
+            # also silently discarded the skill `process_hints` that
+            # DesktopTool._error attaches to hard failures, so app-specific
+            # guidance survived only on the single newest occurrence.
+            d["out"] = self.superseded_note
+            if not self.success:
+                d["err"] = self.error or _failure_summary(self.output)
+            if self.exit_code is not None:
+                d["exit_code"] = self.exit_code
             return d
         if self.success:
             d["out"] = self.output

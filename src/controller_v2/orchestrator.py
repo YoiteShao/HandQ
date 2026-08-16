@@ -149,6 +149,7 @@ class Orchestrator:
         on_state_changed: Optional[Callable[[str], Any]] = None,
         on_recall_started: Optional[Callable[[], Any]] = None,
         on_task_complete: Optional[Callable[[], Awaitable[None]]] = None,
+        on_intent_classified: Optional[Callable[[str], Any]] = None,
         session_dir: Optional[str] = None,
         session_ctx: Optional["SessionContext"] = None,
     ):
@@ -174,6 +175,17 @@ class Orchestrator:
         # close so Chromium doesn't linger between tasks in the same session.
         # Optional; ``None`` = no cleanup callback.
         self._on_task_complete = on_task_complete
+        # Fires once per on_user_message call, right after this turn's FINAL
+        # intent lane is settled (chat/queue/interrupt — after the
+        # commitment-leak guard has had its say, never the raw pre-guard LLM
+        # value). Session-resume's bridge-side gate is the reason this
+        # exists: bridge needs to know the instant a turn resolves to a real
+        # task ("queue") so it can permanently stop searching + withdraw
+        # whatever candidate card is showing, without waiting for
+        # on_user_message's return value (which is just a reply string and
+        # carries no lane information). "chat"/"interrupt" are deliberately
+        # inert here — see the callback's bridge-side consumer for why.
+        self._on_intent_classified = on_intent_classified
         self._session_dir = session_dir
         # Holds SessionContext.active_goal — the standing-goal check-in state.
         # Optional so tests/fixtures that don't need goal support can omit it;
@@ -193,6 +205,15 @@ class Orchestrator:
         # whether a non-empty reply still needs a batch emit.
         self._last_response_streamed: bool = False
 
+        # Diagnostic detail for the most recent LLM-call failure inside
+        # _call_and_parse_streaming (the caught exception, or the raw
+        # non-JSON output that survived both the streaming attempt and the
+        # non-streaming retry). Reset to None at the top of every
+        # _call_and_parse_streaming call — surfaced verbatim in the
+        # "no usable reply" fallback so the user sees the real cause instead
+        # of a placeholder sentence.
+        self._last_llm_error: Optional[str] = None
+
         self._task_channel.on_item_done(self._on_item_done_sync)
         # Mechanical hard-stall concerns are stored on the channel and read
         # passively by INTENT (via render_state_for_coordinator) — no
@@ -200,6 +221,18 @@ class Orchestrator:
         # registered via on_progress_concern: there is nothing for the
         # Coordinator to DO when a concern arrives, only something for it to
         # SHOW when asked later.
+
+    # ── Session-resume restore (session_digest.py) ────────────────────────────
+
+    def restore_conversation(self, history: List[Dict[str, str]]) -> None:
+        """Reinstate a digest's verbatim conversation on a resumed session.
+
+        Plain replace — history is verbatim user/assistant text (no live
+        state), and _format_conversation_history (below) is a pure reader
+        that works the same whether conversation_history was built up turn
+        by turn or injected all at once here.
+        """
+        self.conversation_history = list(history)
 
     # ── User message (single entry point) ────────────────────────────────────
 
@@ -235,7 +268,7 @@ class Orchestrator:
                 f"[Orchestrator] on_user_message error: {e} — fallback",
                 component="Orchestrator",
             )
-            fallback = "Got it — I'll incorporate your message."
+            fallback = f"⚠ Failed to process that message: {type(e).__name__}: {e}"
             self.conversation_history.append({"role": "assistant", "content": fallback})
             if self._on_reply_to_user:
                 self._on_reply_to_user(fallback)
@@ -315,6 +348,20 @@ class Orchestrator:
             )
             intent = "queue"
 
+        # intent is now FINAL for this turn (guard above can no longer touch
+        # it) — this is the one point callers outside the lane-routing logic
+        # below should learn what actually happened. See __init__'s
+        # _on_intent_classified docstring for why this exists and why it
+        # fires here rather than at the raw parsed.get("intent") value.
+        if self._on_intent_classified:
+            try:
+                self._on_intent_classified(intent)
+            except Exception as e:
+                self.logger.warning(
+                    f"[Orchestrator] on_intent_classified callback raised: {e!r}",
+                    component="Orchestrator",
+                )
+
         is_task = intent in ("queue", "interrupt")
 
         # Standing-goal declaration/cancellation is orthogonal to the intent
@@ -331,7 +378,7 @@ class Orchestrator:
         # message (no task implication at all) overwrite the slot and get
         # echoed to the running agent as a directive on its next turn.
         if is_task:
-            self._task_channel.set_latest_user_message(message)
+            self._task_channel.append_user_message(message)
 
         self.conversation_history.append({"role": "assistant", "content": reply or "..."})
 
@@ -345,29 +392,47 @@ class Orchestrator:
             # Emit the reply if it wasn't already streamed. When the INTENT
             # stream fell back to non-streaming (or no chunk hook was set),
             # `_last_response_streamed` is False and the reply still needs to
-            # go out via the batch sink. Fall back to the default sentence
-            # when `reply` is empty (e.g. both the streaming parse AND the
-            # one non-streaming retry in `_call_and_parse_streaming` failed
-            # to produce JSON) — some callers (e.g. the stdio bridge's
-            # `user_input` path) discard this function's return value
-            # entirely and rely solely on the `_on_reply_to_user` callback,
-            # so an empty `reply` must not silently skip the emit.
+            # go out via the batch sink. When `reply` is empty (e.g. both the
+            # streaming parse AND the one non-streaming retry in
+            # `_call_and_parse_streaming` failed to produce JSON), fall back
+            # to a diagnostic sentence instead of a silent placeholder — some
+            # callers (e.g. the stdio bridge's `user_input` path) discard this
+            # function's return value entirely and rely solely on the
+            # `_on_reply_to_user` callback, so an empty `reply` must not
+            # silently skip the emit.
             if not reply and parsed:
                 # JSON parsed fine (parsed is non-empty) but response_to_user
                 # itself was empty/missing — distinct from a total parse
-                # failure (parsed == {}), where the model's actual answer was
-                # silently swallowed by the fallback sentence below. Only
-                # the "non-JSON — one non-streaming retry" WARNING hints at
-                # this from the logs otherwise; this makes the swallow itself
+                # failure (parsed == {}), where `_last_llm_error` below
+                # carries the actual failure detail instead. Only the
+                # "non-JSON — one non-streaming retry" WARNING hints at this
+                # from the logs otherwise; this makes the swallow itself
                 # visible.
                 self.logger.warning(
                     f"[Orchestrator] INTENT parsed successfully but "
                     f"response_to_user was empty (intent={intent!r}) — "
-                    f"falling back to default sentence; model's real answer "
-                    f"was lost",
+                    f"falling back to a diagnostic sentence; model's real "
+                    f"answer was lost",
                     component="Orchestrator",
                 )
-            final_reply = reply or "LLM Service no response."
+            if reply:
+                final_reply = reply
+            elif parsed:
+                # Parsed fine, response_to_user just wasn't populated — show
+                # what the model DID return rather than a generic sentence.
+                final_reply = (
+                    f"⚠ LLM response was missing 'response_to_user' — "
+                    f"parsed fields: {parsed!r}"
+                )
+            else:
+                # Total failure: `_last_llm_error` carries the real cause
+                # (caught exception, or the non-JSON text that survived both
+                # attempts). Only falls back to the generic sentence if that
+                # slot is somehow empty too (defensive; should not happen).
+                final_reply = (
+                    self._last_llm_error
+                    or "⚠ LLM service returned no usable response."
+                )
             if self._on_reply_to_user and not self._last_response_streamed:
                 self._on_reply_to_user(final_reply)
             return final_reply
@@ -408,7 +473,7 @@ class Orchestrator:
         # agent owns decomposition, tool selection, and target discovery —
         # the Coordinator's only job is to get the work into the channel and,
         # for interrupt, abort the in-flight item after the new tail lands.
-        instruction = " ".join(deferred) if deferred else message
+        instruction = message
         force_interrupt = (
             intent == "interrupt"
             and self._task_channel.get_current_item() is not None
@@ -502,6 +567,10 @@ class Orchestrator:
         # below, no fragments are pushed and this stays False so callers know
         # the reply still needs a batch emit.
         self._last_response_streamed = False
+        # Reset the failure-diagnostic slot too — only set below if THIS call
+        # actually fails; a clean run must not leak a stale message from a
+        # previous turn.
+        self._last_llm_error = None
 
         try:
             async for event in call_with_fallback_stream(
@@ -541,7 +610,14 @@ class Orchestrator:
                 return parsed
             # Parse failure (model emitted prose under json_mode, or truncated
             # JSON). A silent None here propagates to `or {}` at the call site.
-            # Retry ONCE non-streaming before giving up.
+            # Capture the actual offending text before retrying, so a total
+            # failure can show the user what the model really said instead of
+            # a generic placeholder.
+            snippet = full_text.strip()
+            self._last_llm_error = (
+                f"model returned non-JSON output ({len(snippet)} chars): "
+                f"{snippet[:300]!r}"
+            ) if snippet else "model returned an empty response"
             self.logger.warning(
                 f"Orchestrator {log_context} stream produced non-JSON "
                 f"({len(full_text)} chars) — one non-streaming retry",
@@ -552,6 +628,7 @@ class Orchestrator:
         except NetworkUnavailableError:
             raise
         except Exception as e:
+            self._last_llm_error = f"{type(e).__name__}: {e}"
             self.logger.warning(
                 f"Orchestrator {log_context} streaming failed: {e} — non-streaming fallback",
                 component="Orchestrator",
@@ -1017,6 +1094,13 @@ class Orchestrator:
         goal was set — not "did the last item succeed", which the Agent's own
         per-item loop already answers on its own. See GoalState's docstring.
         """
+        # Narrow for the type checker: this method is only ever reached via
+        # finalize_completion's `goal = session_ctx.active_goal if session_ctx
+        # else None` short-circuit, so a non-None goal implies a non-None ctx.
+        # Pyright cannot see across that call boundary, and every
+        # `self._session_ctx.active_goal = None` in this method reads as
+        # "attribute access on Optional[SessionContext]" without the assert.
+        assert self._session_ctx is not None
         evidence = completed[goal.baseline_result_count:]
         verdict = await self._judge_goal_satisfaction(goal, evidence)
 

@@ -10,15 +10,41 @@ emergency channel for when operating Windows is inconvenient — it shares the
 same file pipe as Windows, so the two are symmetric and debuggable.
 
 Design (see memory ``linux-handq-design``):
-  * No tmux, no systemd, no LTM / scheduler / personality.
+  * No tmux, no systemd.
   * The daemon is a plain Python process detached with ``setsid``
     (``start_new_session=True``); Windows (or this console) can wake it at any
     time. The *process* persists across Windows power / network loss — an
     in-flight task is NOT replayed if the daemon itself dies (task-level
     durability is out of scope; see the deferred notes in the design).
-  * Windows-only tools are gated off by the ``flow_controller`` platform check,
-    so a bare ``FlowControllerV2`` on Linux already exposes exactly
-    shell / ssh + the file built-ins + the coding context provider.
+
+Platform capability matrix — what a Linux HandQ has and, deliberately, does not.
+There is no single config switch for this; it is the sum of three mechanisms, so
+the whole picture is written down here rather than inferred from scattered gates:
+
+  * Tools: the ONLY gate is ``tool_registry._IS_WINDOWS`` (``tool_registry.py``,
+    NOT ``flow_controller`` — this file's old note said flow_controller and was
+    wrong). Linux registers file built-ins (read/write/edit/glob/grep),
+    shell, ssh (claimable), read_skill, todo_write, spawn_agent/fan_out_agents,
+    notify_user, wait_interval, claim_tool/release_tool, and schedule_wakeup.
+    Everything Windows-only — browser_*, desktop_*, live_shell_*, web_search,
+    email, teams, ask_human, and schedule_create/list/delete — is simply never
+    registered, so it also never appears in the claimable menu.
+  * Process singletons initialised HERE vs on the Windows bridge:
+      - SkillRegistry:  initialised (``_init_skill_registry``). Skills are the
+        one cross-cutting capability a Linux被控 session keeps, so read_skill and
+        the [Available Skills] menu work. Requires the packaged ``Skill/`` dir to
+        ship — see ``packaging/build_linux.sh``.
+      - LongTermMemory: NOT initialised. ``.get()`` returns a null instance, so
+        recall/submit are silent no-ops. A Linux box has no personal history to
+        carry; the embedding model + sqlite it needs are not packaged either.
+      - PersonalityMonitor / activity capture: NOT initialised (Windows-only
+        capture stack; no local user to observe).
+      - Scheduler (cron): NOT initialised, so ``ctx.scheduler`` is None and the
+        Windows-only schedule_create/list/delete are correctly absent.
+        schedule_wakeup does NOT use it (it re-queues on the TaskChannel) and so
+        stays available.
+  * Vision / OCR / screenshots: unreachable — their only callers are the
+    Windows-only desktop_/browser_ tools and the personality capture stack.
 
 Commands:
   handq_linux                  start (if needed) + interactive console
@@ -38,15 +64,34 @@ restart, or someone ran ``--new``). Inside the console, ``new`` starts a fresh
 session and ``status`` inspects the current one without leaving. This is how a
 Linux user tells "same session as before, keep going" from "start over".
 
-File IPC layout (``~/.handq/<user>@<host>/``):
-  state.json            daemon writes coarse status + latest_tool
-                        (includes session_id + working_dir)
-  messages/<id>.txt     inbound goal / follow-up (console AND Windows write here)
-  commands/<id>.json    inbound new_session / interrupt
-  reply/<id>.txt        outbound reply (console fetches it; keyed by message id)
-  .last_seen_session    client-side breadcrumb: session_id this console last saw
-  confirmation_request.json / confirmation_response.json
-                        bidirectional tool / risk / secret / ask_human confirms
+Install root and file IPC layout — everything lives under ONE machine-local root
+(``$HANDQ_ROOT``, resolved by ``handq_setup.sh`` and exported from the per-host
+dispatcher config; see ``_resolve_root``)::
+
+  <root>/                        /local/mnt/workspace/<user>@handq, or /var/tmp/…,
+                                 or ~/handq/<user>@<host> as a last resort
+    handq_linux.dist/            binary + deps + bundled Skill/
+    handq_config.yaml            carries the API key — root is chmod 700
+    state.json                   daemon writes coarse status + latest_tool
+                                 (includes session_id + working_dir)
+    handq.pid
+    messages/<id>.txt            inbound goal / follow-up (console AND Windows write here)
+    commands/<id>.json           inbound new_session / interrupt
+    reply/<id>.txt               outbound reply (console fetches it; keyed by message id)
+    confirmation_request.json / confirmation_response.json
+                                 bidirectional tool / risk / secret / form (ask_human) confirms
+    .last_seen_session           client-side breadcrumb: session_id this console last saw
+    daemon.log  daemon_error.txt
+    skills/                      pushed skills (sibling of the dist, so upgrades
+                                 don't wipe them)
+    workspace/<session_id>/      agent working directory
+
+The root is deliberately NOT under ``$HOME``: in this deployment ``$HOME`` is
+cloud-synced across several physical Linux hosts for the same user, so a
+``$HOME``-based root means two machines share one install and one state directory
+— which is exactly what stopped the same user running a daemon on two machines at
+once. Only the last-resort candidate lives under ``$HOME``, and it carries a host
+segment for that reason.
 """
 from __future__ import annotations
 
@@ -59,6 +104,7 @@ import socket
 import subprocess
 import sys
 import time
+import traceback
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -91,7 +137,7 @@ _IS_FROZEN = bool(getattr(sys, "frozen", False)) or ("__compiled__" in globals()
 __version__ = "0.0.0"
 
 
-# ── IPC layout (~/.handq/<user>@<host>/) ─────────────────────────────────────
+# ── Install root ─────────────────────────────────────────────────────────────
 def _short_host() -> str:
     return socket.gethostname().split(".")[0]
 
@@ -105,21 +151,108 @@ def _user_name() -> str:
         return os.environ.get("USER", "default")
 
 
-HANDQ_DIR = Path.home() / ".handq" / f"{_user_name()}@{_short_host()}"
-STATE_FILE = HANDQ_DIR / "state.json"
-PID_FILE = HANDQ_DIR / "handq.pid"
-MESSAGES_DIR = HANDQ_DIR / "messages"
-COMMANDS_DIR = HANDQ_DIR / "commands"
-REPLY_DIR = HANDQ_DIR / "reply"
+def _root_candidates() -> List[Path]:
+    """The install-root candidate chain, in priority order.
+
+    Must stay in sync with ``handq_setup.sh``'s ``_resolve_handq_root`` and
+    ``remote_handq_tool``'s ``_PROBE``. See :func:`_resolve_root` for why all
+    three exist and why the duplication is bounded.
+    """
+    user = _user_name()
+    return [
+        Path("/local/mnt/workspace") / f"{user}@handq",
+        Path("/var/tmp") / f"{user}@handq",
+        # Last resort only. $HOME is cloud-synced across machines in this
+        # deployment, so this candidate MUST carry the host segment or two
+        # machines land on the same root again.
+        Path.home() / "handq" / f"{user}@{_short_host()}",
+    ]
+
+
+def _root_usable(path: Path) -> bool:
+    """Can we own and write *path*? Mirrors the shell probe's checks.
+
+    A bare ``mkdir`` is not enough: these candidates are multi-user visible and
+    ``/var/tmp`` is sticky, so an existing entry may belong to someone else or be
+    a symlink they planted. And a directory existing is not proof a file can be
+    created in it (per-user quota) — so actually write one.
+    """
+    try:
+        if path.is_symlink():
+            return False
+        if path.exists():
+            if not path.is_dir():
+                return False
+            if hasattr(os, "geteuid") and path.stat().st_uid != os.geteuid():
+                return False
+        else:
+            path.mkdir(parents=True, exist_ok=True)
+        probe = path / f".handq_probe.{os.getpid()}"
+        probe.write_text("", encoding="utf-8")
+        probe.unlink()
+        return True
+    except Exception:
+        return False
+
+
+def _resolve_root() -> Path:
+    """Where this machine's HandQ install and state live.
+
+    ``$HANDQ_ROOT`` is the authority and the normal path: ``handq_setup.sh``
+    resolves the root once and exports it from the per-host dispatcher config
+    (``~/.config/handq/hosts/<shorthost>``), which the dispatcher sources before
+    exec'ing us. Reading it rather than re-deriving it is what keeps this module,
+    the setup script and the Windows probe from drifting apart.
+
+    The candidate chain is only reached when the binary is invoked directly,
+    without going through the dispatcher — a developer running it by hand, or a
+    host whose per-host config has not been written yet. Any divergence between
+    the three implementations can therefore only affect that pre-setup window, and
+    self-heals the moment setup records a root.
+
+    Deliberately NOT under ``$HOME``: in this deployment ``$HOME`` is cloud-synced
+    across several physical Linux hosts for the same user, so a ``$HOME``-based
+    root means two machines share one install directory and one state directory —
+    precisely what stopped the same user running a daemon on two machines at once.
+    Only the last-resort candidate lives under ``$HOME``, and it carries a host
+    segment for that reason.
+    """
+    env_root = os.environ.get("HANDQ_ROOT", "").strip()
+    if env_root:
+        return Path(env_root).expanduser()
+    for cand in _root_candidates():
+        if _root_usable(cand):
+            return cand
+    # Nothing usable. Return the last candidate anyway so the failure surfaces as
+    # a concrete permission/space error against a named path, rather than as a
+    # None deref five frames later.
+    return _root_candidates()[-1]
+
+
+#: Install root: the binary, config, file-IPC pipe, pushed skills and the agent
+#: workspace all live here. Machine-local, so nothing in it is shared between
+#: hosts (see _resolve_root).
+HANDQ_ROOT = _resolve_root()
+STATE_FILE = HANDQ_ROOT / "state.json"
+PID_FILE = HANDQ_ROOT / "handq.pid"
+MESSAGES_DIR = HANDQ_ROOT / "messages"
+COMMANDS_DIR = HANDQ_ROOT / "commands"
+REPLY_DIR = HANDQ_ROOT / "reply"
 PROCESSED_DIR = MESSAGES_DIR / ".processed"
-CONFIRM_REQUEST_FILE = HANDQ_DIR / "confirmation_request.json"
-CONFIRM_RESPONSE_FILE = HANDQ_DIR / "confirmation_response.json"
-DAEMON_LOG = HANDQ_DIR / "daemon.log"
+CONFIRM_REQUEST_FILE = HANDQ_ROOT / "confirmation_request.json"
+CONFIRM_RESPONSE_FILE = HANDQ_ROOT / "confirmation_response.json"
+DAEMON_LOG = HANDQ_ROOT / "daemon.log"
+# Where a pushed skill lands. Deliberately a SIBLING of handq_linux.dist/, not
+# inside it: the deploy script swaps the dist directory wholesale, so a skills dir
+# inside it would be wiped on every upgrade. Keeping it out here also makes the
+# user root differ from the bundled root, which restores the user-shadows-bundled
+# layering SkillRegistry is built around (see _init_skill_registry).
+SKILLS_DIR = HANDQ_ROOT / "skills"
 # Client-side breadcrumb: the session_id this console last talked to. Lets a
 # later invocation distinguish "same session I was on" from "the daemon
 # restarted / someone ran --new since". Written by the client, never the
 # daemon — it records the client's own view, not authoritative state.
-LAST_SEEN_SESSION_FILE = HANDQ_DIR / ".last_seen_session"
+LAST_SEEN_SESSION_FILE = HANDQ_ROOT / ".last_seen_session"
 
 # The msgid whose on_user_message() call is currently on this asyncio Task's
 # call stack — set for the duration of _drain_messages' await, unset outside
@@ -165,13 +298,16 @@ except ValueError:
 
 # ── tiny filesystem helpers ──────────────────────────────────────────────────
 def _ensure_dirs() -> None:
-    for d in (HANDQ_DIR, MESSAGES_DIR, COMMANDS_DIR, REPLY_DIR, PROCESSED_DIR):
+    for d in (HANDQ_ROOT, MESSAGES_DIR, COMMANDS_DIR, REPLY_DIR, PROCESSED_DIR):
         d.mkdir(parents=True, exist_ok=True)
-    # Restrict the IPC root to its owner: anyone who can write here can drive
-    # the agent (submit goals, answer confirmations). Best-effort — a no-op on
-    # filesystems without POSIX permissions.
+    # Restrict the root to its owner: anyone who can write here can drive the
+    # agent (submit goals, answer confirmations), and handq_config.yaml in this
+    # same directory carries the LLM API key. Under $HOME that was covered by the
+    # home directory's own permissions; the machine-local roots this now resolves
+    # to (/local/mnt/workspace, /var/tmp) are multi-user visible, so it has to be
+    # explicit. Best-effort — a no-op on filesystems without POSIX permissions.
     try:
-        HANDQ_DIR.chmod(0o700)
+        HANDQ_ROOT.chmod(0o700)
     except Exception:
         pass
 
@@ -227,6 +363,17 @@ class StateMirror:
         # "" = no task yet, "running" = task in flight, "idle" = settled.
         self._task_status = ""
         self._latest_tool: Optional[Dict[str, Any]] = None
+        # Direct control channel — published in state.json so the Windows side
+        # can read the address over the SSH channel it already uses for
+        # deployment and then switch to a direct connection. Empty/0 when the
+        # daemon is not serving.
+        self._remote_port = 0
+        self._remote_token = ""
+        #: Callable returning a list of {session_id, title, state, ...} dicts for
+        #: the active remote-driven sessions, so state.json can expose them to
+        #: the CLI's --list-sessions / --close-session. Set by the daemon after
+        #: the server starts. None until then (or when not serving).
+        self._remote_sessions_provider = None
 
     # ── wiring ────────────────────────────────────────────────────────────
     def attach_task_channel(self, task_channel: Any) -> None:
@@ -244,6 +391,17 @@ class StateMirror:
 
     def set_task_status(self, status: str) -> None:
         self._task_status = status
+
+    def set_remote_control(self, port: int, token: str) -> None:
+        """Publish the direct-control address into ``state.json``.
+
+        Written here rather than by the server itself so the whole
+        daemon→Windows contract stays in one file with one writer. The token is
+        a secret in a 0700 directory, which is the same protection
+        ``~/.handq/`` already gives the message and reply files.
+        """
+        self._remote_port = int(port)
+        self._remote_token = str(token)
 
     def mark_task_starting(self) -> None:
         """Call the instant a message is drained, before on_user_message runs.
@@ -303,11 +461,28 @@ class StateMirror:
             "status_text": self._status,
             "latest_tool": self._latest_tool,
             "last_updated": datetime.now(timezone.utc).isoformat(),
+            # Direct control channel (docs/fleet_scheduling_design.md §9.8).
+            # 0 / "" when this daemon is not serving.
+            "remote_control_port": self._remote_port,
+            "remote_control_token": self._remote_token,
+            # Active remote-driven sessions (rc-*), so the CLI's --list-sessions
+            # / --close-session can see them. Empty when not serving or when
+            # nobody is connected.
+            "remote_sessions": self._collect_remote_sessions(),
         }
         try:
             _atomic_write_json(STATE_FILE, state)
         except Exception:
             pass
+
+    def _collect_remote_sessions(self) -> list:
+        provider = self._remote_sessions_provider
+        if provider is None:
+            return []
+        try:
+            return provider()
+        except Exception:
+            return []
 
     # ── confirmation routing (async, file-based) ─────────────────────────
     async def request_risk_confirmation(self, description: str):
@@ -343,9 +518,10 @@ class StateMirror:
         resp = await self._await_response("secret", {"prompt": str(prompt)})
         return (resp or {}).get("value", "")
 
-    async def request_user_text(self, prompt: str) -> str:
-        resp = await self._await_response("text", {"prompt": str(prompt)})
-        return (resp or {}).get("value", "")
+    async def request_user_form(self, question: str, fields: list) -> Dict[str, Any]:
+        resp = await self._await_response("form", {"question": str(question), "fields": fields or []})
+        value = (resp or {}).get("value")
+        return value if isinstance(value, dict) else {}
 
     async def _await_response(
         self, kind: str, payload: Dict[str, Any]
@@ -403,6 +579,142 @@ def _unlink(path: Path) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 #  Daemon
 # ─────────────────────────────────────────────────────────────────────────────
+class _LinuxSessionHost:
+    """被控-side ``SessionHost`` for the Linux daemon.
+
+    Each remotely-driven session gets its own ``FlowControllerV2`` in its own
+    session directory, independent of the daemon's single file-IPC session. Two
+    consequences worth naming:
+
+    * ``remote_handq_tool`` (SSH + ``state.json`` polling) and a direct
+      connection can be used at the same time without interfering. That matters
+      during the transition, since the tool stays in place for now.
+    * ``StateMirror`` is deliberately NOT wired as a local mirror. It represents
+      "the one session Windows polls over SSH", and folding remote-session events
+      into it would corrupt the very ``task_status`` the old tool reads.
+    """
+
+    def __init__(self, daemon: "_LinuxDaemon", allow_secret_prompt: bool = False) -> None:
+        self._daemon = daemon
+        self._allow_secret_prompt = allow_secret_prompt
+
+    def describe(self) -> Dict[str, str]:
+        return {"name": socket.gethostname(), "platform": sys.platform}
+
+    async def create_flow(self, session: Any, goal: str) -> Any:
+        from src.remote_control.network_delegate import NetworkUIDelegate
+
+        daemon = self._daemon
+        flow = daemon._build_flow(session.session_id)
+        delegate = NetworkUIDelegate(
+            session,
+            local_delegate=None,
+            allow_secret_prompt=self._allow_secret_prompt,
+        )
+        if flow.interaction_manager is not None:
+            flow.interaction_manager.set_delegate(delegate)
+        # Must be set BEFORE start(): FlowControllerV2.start() reads
+        # self._on_intent_classified once, at Orchestrator construction time
+        # (flow_controller.py's start()), and never again — setting this
+        # after start() would silently bind nothing. _build_flow (shared with
+        # the daemon's own file-IPC session) never wires this hook, because
+        # that path has no resume/task-tracking use for it; a remote session
+        # DOES: marking is_task lets the controller decide, on release,
+        # whether this session is worth a re-adopt record (chat-only
+        # sessions aren't — see RemoteSession.mark_task_started).
+        flow._on_intent_classified = lambda intent: (
+            session.mark_task_started() if intent == "queue" else None
+        )
+        await flow.start()
+        # on_reply_to_user was bound to the daemon's file-IPC reply sink by
+        # _build_flow. For a remote session that sink would write into
+        # reply/<msgid>.txt for messages that have nothing to do with it, so it
+        # is replaced by the delegate's own reply path. This carries the
+        # task-completion summary — the single most important message in the
+        # whole stream — so getting it wrong would be silent and severe.
+        flow._on_reply_to_user = delegate.show_coordinator_reply
+        daemon._remote_flows[session.session_id] = flow
+        # Say it now rather than let the first LLM call say it in 17 minutes.
+        # The controller has no view of this machine's config, so an unusable
+        # daemon has to announce itself into the session the operator is looking
+        # at (the startup ERROR in daemon.log only helps someone already on this
+        # box). Not fatal: the session still exists and becomes useful the moment
+        # the key is fixed and this daemon restarts.
+        if daemon._llm_credential_problem:
+            session.publish_event(
+                "display_error",
+                [f"远端 HandQ 无法调用 LLM：{daemon._llm_credential_problem}"],
+            )
+        return flow
+
+    async def handle_user_input(
+        self, session: Any, kind: str, payload: Dict[str, Any]
+    ) -> None:
+        # desktop_takeover_revoked is the only kind, and desktop_tool is not
+        # registered on Linux (tool_registry.py gates it Windows-only), so there
+        # is nothing to revoke here. Logged rather than silently dropped.
+        if self._daemon._logger:
+            self._daemon._logger.info(
+                f"[handq_linux] ignoring remote user_input kind={kind!r} "
+                "(not applicable on Linux)"
+            )
+
+    async def handle_rpc(
+        self, session: Any, action: str, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        if action != "file_undo":
+            raise ValueError(f"unsupported remote rpc {action!r}")
+        flow = self._daemon._remote_flows.get(session.session_id)
+        if flow is None:
+            raise RuntimeError("session has no flow")
+        return await flow.undo_files(payload.get("item_id"))
+
+    async def push_skills(self, skills: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        from src.infrastructure.skills import SkillRegistry
+
+        registry = SkillRegistry.get()
+        results: List[Dict[str, Any]] = []
+        for entry in skills:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name") or "")
+            files = entry.get("files")
+            files = files if isinstance(files, list) else []
+            results.append(registry.receive_skill_push(name, files))
+        return results
+
+    def on_session_destroyed(self, session: Any) -> None:
+        """Drop this session's flow reference.
+
+        The daemon keeps ``_remote_flows`` so ``handle_rpc`` can find a session's
+        flow; a destroyed session must leave it, or the dict grows for the life of
+        the process and ``stop()`` later tries to destroy flows that are already
+        gone. Cheap here because Linux allocates far less per session than the
+        Windows bridge does — no root log handler, no per-session service list
+        (the daemon's LLM services are shared and closed once in ``stop()``).
+
+        The ``--close-session`` command handler used to pop this itself, which
+        covered exactly one of the four ways a session dies. This covers all of
+        them.
+        """
+        self._daemon._remote_flows.pop(session.session_id, None)
+
+    def on_client_released(self) -> None:
+        """Client sent an explicit Disconnect. A Linux daemon exists ONLY to be
+        driven, so releasing it means its job is done — exit the whole process.
+
+        The server has already destroyed the sessions and dropped the
+        connection by the time this fires; we just need to tear the daemon down.
+        Scheduled on the loop rather than done inline so the dispatch that
+        triggered it can return cleanly first.
+        """
+        if self._daemon._logger:
+            self._daemon._logger.info(
+                "[handq_linux] client released the server — exiting daemon"
+            )
+        self._daemon.request_shutdown()
+
+
 class _LinuxDaemon:
     """Resident FlowControllerV2 + file-IPC pump.
 
@@ -424,8 +736,85 @@ class _LinuxDaemon:
         # Message ids for which the sink has already written the authoritative
         # reply, so _drain_messages' post-return ack write won't clobber it.
         self._final_reply_msgids: set = set()
+        # Direct control channel (docs/fleet_scheduling_design.md). Sessions
+        # driven from a Windows HandQ live here, entirely separate from the
+        # single file-IPC session above — so the legacy remote_handq_tool path
+        # and a direct connection can be in use at the same time without either
+        # noticing the other.
+        self._remote_server: Any = None
+        self._remote_flows: Dict[str, Any] = {}
+        #: "" when this machine can authenticate to the LLM, else the reason it
+        #: cannot. Computed once in start(); see _llm_credential_problem.
+        self._llm_credential_problem: str = ""
+        #: Set by run() so request_shutdown() can trip the loop from a client
+        #: release. None until the daemon's run loop starts.
+        self._stop_event: Any = None
 
     # ── lifecycle ─────────────────────────────────────────────────────────
+    def _init_skill_registry(self) -> None:
+        """Load the Skill roster so read_skill and the [Available Skills] menu
+        work on Linux exactly as they do on Windows.
+
+        This is a process-level singleton the Windows bridge initialises in
+        ``bridge_main`` (:806-832) and the Linux daemon simply never did — so
+        ``SkillRegistry.get()`` fell back to an empty, unscanned instance, the
+        agent's skill prelude vanished, and ``read_skill`` failed for every
+        name while telling the model to "pick one from the menu" that also
+        wasn't there. Skills are the ONE cross-cutting capability a Linux被控
+        session is meant to keep (tools are gated Windows-only, LTM/personality
+        are deliberately off), so this belongs on the boot path, not out of it.
+
+        Requires the packaged ``Skill/`` directory to actually ship (see
+        ``packaging/build_linux.sh``) — without both halves the roster is empty.
+        A broken skill file must never stop the daemon coming up, so this is
+        best-effort and logged, mirroring the Windows try/except.
+
+        The user root is passed EXPLICITLY as ``<root>/skills``. Left to its
+        default, ``_default_skills_root()``'s POSIX branch returns
+        ``_install_dir()/Skill`` — which under a frozen build is
+        ``<root>/handq_linux.dist/Skill``, i.e. the *same physical directory* as
+        the bundled root. Three things went wrong as a result, and this one
+        argument fixes all of them:
+
+          * ``_scan_two_roots`` hit its same-root short-circuit, so the
+            user-shadows-bundled layering silently did not exist and a pushed
+            skill OVERWROTE the shipped copy of the same name (via
+            ``receive_skill_push`` → ``_mirror_files_into``, which rmtree's the
+            target first) — the exact corruption that function's docstring says
+            the design prevents.
+          * The deploy script swaps ``handq_linux.dist`` wholesale, so every
+            pushed skill was deleted on each upgrade.
+          * Under the old ``$HOME``-based layout the directory was cloud-synced,
+            so a push on one host tore up a scan in progress on another.
+        """
+        try:
+            from src.infrastructure.skills import SkillRegistry
+        except Exception:
+            if self._logger:
+                self._logger.warning(
+                    f"[handq_linux] SkillRegistry import failed; skills disabled: "
+                    f"{traceback.format_exc()}"
+                )
+            return
+        try:
+            SkillRegistry.init(SKILLS_DIR)
+        except Exception:
+            if self._logger:
+                self._logger.error(
+                    f"[handq_linux] SkillRegistry.init failed; continuing with "
+                    f"empty registry: {traceback.format_exc()}"
+                )
+            return
+        if self._logger:
+            try:
+                roster = SkillRegistry.get().debug_roster()
+            except Exception:
+                roster = []
+            self._logger.info(
+                f"[handq_linux] SkillRegistry roster: {len(roster)} skill(s): "
+                f"{'; '.join(roster) if roster else '(none)'}"
+            )
+
     async def start(self) -> None:
         from src.infrastructure.logger import (
             initialize_logger, LogLevel, get_logger,
@@ -441,11 +830,19 @@ class _LinuxDaemon:
         except Exception:
             level = LogLevel.INFO
         initialize_logger(
-            name="HandQ", level=level, log_file=None, log_dir=str(HANDQ_DIR)
+            name="HandQ", level=level, log_file=None, log_dir=str(HANDQ_ROOT)
         )
         self._logger = get_logger()
 
         self._consolidated, self._helper = _build_llm_services(self._config_path)
+        self._llm_credential_problem = _llm_credential_problem(self._config_path)
+        if self._llm_credential_problem:
+            self._logger.error(f"[handq_linux] {self._llm_credential_problem}")
+        # Shared pool, so this is wired once here rather than per session — see
+        # _on_llm_server_error for why a per-session closure would be wrong.
+        for svc in list(self._consolidated) + list(self._helper):
+            svc.on_server_error = self._on_llm_server_error
+        self._init_skill_registry()
         session_id = _new_session_id()
         session_dir = self._session_dir(session_id)
         self._mirror = StateMirror(session_id, working_dir=str(session_dir))
@@ -455,24 +852,108 @@ class _LinuxDaemon:
 
         PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
         self._mirror.set_task_status("")
+        await self._start_remote_control(cm)
         self._mirror.snapshot()
         self._logger.info(
             f"[handq_linux] daemon up pid={os.getpid()} session={session_id} "
-            f"workdir={session_dir} ipc={HANDQ_DIR}"
+            f"workdir={session_dir} root={HANDQ_ROOT}"
         )
 
-    def _session_dir(self, session_id: str) -> Path:
-        """The per-session working directory: ~/<workspace_base>/<session_id>/.
+    # ── direct control channel ────────────────────────────────────────────
+    async def _start_remote_control(self, cm: Any) -> None:
+        """Always serve the direct control channel.
 
-        Deterministic from session_id, so both _build_flow (which the agent
-        works inside) and the StateMirror (which reports it to the user via
-        state.json) resolve the exact same path.
+        There is deliberately **no ``serve`` switch on Linux**. A Linux HandQ
+        exists to be driven from somewhere else — it has no local UI, so
+        "someone might be using it locally and should opt in first" (the reason
+        the Windows side has a switch) simply does not apply. Making it
+        unconditional also removes an entire class of failure that bit us in
+        testing: the Windows auto-pair path used to have to SFTP-patch
+        ``remote_control.serve: true`` into the remote config and then restart
+        the daemon for it to take effect — which meant deciding whether it was
+        safe to interrupt a running task just to open a port. None of that code
+        needs to exist now.
+
+        Never raises: a Linux box that cannot bind the port must still work as
+        the file-IPC daemon it already was, so a failure is logged and the
+        address fields in ``state.json`` simply stay empty. The Windows side
+        reads those fields to decide whether a direct connection is available,
+        so "empty" is a meaningful, handled answer rather than an error state.
+        """
+        try:
+            from src.remote_control.serving import RemoteControlConfig
+            from src.remote_control.server import RemoteControlServer
+        except Exception:
+            if self._logger:
+                self._logger.warning("[handq_linux] remote_control unavailable")
+            return
+
+        # There is no `serve` flag any more — a Linux daemon exists to be driven,
+        # so it always listens (see remote_control/serving.py's docstring). The
+        # section's remaining keys — bind, port, max_sessions,
+        # allow_remote_secret_prompt — are honoured.
+        rc_cfg = RemoteControlConfig.from_config(cm.get_config())
+
+        try:
+            token = rc_cfg.resolve_token()
+            server = RemoteControlServer(
+                token=token,
+                host=_LinuxSessionHost(
+                    self, allow_secret_prompt=rc_cfg.allow_remote_secret_prompt
+                ),
+                server_name=socket.gethostname(),
+                max_sessions=rc_cfg.max_sessions,
+            )
+            port = await server.start(rc_cfg.bind, rc_cfg.port)
+            self._remote_server = server
+            assert self._mirror is not None
+            self._mirror.set_remote_control(port, token)
+            # Let state.json expose the live remote sessions to the CLI
+            # (--list-sessions / --close-session). The server's own registry is
+            # the source of truth; we just surface a summary.
+            self._mirror._remote_sessions_provider = self._remote_session_summaries
+            if self._logger:
+                self._logger.info(
+                    f"[handq_linux] remote control listening on "
+                    f"{rc_cfg.bind}:{port}"
+                )
+            # Printed, not just logged, so an operator who started the daemon in
+            # a terminal can copy the pairing string straight out of it — the
+            # manual-pairing path for Linux (design doc §2).
+            from src.remote_control.address import format_address, guess_lan_ip
+
+            print(
+                "CONNECT ME: "
+                + format_address(
+                    guess_lan_ip(), port, token, socket.gethostname()
+                ),
+                flush=True,
+            )
+        except Exception as exc:
+            if self._logger:
+                self._logger.warning(
+                    f"[handq_linux] remote control failed to start: {exc}"
+                )
+
+    def _session_dir(self, session_id: str) -> Path:
+        """The per-session working directory: ``<root>/workspace/<session_id>/``.
+
+        Deterministic from session_id, so both _build_flow (which the agent works
+        inside) and the StateMirror (which reports it to the user via state.json)
+        resolve the exact same path.
+
+        Lives under the machine-local install root rather than ``$HOME`` — the old
+        ``~/<workspace_base>/<session_id>`` was shared across every host whose home
+        is cloud-synced, so two daemons that started in the same second wrote their
+        digests and execution traces into one directory. ``session.workspace_base``
+        still names the subdirectory, so the config knob keeps working; it is just
+        no longer relative to ``$HOME``.
         """
         from src.infrastructure.config_manager import ConfigManager
         cm = ConfigManager(self._config_path)
         sess_cfg = cm.get_section("session") or {}
-        workspace_base = sess_cfg.get("workspace_base", ".workspace") or ".workspace"
-        return Path.home() / workspace_base / session_id
+        workspace_base = sess_cfg.get("workspace_base", "workspace") or "workspace"
+        return HANDQ_ROOT / workspace_base / session_id
 
     def _build_flow(self, session_id: str) -> Any:
         from src.controller_v2.flow_controller import FlowControllerV2
@@ -488,6 +969,11 @@ class _LinuxDaemon:
             config_path=self._config_path,
             on_reply_to_user=self._on_agent_reply,
             helper_llm_services=self._helper,
+            # Passed so the session digest carries a real id rather than "".
+            # The Windows bridge always passes it (stdio_bridge._ensure_flow);
+            # omitting it here made every Linux digest.json — including those a
+            # remote-driven rc- session writes — record an empty session_id.
+            session_id=session_id,
         )
 
     def _bind_mirror(self) -> None:
@@ -495,6 +981,30 @@ class _LinuxDaemon:
         if self._flow.interaction_manager is not None:
             self._flow.interaction_manager.set_delegate(self._mirror)
         self._mirror.attach_task_channel(self._flow._task_channel)
+
+    def _on_llm_server_error(self, msg: str, retry_in: int, attempts_left: int) -> None:
+        """Fan an LLM-service error out to every live remote session.
+
+        Cannot be a per-session closure the way ``stdio_bridge`` does it
+        (``stdio_bridge.py``'s ``_on_llm_server_error``): the Windows bridge builds
+        a pool per session, while this daemon shares one pool across all of them,
+        so the last session created would own the callback and every other
+        operator would be told nothing. Broadcasting is also the honest answer —
+        a server-side problem is session-agnostic.
+
+        Without this, a controller driving this machine saw nothing at all while a
+        retry ladder ran: ``on_server_error`` was only ever wired on the Windows
+        side, so the被控 Linux path had no way to say "still trying".
+        """
+        server = self._remote_server
+        if server is None:
+            return
+        text = f"⚠ 远端 LLM 服务错误：{msg}（{retry_in}s 后重试，还剩 {attempts_left} 次）"
+        for session in server.sessions():
+            try:
+                session.publish_event("show_user_notice", [text, False])
+            except Exception:
+                pass
 
     def _on_agent_reply(self, reply: str) -> None:
         """Sink for ``FlowControllerV2.on_reply_to_user`` — the authoritative reply.
@@ -559,6 +1069,22 @@ class _LinuxDaemon:
             self._logger.info(f"[handq_linux] new session={session_id} workdir={session_dir}")
 
     async def stop(self) -> None:
+        # Remote control first, so attached controllers are told the sessions are
+        # ending on purpose (server_shutdown) rather than seeing a bare socket
+        # close and starting to reconnect to a process that is exiting.
+        if self._remote_server is not None:
+            try:
+                await self._remote_server.stop()
+            except Exception:
+                pass
+            self._remote_server = None
+        for flow in list(self._remote_flows.values()):
+            try:
+                await flow.destroy()
+            except Exception:
+                pass
+        self._remote_flows.clear()
+
         if self._flow is not None:
             try:
                 await self._flow.destroy()
@@ -578,6 +1104,10 @@ class _LinuxDaemon:
         import signal
 
         stop = asyncio.Event()
+        # Expose the stop event so request_shutdown() (called from the server's
+        # on_client_released hook when a client releases us) can trip it from
+        # outside the run loop.
+        self._stop_event = stop
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
             try:
@@ -586,15 +1116,49 @@ class _LinuxDaemon:
                 pass
 
         try:
+            _last_remote_snapshot = 0.0
             while not stop.is_set():
                 await self._drain_commands()
                 await self._drain_messages()
+                # Refresh state.json's remote_sessions list periodically so the
+                # CLI's --list-sessions reflects sessions that came/went via the
+                # direct channel (which doesn't touch the file-IPC snapshot path).
+                if self._remote_server is not None and self._mirror is not None:
+                    now = time.monotonic()
+                    if now - _last_remote_snapshot >= 2.0:
+                        _last_remote_snapshot = now
+                        self._mirror.snapshot()
                 try:
                     await asyncio.wait_for(stop.wait(), timeout=POLL_INTERVAL)
                 except asyncio.TimeoutError:
                     pass
         finally:
             await self.stop()
+
+    def request_shutdown(self) -> None:
+        """Trip the run loop's stop event from outside (e.g. a client release).
+
+        Safe to call from a coroutine running on the daemon's own loop; the
+        next loop iteration sees the event set and falls into ``self.stop()``.
+        """
+        ev = getattr(self, "_stop_event", None)
+        if ev is not None:
+            ev.set()
+
+    def _remote_session_summaries(self) -> list:
+        """Summaries of the live remote-driven sessions, for state.json.
+
+        Reads the server's own session registry (the source of truth) rather
+        than _remote_flows, so the fields match what the client sees
+        (session.describe()). Returns [] when not serving.
+        """
+        server = self._remote_server
+        if server is None:
+            return []
+        try:
+            return [s.describe() for s in server.sessions()]
+        except Exception:
+            return []
 
     async def _drain_commands(self) -> None:
         for cmd_file in sorted(COMMANDS_DIR.glob("*.json")):
@@ -641,6 +1205,29 @@ class _LinuxDaemon:
                 self._mirror.snapshot()
         elif action == "new_session":
             await self._new_session()
+        elif action == "close_session":
+            # CLI --close-session <id>: destroy one remote-driven session.
+            # Goes through the server's registry so the client's tab is told
+            # (session_closed) and the session is really gone, not just detached.
+            # The _remote_flows entry is dropped by
+            # _LinuxSessionHost.on_session_destroyed, which the server calls for
+            # every destruction path rather than only this one.
+            sid = str(cmd.get("session_id") or "")
+            server = self._remote_server
+            if sid and server is not None:
+                try:
+                    await server.close_session_by_id(sid)
+                    if self._mirror is not None:
+                        self._mirror.snapshot()
+                except Exception:
+                    if self._logger:
+                        self._logger.warning(
+                            f"[handq_linux] close_session {sid} failed: "
+                            f"{traceback.format_exc()}")
+        elif action == "exit_server":
+            # CLI-driven full stop of the server role. On Linux that means
+            # exiting the daemon entirely (its only purpose is being served).
+            self.request_shutdown()
 
     async def _drain_messages(self) -> None:
         for msg_file in sorted(MESSAGES_DIR.glob("*.txt")):
@@ -705,7 +1292,17 @@ class _LinuxDaemon:
 
 
 def _new_session_id() -> str:
-    return datetime.now().strftime("session_%Y%m%d_%H%M%S")
+    """A fresh session id: timestamp plus a short random suffix.
+
+    The suffix is not decoration. Second resolution alone collides in practice:
+    ``_new_session`` runs on every ``new_session`` command from the Windows side,
+    and a daemon can be restarted inside the same second. Two sessions sharing an
+    id share a working directory — ``_build_flow``'s ``mkdir(exist_ok=True)``
+    silently reuses it, ``SessionDigest.load`` then adopts the PREVIOUS session's
+    digest as ``prior``, and ``ExecutionRecorder`` appends into the old session's
+    records. Same idiom as ``_submit_message``'s msgid.
+    """
+    return datetime.now().strftime("session_%Y%m%d_%H%M%S_") + uuid.uuid4().hex[:6]
 
 
 def _archive(path: Path) -> None:
@@ -715,6 +1312,37 @@ def _archive(path: Path) -> None:
         os.replace(path, PROCESSED_DIR / path.name)
     except Exception:
         _unlink(path)
+
+
+def _llm_credential_problem(config_path: Optional[str]) -> str:
+    """Return "" if this machine can authenticate to the LLM, else why it cannot.
+
+    A blank ``llm.API_KEY`` is *survivable* on a Windows controller: with an empty
+    key the Anthropic SDK falls back to ``ANTHROPIC_API_KEY`` /
+    ``ANTHROPIC_AUTH_TOKEN`` from the environment, so that machine keeps working
+    and nothing there complains. A daemon has no such environment, so the same
+    blank surfaces as ``TypeError: Could not resolve authentication method`` on the
+    first LLM call of every session — and that is precisely how a blank got here
+    once already: an upgrade wiped the controller's key and its next deploy copied
+    the blank over a key that had been working.
+
+    Checked up front so the failure is one readable line in daemon.log and one
+    immediate message in the operator's tab, rather than a stall.
+    """
+    from src.infrastructure.config_manager import ConfigManager
+
+    llm_cfg = ConfigManager(config_path).get_section("llm") or {}
+    if str(llm_cfg.get("API_KEY") or "").strip():
+        return ""
+    for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
+        if os.environ.get(name, "").strip():
+            return ""
+    return (
+        f"llm.API_KEY 为空（{config_path or 'handq_config.yaml'}），且环境变量 "
+        "ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN 都没有设置 —— 这台机器上的每一次 "
+        "LLM 调用都会失败。请在这台机器的 handq_config.yaml 里填入 llm.API_KEY"
+        "（控制端每次连接时也会自动同步这一段）。"
+    )
 
 
 def _build_llm_services(config_path: Optional[str]) -> Tuple[List[Any], List[Any]]:
@@ -766,7 +1394,7 @@ def _run_daemon(config_path: Optional[str]) -> int:
     except Exception:
         import traceback
         try:
-            (HANDQ_DIR / "daemon_error.txt").write_text(
+            (HANDQ_ROOT / "daemon_error.txt").write_text(
                 traceback.format_exc(), encoding="utf-8"
             )
         except Exception:
@@ -941,8 +1569,45 @@ def _pump_confirmation(handled: set) -> None:
     print()  # break off the silent wait line
     if kind == "secret":
         resp["value"] = getpass.getpass(f"[confirm] {req.get('prompt', 'secret')}: ")
-    elif kind == "text":
-        resp["value"] = _prompt(f"[confirm] {req.get('prompt', 'input')}: ")
+    elif kind == "form":
+        question = str(req.get("question") or "")
+        if question:
+            print(f"[confirm] {question}")
+        answers: Dict[str, Any] = {}
+        for field in req.get("fields") or []:
+            fid = str(field.get("id") or "")
+            if not fid:
+                continue
+            label = str(field.get("label") or fid)
+            ftype = str(field.get("type") or "text")
+            options = field.get("options") or []
+            if ftype == "radio" and options:
+                print(f"  {label}:")
+                for i, opt in enumerate(options, 1):
+                    print(f"    {i}. {opt}")
+                choice = _prompt("  choose number> ").strip()
+                try:
+                    answers[fid] = options[int(choice) - 1]
+                except (ValueError, IndexError):
+                    answers[fid] = choice
+            elif ftype == "checkbox" and options:
+                print(f"  {label}:")
+                for i, opt in enumerate(options, 1):
+                    print(f"    {i}. {opt}")
+                choice = _prompt("  choose numbers (comma-separated)> ").strip()
+                picked = []
+                for tok in choice.split(","):
+                    tok = tok.strip()
+                    if not tok:
+                        continue
+                    try:
+                        picked.append(options[int(tok) - 1])
+                    except (ValueError, IndexError):
+                        pass
+                answers[fid] = picked
+            else:
+                answers[fid] = _prompt(f"  {label}: ")
+        resp["value"] = answers
     elif kind in ("tool", "risk"):
         if kind == "tool":
             label = f"run tool '{req.get('tool_name')}'"
@@ -1079,6 +1744,41 @@ def cmd_exit() -> int:
     return 1
 
 
+def cmd_list_sessions() -> int:
+    """List the active remote-driven sessions (rc-*), for operators managing a
+    headless Linux server. Reads state.json (the daemon keeps it fresh)."""
+    if not _daemon_alive():
+        print("handq_linux: daemon not running.")
+        return 1
+    state = _read_json(STATE_FILE) or {}
+    sessions = state.get("remote_sessions") or []
+    port = state.get("remote_control_port") or 0
+    if not port:
+        print("· server not listening (no remote_control_port in state.json).",
+              file=sys.stderr)
+    if not sessions:
+        print("· no active remote sessions.", file=sys.stderr)
+    else:
+        print(f"· {len(sessions)} active remote session(s):", file=sys.stderr)
+    # Machine-readable list on stdout.
+    print(json.dumps(sessions, ensure_ascii=False, indent=2))
+    return 0
+
+
+def cmd_close_session(session_id: str) -> int:
+    """Destroy one remote-driven session by id. The client's tab is told and
+    cannot recover it."""
+    if not session_id:
+        print("handq_linux: --close-session requires a session id.", file=sys.stderr)
+        return 2
+    if not _daemon_alive():
+        print("handq_linux: daemon not running.")
+        return 1
+    _send_command("close_session", session_id=session_id)
+    print(f"· requested close of session {session_id}.", file=sys.stderr)
+    return 0
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  Arg parsing + dispatch
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1120,6 +1820,11 @@ def _build_parser() -> argparse.ArgumentParser:
                         help="Print the daemon's state.json.")
     parser.add_argument("--exit", action="store_true", dest="cmd_exit",
                         help="Stop the daemon.")
+    parser.add_argument("--list-sessions", action="store_true", dest="cmd_list_sessions",
+                        help="List active remote-driven sessions.")
+    parser.add_argument("--close-session", metavar="ID", default=None,
+                        dest="cmd_close_session",
+                        help="Destroy the named remote session.")
     parser.add_argument("--version", "-V", action="store_true", dest="show_version",
                         help="Print the version and exit.")
     parser.add_argument("--_daemon", action="store_true", dest="run_daemon",
@@ -1145,6 +1850,10 @@ def main() -> None:
         sys.exit(_run_daemon(config_path))
     if args.cmd_exit:
         sys.exit(cmd_exit())
+    if args.cmd_list_sessions:
+        sys.exit(cmd_list_sessions())
+    if args.cmd_close_session is not None:
+        sys.exit(cmd_close_session(str(args.cmd_close_session)))
     if args.cmd_status:
         sys.exit(cmd_status())
     if args.cmd_new:

@@ -36,14 +36,14 @@
     }
 }
 html[data-vt-scope="session"]::view-transition-group(*) {
-    animation-duration: 320ms;
-    animation-timing-function: cubic-bezier(0.22, 1.2, 0.36, 1);
+    animation-duration: 280ms;
+    animation-timing-function: var(--ease-mac-pop);
 }
 html[data-vt-scope="session"]::view-transition-old(*) {
-    animation: session-card-exit 240ms cubic-bezier(0.4, 0, 0.6, 1) forwards;
+    animation: session-card-exit 280ms var(--ease-mac-pop) forwards;
 }
 html[data-vt-scope="session"]::view-transition-new(*) {
-    animation: session-card-enter 400ms cubic-bezier(0.22, 1.2, 0.36, 1) both;
+    animation: session-card-enter 280ms var(--ease-mac-pop) both;
 }
 @media (prefers-reduced-motion: reduce) {
     html[data-vt-scope="session"]::view-transition-old(*),
@@ -183,6 +183,104 @@ html[data-vt-scope="session"]::view-transition-new(*) {
     --hairline-soft:rgba(0, 0, 0, 0.06);
     --hairline-bright: rgba(255, 255, 255, 0.60);
 
+    /* --------- adaptive label colors ("liquid glass" text over an
+       unpredictable desktop) ------------------------------------------
+       Replaces two earlier, both-wrong approaches:
+         1. A fixed dark --fg assumed the plate under text was always
+            light — broke wherever a panel had no plate.
+         2. mix-blend-mode: difference computed `|desktop − text|`, which
+            is only correct if the literal desktop color reaches the text
+            layer unmodified. It never does here — glass-effect.js's WebGL
+            shader tints everything it touches (coreOpacity mix, saturation
+            lift, tint blend), so "white desktop" arrives at the text layer
+            as some shader-tinted off-white, and the difference can land
+            anywhere from near-invisible to a stray color — exactly the
+            "white text on white, black text on black" reports.
+       Fix: glass-effect.js measures the REAL desktop's average luminance
+       (reusing the 32x18 downsample already decoded for the idle-skip
+       redraw check) and toggles html.desktop-is-dark from that live
+       measurement — a discrete flip with hysteresis, not a continuous
+       blend. These tokens are the ONE place that reacts to the flip;
+       every text rule below reads one of these instead of hard-coding a
+       color, exactly like Apple's --color-label / --color-secondary-label
+       vocabulary (see macos-sequoia-clone's globals.css for the reference
+       this mirrors). Alpha ladder matches Apple's real label opacities
+       (label 100%, secondary ~55-60%, tertiary ~35%). */
+    --label:            var(--fg);
+    --label-secondary:  rgba(var(--fg-rgb), 0.58);
+    --label-tertiary:   rgba(var(--fg-rgb), 0.36);
+    --label-separator:  rgba(var(--fg-rgb), 0.12);
+
+    /* --------- token system: RGB triples ---------------------------------
+       Purpose: one canonical channel triple per palette family, consumed by
+       new code as `rgba(var(--fg-rgb), <alpha>)` etc. Every alpha step is
+       then a documented decision instead of an independent literal. The
+       existing --fg/--tint hex forms above are kept as sibling opaque
+       aliases (rgb(var(--fg-rgb)) evaluates to the same colour) so nothing
+       migrates yet — sites gradually convert as they're touched.
+
+       An audit before this landed counted 443 hardcoded colour literals in
+       this file across 63 distinct RGB triples. Just these four cover
+       273 of them (140 white, 71 black, 54 tint, 8 fg), each currently
+       written with 8-39 independent alpha values. Adding --fg-soft-rgb /
+       --fg-mute-rgb / --tint-strong-rgb would cover 31 more; deferred
+       until a site needs a mid-tone at a new alpha (grey text is almost
+       always used at alpha 1, not as an rgba consumer).
+
+       NOT DERIVED FROM the demo's `--color-label/-secondary-label/-
+       tertiary-label/-separator` semantic scheme. Two collisions blocked
+       adopting it verbatim: `--color-separator: rgba(var(--fg-rgb), 0.10)`
+       would silently RE-TINT every hairline (--hairline is rgba(0,0,0,.10),
+       different RGB); and demo's proposal covers only 62 of the 443
+       literals — it misses the two BIGGEST triples (white, black) which
+       are 47% of the total by themselves. Fixing that in a single scheme
+       needed --white-rgb / --black-rgb tokens the demo didn't define. */
+    --fg-rgb:          26, 29, 34;    /* = --fg */
+    --tint-rgb:        184, 175, 196; /* = --tint */
+    --white-rgb:       255, 255, 255;
+    --black-rgb:       0, 0, 0;
+
+    /* --------- token system: radius ------------------------------------
+       Semantic names for the radius values ACTUALLY IN USE (audited: 118
+       decls across 22 distinct px values). This is not the demo's regular
+       4/8/12/16/20/30 ladder — trying to force-fit hit 46 decls that
+       don't land on any step (10px×16 is the second-most-common radius,
+       6px×11 the third, 14px×5, plus 7/9/5/3/2/18px singletons — a
+       6-step ladder can't absorb them without silently changing 46
+       visuals). Instead: name what exists.
+
+       Non-tokenizable multi-value radii are called out inline and stay as
+       literals: .session-card `20px / 14px 14px 20px 20px` (elliptical +
+       asymmetric), .session-card-head `14px 14px 0 0` (top-corners-only),
+       .ss-reopen `16px 4px 4px 16px`, .fc-resize `7px 0 7px 0`. Any
+       single-token substitution loses information there. */
+    --radius-badge:    4px;    /* smallest, pill-shaped tags/dots */
+    --radius-btn-s:    6px;    /* compact icon-button pucks */
+    --radius-btn:      8px;    /* default rectangular button (28 occ.) */
+    --radius-input:    10px;   /* text inputs, list rows (16 occ.) */
+    --radius-panel:    12px;   /* medium-weight panels */
+    --radius-card:     14px;   /* .session-card body (single-value form) */
+    --radius-panel-l:  16px;   /* large panels: sidebar, plan card */
+    --radius-card-outer: 20px; /* card OUTER radius, for concentric math */
+    --radius-app:      30px;   /* the app frame's outer edge */
+    --radius-pill:     999px;  /* fully-round pills */
+    --radius-circle:   50%;    /* circular pucks / avatars */
+
+    /* --------- token system: spacing (4px grid) ------------------------
+       New surface for future code. Not applied to any existing decl:
+       an audit found 299 spacing decls / 395 px tokens, 59.5% of them
+       OFF the 4px grid (10px×60, 6px×48, 14px×35 are individually more
+       common than several on-grid values), so a bulk conversion would
+       change layout across most of the app. The tokens exist so NEW
+       code lands on the grid by default without a policy fight over
+       tuning 235 existing values. */
+    --space-1: 4px;
+    --space-2: 8px;
+    --space-3: 12px;
+    --space-4: 16px;
+    --space-5: 24px;
+    --space-6: 32px;
+
     /* Layer 2 — "card readability" tint. Layer 1 (the WebGL edge-
        refraction canvas in glass-effect.js) is the pure transparent glass
        base; these vars are the SEPARATE knob for how opaque the cards
@@ -217,7 +315,7 @@ html[data-vt-scope="session"]::view-transition-new(*) {
        (::before, the "light-direction highlight band" cue) — the two are
        distinct cues (silhouette edge vs. highlight band) and 0.35 keeps the
        flat edge from doubling the ring into a hard white outline. */
-    --l2-border-alpha: 0.35;
+    --l2-border-alpha: 0;
     /* Plain frosted-glass blur — sits ON TOP of whatever Layer 1's WebGL
        shader already produced underneath (the desktop, refracted/
        dispersed/glowing), so this is compositing a second, ordinary
@@ -270,16 +368,42 @@ html[data-vt-scope="session"]::view-transition-new(*) {
     --tool-fg:      #2c313a;
     --tool-border:  transparent;
 
-    /* Liquid glass shadows — deep colored shadow + inner highlight glow */
-    --shadow-card:    0 2px 4px rgba(0, 0, 0, 0.04),
-                      0 8px 32px rgba(122, 114, 133, 0.08),
-                      0 1px 0 rgba(255, 255, 255, 0.80) inset;
-    --shadow-overlay: 0 24px 80px rgba(0, 0, 0, 0.18),
-                      0 8px 32px rgba(122, 114, 133, 0.10),
-                      0 1px 0 rgba(255, 255, 255, 0.70) inset;
-    --shadow-floating: 0 16px 48px rgba(0, 0, 0, 0.14),
-                       0 4px 16px rgba(122, 114, 133, 0.08),
-                       0 1px 0 rgba(255, 255, 255, 0.65) inset;
+    /* Atomic shadow colors — every box-shadow in the app should source its
+       color from one of these instead of an independent literal (was:
+       rgba(0,0,0,x) drops mixed with an unrelated rgba(122,114,133,x)
+       tint, two unconnected color decisions). All four derive from
+       --fg-rgb, so shadow hue always matches body-text hue by construction
+       — the "hue stays put, source unifies" fix. --shadow-inner-hi is the
+       one exception (white, not --fg-rgb): it plays the top inset
+       highlight line, which is meant to read as a light catching a raised
+       edge, not a tinted shadow. */
+    --shadow-atom-xs:  rgba(var(--fg-rgb), 0.03);
+    --shadow-atom-s:   rgba(var(--fg-rgb), 0.05);
+    --shadow-atom-m:   rgba(var(--fg-rgb), 0.09);
+    --shadow-atom-l:   rgba(var(--fg-rgb), 0.16);
+    --shadow-inner-hi: rgba(255, 255, 255, 0.55);
+
+    /* Liquid glass shadows — deep colored shadow + inner highlight glow.
+       Four-tier ladder shared with the demo: control < card < floating <
+       overlay. Composed from the atoms above so every tier shares one
+       color lineage instead of each tier hardcoding its own literals.
+       CAUTION: .session-card / .task-plan-panel / .agent-todo-panel /
+       .ss-section carry their OWN shadows expressed through
+       --l2-shadow-a-* / -b-* tokens, live-tunable via Ctrl+Shift+G's
+       Layer-2 sliders. Do NOT replace those with --shadow-card — that
+       breaks the Layer-2 tuning UI. */
+    --shadow-control: 0 1px 2px var(--shadow-atom-xs),
+                      0 2px 8px var(--shadow-atom-s),
+                      0 1px 0 var(--shadow-inner-hi) inset;
+    --shadow-card:    0 2px 4px var(--shadow-atom-xs),
+                      0 8px 32px var(--shadow-atom-s),
+                      0 1px 0 var(--shadow-inner-hi) inset;
+    --shadow-floating: 0 16px 48px var(--shadow-atom-m),
+                       0 4px 16px var(--shadow-atom-s),
+                       0 1px 0 var(--shadow-inner-hi) inset;
+    --shadow-overlay: 0 24px 80px var(--shadow-atom-l),
+                      0 8px 32px var(--shadow-atom-m),
+                      0 1px 0 var(--shadow-inner-hi) inset;
 
     /* Liquid glass RING — the defining feature, v3.
        A straight inset box-shadow line (the old --bevel) reads as a flat
@@ -316,10 +440,33 @@ html[data-vt-scope="session"]::view-transition-new(*) {
     --spring: cubic-bezier(0.34, 1.56, 0.64, 1);
     --spring-soft: cubic-bezier(0.22, 1.2, 0.36, 1);
     --ease-glass: cubic-bezier(0.4, 0, 0.2, 1);
+    /* "Apple pop" curve — snappier ease-out-expo feel, used for the
+       unified View Transition curve and the Genie new-session entrance. */
+    --ease-mac-pop: cubic-bezier(0.16, 1, 0.3, 1);
+    /* Sidebar width transition — shape-matched to Windows' native
+       window-resize DWM animation (a steady, evenly-decelerating ease-out).
+       Durations still differ (Windows ~180ms vs sidebar 320ms), but the
+       MOTION SHAPE matches, so the outer window edge and the sidebar's
+       inner edge read as one coherent decelerate rather than two independent
+       curves side by side. An earlier value cubic-bezier(0.16, 0.8, 0.24, 1)
+       reached y=0.8 at x=0.16 — an aggressive "snap-then-linger" that
+       looked visibly out of phase with the outer window's steady curve.
+       Value matches --ease-glass by design; kept as its own token so the
+       sidebar can diverge later without changing every generic-motion
+       consumer. */
+    --ease-sidebar-reveal: cubic-bezier(0.4, 0, 0.2, 1);
 
-    --sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display",
-            "Helvetica Neue", "Segoe UI Variable Text", "Segoe UI Variable",
-            "Segoe UI", system-ui, "Inter", Roboto, sans-serif;
+    /* Font family — `system-ui` is the CSS keyword that resolves to
+       whatever the OS calls its UI font: SF on macOS ≥ 10.11, Segoe UI
+       Variable on Windows 11 (falling back to Segoe UI on Windows 10),
+       Roboto or the desktop's UI font on Linux. Chromium (which is what
+       Electron runs) supports it universally — the previous 10-name stack
+       was defensive against browsers that don't. `sans-serif` at the end
+       covers the pathological case where system-ui resolves to nothing.
+       Whatever the OS chose is also the font that responds to the
+       --fw-<TextStyle> variable-axis weights above, provided its build
+       ships the wght axis (macOS ≥ 10.15, Windows 11). */
+    --sans: system-ui, sans-serif;
     /* Per docs/macos_typography_complete_guide.md §12: `ui-monospace` first
        so macOS gets the OS-optimized mono, then explicit SF Mono / Menlo /
        Cascadia / Consolas fallbacks for older or non-Apple platforms. */
@@ -351,11 +498,61 @@ html[data-vt-scope="session"]::view-transition-new(*) {
 
     /* Weight aliases — macOS UI vocabulary (docs §6). Use these instead of
        raw numbers at the call site so "why is this 600" reads as "semibold
-       emphasized" rather than an arbitrary weight. */
+       emphasized" rather than an arbitrary weight.
+
+       These are the role-name family (regular/medium/semibold/bold) —
+       size-agnostic. Every existing consumer picks a weight this way
+       ("this element wants to read as bold, at whatever size it happens
+       to be"). Below there is a second, size-KEYED family that overlays
+       Apple's optical-weight adjustment: at small sizes strokes need to
+       be a hair thicker to hold their shape, at large sizes a hair
+       thinner not to look chunky. Sites that care about optical
+       correctness opt into the --fw-<TextStyle> tokens; the majority
+       stay on role names. */
     --fw-regular:  400;
     --fw-medium:   500;
     --fw-semibold: 600;
     --fw-bold:     700;
+
+    /* Per-Text-Style weight — optical compensation ladder (Apple system
+       fonts' internal design where smaller sizes ship pre-thickened).
+       Only takes effect on Variable fonts (SF Pro Variable on macOS ≥ 10.15,
+       Segoe UI Variable on Windows 11, and Inter Variable if we ever bundle
+       it). Static fonts snap to the nearest available weight (usually 400
+       or 500 for the body tier, 700 for titles) — same fallback the
+       role-name family has always had, so nothing regresses. Numbers picked
+       against the shipping type scale, not arbitrary: body 450 sits where
+       Apple's own SF Text tunes at 13pt; footnote 560 accounts for stroke
+       loss at 10px. */
+    --fw-largeTitle:  780;
+    --fw-title1:      720;
+    --fw-title2:      650;
+    --fw-title3:      620;
+    --fw-body:        450;
+    --fw-callout:     480;
+    --fw-subheadline: 520;
+    --fw-footnote:    560;
+
+    /* Per-Text-Style letter-spacing (tracking) — same optical principle:
+       at big sizes the space between letters reads as "too airy" (needs
+       negative tracking to pull them in), at small sizes it reads as "too
+       tight" (needs positive tracking to breathe). Numbers hand-tuned
+       against the shipping sizes; not a mathematical function of the
+       size, because kerning tables are not linear.
+
+       Replaces ~15 hand-tuned letter-spacing values scattered across
+       styles.css that ranged from -0.2px to 1.2px with no visible system.
+       Decorative departures (uppercase headers with wide track, tabular
+       time with 0 track) still opt out per-rule — those are intentional
+       visual signals rather than optical corrections. */
+    --tracking-largeTitle:  -0.011em;
+    --tracking-title1:      -0.009em;
+    --tracking-title2:      -0.006em;
+    --tracking-title3:      -0.003em;
+    --tracking-body:         0;
+    --tracking-callout:      0.002em;
+    --tracking-subheadline:  0.006em;
+    --tracking-footnote:     0.012em;
 
     /* White glow halo that lifts dark text off an unpredictable backdrop.
        The right-hand detail panel sits over Layer 1's glass with
@@ -373,6 +570,18 @@ html[data-vt-scope="session"]::view-transition-new(*) {
        `text-shadow: var(--text-halo)` consumer resolves cleanly; flip back
        to a shadow here if the plates are ever dialed far down again. */
     --text-halo: none;
+}
+
+/* Dark-desktop override for the adaptive label ladder above. White with
+   the same alpha steps Apple uses for dark-mode label colors. Toggled by
+   glass-effect.js from a real measurement of the desktop behind the glass
+   — see the --label token comments in :root for why this replaced
+   mix-blend-mode: difference. */
+html.desktop-is-dark {
+    --label:            #fff;
+    --label-secondary:  rgba(var(--white-rgb), 0.68);
+    --label-tertiary:   rgba(var(--white-rgb), 0.42);
+    --label-separator:  rgba(var(--white-rgb), 0.16);
 }
 
 /* ============================================================ */
@@ -394,8 +603,6 @@ html[data-vt-scope="session"]::view-transition-new(*) {
 .tool-card::before,
 .task-plan-panel::before,
 .agent-todo-panel::before,
-.ss-section::before,
-.session-card::before,
 .floating-composer::before,
 .mention-dropdown::before {
     content: '';
@@ -414,13 +621,9 @@ html[data-vt-scope="session"]::view-transition-new(*) {
     mask-composite: exclude;
     pointer-events: none;
 }
-.tb-btn::before,
 .titlebar-new-btn::before,
 .titlebar-island::before,
-.composer-input-wrap > button::before,
-.session-card-close::before,
-.session-card-min::before,
-.session-card-max::before {
+.composer-input-wrap > button::before {
     content: '';
     position: absolute;
     inset: 0;
@@ -439,45 +642,44 @@ html[data-vt-scope="session"]::view-transition-new(*) {
 }
 
 /* ============================================================ */
-/* Liquid Glass — adaptive content plates.                      */
-/* Elements carrying var(--l2-plate) / var(--l2-plate-strong)   */
-/* get their own backdrop-filter: brightness() + blur() so the  */
-/* plate adapts to whatever sits behind it. On dark desktops    */
-/* the brightness lift ensures WCAG-AA text contrast without    */
-/* needing high-opacity white; on light desktops the plate is   */
-/* nearly invisible — a subtle frosted patch, not a white card. */
-/* This is what makes the glass system ADAPTIVE rather than     */
-/* background-dependent. Never raise plate fill opacity to fix  */
-/* readability — raise brightness() instead.                    */
-/* ============================================================ */
-.task-plan-header,
-.agent-todo-header,
-.ss-section-head,
-.ss-header .ss-name {
-    backdrop-filter: blur(6px) brightness(1.4);
-    -webkit-backdrop-filter: blur(6px) brightness(1.4);
-}
-.task-plan-items,
-.agent-todo-items,
-.ss-activity-list,
-.ss-files-list {
-    backdrop-filter: blur(6px) brightness(1.3);
-    -webkit-backdrop-filter: blur(6px) brightness(1.3);
-}
-
-/* ============================================================ */
-/* Session card head — adaptive plate replacing crude text-glow.*/
-/* Rather than painting a 3-layer white text-shadow halo on the */
-/* title (which reads as cheap CSS glow = plastic), the entire  */
-/* head strip now carries a subtle adaptive plate so ALL its    */
-/* content (title, pill, close btn) stays readable on any       */
-/* background without per-element hacks. The plate uses         */
-/* backdrop-filter:brightness() against the card's already-     */
-/* blurred surface, creating adaptive luma boost precisely      */
-/* where it's needed — refined, not crude.                      */
+/* Liquid Glass — text legibility.                              */
+/* Text over this glass used to lean on brightness()-boosted     */
+/* "plate" patches (backdrop-filter: blur+brightness under each   */
+/* label) plus a fixed dark --fg color. Retired: brightness()    */
+/* cannot lift a true-black backdrop (multiplying 0 stays 0), so  */
+/* dark text over a black desktop still failed no matter how the  */
+/* plates were tuned — and per-element plates fighting the panel's */
+/* own translucency were part of what made the sidebar look        */
+/* inconsistent (some labels boxed, some not, alignment fighting   */
+/* the box padding).                                                */
+/* Replaced by glass-effect.js actually measuring the desktop's     */
+/* luminance and flipping html.desktop-is-dark; --label /           */
+/* --label-secondary / --label-tertiary (see :root) resolve to the  */
+/* correct light-or-dark alpha ladder from that single flip. Text    */
+/* sits directly on the glass now — no plate, no per-element         */
+/* backdrop-filter — matching how macOS itself labels sidebar         */
+/* sections (see FinderSidebar-style group labels: bare text in       */
+/* --color-secondary-label directly over the vibrancy material,        */
+/* never boxed). */
 /* ============================================================ */
 
 * { box-sizing: border-box; }
+
+/* Buttons and button-like rows should behave like native controls, not
+   selectable text — clicking/dragging on a label shouldn't leave a text
+   selection behind. Real <button> elements get this for free in most
+   browsers, but Chromium doesn't guarantee it here since these sit inside
+   flex containers with their own user-select; div-based "row" controls
+   (list items, cards, tabs) need it explicitly since they're plain text
+   containers by default. */
+button,
+.admin-tab, .model-tab, .sched-list-item, .skill-toggle,
+.ss-tree-dir, .ss-file-row, .stage-rail-thumb, .ss-resume-row,
+.mention-item, .src-candidate,
+.ss-header .ss-title, .ss-section-head, .ss-section-title, .ss-section-count {
+    user-select: none;
+}
+
 
 html, body {
     height: 100%;
@@ -487,19 +689,29 @@ html, body {
     overflow: hidden;
     color: var(--fg);
     font-family: var(--sans);
-    /* macOS body Text Style — 13px / Regular. Per docs §10, macOS body is
-       intentionally denser than iOS (17pt), because macOS UI runs on mouse
-       + keyboard with sidebars, tables, toolbars, and high info density.
-       The old 15px / weight-520 base was heavier than macOS Regular and
-       optically closer to iOS body size — moving to 13px / 400 aligns the
-       whole app with system convention. Individual chrome and titles opt
-       up via the Text Style tokens (callout / title3 / etc.). */
+    /* macOS body Text Style — 13px, weight from the per-Text-Style
+       optical ladder (--fw-body: 450), tracking neutral (--tracking-body).
+       Was --fw-regular (400) with a global -0.005em tracking; the new
+       tokens replace both — 450 gives body just enough optical weight
+       to hold its own without dragging the whole document to medium,
+       and 0 tracking is where Apple SF Text lands at 13pt.
+
+       Weight and tracking are read as CSS custom properties so any
+       downstream override can still swap them per-element (e.g. an
+       :emphasized run that wants --fw-title3's weight even though it's
+       still body-sized). */
     font-size: var(--fs-body);
-    font-weight: var(--fw-regular);
+    font-weight: var(--fw-body);
     line-height: var(--lh-body);
-    letter-spacing: -0.005em;
+    letter-spacing: var(--tracking-body);
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
+    /* Always-on kerning + ligatures. Chromium's `auto` disables both at
+       body sizes (< 20px), so today's body text lands without the
+       kerning table applied. HandQ's total text volume is small, so the
+       shaping cost is imperceptible; what we get back is correct
+       "fi"/"fl"/"Th" pairs at every size. */
+    text-rendering: optimizeLegibility;
     background: transparent;
 }
 
@@ -823,21 +1035,17 @@ body.glass-fallback .ss-files-list {
 }
 
 .titlebar-brand {
-    /* Callout emphasized (12px / bold). Old rule hard-coded the "SF Pro
-       Display" family for a display-heavy look, but per docs §5 Display
-       optical size is meant for 20pt+ — at 12px SF Text (via var(--sans))
-       renders with correct small-text tracking. Removing the hard family
-       stack also drops the Windows "Segoe UI Semibold" hop that skipped
-       Variable font axes on Segoe UI Variable Display.
-       Single tight shadow provides emergency contrast on dark desktops
-       without the crude "white glow" of the old 3-layer recipe. */
+    /* Fixed dark color, NOT the adaptive --label token. The brand sits
+       directly beside the logo image, which has its own opaque light
+       background baked into the asset — so unlike sidebar/card text (which
+       floats over the literal unpredictable desktop), this text always has
+       a known-light backdrop and should never flip to white. */
     font-family: var(--sans);
     font-size: var(--fs-callout);
     line-height: var(--lh-callout);
     font-weight: var(--fw-bold);
     letter-spacing: 0.3px;
     color: var(--fg);
-    text-shadow: 0 0.5px 2px rgba(255, 255, 255, 0.55);
 }
 
 .titlebar-controls {
@@ -858,8 +1066,9 @@ body.glass-fallback .ss-files-list {
 
 /* Window buttons — small circular pucks (20×20), one size down from the
    previous 22px so they read as secondary next to the centered title pill.
-   Only .tb-close carries a persistent tint (soft red); .tb-min / .tb-max
-   inherit the neutral frost from .tb-btn. */
+   Solid opaque fills (no frost/blur) — .tb-close is macOS-red, .tb-min /
+   .tb-max are pure white. Each sets its own `background`; no shared fill
+   here so there's no transparency to fight. */
 .tb-btn {
     width: 20px;
     height: 20px;
@@ -869,28 +1078,15 @@ body.glass-fallback .ss-files-list {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    cursor: pointer;
+    cursor: default;
     color: var(--fg-soft);
     position: relative;
-    /* Lower fill than the old flat frost (was 0.24) — now that the
-       contour ring + real edge refraction (backdrop-filter's SVG
-       url()) carry the glass identity, a lighter fill lets more of
-       the bent backdrop show through, closer to the reference's
-       actual transparency. */
-    background: rgba(255, 255, 255, 0.16);
-    backdrop-filter: blur(8px) saturate(130%) url(#lg-distort-circle);
-    -webkit-backdrop-filter: blur(8px) saturate(130%) url(#lg-distort-circle);
     transition: background 180ms var(--ease-glass),
                 color 180ms var(--ease-glass),
                 transform 120ms var(--spring);
 }
 .tb-btn svg     {
     width: 12px; height: 12px; display: block;
-    /* Single tight drop-shadow — enough to separate the glyph from dark
-       backdrops without the chunky double-layer halo that screamed
-       "readability hack." The puck's own backdrop-filter already carries
-       the glass identity; this just ensures the SVG stroke reads. */
-    filter: drop-shadow(0 0 0.5px rgba(255, 255, 255, 0.65));
 }
 /* Max/restore icon toggle. The .tb-max button carries both SVGs; renderer.js
    flips the `is-maximized` class in response to main-process maximize /
@@ -900,33 +1096,51 @@ body.glass-fallback .ss-files-list {
 .tb-btn.is-maximized .tb-icon-restore { display: block; }
 .tb-btn:focus   { outline: none; }
 .tb-btn:focus-visible {
-    background: rgba(255, 255, 255, 0.55);
+    outline: 2px solid rgba(184, 175, 196, 0.55);
+    outline-offset: 2px;
 }
 
+/* Inactive-window chrome dimming — real OS windows desaturate their
+   titlebar when they lose focus; frameless windows get nothing for free,
+   so main.js pushes focus/blur and this reads html.window-inactive. */
+html.window-inactive .titlebar-brand,
+html.window-inactive .titlebar-logo { opacity: 0.5; }
+html.window-inactive .tb-btn { opacity: 0.6; }
+
+/* .tb-min / .tb-max — solid pure white (user's explicit ask: no
+   transparency, no grey). Dark icon for contrast against the white disc. */
+.tb-min,
+.tb-max {
+    background: #fff;
+    color: rgba(0, 0, 0, 0.62);
+}
 .tb-min:hover,
 .tb-max:hover {
-    background: rgba(255, 255, 255, 0.55);
-    color: var(--fg);
+    background: #fff;
+    color: rgba(0, 0, 0, 0.85);
+    transform: scale(1.06);
 }
 .tb-min:active,
 .tb-max:active {
-    background: rgba(255, 255, 255, 0.38);
+    background: #ededed;
+    transform: translateY(1px) scale(1.02);
 }
 
 .tb-close {
-    /* Persistent soft red tint — the "close" affordance is colour-coded
-       from base, not just on hover. Deepens on hover for the commit
-       affordance. */
-    background: rgba(232, 130, 130, 0.32);
-    color: rgba(190, 50, 50, 0.90);
+    /* macOS-style solid red — the close affordance is colour-coded from
+       base, not just on hover, matching the reference traffic light. */
+    background: #ff5f57;
+    color: #fff;
 }
 .tb-close:hover {
-    background: rgba(220, 130, 130, 0.90);
+    background: #ff443a;
     color: #fff;
+    transform: scale(1.06);
 }
 .tb-close:active {
-    background: rgba(200, 110, 110, 0.85);
+    background: #e0392f;
     color: #fff;
+    transform: translateY(1px) scale(1.02);
 }
 
 /* ---------- Titlebar centre group + standalone New button ----------
@@ -964,19 +1178,15 @@ body.glass-fallback .ss-files-list {
     border: none;
     border-radius: 50%;
     position: relative;
-    /* Lower fill than the old 0.85 flat frost — the contour ring +
-       real edge refraction now carry the glass identity, so the fill
-       can sit much closer to the reference's actual transparency. */
-    background: rgba(255, 255, 255, 0.28);
-    backdrop-filter: blur(14px) saturate(140%) url(#lg-distort-circle);
-    -webkit-backdrop-filter: blur(14px) saturate(140%) url(#lg-distort-circle);
+    /* Solid opaque white — same treatment as .tb-min/.tb-max (no frost,
+       no transparency, no glass ring). */
+    background: #fff;
     color: var(--tint-strong);
     line-height: 1;
-    cursor: pointer;
+    cursor: default;
     display: flex;
     align-items: center;
     justify-content: center;
-    box-shadow: 0 0 0 0.5px rgba(0, 0, 0, 0.08);
     transition: background 180ms var(--ease-glass),
                 color 180ms var(--ease-glass),
                 transform 120ms var(--spring);
@@ -985,12 +1195,10 @@ body.glass-fallback .ss-files-list {
 }
 .titlebar-new-btn svg {
     width: 14px; height: 14px; display: block;
-    /* Single tight shadow — same refined approach as .tb-btn svg. */
-    filter: drop-shadow(0 0 0.5px rgba(255, 255, 255, 0.65));
 }
 .titlebar-new-btn:hover {
-    background: rgba(184, 175, 196, 0.65);
-    color: #fff;
+    background: #fff;
+    color: var(--tint-strong);
     /* Quarter-turn on hover — the + rotating toward × reads as the "add"
        gesture rather than a bare scale-up. Rides the existing spring
        `transform` transition (declared on the base rule), so this is a
@@ -1001,6 +1209,78 @@ body.glass-fallback .ss-files-list {
     outline: 2px solid rgba(184, 175, 196, 0.5);
     outline-offset: 2px;
 }
+
+/* ---------- 被控状态指示器（标题栏 ⇄） ----------
+   Only present in the DOM's flow when the machine is serving (JS toggles
+   .hidden). Pill-shaped rather than the circle the +/new button uses, so it
+   reads as a status chip, not another action button. Highlights when a remote
+   operator is actually driving a session. */
+.titlebar-serve-indicator {
+    flex: 0 0 auto;
+    height: 20px;
+    padding: 0 8px 0 6px;
+    margin-left: 4px;
+    border: none;
+    border-radius: 10px;
+    display: flex;
+    align-items: center;
+    gap: 3px;
+    background: rgba(255, 255, 255, 0.28);
+    backdrop-filter: blur(14px) saturate(140%);
+    -webkit-backdrop-filter: blur(14px) saturate(140%);
+    color: var(--label-secondary);
+    line-height: 1;
+    cursor: default;
+    box-shadow: 0 0 0 0.5px rgba(0, 0, 0, 0.08);
+    transition: background 180ms var(--ease-glass), color 180ms var(--ease-glass);
+    -webkit-app-region: no-drag;
+    app-region: no-drag;
+}
+.titlebar-serve-indicator.hidden { display: none; }
+.titlebar-serve-indicator svg {
+    width: 14px; height: 14px; display: block; flex: 0 0 auto;
+}
+.titlebar-serve-indicator .serve-indicator-count {
+    font-size: var(--fs-caption2, 11px);
+    font-weight: var(--fw-semibold);
+    min-width: 6px;
+    text-align: center;
+}
+/* Being driven right now: tint it so it's unmistakable at a glance that this
+   machine is under remote control. */
+.titlebar-serve-indicator.active {
+    color: var(--tint-strong);
+    background: color-mix(in srgb, var(--tint-strong) 18%, rgba(255, 255, 255, 0.28));
+}
+/* A remote agent is driving the physical mouse/keyboard THIS INSTANT — a
+   stronger claim than .active ("a remote session exists"). Escalated to the
+   destructive/alert tint because the fullscreen takeover overlay hides between
+   desktop actions while the takeover is still armed, and this chip is what
+   remains visible in that gap. A slow pulse rather than a fast blink: it has to
+   be noticeable without becoming the reason someone stops looking at the
+   titlebar. Animating opacity only, so it stays a compositor-only tween — see
+   the glass-effect jank notes before adding anything that repaints here. */
+.titlebar-serve-indicator.driving-desktop {
+    color: #fff;
+    background: color-mix(in srgb, var(--error-fg) 78%, transparent);
+    animation: serve-driving-pulse 1.8s var(--ease-glass, ease-in-out) infinite;
+}
+@keyframes serve-driving-pulse {
+    0%, 100% { opacity: 1; }
+    50%      { opacity: 0.62; }
+}
+@media (prefers-reduced-motion: reduce) {
+    .titlebar-serve-indicator.driving-desktop { animation: none; }
+}
+.titlebar-serve-indicator:hover {
+    background: rgba(184, 175, 196, 0.5);
+    color: #fff;
+}
+.titlebar-serve-indicator:focus-visible {
+    outline: 2px solid rgba(184, 175, 196, 0.5);
+    outline-offset: 2px;
+}
+
 
 /* ---------- Titlebar Dynamic Island (brand pill morph + menu) ----------
    Collapsed state: rounded pill containing logo + "HandQ".
@@ -1051,7 +1331,12 @@ body.glass-fallback .ss-files-list {
 
 .titlebar-island.expanded {
     width: 150px;
-    height: 140px;
+    /* height is intentionally NOT hardcoded here — see expandIsland() in
+       renderer.js. A fixed pixel value has to be hand-tuned every time a menu
+       item is added or removed (this clipped the bottom item the moment a
+       4th entry was added); JS measures the real content height instead, so
+       this rule never needs touching again regardless of how many items the
+       menu holds. */
     border-radius: 18px;
     background: rgba(255, 255, 255, 0.92);
     backdrop-filter: blur(16px) saturate(115%);
@@ -1059,6 +1344,18 @@ body.glass-fallback .ss-files-list {
     box-shadow:
         0 12px 40px rgba(0, 0, 0, 0.20),
         0 2px 6px rgba(0, 0, 0, 0.08);
+}
+
+/* Collapsing back to the pill re-applies the base rule's SVG url()
+   distortion filter (not GPU-compositable) the instant .expanded is
+   removed, while width/height are still animating back down over
+   380ms — forcing a re-rasterize every frame of that shrink. Swap to
+   plain blur for the whole morph window (JS toggles this class in
+   expandIsland/collapseIsland); the SVG filter only needs to be back
+   once the pill is fully settled. */
+.titlebar-island.island-morphing {
+    backdrop-filter: blur(16px) saturate(115%);
+    -webkit-backdrop-filter: blur(16px) saturate(115%);
 }
 
 .titlebar-island-trigger {
@@ -1071,7 +1368,7 @@ body.glass-fallback .ss-files-list {
     padding: 0 14px;
     background: transparent;
     border: none;
-    cursor: pointer;
+    cursor: default;
     font-family: inherit;
     color: var(--fg);
     outline: none;
@@ -1120,7 +1417,7 @@ body.glass-fallback .ss-files-list {
     font-size: var(--fs-body);
     line-height: var(--lh-body);
     font-weight: var(--fw-medium);
-    cursor: pointer;
+    cursor: default;
     text-align: left;
     transition: background 140ms var(--ease-glass);
     -webkit-app-region: no-drag;
@@ -1279,7 +1576,12 @@ body.glass-fallback .ss-files-list {
     max-width: 100%;
     background: rgba(0, 0, 0, 0.03);
     border: none;
-    color: #3a3f48;
+    /* Near-zero background alpha + the blur inherited from .bubble means
+       this is real glass, not a plate — text must track the same
+       adaptive --label the rest of the glass surfaces use (see the
+       html.desktop-is-dark / --label token comments in :root), not a
+       fixed color that goes illegible over a dark desktop. */
+    color: var(--label);
     text-align: center;
     border-top-left-radius: 16px;
     box-shadow: none;
@@ -1294,7 +1596,9 @@ body.glass-fallback .ss-files-list {
     background: rgba(0, 0, 0, 0.03);
     border: none;
     border-radius: 20px;
-    color: var(--fg-mute);
+    /* Same real-glass reasoning as .bubble.system above — adaptive
+       secondary label instead of the fixed --fg-mute. */
+    color: var(--label-secondary);
     text-align: center;
     word-break: break-word;
     box-shadow: none;
@@ -1342,11 +1646,17 @@ body.glass-fallback .ss-files-list {
     margin: 0.5em 0;
 }
 
-.md-rendered .md-h1 { font-size: var(--fs-title2); line-height: var(--lh-title2); font-weight: var(--fw-bold); letter-spacing: -0.005em; }
-.md-rendered .md-h2 { font-size: var(--fs-title3); line-height: var(--lh-title3); font-weight: var(--fw-bold); }
-.md-rendered .md-h3 { font-size: var(--fs-body); line-height: var(--lh-body); font-weight: var(--fw-bold); }
-.md-rendered .md-h4 { font-size: var(--fs-body); line-height: var(--lh-body); font-weight: var(--fw-semibold); }
-.md-rendered .md-h5 { font-size: var(--fs-callout); line-height: var(--lh-callout); font-weight: var(--fw-semibold); color: var(--fg-soft); }
+.md-rendered .md-h1 { font-size: var(--fs-title2); line-height: var(--lh-title2); font-weight: var(--fw-title2); letter-spacing: var(--tracking-title2); }
+.md-rendered .md-h2 { font-size: var(--fs-title3); line-height: var(--lh-title3); font-weight: var(--fw-title3); letter-spacing: var(--tracking-title3); }
+/* h3/h4 are body-SIZED but heading-ROLED — keep the emphasized weights
+   (bold / semibold) rather than the per-Text-Style body weight (450),
+   otherwise a heading and a paragraph of body copy read identically. */
+.md-rendered .md-h3 { font-size: var(--fs-body); line-height: var(--lh-body); font-weight: var(--fw-bold); letter-spacing: var(--tracking-body); }
+.md-rendered .md-h4 { font-size: var(--fs-body); line-height: var(--lh-body); font-weight: var(--fw-semibold); letter-spacing: var(--tracking-body); }
+.md-rendered .md-h5 { font-size: var(--fs-callout); line-height: var(--lh-callout); font-weight: var(--fw-semibold); letter-spacing: var(--tracking-callout); color: var(--fg-soft); }
+/* Decorative uppercase — keeps its own wide track by design, not
+   optical. tracking-footnote (0.012em ≈ 0.12px) would be far too tight
+   for an all-caps run. */
 .md-rendered .md-h6 { font-size: var(--fs-footnote); line-height: var(--lh-footnote); font-weight: var(--fw-bold); color: var(--fg-mute); text-transform: uppercase; letter-spacing: 0.5px; }
 
 .md-rendered .md-ul,
@@ -1442,7 +1752,7 @@ body.glass-fallback .ss-files-list {
 }
 .tool-card > summary {
     list-style: none;
-    cursor: pointer;
+    cursor: default;
     padding: 8px 12px;
     display: flex;
     align-items: center;
@@ -1497,19 +1807,21 @@ body.glass-fallback .ss-files-list {
     justify-content: center;
     border: none;
     border-radius: 50%;
-    background: rgba(184, 175, 196, 0.15);
+    background: rgba(184, 175, 196, 0.55);
     backdrop-filter: blur(10px) url(#lg-distort-circle);
     -webkit-backdrop-filter: blur(10px) url(#lg-distort-circle);
     color: var(--tint-strong);
-    cursor: pointer;
-    box-shadow: none;
+    cursor: default;
+    box-shadow: inset 0 1px 0 var(--shadow-inner-hi),
+                0 1px 3px var(--shadow-atom-s);
     transition: background 180ms var(--ease-glass),
                 color 180ms var(--ease-glass),
-                transform 180ms var(--spring);
+                transform 180ms var(--spring),
+                box-shadow 180ms var(--ease-glass);
     z-index: 1;
 }
 .composer-input-wrap > button:hover {
-    background: rgba(184, 175, 196, 0.28);
+    background: rgba(184, 175, 196, 0.72);
     color: var(--fg);
     transform: scale(1.08);
 }
@@ -1570,7 +1882,7 @@ body.glass-fallback .ss-files-list {
     line-height: var(--lh-callout);
     font-weight: var(--fw-semibold);
     letter-spacing: 0.01em;
-    cursor: pointer;
+    cursor: default;
     box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.65),
                 inset 0 -0.5px 0 rgba(0, 0, 0, 0.06),
                 0 0 0 0.5px rgba(0, 0, 0, 0.08);
@@ -1657,7 +1969,15 @@ body.glass-fallback .ss-files-list {
 
 .overlay-card {
     width: min(720px, 92vw);
-    max-height: 86vh;
+    /* Hard caps so every variant below (.settings-card, .admin-card, etc.)
+       stays draggable-resizable within a sane range regardless of its own
+       default width — see .overlay-resize-handle + renderer.js's
+       initOverlayCardResize(). Variants used to set their own max-height
+       (84-88vh); consolidated here so the resize cap is uniform. */
+    min-width: 420px;
+    min-height: 320px;
+    max-width: 98vw;
+    max-height: 94vh;
     display: flex;
     flex-direction: column;
     /* Solid white "whiteboard" surface — these utility panels (Settings,
@@ -1679,6 +1999,63 @@ body.glass-fallback .ss-files-list {
     position: relative;
 }
 
+/* The two dialog cards are built in JS (admin-panel.js's confirmDialog,
+   remote-control.js's confirmDialog + pairing dialog) and carry no resize
+   handle, so .overlay-card's clamps above only hurt them: min-height floors a
+   three-line confirm at 320px, leaving a slab of blank space under its
+   buttons, and min-width overrides their own narrower width on small windows.
+   Let them size to content. */
+.confirm-dialog-card,
+.rc-dialog-card {
+    min-width: 0;
+    min-height: 0;
+}
+
+/* User drag-resize corner (bottom-right), wired up by renderer.js's
+   initOverlayCardResize(). Same shape as .terminal-resize-handle, retinted
+   dark-on-light since .overlay-card is an opaque white surface rather than
+   dark glass. */
+.overlay-resize-handle {
+    position: absolute;
+    right: 0;
+    bottom: 0;
+    width: 16px;
+    height: 16px;
+    cursor: nwse-resize;
+    z-index: 10;
+    border-radius: 6px 0 6px 0;
+    background: rgba(0, 0, 0, 0.045);
+}
+.overlay-resize-handle::after {
+    content: '';
+    position: absolute;
+    bottom: 4px;
+    right: 4px;
+    width: 8px;
+    height: 8px;
+    border-right: 2px solid rgba(0, 0, 0, 0.22);
+    border-bottom: 2px solid rgba(0, 0, 0, 0.22);
+}
+
+/* Dragging an overlay's resize handle: kill the card's entrance/settle
+   transitions so the box tracks the pointer 1:1 instead of chasing it
+   through an eased curve (mirrors html.window-resizing below). */
+.overlay-resizing .overlay-card {
+    transition: none !important;
+    animation: none !important;
+}
+
+/* Scrollbar thumb contrast: the global ::-webkit-scrollbar-thumb further
+   down (rgba(184,175,196,0.20)) is tuned for translucent/dark glass
+   surfaces and reads as nearly invisible against .overlay-card's opaque
+   white. Darken it specifically inside these panels. */
+.overlay-card ::-webkit-scrollbar-thumb {
+    background: rgba(120, 105, 140, 0.38);
+}
+.overlay-card ::-webkit-scrollbar-thumb:hover {
+    background: rgba(120, 105, 140, 0.55);
+}
+
 .overlay-header {
     flex: 0 0 auto;
     display: flex;
@@ -1691,9 +2068,9 @@ body.glass-fallback .ss-files-list {
     margin: 0;
     font-size: var(--fs-title3);
     line-height: var(--lh-title3);
-    font-weight: var(--fw-semibold);
+    font-weight: var(--fw-title3);
     color: var(--fg);
-    letter-spacing: -0.005em;
+    letter-spacing: var(--tracking-title3);
 }
 .overlay-close {
     background: transparent;
@@ -1701,11 +2078,20 @@ body.glass-fallback .ss-files-list {
     color: var(--fg-mute);
     font-size: 22px;
     line-height: 1;
-    cursor: pointer;
+    cursor: default;
     padding: 0 8px;
     border-radius: 8px;
+    /* Was: no transition — hover flipped instantly, no focus outline. */
+    transition: background 160ms var(--ease-glass),
+                color 160ms var(--ease-glass),
+                transform 120ms var(--ease-glass);
 }
 .overlay-close:hover { color: var(--fg); background: rgba(0, 0, 0, 0.05); }
+.overlay-close:active { transform: translateY(1px); }
+.overlay-close:focus-visible {
+    outline: 2px solid rgba(184, 175, 196, 0.5);
+    outline-offset: 2px;
+}
 
 /* ---------- Settings overlay ---------- */
 
@@ -1737,15 +2123,15 @@ body.glass-fallback .ss-files-list {
     padding: 14px 18px 18px;
     display: flex;
     flex-direction: column;
-    gap: 14px;
+    gap: 8px;
     min-height: 0;
 }
 .settings-form fieldset {
-    border: 1px solid rgba(0, 0, 0, 0.06);
+    border: 1px solid var(--hairline-soft);
     border-radius: 12px;
-    padding: 12px 14px 14px;
+    padding: 9px 14px 10px;
     margin: 0;
-    background: transparent;
+    background: rgba(0, 0, 0, 0.015);
 }
 .settings-form legend {
     padding: 0 6px;
@@ -1759,7 +2145,7 @@ body.glass-fallback .ss-files-list {
     display: flex;
     flex-direction: column;
     gap: 4px;
-    margin-bottom: 12px;
+    margin-bottom: 9px;
 }
 .settings-form label:last-child { margin-bottom: 0; }
 .settings-form label > span {
@@ -1836,11 +2222,22 @@ body.glass-fallback .ss-files-list {
     border: none;
     padding: 0;
     margin: 0;
-    cursor: pointer;
+    cursor: default;
     color: var(--fg-mute);
     border-radius: 6px;
+    /* Was: hover flipped `color` only, no background — the weakest
+       feedback in the app. Adding the same background-deepen + press
+       treatment used elsewhere; keeps parity with the icon-button
+       recipe without changing the eye glyph. */
+    transition: background 160ms var(--ease-glass),
+                color 160ms var(--ease-glass),
+                transform 120ms var(--ease-glass);
 }
-.settings-form .input-eye-btn:hover { color: var(--fg); }
+.settings-form .input-eye-btn:hover {
+    color: var(--fg);
+    background: rgba(0, 0, 0, 0.05);
+}
+.settings-form .input-eye-btn:active { transform: translateY(1px); }
 .settings-form .input-eye-btn:focus { outline: none; }
 .settings-form .input-eye-btn:focus-visible {
     outline: 2px solid rgba(184, 175, 196, 0.55);
@@ -1852,9 +2249,9 @@ body.glass-fallback .ss-files-list {
 .settings-form .help-text,
 .settings-form small.help-text {
     display: block;
-    margin-top: 4px;
+    margin-top: 3px;
     font-size: var(--fs-subheadline);
-    line-height: 1.5;
+    line-height: 1.4;
     color: var(--fg-mute);
     font-style: normal;
     font-weight: var(--fw-regular);
@@ -1865,8 +2262,8 @@ body.glass-fallback .ss-files-list {
 }
 .settings-form .help-text strong { color: var(--fg); }
 .settings-form .fieldset-intro {
-    margin: 0 0 12px;
-    padding: 8px 10px;
+    margin: 0 0 10px;
+    padding: 7px 10px;
     background: rgba(245, 245, 245, 0.55);
     border-left: 3px solid var(--tint);
     border-radius: 4px;
@@ -1876,37 +2273,41 @@ body.glass-fallback .ss-files-list {
 .model-selector-panel {
     margin-top: 4px;
     border: 1px solid var(--hairline);
-    border-radius: 8px;
+    border-radius: 10px;
     overflow: hidden;
     background: rgba(255, 255, 255, 0.25);
 }
 .model-selector-tabs {
     display: flex;
     gap: 2px;
-    padding: 0 12px;
-    border-bottom: 1px solid var(--hairline);
+    padding: 4px;
+    margin: 4px;
+    border-radius: 8px;
+    background: rgba(0, 0, 0, 0.05);
 }
 .model-tab {
+    flex: 1 1 auto;
     background: transparent;
     border: none;
-    border-bottom: 2px solid transparent;
-    padding: 8px 14px;
-    margin-bottom: -1px;
+    border-radius: 6px;
+    padding: 5px 14px;
     color: var(--fg-mute);
     font: inherit;
     font-size: var(--fs-callout);
     line-height: var(--lh-callout);
-    cursor: pointer;
-    transition: color 120ms, border-color 120ms;
+    cursor: default;
+    transition: color 120ms, background 160ms var(--ease-glass),
+                box-shadow 160ms var(--ease-glass);
 }
 .model-tab:hover { color: var(--fg); }
 .model-tab.active {
     color: var(--fg);
-    border-bottom-color: var(--tint);
+    background: #fff;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12);
     font-weight: var(--fw-semibold);
 }
 .model-tab-panel {
-    padding: 10px 14px;
+    padding: 8px 14px 12px;
     max-height: 180px;
     overflow-y: auto;
 }
@@ -1931,7 +2332,7 @@ body.glass-fallback .ss-files-list {
     margin-bottom: 0;
     padding: 3px 6px;
     border-radius: 6px;
-    cursor: pointer;
+    cursor: default;
     font-family: var(--mono);
     font-size: var(--fs-callout);
     line-height: var(--lh-callout);
@@ -1952,37 +2353,96 @@ body.glass-fallback .ss-files-list {
 
 .settings-form label.checkbox-row {
     display: grid;
-    grid-template-columns: auto 1fr;
+    grid-template-columns: 32px 1fr;
     grid-column-gap: 10px;
     align-items: start;
-    margin-bottom: 10px;
+    margin-bottom: 7px;
+    position: relative; /* anchor for the pill track/thumb pseudo-elements */
 }
 .settings-form label.checkbox-row > input[type="checkbox"] {
-    margin-top: 3px;
+    /* Radix-style pill switch — same recipe as .skill-toggle. The native
+       checkbox stays in the DOM/a11y tree (keyboard focus, checked state,
+       form semantics) but is visually collapsed; ::before/::after on the
+       label itself paint the track/thumb. Column 1 is pinned to a fixed
+       32px (was `auto`, sized from the checkbox's own rendered width) so
+       taking the checkbox out of grid flow here doesn't collapse that
+       track and overlap the pill onto column 2's text. */
+    position: absolute;
+    left: 0;
+    top: 3px;
+    width: 32px;
+    height: 20px;
+    margin: 0;
+    opacity: 0;
+    cursor: default;
+}
+.settings-form label.checkbox-row::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 3px;
+    width: 32px;
+    height: 20px;
+    border-radius: 999px;
+    background: rgba(0, 0, 0, 0.14);
+    transition: background 160ms var(--ease-glass);
+}
+.settings-form label.checkbox-row::after {
+    content: '';
+    position: absolute;
+    left: 2px;
+    top: 5px;
     width: 16px;
     height: 16px;
-    accent-color: var(--tint-strong);
+    border-radius: 50%;
+    background: #fff;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+    transition: transform 160ms var(--ease-glass);
+}
+.settings-form label.checkbox-row:has(> input[type="checkbox"]:checked)::before {
+    background: var(--tint-strong);
+}
+.settings-form label.checkbox-row:has(> input[type="checkbox"]:checked)::after {
+    /* 32 (track) − 16 (thumb) − 2 (start offset) = 14px travel. */
+    transform: translate(14px, 0);
+}
+.settings-form label.checkbox-row:has(> input[type="checkbox"]:focus-visible)::before {
+    outline: 2px solid rgba(184, 175, 196, 0.5);
+    outline-offset: 2px;
 }
 .settings-form label.checkbox-row > span        { grid-column: 2; }
 .settings-form label.checkbox-row > .help-text  { grid-column: 2; margin-top: 2px; }
 
 /* ── Tool groups ───────────────────────────────────────────────────────
- * Each registered tool gets a small bordered card containing the tool
- * name and its switches. Sub-rows are indented so the user can tell at
- * a glance which switches belong to which tool. When Enable is off, the
- * Auto-approve row is hidden (see renderer.js applyEnableVisibility).
+ * Each registered tool gets a small card containing the tool name and
+ * its switches, laid out as a compact grid (macOS grouped-list style —
+ * dense cards rather than one full-width row per tool). Sub-rows are
+ * indented so the user can tell at a glance which switches belong to
+ * which tool. When Enable is off, the Auto-approve row is hidden (see
+ * renderer.js applyEnableVisibility).
  */
+.settings-form .tool-group-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+    gap: 8px;
+}
 .settings-form .tool-group {
-    margin: 0 0 14px;
-    padding: 10px 12px 6px;
-    border: 1px solid var(--hairline);
-    border-radius: 8px;
-    background: rgba(255, 255, 255, 0.30);
+    margin: 0;
+    padding: 10px 12px;
+    border: 1px solid var(--hairline-soft);
+    border-radius: 10px;
+    background: rgba(255, 255, 255, 0.34);
+    transition: background 160ms var(--ease-glass),
+                border-color 160ms var(--ease-glass);
+}
+.settings-form .tool-group:hover {
+    background: rgba(255, 255, 255, 0.55);
+    border-color: var(--hairline);
 }
 .settings-form .tool-group-name {
     font-weight: var(--fw-semibold);
     color: var(--fg);
-    margin-bottom: 8px;
+    margin-bottom: 4px;
     display: flex;
     align-items: center;
     gap: 8px;
@@ -1996,12 +2456,9 @@ body.glass-fallback .ss-files-list {
     background: rgba(184, 175, 196, 0.15);
     color: var(--tint-strong);
 }
-.settings-form label.checkbox-row.tool-sub {
-    margin-left: 18px;
-    margin-bottom: 8px;
-}
-.settings-form label.checkbox-row.tool-sub:last-child {
-    margin-bottom: 4px;
+.settings-form .tool-group label.checkbox-row.tool-sub {
+    margin-left: 0;
+    margin-bottom: 0;
 }
 .settings-form .tool-group label.checkbox-row.tool-sub.is-hidden {
     display: none;
@@ -2010,37 +2467,45 @@ body.glass-fallback .ss-files-list {
 .settings-actions {
     display: flex;
     align-items: center;
-    gap: 10px;
+    gap: 8px;
     flex-wrap: wrap;
     padding-top: 4px;
 }
 .settings-actions button {
-    padding: 8px 16px;
+    padding: 7px 15px;
     border: none;
-    border-radius: 10px;
-    background: rgba(0, 0, 0, 0.05);
+    border-radius: var(--radius-btn);
+    background: rgba(120, 120, 130, 0.16);
     color: var(--fg);
-    cursor: pointer;
+    cursor: default;
     font-family: var(--sans);
+    font-size: var(--fs-callout);
+    line-height: var(--lh-callout);
+    box-shadow: 0 0 0 1px var(--shadow-atom-xs),
+                0 1px 2px var(--shadow-atom-s);
     transition: transform 180ms var(--spring),
-                background 180ms var(--ease-glass);
+                background 180ms var(--ease-glass),
+                box-shadow 180ms var(--ease-glass);
 }
 .settings-actions button:active { transform: translateY(1px) scale(0.97); }
 .settings-actions button[type="submit"] {
-    background: rgba(184, 175, 196, 0.18);
-    color: var(--tint-strong);
+    background: var(--tint-strong);
+    color: #fff;
     font-weight: var(--fw-semibold);
 }
 .settings-actions button:hover {
-    background: rgba(0, 0, 0, 0.08);
+    background: rgba(120, 120, 130, 0.24);
     transform: translateY(-1px);
+    box-shadow: 0 0 0 1px var(--shadow-atom-xs),
+                0 4px 10px var(--shadow-atom-m);
 }
 .settings-actions button[type="submit"]:hover {
-    background: rgba(184, 175, 196, 0.28);
+    background: var(--tint-strong);
+    filter: brightness(1.08);
 }
 
 .settings-form input[readonly]#cfg-hotkey {
-    cursor: pointer;
+    cursor: default;
     text-align: center;
     font-family: var(--mono);
     font-size: var(--fs-callout);
@@ -2064,11 +2529,18 @@ code {
 
 .muted { color: var(--fg-mute); font-size: var(--fs-callout); }
 
-.settings-section-header { cursor: pointer; display: flex; align-items: center; justify-content: space-between; user-select: none; }
+.settings-section-header { cursor: default; display: flex; align-items: center; justify-content: space-between; user-select: none; }
 .settings-section-header .settings-chevron { transition: transform .2s ease; display: inline-block; }
 .settings-section.collapsed .settings-chevron { transform: rotate(-90deg); }
 .settings-section.collapsed > *:not(legend):not(.settings-section-header) { display: none; }
 .settings-version, .settings-version-centered { text-align: center; }
+
+/* ---------- Text selection (tint-themed, not Chromium default blue) ---------- */
+
+::selection {
+    background: rgba(184, 175, 196, 0.22);
+    color: inherit;
+}
 
 /* ---------- Scrollbars (liquid glass, slim) ---------- */
 
@@ -2126,8 +2598,11 @@ code {
     display: none;
 }
 
-/* Hide close (×) button on panel and tabs while any session is alive */
-.terminal-panel.has-alive .terminal-btn-close {
+/* Hide the panel-level close (×) button while the ACTIVE session is alive.
+   With concurrent sessions the panel is shared; the button reflects only the
+   currently visible tab, so a dead active session can be closed even while
+   other tabs keep running. */
+.terminal-panel.active-alive .terminal-btn-close {
     display: none;
 }
 
@@ -2171,7 +2646,7 @@ code {
     font-size: var(--fs-subheadline);
     line-height: var(--lh-subheadline);
     border-radius: 6px;
-    cursor: pointer;
+    cursor: default;
     white-space: nowrap;
     transition: background 0.15s, color 0.15s;
 }
@@ -2212,17 +2687,28 @@ code {
     background: transparent;
     color: #8a8d96;
     border-radius: 4px;
-    cursor: pointer;
+    cursor: default;
     display: flex;
     align-items: center;
     justify-content: center;
     font-size: 14px;
     line-height: 1;
+    /* Was: no transition — every state change snapped instantly. */
+    transition: background 160ms var(--ease-glass),
+                color 160ms var(--ease-glass),
+                transform 120ms var(--ease-glass);
 }
 
 .terminal-panel-controls button:hover {
     background: rgba(255, 255, 255, 0.08);
     color: #d8dae0;
+}
+.terminal-panel-controls button:active {
+    transform: translateY(1px);
+}
+.terminal-panel-controls button:focus-visible {
+    outline: 2px solid rgba(184, 175, 196, 0.5);
+    outline-offset: 2px;
 }
 
 .terminal-panel-body {
@@ -2280,7 +2766,20 @@ code {
     font-size: 13px;
     display: none;
     color: #8a8d96;
+    /* Was a <span>. Now a real <button> for keyboard accessibility, so
+       reset the browser button chrome first: no background/border/padding,
+       inherit font, keep our own hover behaviour intact. */
+    background: transparent;
+    border: none;
+    padding: 0;
+    cursor: default;
+    font: inherit;
+    line-height: 1;
     transition: color 0.15s;
+}
+.tab-close:focus-visible {
+    outline: 2px solid rgba(184, 175, 196, 0.5);
+    outline-offset: 2px;
 }
 
 .terminal-tab.dead .tab-close {
@@ -2315,9 +2814,9 @@ code {
     font-family: var(--sans);
     font-size: var(--fs-title2);
     line-height: var(--lh-title2);
-    font-weight: var(--fw-semibold);
+    font-weight: var(--fw-title2);
     color: var(--fg-soft);
-    letter-spacing: -0.2px;
+    letter-spacing: var(--tracking-title2);
     animation: settings-pulse 1.4s ease-in-out infinite;
 }
 @keyframes settings-pulse {
@@ -2359,7 +2858,6 @@ code {
 
 .admin-card {
     width: min(900px, 94vw);
-    max-height: 84vh;
     display: flex;
     flex-direction: column;
 }
@@ -2367,38 +2865,39 @@ code {
 .admin-tabs {
     display: flex;
     gap: 2px;
-    padding: 0 18px;
-    border-bottom: 1px solid var(--hairline);
+    padding: 4px;
+    margin: 0 18px;
+    background: rgba(0, 0, 0, 0.05);
+    border-radius: var(--radius-btn);
     flex-wrap: wrap;
 }
 .admin-tab {
     background: transparent;
     border: none;
-    border-bottom: 2px solid transparent;
-    padding: 9px 14px;
-    margin-bottom: -1px;
+    border-radius: var(--radius-btn-s);
+    padding: 6px 14px;
     color: var(--fg-mute);
     font: inherit;
     font-size: var(--fs-callout);
     line-height: var(--lh-callout);
     font-family: var(--sans);
-    cursor: pointer;
-    transition: color 120ms ease, background 120ms ease, border-color 120ms ease;
+    cursor: default;
+    transition: color 150ms ease, background 150ms ease, box-shadow 150ms ease;
 }
 .admin-tab:hover {
     color: var(--fg);
-    background: rgba(255, 255, 255, 0.45);
+    background: rgba(255, 255, 255, 0.35);
 }
 .admin-tab.active {
     color: var(--fg);
-    border-bottom-color: var(--tint);
+    background: #fff;
     font-weight: var(--fw-semibold);
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.12);
 }
 .admin-tab:focus-visible {
     outline: none;
     color: var(--fg);
     box-shadow: 0 0 0 2px rgba(184, 175, 196, 0.30);
-    border-radius: 4px;
 }
 
 .admin-toast {
@@ -2481,7 +2980,7 @@ code {
     background: rgba(255, 255, 255, 0.55);
     border: 1px solid var(--hairline);
     border-radius: 8px;
-    cursor: pointer;
+    cursor: default;
     transition: background 120ms ease, transform 80ms ease;
 }
 .admin-pane-header > button:hover { background: rgba(255, 255, 255, 0.78); }
@@ -2562,7 +3061,7 @@ code {
     background: rgba(255, 255, 255, 0.55);
     border: 1px solid var(--hairline);
     border-radius: 8px;
-    cursor: pointer;
+    cursor: default;
     transition: background 120ms ease, transform 80ms ease;
 }
 .admin-entry-actions button:hover { background: rgba(255, 255, 255, 0.78); }
@@ -2580,12 +3079,13 @@ code {
     font-size: var(--fs-body);
     line-height: var(--lh-body);
     font-weight: var(--fw-bold);
-    color: var(--fg);
-    /* Title chip — adaptive plate; backdrop-filter:brightness() applied
-       by the plate selector group ensures contrast on dark desktops. */
-    background: var(--l2-plate-strong);
-    padding: 2px 9px; border-radius: 7px;
-    box-shadow: inset 0 0.5px 0 rgba(255, 255, 255, 0.55);
+    /* Module label — no plate/pill. Matches macOS sidebar group labels
+       (Finder/Mail-style): bare text directly on the glass, colored from
+       the adaptive --label ladder rather than boxed for contrast. See
+       glass-effect.js's luma sampler + the --label token comments in
+       :root for why this reads correctly on any desktop without a
+       backing shape. */
+    color: var(--label);
 }
 .task-plan-items,
 .agent-todo-items {
@@ -2593,11 +3093,6 @@ code {
     flex-direction: column;
     gap: 4px;
     margin-top: 8px;
-    /* Inset content plate under the plan/todo rows so the item text stays
-       readable on any desktop while the panel shell stays glass. */
-    background: var(--l2-plate);
-    padding: 6px 8px;
-    border-radius: 10px;
 }
 .task-plan-item,
 .agent-todo-item {
@@ -2607,39 +3102,39 @@ code {
     align-items: start;
     font-size: var(--fs-callout);
     line-height: 1.45;
-    color: var(--fg);
+    color: var(--label);
 }
 .task-plan-item .tp-glyph,
 .agent-todo-item .at-glyph {
     font-family: var(--mono);
     text-align: center;
-    color: var(--fg-mute);
+    color: var(--label-secondary);
 }
 .task-plan-item .tp-text,
 .agent-todo-item .at-text { word-break: break-word; }
 
 .task-plan-item.tp-done .tp-glyph     { color: #2e8b57; }
-.task-plan-item.tp-done .tp-text      { color: var(--fg-mute); text-decoration: line-through; }
+.task-plan-item.tp-done .tp-text      { color: var(--label-secondary); text-decoration: line-through; }
 .task-plan-item.tp-running .tp-glyph  { color: rgba(184, 175, 196, 0.95); }
 .task-plan-item.tp-running            { font-weight: var(--fw-semibold); }
 .task-plan-item.tp-failed .tp-glyph   { color: #c0392b; }
 .task-plan-item.tp-interrupted .tp-glyph { color: #d08a1e; }
-.task-plan-item.tp-skipped .tp-glyph  { color: var(--fg-mute); opacity: 0.7; }
+.task-plan-item.tp-skipped .tp-glyph  { color: var(--label-secondary); opacity: 0.7; }
 .task-plan-item.tp-skipped .tp-text   {
-    color: var(--fg-mute);
+    color: var(--label-secondary);
     text-decoration: line-through;
     text-decoration-style: dashed;
     opacity: 0.85;
 }
 .task-plan-item.tp-pending .tp-glyph,
-.task-plan-item.tp-pending .tp-text   { color: var(--fg-mute); }
+.task-plan-item.tp-pending .tp-text   { color: var(--label-secondary); }
 
 .agent-todo-item.at-completed .at-glyph { color: #2e8b57; }
-.agent-todo-item.at-completed .at-text  { color: var(--fg-mute); text-decoration: line-through; }
+.agent-todo-item.at-completed .at-text  { color: var(--label-secondary); text-decoration: line-through; }
 .agent-todo-item.at-in_progress .at-glyph { color: rgba(184, 175, 196, 0.95); }
 .agent-todo-item.at-in_progress          { font-weight: var(--fw-semibold); }
 .agent-todo-item.at-pending .at-glyph,
-.agent-todo-item.at-pending .at-text     { color: var(--fg-mute); }
+.agent-todo-item.at-pending .at-text     { color: var(--label-secondary); }
 
 .admin-stats-output {
     font-family: var(--mono);
@@ -2725,7 +3220,7 @@ code {
     background: rgba(255, 255, 255, 0.55);
     border: 1px solid var(--hairline);
     border-radius: 10px;
-    cursor: pointer;
+    cursor: default;
     transition: background 120ms ease, transform 80ms ease;
 }
 .admin-tool-block button:hover { background: rgba(255, 255, 255, 0.78); }
@@ -2749,7 +3244,6 @@ code {
 
 .sched-card {
     width: min(720px, 94vw);
-    max-height: 86vh;
     display: flex;
     flex-direction: column;
 }
@@ -2833,10 +3327,73 @@ code {
        own compositing layer that DWM can translate without re-blending. */
     contain: layout paint style;
     animation: liquid-entrance 380ms var(--spring-soft) both;
-    transition: box-shadow 200ms var(--ease-glass);
+    /* width: paces the card's grid-driven resize to the same 200ms
+       spring-soft beat the rail/sidebar use, so a DISCRETE resize target
+       (the window's own native setBounds landing on a new size) animates
+       smoothly instead of snapping. This is deliberately SUPPRESSED during
+       sidebar open/close (see body.card-width-instant below) — there, the
+       card's grid-computed width is a continuously moving target for the
+       whole 200-250ms (recomputed every frame as the sidebar's own
+       transition runs), and letting this transition stay armed against a
+       moving goalpost made the card visibly lag behind the sidebar's clean
+       curve instead of tracking it in lockstep. */
+    transition: box-shadow 200ms var(--ease-glass),
+                width 200ms var(--spring-soft, cubic-bezier(0.22, 1.2, 0.36, 1));
     position: relative;
     -webkit-app-region: no-drag;
     app-region: no-drag;
+}
+
+/* See .session-card's width-transition comment above and
+   session-sidebar.js's _setCollapsed (sets/clears this class across the
+   same ~250ms window as widthTransitionEndTs). Suppressing the card's own
+   transition here lets it snap to each frame's grid-computed width in
+   perfect lockstep with the sidebar's CSS-driven curve, rather than
+   running a second, independently-retargeting animation on top of it. */
+body.card-width-instant .session-card {
+    transition: box-shadow 200ms var(--ease-glass), width 1ms linear !important;
+}
+/* The sidebar's own child cards (.task-plan-panel/.agent-todo-panel/
+   .ss-section) still carry a real backdrop-filter blur — every frame of
+   the sidebar's own width transition forces a full re-rasterization of
+   that blur at the new element size, on top of the grid reflow already
+   happening elsewhere. That per-frame re-blur cost (not the transition's
+   200ms duration) is what reads as stutter during open/close. Swapping to
+   a flat, near-equivalent solid fill for the same window removes the
+   per-frame rasterization cost entirely; blur returns once the sidebar
+   is settled. */
+body.card-width-instant .task-plan-panel,
+body.card-width-instant .agent-todo-panel,
+body.card-width-instant .ss-section {
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+    background: rgba(255, 255, 255, 0.55) !important;
+}
+/* …and the nested legibility plates INSIDE those panels, which the rule
+   above does not reach: they match on their own selectors and each carries
+   another blur(6px), so a panel with a header + a scrolling list keeps two
+   to six live blur regions re-rasterizing while it changes width. Only the
+   filter is dropped — each plate keeps its own translucent white background
+   (--l2-plate / -strong), which over the near-opaque fill above is more than
+   enough contrast on its own. What's lost for the ~370ms window is the
+   brightness() boost, not the plate itself. */
+body.card-width-instant .task-plan-header,
+body.card-width-instant .agent-todo-header,
+body.card-width-instant .ss-section-head,
+body.card-width-instant .ss-header .ss-name,
+body.card-width-instant .ss-header .ss-title,
+body.card-width-instant .task-plan-items,
+body.card-width-instant .agent-todo-items,
+body.card-width-instant .ss-activity-list,
+body.card-width-instant .ss-files-list {
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .session-card {
+        transition: box-shadow 200ms var(--ease-glass), width 1ms linear;
+    }
 }
 
 .session-card:hover {
@@ -2857,36 +3414,26 @@ code {
     align-items: center;
     gap: 8px;
     padding: 6px 10px;
-    /* Adaptive plate — a low-alpha white fill + backdrop-filter:brightness()
-       lifts luma on dark desktops while staying nearly invisible on light.
-       This replaces the old crude 3-layer text-shadow on .session-card-title
-       which read as "cheap CSS glow." The plate covers the whole head strip
-       so title, pill, and close button all benefit. */
-    background: rgba(255, 255, 255, 0.22);
-    backdrop-filter: blur(6px) brightness(1.35);
-    -webkit-backdrop-filter: blur(6px) brightness(1.35);
-    /* Concentric with the card's own 20px/14px top radii minus 3px margin. */
-    border-radius: 14px 14px 0 0;
+    /* No plate — see the "Liquid Glass — text legibility" note above.
+       .session-card-title / .session-card-pill read from --label /
+       --label-secondary, which glass-effect.js flips light/dark from a
+       real measurement of the desktop behind the glass, so the head
+       strip stays plain glass with no per-region brightness boost. */
     margin: 3px 3px 0;
 }
 
 .session-card-title {
     flex: 0 0 auto;
-    /* macOS title3, emphasized (semibold). Old rule was 16px/700 with a
-       hard "SF Pro Display" family stack; per docs §5 optical size, Display
-       is meant for 20pt+, so at 15px SF Text renders with proper small-
-       heading tracking. family folded back to var(--sans) so titlebar,
-       cards, and section heads all share one family and Display's optical
-       tuning doesn't leak below its intended range.
-       Readability comes from the .session-card-head's adaptive plate
-       (backdrop-filter:brightness) rather than a text-shadow halo. */
+    /* macOS title3, emphasized (semibold). Color is the adaptive --label
+       token — see :root + html.desktop-is-dark — so this reads correctly
+       whether the glass behind it is showing a light or dark desktop,
+       without a plate or text-shadow underneath it. */
     font-family: var(--sans);
     font-size: var(--fs-title3);
     line-height: var(--lh-title3);
-    font-weight: var(--fw-semibold);
-    letter-spacing: -0.01em;
-    color: var(--fg);
-    text-shadow: none;
+    font-weight: var(--fw-title3);
+    letter-spacing: var(--tracking-title3);
+    color: var(--label);
 }
 
 .session-card-title-input {
@@ -2908,93 +3455,122 @@ code {
     min-width: 0;
     font-size: var(--fs-subheadline);
     line-height: var(--lh-subheadline);
-    color: var(--fg-soft);
+    color: var(--label-secondary);
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
-    /* No text-shadow needed — the .session-card-head adaptive plate handles
-       contrast for all elements within the header area. */
 }
+
 
 .session-card-pill.working {
     color: var(--tint-strong);
 }
 
+/* ---------- Remote-control badge on a session card ---------- */
+/* The only chrome that distinguishes a remotely-driven tab. Everything else on
+   the card is identical, because the bridge replays the remote machine's UI
+   events through the same delegate a local session uses. */
+.session-card-remote {
+    flex: 0 0 auto;
+    margin-right: 6px;
+    padding: 1px 7px;
+    border-radius: 9px;
+    font-size: var(--fs-caption2, 11px);
+    font-weight: var(--fw-semibold);
+    white-space: nowrap;
+    color: var(--label-secondary);
+    background: color-mix(in srgb, var(--label) 8%, transparent);
+}
+
+.session-card-remote.connected {
+    color: var(--tint-strong);
+    background: color-mix(in srgb, var(--tint-strong) 14%, transparent);
+}
+
+/* Reconnecting is deliberately NOT styled as an error: the remote agent is
+   still working and the client is already retrying. Amber-ish "in progress",
+   not red "failed". */
+.session-card-remote.pending,
+.session-card-remote.reconnecting {
+    color: var(--label);
+    background: color-mix(in srgb, var(--label) 14%, transparent);
+    animation: rc-badge-pulse 1.6s ease-in-out infinite;
+}
+
+.session-card-remote.superseded,
+.session-card-remote.failed {
+    color: var(--error-fg, #b3261e);
+    background: var(--error-bg, rgba(179, 38, 30, 0.12));
+}
+
+.session-card-remote.closed {
+    color: var(--label-secondary);
+    text-decoration: line-through;
+}
+
+@keyframes rc-badge-pulse {
+    0%, 100% { opacity: 1; }
+    50%      { opacity: 0.55; }
+}
+
+/* Respect the OS "reduce motion" setting — the pulse is decorative. */
+@media (prefers-reduced-motion: reduce) {
+    .session-card-remote.pending,
+    .session-card-remote.reconnecting { animation: none; }
+}
+
 .session-card-close {
     flex: 0 0 auto;
-    width: 22px;
-    height: 22px;
+    width: 18px;
+    height: 18px;
     padding: 0;
-    display: flex;
-    align-items: center;
-    justify-content: center;
+    /* grid + place-items instead of flex row + align/justify-content —
+       flexbox's centering here is line-box based, so the 12px svg's own
+       (sub-pixel-rounded) intrinsic box can settle a hair off-centre in
+       the 18px circle at rest; the hover state's transform:scale happened
+       to promote the button to its own compositor layer and pixel-snap
+       differently, which is why the icon only *looked* centred on hover.
+       Grid's place-items centres against the box itself, not a line box,
+       so the icon lands dead-centre in every state — hover is now purely
+       a colour change (see :hover below), never a reposition. */
+    display: grid;
+    place-items: center;
     border: none;
     border-radius: 50%;
-    /* Translucent-white close button. User's intent: "透明白色, 真正透明,
-       而不是灰色" — a button that reads as WHITE frost, not grey, even
-       when the desktop behind HandQ is dark. Every previous single-layer
-       attempt failed on this: alpha compositing a translucent white
-       against a dark backdrop necessarily produces grey (e.g. 16% white
-       on luma-30 desktop head-plate = luma 76 = medium grey, exactly
-       what the earlier neutral version looked like).
-       Multi-layer white stack — two `background` layers on the ELEMENT
-       (independent of backdrop-filter, which processes what's behind):
-         1. Bottom: rgba(255, 255, 255, 0.55) — 55% white base.
-         2. Top: rgba(255, 255, 255, 0.38) linear-gradient (via the
-            CSS multi-background trick — only gradients / images can
-            stack via comma-separated syntax; plain colours can't).
-       Compound effective opacity is 1 - (1-0.55)(1-0.38) = 0.72, so on
-       a luma-30 dark desktop the disc reads at ~192 (light off-white)
-       and on a luma-200 light desktop at ~240 (near pure white). The
-       remaining 28% transparency means backdrop-filter's blur + saturate
-       + circle-distort still show through — the glass identity is
-       preserved, just white-forward instead of grey-forward.
-       Text × is soft dark grey at 75% alpha — visible on the white disc
-       without dominating. Hover raises both layers to feel "solid white"
-       for the commit affordance; active bumps further. No red anywhere,
-       per user's earlier "no colour" preference — the close identity
-       comes from the × glyph and card-top-right position alone. */
+    /* Solid pure white, same idiom as the titlebar's .tb-min / .tb-max
+       (see styles.css:1110) — per explicit user request to match the
+       titlebar buttons' white, not the titlebar close button's red. */
     position: relative;
-    background:
-        linear-gradient(rgba(255, 255, 255, 0.38), rgba(255, 255, 255, 0.38)),
-        rgba(255, 255, 255, 0.55);
-    color: rgba(60, 60, 60, 0.75);
-    backdrop-filter: blur(8px) saturate(130%) url(#lg-distort-circle);
-    -webkit-backdrop-filter: blur(8px) saturate(130%) url(#lg-distort-circle);
-    font-size: 15px;
-    line-height: 1;
-    cursor: pointer;
+    background: #fff;
+    color: rgba(0, 0, 0, 0.62);
+    cursor: default;
     transition: background 160ms var(--ease-glass),
                 color 160ms var(--ease-glass),
                 transform 120ms var(--spring);
 }
+.session-card-close svg {
+    width: 10px; height: 10px; display: block;
+}
 .session-card-close:hover {
-    /* Compound ~88% white — reads as "solidified" for the click commit
-       affordance while still not fully opaque (backdrop-filter's glass
-       edge distortion still shows through the remaining 12%). */
-    background:
-        linear-gradient(rgba(255, 255, 255, 0.60), rgba(255, 255, 255, 0.60)),
-        rgba(255, 255, 255, 0.70);
-    color: rgba(30, 30, 30, 0.90);
-    transform: scale(1.08);
+    background: #fff;
+    color: rgba(0, 0, 0, 0.85);
+    transform: scale(1.06);
 }
 .session-card-close:active {
-    background:
-        linear-gradient(rgba(255, 255, 255, 0.75), rgba(255, 255, 255, 0.75)),
-        rgba(255, 255, 255, 0.75);
-    color: rgba(0, 0, 0, 0.90);
+    background: #ededed;
+    transform: translateY(1px) scale(1.02);
 }
 .session-card-close:focus-visible {
-    outline: 2px solid rgba(255, 255, 255, 0.65);
+    outline: 2px solid rgba(184, 175, 196, 0.55);
     outline-offset: 2px;
 }
 
-/* Minimize (→ stage rail) / maximize (sole main-slot occupant) — same
-   22px disc as the close button, same glass treatment (frost + distort +
-   contour ring). Neutral tint since neither is destructive; the shared
-   ::before ring above gives all three buttons matching depth. Only
-   rendered when sessions.size > 1 (see renderer.js _syncCardControls);
-   a single session has nothing to minimize into or maximize over. */
+/* Minimize (→ stage rail) / maximize (sole main-slot occupant) — 22px
+   glass disc, same treatment (frost + distort + contour ring). Neutral
+   tint since neither is destructive; the shared ::before ring above
+   gives all three buttons matching depth. Only rendered when
+   sessions.size > 1 (see renderer.js _syncCardControls); a single
+   session has nothing to minimize into or maximize over. */
 .session-card-min,
 .session-card-max {
     flex: 0 0 auto;
@@ -3011,7 +3587,7 @@ code {
     color: var(--fg-soft);
     backdrop-filter: blur(8px) saturate(130%) url(#lg-distort-circle);
     -webkit-backdrop-filter: blur(8px) saturate(130%) url(#lg-distort-circle);
-    cursor: pointer;
+    cursor: default;
     transition: background 160ms var(--ease-glass),
                 color 160ms var(--ease-glass),
                 transform 120ms var(--spring);
@@ -3048,7 +3624,9 @@ code {
 }
 
 .session-card-confirm {
-    flex: 0 0 auto;
+    flex: 0 1 auto;
+    max-height: 60%;
+    overflow-y: auto;
     padding: 8px 10px 0;
 }
 .session-card-confirm.hidden { display: none; }
@@ -3176,6 +3754,32 @@ code {
     overflow: hidden;
     overflow-clip-margin: 0;
 }
+/* JS-driven reveal, rail side — the same mechanism as the sidebar's
+   .ss-driving (see layout-drive.js). The `transition: width` above carried a
+   comment conceding that its hand-matched 200ms only got "close enough that
+   the chat card only drifts a few pixels"; measured, that drift was ~30px.
+   Driving the width from the window's real width removes it rather than
+   shrinking it. The extra class outranks the [data-empty="true"] rule's
+   `width: 0 !important`, and margin is held at its open value so the box
+   stays intact while a driven collapse runs. `overflow` is deliberately NOT
+   restored — the empty state's `hidden` is what keeps the thumbnails from
+   showing as a sliver on the way down, which is exactly what's wanted here
+   too. */
+.stage-rail.rail-driving[data-empty] {
+    transition: none !important;
+    width: var(--rail-driven-w, 0px) !important;
+}
+.stage-rail.rail-driving[data-empty="true"] {
+    margin: 7px 0 10px 10px;
+}
+/* Genie new-session entrance (renderer.js's _placeSession) drives this
+   element's width via Element.animate() instead, on a shared timeline
+   with the new/demoted card transforms — the base rule's own CSS
+   transition above would otherwise fight the WAAPI animation over the
+   same property. */
+.stage-rail.genie-active {
+    transition: none !important;
+}
 .stage-rail-list {
     flex: 1 1 auto;
     min-height: 0;
@@ -3228,6 +3832,8 @@ code {
     width: 100%;
     border-radius: 14px;
     overflow: hidden;
+    /* Whole-thumb click target (switches to this session) with no button
+       chrome inside it — same reasoning as .ss-resume-row above. */
     cursor: pointer;
     border: 1px solid rgba(60, 80, 120, 0.14);
     box-shadow: 0 2px 8px rgba(20, 20, 30, 0.08);
@@ -3448,6 +4054,11 @@ code {
     white-space: pre-wrap;
     word-break: break-word;
 }
+.scc-desc.md-rendered {
+    white-space: normal;
+}
+.scc-desc.md-rendered > :first-child { margin-top: 0; }
+.scc-desc.md-rendered > :last-child  { margin-bottom: 0; }
 .scc-decision {
     margin: 0;
     max-height: 28vh;
@@ -3463,7 +4074,51 @@ code {
 }
 .scc-decision.hidden,
 .scc-secret-wrap.hidden,
+.scc-fields.hidden,
 .scc-guidance.hidden { display: none; }
+.scc-fields {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+.scc-field {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+.scc-field-label {
+    font-size: var(--fs-subheadline);
+    line-height: var(--lh-subheadline);
+    color: var(--fg-mute);
+}
+.scc-field-input {
+    padding: 8px 10px;
+    border: 1px solid rgba(0, 0, 0, 0.12);
+    border-radius: 8px;
+    font: inherit;
+    font-family: var(--sans);
+    color: var(--fg);
+    background: rgba(255, 255, 255, 0.8);
+    resize: vertical;
+}
+.scc-field-options {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+.scc-field-option {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: var(--fs-callout);
+    line-height: var(--lh-callout);
+    color: var(--fg);
+    cursor: default;
+}
+.scc-field-option input {
+    accent-color: var(--tint);
+    margin: 0;
+}
 .scc-secret-wrap {
     display: flex;
     flex-direction: column;
@@ -3506,7 +4161,7 @@ code {
     font: inherit;
     font-size: var(--fs-callout);
     line-height: var(--lh-callout);
-    cursor: pointer;
+    cursor: default;
     background: rgba(255, 255, 255, 0.7);
     color: var(--fg);
 }
@@ -3532,7 +4187,7 @@ code {
     border-radius: 8px;
     background: rgba(255, 255, 255, 0.55);
     color: var(--fg);
-    cursor: pointer;
+    cursor: default;
     font-family: var(--sans);
     transition: background 120ms ease, transform 80ms ease;
 }
@@ -3562,7 +4217,7 @@ code {
 .sched-list-item {
     padding: 9px 12px;
     border-radius: 8px;
-    cursor: pointer;
+    cursor: default;
     margin-bottom: 4px;
     border: 1px solid transparent;
     transition: background 100ms ease, border-color 100ms ease;
@@ -3657,12 +4312,16 @@ code {
 
 /* Danger button — sits on the same .settings-actions visual base. */
 button.danger {
-    background: rgba(220, 130, 130, 0.10);
+    background: rgba(220, 130, 130, 0.22);
     border-color: rgba(220, 130, 130, 0.45);
     color: #b85050;
+    box-shadow: 0 0 0 1px var(--shadow-atom-xs),
+                0 1px 2px var(--shadow-atom-s);
 }
 button.danger:hover:not(:disabled) {
-    background: rgba(220, 130, 130, 0.18);
+    background: rgba(220, 130, 130, 0.32);
+    box-shadow: 0 0 0 1px var(--shadow-atom-xs),
+                0 4px 10px var(--shadow-atom-m);
 }
 
 /* ── Create modal — reuses .settings-card and .settings-form ──── */
@@ -3699,7 +4358,6 @@ button.danger:hover:not(:disabled) {
 /* Same glass language as the Scheduler overlay. */
 .skills-card {
     width: min(760px, 94vw);
-    max-height: 86vh;
     display: flex;
     flex-direction: column;
 }
@@ -3725,7 +4383,7 @@ button.danger:hover:not(:disabled) {
     border-radius: 8px;
     background: rgba(255, 255, 255, 0.55);
     color: var(--fg);
-    cursor: pointer;
+    cursor: default;
     font-family: var(--sans);
     transition: background 120ms ease, transform 80ms ease;
 }
@@ -3754,16 +4412,21 @@ button.danger:hover:not(:disabled) {
     display: flex;
     flex-direction: column;
     gap: 8px;
-    padding: 12px 14px;
+    padding: 16px;
     border: 1px solid var(--hairline);
     border-radius: 10px;
     background: rgba(255, 255, 255, 0.42);
-    transition: opacity 120ms ease;
+    transition: opacity 120ms ease, background 160ms var(--ease-glass),
+                box-shadow 160ms var(--ease-glass);
+}
+.skill-card:hover {
+    background: rgba(255, 255, 255, 0.62);
+    box-shadow: 0 2px 10px rgba(20, 20, 30, 0.08);
 }
 .skill-card.disabled { opacity: 0.55; }
 .skill-card.standing {
-    border-color: rgba(90, 130, 245, 0.55);
-    background: rgba(90, 130, 245, 0.10);
+    border-color: var(--tint-strong);
+    background: rgba(184, 175, 196, 0.14);
 }
 .skill-card-badge {
     flex: 0 0 auto;
@@ -3774,9 +4437,9 @@ button.danger:hover:not(:disabled) {
     text-transform: uppercase;
     padding: 2px 7px;
     border-radius: 999px;
-    color: #3a5bd0;
-    background: rgba(90, 130, 245, 0.18);
-    border: 1px solid rgba(90, 130, 245, 0.42);
+    color: var(--tint-strong);
+    background: rgba(184, 175, 196, 0.22);
+    border: 1px solid var(--tint-strong);
 }
 .skill-card-badge.auto {
     color: #a86412;
@@ -3790,6 +4453,20 @@ button.danger:hover:not(:disabled) {
     gap: 10px;
     flex-wrap: wrap;
 }
+/* Upload-Skill picker's per-card selector — a real checkbox (native square +
+   accent-color), same recipe as .model-check-list's model picker, unlike
+   .skill-toggle's pill switch used for the Enabled/Standing settings below. */
+.skill-upload-pick {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    cursor: default;
+}
+.skill-upload-pick input[type="checkbox"] {
+    flex: none;
+    accent-color: var(--tint);
+    margin: 0;
+}
 .skill-card-name {
     font-family: var(--mono);
     font-size: var(--fs-body);
@@ -3802,12 +4479,79 @@ button.danger:hover:not(:disabled) {
 .skill-toggle {
     display: inline-flex;
     align-items: center;
-    gap: 5px;
+    gap: 8px;
     font-size: var(--fs-subheadline);
     line-height: var(--lh-subheadline);
     color: var(--fg-mute);
-    cursor: pointer;
+    cursor: default;
     flex: 0 0 auto;
+    /* Radix-style pill switch, no JS. The native checkbox is visually
+       hidden but stays functional (checked state, keyboard focus, form
+       semantics). The two spans are ::before / ::after on the LABEL so
+       the JS `<label><input><span>text</span></label>` markup keeps
+       working — no HTML changes needed here or in admin-panel.js.
+       ::before is the pill track, ::after the thumb. Sibling selectors
+       key off the input's :checked and :focus-visible states. */
+    position: relative;
+    padding-left: 40px;              /* room for the 32px pill + 8px gap */
+    min-height: 20px;
+}
+.skill-toggle > input[type="checkbox"] {
+    /* Keep the native input in the accessibility tree AND on-screen for
+       keyboard focus, but visually collapsed. Not display:none — that
+       kicks the input out of tab order in some browsers and removes it
+       from the a11y tree. */
+    position: absolute;
+    left: 0;
+    top: 50%;
+    width: 32px;
+    height: 20px;
+    margin: 0;
+    transform: translateY(-50%);
+    opacity: 0;
+    cursor: default;
+}
+.skill-toggle::before {
+    /* Pill track. */
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 32px;
+    height: 20px;
+    border-radius: 999px;
+    background: rgba(0, 0, 0, 0.14);
+    transition: background 160ms var(--ease-glass);
+}
+.skill-toggle::after {
+    /* Thumb. Slides right when the input is checked (see sibling rule). */
+    content: '';
+    position: absolute;
+    left: 2px;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: #fff;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.25);
+    transition: transform 160ms var(--ease-glass);
+}
+.skill-toggle > input[type="checkbox"]:checked ~ * {
+    /* Nothing — we key off the input directly on ::after via :has, but
+       need a rule so the browser evaluates the sibling combinator. */
+}
+.skill-toggle:has(> input[type="checkbox"]:checked)::before {
+    background: var(--tint-strong);
+}
+.skill-toggle:has(> input[type="checkbox"]:checked)::after {
+    /* 32 (track) − 16 (thumb) − 2 (start offset) = 14px travel. */
+    transform: translate(14px, -50%);
+}
+.skill-toggle:has(> input[type="checkbox"]:focus-visible)::before {
+    outline: 2px solid rgba(184, 175, 196, 0.5);
+    outline-offset: 2px;
 }
 .skill-card-desc {
     font-size: var(--fs-callout);
@@ -3832,14 +4576,18 @@ button.danger:hover:not(:disabled) {
     border-radius: 8px;
     background: rgba(255, 255, 255, 0.55);
     color: var(--fg);
-    cursor: pointer;
+    cursor: default;
     font-family: var(--sans);
     transition: background 120ms ease, transform 80ms ease;
 }
-.skill-card-actions button:hover { background: rgba(255, 255, 255, 0.78); }
+.skill-card-actions button:not(.danger):hover:not(:disabled) {
+    background: rgba(184, 175, 196, 0.18);
+    border-color: var(--tint-strong);
+    color: var(--tint-strong);
+}
 .skill-card-actions button:active { transform: translateY(1px); }
 
-.skill-form-modal { width: min(560px, 94vw); max-height: 86vh; }
+.skill-form-modal { width: min(560px, 94vw); }
 .skill-form-modal .settings-form {
     padding: 18px 22px 22px 22px;
     margin: 0;
@@ -3943,20 +4691,32 @@ button.danger:hover:not(:disabled) {
     box-shadow: none;
     margin: 7px 10px 10px 0;
     overflow: hidden;
-    /* Width transition — 200ms with spring-soft to approximate Windows'
-       OS-animated setBounds curve. Two animations run in parallel on
-       toggle: this CSS transition (sidebar width) and Windows' native
-       window resize (main.js's `setBounds(..., true)`). Chat-region is a
-       flex victim between them — if the two clocks don't line up, the
-       chat card's width oscillates mid-transition (reads as "sidebar
-       and card animate on different timings"). Was 240ms ease-glass
-       which noticeably overran Windows' ~180ms resize. 200ms + spring-
-       soft gets close enough that the chat card only drifts a few px.
+    /* Width transition — 320ms, no-overshoot decelerate (see
+       --ease-sidebar-reveal). Was 200ms spring-soft, which (a) had a small
+       overshoot before settling and (b) was tuned to approximate Windows'
+       ~180ms native window-resize curve so the two animations wouldn't
+       visibly drift apart. Slowing this down on its own reintroduces that
+       drift — the chat card underneath will show a few more px of
+       mid-transition width wobble than before (widthTransitionEndTs /
+       card-width-instant below are widened to match this duration so at
+       least the SIDEBAR side of that drift stays suppressed for the
+       card's own width transition and the sidebar-blur-during-toggle
+       fix). Two animations run in parallel on toggle: this CSS transition
+       (sidebar width) and Windows' native window resize (main.js's
+       `setBounds(..., true)`).
        See session-sidebar.js's _widthTransitionEndTs for the JS-side
        gate that suppresses ResizeObserver's own per-frame width writes
        during this window so they don't retarget the transition. */
-    transition: width 200ms var(--spring-soft, cubic-bezier(0.22, 1.2, 0.36, 1));
+    transition: width 320ms var(--ease-sidebar-reveal, cubic-bezier(0.4, 0, 0.2, 1));
     color: var(--fg-soft, #3a3f48);
+}
+/* Live width-handle drag (session-sidebar.js's _wireDrag on
+   .ss-width-handle) writes this element's width on every pointermove.
+   Without this override the base rule's 200ms transition above would
+   retarget on every one of those writes instead of snapping straight to
+   the pointer, producing a rubber-banding lag during the drag. */
+.session-sidebar.ss-width-dragging {
+    transition: none !important;
 }
 .session-sidebar[data-collapsed="true"] {
     /* Fully out of the layout: no rail, no gutter. When the user closes
@@ -3971,6 +4731,49 @@ button.danger:hover:not(:disabled) {
 }
 .session-sidebar[data-collapsed="true"] .ss-inner,
 .session-sidebar[data-collapsed="true"] .ss-header { display: none; }
+
+/* ============================================================
+   JS-driven reveal. The panel's width is not animated by CSS during a
+   toggle — layout-drive.js recomputes it every frame from the window's real
+   current width and writes it here, so the flex:1 chat region between the
+   two panels keeps a constant width instead of absorbing the difference
+   between the panel's clock and the OS window resize's. See that file for
+   the full rationale and the numbers. The `transition: width` on the base
+   rule stays for its other job: smoothing the ratio-recompute writes
+   ResizeObserver makes while the sidebar is idle.
+
+   The extra class here lifts these rules above
+   .session-sidebar[data-collapsed="true"] on specificity, so the driven
+   width wins over that rule's `width: 0 !important` regardless of which
+   appears later in the file. margin/border/display are restored for a
+   related reason: a driven CLOSE flips data-collapsed to "true" up front, so
+   that every state reader sees the settled truth immediately, but the panel
+   is still on screen for another ~200ms and has to keep its box intact until
+   the drive lands on 0.
+
+   Note html.perf-mode's own .session-sidebar rules (a clip-path reveal at a
+   fixed layout width) carry an extra element selector and therefore outrank
+   these. That's acceptable — perf-mode is an explicit A/B toggle, and its
+   whole purpose is to substitute a different reveal.
+   ============================================================ */
+.session-sidebar.ss-driving[data-collapsed] {
+    transition: none !important;
+    width: var(--ss-driven-w, 0px) !important;
+    min-width: 0 !important;
+}
+.session-sidebar.ss-driving[data-collapsed="true"] {
+    margin-right: 10px;
+    border: 1px solid rgba(60, 80, 120, 0.14);
+}
+.session-sidebar.ss-driving[data-collapsed="true"] .ss-inner,
+.session-sidebar.ss-driving[data-collapsed="true"] .ss-header { display: flex; }
+/* The floating reopen button keys off data-collapsed, which flips at the
+   START of a driven close — without this it would pop in over the panel it
+   replaces. session-sidebar.js sets this class for the drive's duration. */
+body.ss-driving-active .ss-reopen {
+    opacity: 0 !important;
+    pointer-events: none !important;
+}
 /* No rail-pulse rule anymore — activity hint lives on the floating reopen
    button, not on a phantom edge strip. */
 
@@ -3995,12 +4798,17 @@ button.danger:hover:not(:disabled) {
     border: 1px solid rgba(60, 80, 120, 0.14);
     box-shadow: 0 3px 14px rgba(30, 40, 60, 0.10);
     color: var(--fg-soft, #3a3f48);
+    /* Toggles sidebar visibility on click — a real affordance-carrying
+       control, unlike the pure-layout .ss-width-handle drag strip. */
     cursor: pointer;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    justify-content: center;
-    gap: 4px;
+    /* Grid + place-items, not flex column — the dot used to be a flex
+       sibling of the svg, so even invisible (opacity:0) it still occupied
+       its 6px + 4px-gap slot and justify-content:center centred the
+       (dot+gap+svg) stack as a unit, pushing the chevron below the
+       button's true midpoint. The dot is absolutely positioned below
+       instead, out of flow, so the grid centres the chevron alone. */
+    display: grid;
+    place-items: center;
     transition: transform 240ms var(--ease-glass, cubic-bezier(0.4, 0, 0.2, 1)),
                 opacity 240ms var(--ease-glass, cubic-bezier(0.4, 0, 0.2, 1)),
                 background 150ms;
@@ -4021,6 +4829,10 @@ button.danger:hover:not(:disabled) {
    instead of the previous #f0a020 amber to match the desaturated file-tree
    palette below. */
 .ss-reopen-dot {
+    position: absolute;
+    left: 50%;
+    bottom: 12px;
+    transform: translateX(-50%);
     width: 6px; height: 6px; border-radius: 50%;
     background: var(--tint);
     box-shadow: 0 0 6px rgba(184, 175, 196, 0.55);
@@ -4056,43 +4868,40 @@ button.danger:hover:not(:disabled) {
     display: flex; align-items: center; gap: 8px;
     padding: 6px 10px 6px 12px;
     border-bottom: 1px solid rgba(60, 80, 120, 0.12);
-    font-size: var(--fs-footnote); letter-spacing: 1.2px; text-transform: uppercase;
-    line-height: var(--lh-footnote);
-    color: var(--fg, #1a1d22);
-    font-weight: var(--fw-bold);
     -webkit-app-region: no-drag;
     app-region: no-drag;
 }
 .ss-header .ss-title {
+    /* macOS sidebar group-label recipe (Finder/Mail/System Settings all
+       converge on this): small, semibold (NOT bold), uppercase, modest
+       tracking, muted secondary-label color, sitting bare on the panel's
+       own material — no plate/pill/shadow. Previously bold + 1.2px
+       tracking + a boxed plate, which read as a loud "badge" rather than
+       Apple's quiet section label. Size/weight/tracking moved off
+       .ss-header (which no longer needs its own typography — .ss-name
+       below sets its own) onto this rule directly. */
     flex: 0 0 auto;
-    /* Same adaptive plate as other titles — "SESSION DETAIL" was previously
-       naked text sitting on the transparent sidebar, invisible on dark
-       desktops. The plate hugs the label; the header strip stays glass. */
-    background: var(--l2-plate-strong);
-    backdrop-filter: blur(6px) brightness(1.4);
-    -webkit-backdrop-filter: blur(6px) brightness(1.4);
-    padding: 2px 8px; border-radius: 7px;
-    box-shadow: inset 0 0.5px 0 rgba(255, 255, 255, 0.55);
+    font-size: var(--fs-footnote);
+    line-height: var(--lh-footnote);
+    font-weight: var(--fw-semibold);
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+    color: var(--label-secondary);
 }
 .ss-header .ss-name {
     flex: 0 1 auto; min-width: 0;
-    font-size: var(--fs-footnote); text-transform: none; letter-spacing: 0;
+    font-size: var(--fs-footnote);
     line-height: var(--lh-footnote);
-    color: var(--fg, #1a1d22); font-weight: var(--fw-semibold);
+    color: var(--label-secondary); font-weight: var(--fw-medium);
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     transition: opacity 200ms;
-    /* Content plate hugging the session name — adaptive brightness via
-       the plate selector group's backdrop-filter. The chip shrinks to text
-       width (flex:0 1 auto) so it doesn't stretch across the header. */
-    background: var(--l2-plate-strong);
-    padding: 2px 8px; border-radius: 7px;
-    box-shadow: inset 0 0.5px 0 rgba(255, 255, 255, 0.55);
 }
 .ss-collapse {
     width: 22px; height: 22px; border-radius: 6px;
     border: 1px solid transparent;
     background: transparent;
-    color: var(--fg-mute, #6e737d);
+    color: var(--label-secondary);
+    /* Collapses the sidebar on click. */
     cursor: pointer; font: inherit;
     display: inline-flex; align-items: center; justify-content: center;
     transition: background 150ms, border-color 150ms, color 150ms;
@@ -4100,7 +4909,7 @@ button.danger:hover:not(:disabled) {
 .ss-collapse:hover {
     background: rgba(60, 80, 120, 0.10);
     border-color: rgba(60, 80, 120, 0.22);
-    color: var(--fg-soft, #3a3f48);
+    color: var(--label);
 }
 .ss-collapse svg { display: block; }
 
@@ -4136,6 +4945,125 @@ button.danger:hover:not(:disabled) {
    inside its own capped box past that point instead of pushing Activity
    down. .ss-body below is flex:1 1 auto, so whatever height the plan bar
    doesn't use flows to Activity/Files rather than becoming dead space. */
+/* ── Resume candidates section (top of sidebar when idle) ───────────── */
+.ss-resume-section {
+    flex: 0 0 auto;
+    padding: 12px;
+    /* Opaque card backing so the resume choice reads as one solid panel
+       (the sidebar host itself is transparent — see .session-sidebar). */
+    background: rgba(250, 249, 252, 0.97);
+    border: 1px solid color-mix(in srgb, var(--tint-strong) 30%, transparent);
+    border-radius: 12px;
+    margin: 8px;
+    box-shadow: 0 2px 14px color-mix(in srgb, var(--tint-strong) 14%, transparent);
+    -webkit-app-region: no-drag;
+    app-region: no-drag;
+}
+.ss-resume-section.hidden { display: none; }
+
+/* While a resume offer is up, the sidebar shows ONLY the resume choice —
+   hide the plan bar / activity / files so nothing competes with the
+   identity decision (set by session-sidebar.js's data-resume-active), and
+   let the resume card CLAIM the full panel height (flex:1, not 0 0 auto)
+   instead of sizing to its own content and leaving dead space below. The
+   card itself becomes a column so the candidate list can grow into
+   whatever room the title/actions don't use — see .ss-resume-list below. */
+.session-sidebar[data-resume-active="true"] #ss-planbar,
+.session-sidebar[data-resume-active="true"] #ss-body {
+    display: none;
+}
+.session-sidebar[data-resume-active="true"] .ss-resume-section {
+    flex: 1 1 auto;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+}
+.ss-resume-title {
+    font-weight: var(--fw-semibold);
+    font-size: var(--fs-body);
+    line-height: var(--lh-body);
+    color: var(--fg);
+    margin-bottom: 8px;
+}
+.ss-resume-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    /* Grow to fill whatever room the section has (title/actions/countdown
+       are fixed-size siblings) — the resume section now claims the full
+       sidebar height, so the list should absorb that space rather than
+       leaving it blank below a short list. max-height is a ceiling for
+       the rare case content is taller than the panel; min-height:0 lets
+       it actually shrink/scroll inside a flex column instead of
+       overflowing its parent. */
+    flex: 1 1 auto;
+    min-height: 0;
+    max-height: 100%;
+    overflow-y: auto;
+}
+.ss-resume-row {
+    border: 1px solid color-mix(in srgb, var(--tint-strong) 28%, transparent);
+    border-radius: 9px;
+    background: #ffffff;
+    padding: 8px 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    /* Whole-row click target with no button chrome inside it (unlike
+       .admin-tab/.sched-list-item, which look and behave like controls) —
+       a hand cursor is the only affordance telling the user it's tappable. */
+    cursor: pointer;
+    transition: background 120ms ease, border-color 120ms ease;
+}
+.ss-resume-row:hover {
+    background: color-mix(in srgb, var(--tint) 12%, #ffffff);
+    border-color: color-mix(in srgb, var(--tint-strong) 55%, transparent);
+}
+.ss-resume-row-title {
+    font-weight: var(--fw-semibold);
+    font-size: var(--fs-callout);
+    line-height: var(--lh-callout);
+    color: var(--fg);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.ss-resume-row-meta {
+    font-size: var(--fs-subheadline);
+    line-height: var(--lh-subheadline);
+    color: var(--fg-mute);
+}
+.ss-resume-row-answer {
+    font-size: var(--fs-subheadline);
+    line-height: var(--lh-subheadline);
+    color: var(--fg-mute);
+    font-style: italic;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.ss-resume-actions {
+    display: flex;
+    justify-content: flex-end;
+    margin-top: 8px;
+}
+.ss-resume-dismiss {
+    padding: 6px 14px;
+    border: 1px solid rgba(0, 0, 0, 0.12);
+    border-radius: 8px;
+    font: inherit;
+    font-size: var(--fs-callout);
+    line-height: var(--lh-callout);
+    cursor: pointer;
+    /* Opaque surface — matches the candidate rows / panel rather than
+       being see-through against the transparent sidebar (the rows sit on
+       an opaque white; the button should read as the same solid material,
+       not a ghosted control floating over desktop content). */
+    background: #ffffff;
+    color: var(--fg);
+}
+.ss-resume-dismiss:hover { background: color-mix(in srgb, var(--tint) 12%, #ffffff); color: var(--fg); }
+
 .ss-planbar {
     flex: 0 0 auto;
     max-height: 30cqh;
@@ -4237,20 +5165,21 @@ button.danger:hover:not(:disabled) {
 .ss-activity-section { flex: 55 1 0; min-height: 80px; }
 .ss-files-section { flex: 45 1 0; min-height: 80px; }
 .ss-section-head {
+    /* macOS sidebar group-label recipe — see the .ss-header .ss-title
+       comment above for the full rationale (same recipe, same research).
+       No plate/pill/box — this is "ACTIVITY" / "FILES" sitting bare on
+       the panel's own glass, exactly like Finder's "Favorites" or Mail's
+       "On My Mac" group labels. */
     flex: 0 0 auto;
     display: flex; align-items: center; gap: 10px;
     margin: 6px 6px 0 6px;
-    padding: 6px 10px;
-    border-radius: 9px;
-    font-size: var(--fs-subheadline); letter-spacing: 1.2px; text-transform: uppercase;
+    padding: 6px 10px 2px;
+    font-size: var(--fs-subheadline);
     line-height: var(--lh-subheadline);
-    font-weight: var(--fw-bold);
-    color: var(--fg, #1a1d22);
-    /* Title band — adaptive plate hugging the module title. The
-       backdrop-filter:brightness() (applied via the plate selector group
-       above) ensures contrast on dark desktops without heavy opaque fill. */
-    background: var(--l2-plate-strong);
-    box-shadow: inset 0 0.5px 0 rgba(255, 255, 255, 0.55);
+    font-weight: var(--fw-semibold);
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+    color: var(--label-secondary);
 }
 /* Files head carries an inline legend after the title. Allow wrap so that,
    once the title + legend + count no longer fit on one line (narrow window),
@@ -4260,7 +5189,7 @@ button.danger:hover:not(:disabled) {
 .ss-section-title { flex: 0 0 auto; }
 .ss-section-count {
     letter-spacing: 0; text-transform: none; font-weight: var(--fw-medium);
-    color: var(--fg-soft, #3a3f48);
+    color: var(--label-tertiary);
     margin-left: auto;   /* pin the count to the right edge of the head */
 }
 
@@ -4283,7 +5212,7 @@ button.danger:hover:not(:disabled) {
 .ss-activity-item {
     padding: 6px 4px;
     border-top: 1px dashed rgba(60, 80, 120, 0.12);
-    cursor: pointer;
+    cursor: default;
     /* The row is click-to-expand but gave no hover feedback, unlike the
        file rows in the sibling panel (.ss-file-row:hover shifts color).
        This closes that affordance gap: a hairline tint + 2px inset nudge
@@ -4324,17 +5253,17 @@ button.danger:hover:not(:disabled) {
 }
 .ss-activity-item .aa-label {
     flex: 1 1 auto; min-width: 0;
-    color: var(--fg, #1a1d22);
+    color: var(--label);
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .ss-activity-item.expanded .aa-label { white-space: normal; }
 .ss-activity-item .aa-time {
-    flex: 0 0 auto; color: var(--fg-mute, #6e737d);
+    flex: 0 0 auto; color: var(--label-tertiary);
     font-size: var(--fs-footnote); font-variant-numeric: tabular-nums;
 }
 .ss-activity-item .aa-result {
     display: block; margin-top: 3px;
-    color: var(--fg-soft, #3a3f48);
+    color: var(--label-secondary);
     /* Borrowed the chat-bubble typographic recipe — mono at 11px was
        reading thin/washed-out here. SF Pro Text at callout (12px / 1.45)
        gives the same "present, readable" feel as bubbles without going as
@@ -4353,7 +5282,7 @@ button.danger:hover:not(:disabled) {
 }
 .ss-activity-item .aa-content {
     display: block; margin-top: 3px;
-    color: var(--fg-soft, #3a3f48);
+    color: var(--label-secondary);
     font-family: var(--sans);
     font-size: var(--fs-callout);
     line-height: 1.45;
@@ -4370,7 +5299,7 @@ button.danger:hover:not(:disabled) {
 }
 .ss-activity-empty {
     text-align: center; padding: 16px 8px;
-    color: var(--fg-mute, #6e737d);
+    color: var(--label-secondary);
     font-size: var(--fs-callout); line-height: var(--lh-callout);
     font-style: italic;
 }
@@ -4425,15 +5354,15 @@ button.danger:hover:not(:disabled) {
     font-family: var(--sans);
     font-size: var(--fs-callout);
     line-height: var(--lh-callout);
-    color: var(--fg, #1a1d22);
-    cursor: pointer;
+    color: var(--label);
+    cursor: default;
     white-space: nowrap;
     transition: color 150ms;
 }
 .ss-tree-dir:hover { color: var(--tint-strong); }
 .ss-tree-twist {
     flex: 0 0 auto; width: 12px; text-align: center;
-    font-size: 9px; color: var(--fg-mute, #6e737d);
+    font-size: 9px; color: var(--label-tertiary);
 }
 .ss-tree-folder {
     flex: 1 1 auto; min-width: 0;
@@ -4445,16 +5374,20 @@ button.danger:hover:not(:disabled) {
 .ss-file-row {
     display: flex; align-items: center; gap: 6px;
     padding: 3px 6px 3px 0;
-    color: var(--fg-soft, #3a3f48);
+    color: var(--label-secondary);
     font-family: var(--mono);
     font-size: var(--fs-subheadline);
     line-height: var(--lh-subheadline);
-    cursor: pointer;
+    cursor: default;
     transition: color 150ms;
 }
 .ss-file-row:hover { color: var(--tint-strong); }
 .ss-file-row.new-flash {
-    animation: ss-row-flash 900ms cubic-bezier(0.22, 1.2, 0.36, 1);
+    /* 420ms — brought in line with the activity list's aa-slide-in
+       (260ms spring-soft); was 900ms, more than 3x that clock, so the
+       same backend event visibly animated the two sidebar panels at
+       very different paces. */
+    animation: ss-row-flash 420ms cubic-bezier(0.22, 1.2, 0.36, 1);
 }
 @keyframes ss-row-flash {
     /* background-color (not background shorthand) — the row's background-image
@@ -4491,7 +5424,7 @@ button.danger:hover:not(:disabled) {
     margin-left: 4px;
     font-size: var(--fs-caption, var(--fs-footnote));
     letter-spacing: 0; text-transform: none; font-weight: var(--fw-medium);
-    color: var(--fg-mute, #6e737d);
+    color: var(--label-tertiary);
 }
 .ss-files-legend .lg { display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
 .ss-files-legend .ss-kind-dot { width: 7px; height: 7px; box-shadow: none; }
@@ -4529,7 +5462,7 @@ button.danger:hover:not(:disabled) {
     border: none; border-radius: 5px;
     background: transparent;
     color: var(--fg-mute, #6e737d);
-    font-size: 13px; line-height: 1; cursor: pointer;
+    font-size: 13px; line-height: 1; cursor: default;
     transition: background 150ms, color 150ms;
 }
 .ss-file-undo:hover { background: rgba(224, 85, 85, 0.16); color: #c04545; }
@@ -4548,7 +5481,7 @@ button.danger:hover:not(:disabled) {
 .ss-undo-confirm .uc-msg { flex: 1 1 auto; min-width: 0; color: #c04545; }
 .ss-undo-confirm button {
     flex: 0 0 auto;
-    padding: 2px 10px; border-radius: 5px; cursor: pointer;
+    padding: 2px 10px; border-radius: 5px; cursor: default;
     font: inherit; font-size: var(--fs-subheadline);
     border: 1px solid rgba(224, 85, 85, 0.35);
 }
@@ -4559,9 +5492,135 @@ button.danger:hover:not(:disabled) {
 
 .ss-files-empty {
     text-align: center; padding: 24px 8px;
-    color: var(--fg-soft, #3a3f48);
+    color: var(--label-secondary);
     font-size: var(--fs-callout); line-height: var(--lh-callout);
     font-style: italic;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   PERFORMANCE MODE (Ctrl+Shift+P toggle)
+   Removes expensive-per-frame effects that individually are fine but
+   compound under real DOM load.
+   ═══════════════════════════════════════════════════════════════════════════ */
+
+/* 1. Kill SVG filter references — Blink rasterizes these (non-GPU-compositable)
+      and must re-rasterize every frame during any geometry animation. */
+html.perf-mode .tb-btn,
+html.perf-mode .titlebar-new-btn,
+html.perf-mode .titlebar-island,
+html.perf-mode .titlebar-island.expanded,
+html.perf-mode .session-card-close,
+html.perf-mode .session-card-min {
+    backdrop-filter: blur(16px) saturate(115%);
+    -webkit-backdrop-filter: blur(16px) saturate(115%);
+}
+
+/* 2. Session cards: replace backdrop-filter with solid semi-transparent bg
+      during View Transitions — prevents per-frame blur re-sample on position
+      interpolation. */
+html.perf-mode .session-card {
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+    background: rgba(255, 255, 255, 0.90);
+}
+
+/* 3. Chat bubbles: no backdrop-filter (they sit on an already-blurred card) */
+html.perf-mode .bubble {
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+    background: rgba(255, 255, 255, 0.88);
+}
+
+/* 4. Sidebar: use clip-path instead of width for collapse animation
+      (avoids flex reflow of all siblings per frame) */
+html.perf-mode .session-sidebar {
+    transition: clip-path 200ms var(--spring-soft, cubic-bezier(0.22, 1.2, 0.36, 1)),
+                margin 200ms var(--spring-soft, cubic-bezier(0.22, 1.2, 0.36, 1)) !important;
+    clip-path: inset(0 0 0 0 round 16px);
+}
+html.perf-mode .session-sidebar[data-collapsed="true"] {
+    clip-path: inset(0 0 0 100% round 16px) !important;
+    width: 264px !important;   /* keep layout width, just clip visually */
+    min-width: 264px !important;
+    margin-right: 0 !important;
+}
+
+/* 5. Titlebar island: remove will-change on width/height (useless for
+      non-compositable properties; just wastes VRAM). */
+html.perf-mode .titlebar-island {
+    will-change: transform;
+}
+
+/* 6. Performance mode indicator */
+html.perf-mode::after {
+    content: 'PERF MODE';
+    position: fixed;
+    bottom: 8px; right: 8px;
+    font-size: 9px; font-weight: 800;
+    padding: 3px 8px; border-radius: 6px;
+    background: rgba(40, 160, 80, 0.15);
+    color: #2a7;
+    z-index: 99999;
+    pointer-events: none;
+    font-family: 'Segoe UI', system-ui, sans-serif;
+}
+
+/* 7. During any active View Transition (unconditional, not perf-mode-
+      gated — see renderer.js's _runVT): ensure no backdrop-filter on
+      cards while they are being position-interpolated by the browser. */
+html.vt-active .session-card {
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+}
+
+/* 8. While the OS window is resizing (html.window-resizing, set by
+      renderer.js on the first resize tick and cleared a beat after the
+      last). A resize forces Chromium to re-rasterize every
+      backdrop-filter region at its new size, every frame — and a resize
+      is not rare here, since the auto-resize IPC fires one on session
+      create/close, rail open/close and every sidebar toggle. That is the
+      common thread behind "anything that changes the UI's size feels
+      choppy".
+
+      Deliberately NOT the flat-fill treatment perf-mode uses
+      (`backdrop-filter: none` + an opaque white background). Swapping a
+      blurred surface for near-opaque white and back trades stutter for a
+      visible white flash several times a minute. Blur cost scales with
+      the kernel radius instead, so dialling the radius down keeps the
+      glass translucent — the surfaces stay recognisably themselves,
+      they just soften for the duration.
+
+      The three widest surfaces (.session-card, .task-plan-panel /
+      .agent-todo-panel, .ss-section) all read their radius from
+      --l2-blur, so one token override covers all of them. html.* beats
+      :root on specificity, so this needs no !important. */
+html.window-resizing {
+    --l2-blur: 8px;
+}
+/* The SVG-referencing filters are a different problem: Blink cannot
+   GPU-composite a url() filter chain at all, so these re-rasterize on the
+   CPU every frame regardless of radius (the comment above perf-mode's
+   rule 1 says the same). Here the url() is dropped outright rather than
+   reduced — on affordances this small the refraction is the first thing
+   you stop noticing and the first thing worth paying for. */
+html.window-resizing .tb-btn,
+html.window-resizing .titlebar-new-btn,
+html.window-resizing .titlebar-island,
+html.window-resizing .session-card-close,
+html.window-resizing .session-card-min,
+html.window-resizing .session-card-max,
+html.window-resizing .composer-input-wrap > button,
+html.window-resizing .terminal-resize-handle,
+html.window-resizing .fc-resize,
+html.window-resizing ::-webkit-scrollbar-thumb {
+    backdrop-filter: blur(8px) saturate(120%);
+    -webkit-backdrop-filter: blur(8px) saturate(120%);
+}
+/* Bubbles carry their own 20px blur and there is one per message, so a
+   long conversation multiplies the per-frame cost by its scrollback. */
+html.window-resizing .bubble {
+    backdrop-filter: blur(6px) saturate(110%);
+    -webkit-backdrop-filter: blur(6px) saturate(110%);
 }
 
 /* ============================================================ */
@@ -4636,7 +5695,17 @@ button.danger:hover:not(:disabled) {
     color: var(--fg-mute);
     font-size: 18px;
     line-height: 1;
-    cursor: pointer;
+    cursor: default;
+    /* Was: no transition — instant snap on hover, no press feedback,
+       no focus outline. */
+    transition: background 160ms var(--ease-glass),
+                color 160ms var(--ease-glass),
+                transform 120ms var(--ease-glass);
+}
+.fc-close:active { transform: translateY(1px); }
+.fc-close:focus-visible {
+    outline: 2px solid rgba(184, 175, 196, 0.5);
+    outline-offset: 2px;
 }
 .fc-close:hover {
     background: rgba(0, 0, 0, 0.06);
@@ -4725,13 +5794,13 @@ button.danger:hover:not(:disabled) {
     gap: 8px;
     padding: 6px 10px;
     border-radius: 8px;
-    cursor: pointer;
+    cursor: default;
     line-height: 1.35;
     user-select: none;
 }
 .mention-item:hover,
 .mention-item.selected {
-    background: rgba(0, 122, 255, 0.14);
+    background: rgba(184, 175, 196, 0.20);
 }
 .mention-item-icon {
     flex: 0 0 auto;
@@ -4801,4 +5870,960 @@ button.danger:hover:not(:disabled) {
     font-family: var(--mono);
 }
 
+/* ---- Custom hover tooltip (replaces native title="" popups) ------------- */
+/* Native title= tooltips render as an unstyled OS box that clashes with the
+   liquid-glass aesthetic. renderer.js migrates every [title] to
+   [data-tooltip] on load and drives this single shared floater via event
+   delegation instead. Dark-on-glass (rather than the app's usual light
+   glass) so it stays readable over any desktop content without needing the
+   luma-adaptive label system. */
+.hq-tooltip {
+    position: fixed;
+    /* Above every overlay layer in the app (.overlay: 100, confirm/pairing
+       dialogs: 2000-2100, #overlay-sched-form/#overlay-skill-form: 1500) —
+       a tooltip that can be triggered from inside an open overlay (e.g. a
+       Connect panel session chip) must render above that overlay's own
+       backdrop, or it's invisible behind it. */
+    z-index: 2200;
+    pointer-events: none;
+    padding: 4px 8px;
+    font-size: var(--fs-footnote);
+    line-height: var(--lh-footnote);
+    color: #fff;
+    background: rgba(30, 30, 34, 0.85);
+    backdrop-filter: blur(12px) saturate(130%);
+    -webkit-backdrop-filter: blur(12px) saturate(130%);
+    border-radius: 6px;
+    white-space: nowrap;
+    animation: liquid-entrance 150ms var(--spring-soft) both;
+}
+.hq-tooltip.hidden { display: none; }
 
+
+
+
+/* ==========================================================================
+   Remote machines overlay — direct control channel
+   (docs/fleet_scheduling_design.md)
+
+   Reuses .overlay / .overlay-card / .overlay-header / .help-text wholesale;
+   only the two lists and the pairing dialog need rules of their own. Prefix is
+   `remote-*` for the overlay shell and `rc-*` for the rows and dialog, matching
+   the codebase habit of a short prefix per component (ss-, sk-, scc-).
+   ========================================================================== */
+
+.remote-card {
+    width: min(760px, 92vw);
+    display: flex;
+    flex-direction: column;
+}
+
+.remote-body {
+    overflow-y: auto;
+    padding: 4px 2px 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 22px;
+}
+
+.remote-section-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 6px;
+}
+
+.remote-section-head h3 {
+    margin: 0;
+    font-size: var(--fs-body);
+    font-weight: var(--fw-semibold);
+    color: var(--label);
+}
+
+.remote-serve-state {
+    font-size: var(--fs-subheadline);
+    font-weight: var(--fw-semibold);
+}
+.remote-serve-state.on  { color: var(--tint-strong); }
+.remote-serve-state.off { color: var(--label-secondary); }
+
+/* ---------- Paired-target rows ---------- */
+
+.remote-target-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-top: 10px;
+}
+
+.rc-empty {
+    padding: 18px;
+    text-align: center;
+    font-size: var(--fs-subheadline);
+    color: var(--label-secondary);
+    border: 1px dashed color-mix(in srgb, var(--label) 18%, transparent);
+    border-radius: 10px;
+}
+
+.rc-target {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 10px 12px;
+    border-radius: 10px;
+    background: color-mix(in srgb, var(--label) 5%, transparent);
+}
+
+/* Connection dot. Grey = paired but not connected, which is the normal
+   resting state — a target is only connected while a session is open. */
+.rc-dot {
+    flex: 0 0 auto;
+    width: 8px;
+    height: 8px;
+    margin-top: 6px;
+    border-radius: 50%;
+    background: color-mix(in srgb, var(--label) 28%, transparent);
+}
+.rc-dot.on { background: var(--tint-strong); }
+
+.rc-target-info { flex: 1 1 auto; min-width: 0; }
+
+.rc-target-name {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: var(--fs-callout);
+    font-weight: var(--fw-semibold);
+    color: var(--label);
+}
+
+.rc-target-os {
+    padding: 0 6px;
+    border-radius: 8px;
+    font-size: var(--fs-caption2, 11px);
+    font-weight: var(--fw-regular);
+    color: var(--label-secondary);
+    background: color-mix(in srgb, var(--label) 10%, transparent);
+}
+
+.rc-target-endpoint {
+    margin-top: 2px;
+    font-family: var(--mono);
+    font-size: var(--fs-caption2, 11px);
+    color: var(--label-secondary);
+}
+
+/* Sessions still alive on that machine that we have driven before — clicking
+   one re-adopts it, which is the "come back tomorrow" path. */
+.rc-target-sessions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 7px;
+}
+
+.rc-session-chip-wrap {
+    display: inline-flex;
+    align-items: stretch;
+    max-width: 260px;
+}
+
+.rc-session-chip {
+    max-width: 220px;
+    padding: 2px 9px;
+    border: 1px solid color-mix(in srgb, var(--tint-strong) 35%, transparent);
+    border-radius: 10px 0 0 10px;   /* left half of the pill; × has the right */
+    border-right: none;
+    font-size: var(--fs-caption2, 11px);
+    color: var(--tint-strong);
+    background: transparent;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    cursor: default;
+}
+.rc-session-chip:hover {
+    background: color-mix(in srgb, var(--tint-strong) 12%, transparent);
+}
+
+/* × next to the chip: distinct hover state so "delete" is unmistakable, but
+   base state stays subtle enough not to shout "danger" every time you look at
+   the panel. */
+.rc-session-kill {
+    padding: 0 6px;
+    border: 1px solid color-mix(in srgb, var(--tint-strong) 35%, transparent);
+    border-radius: 0 10px 10px 0;
+    font-size: var(--fs-caption2, 11px);
+    line-height: 1;
+    color: var(--label-secondary);
+    background: transparent;
+    cursor: default;
+}
+.rc-session-kill:hover {
+    color: var(--error-fg, #b3261e);
+    background: color-mix(in srgb, var(--error-fg, #b3261e) 12%, transparent);
+    border-color: color-mix(in srgb, var(--error-fg, #b3261e) 40%, transparent);
+}
+
+.rc-target-actions {
+    flex: 0 0 auto;
+    display: flex;
+    gap: 6px;
+}
+
+/* ---------- This machine's own address ---------- */
+
+.rc-pairing-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 10px 0 6px;
+}
+
+/* The pairing string carries a bearer token. Selectable on purpose — the copy
+   button can be denied clipboard access, and select-then-Ctrl+C is the fallback
+   that always works. */
+.rc-pairing {
+    flex: 1 1 auto;
+    min-width: 0;
+    padding: 7px 10px;
+    border-radius: 8px;
+    font-family: var(--mono);
+    font-size: var(--fs-caption2, 11px);
+    color: var(--label);
+    background: color-mix(in srgb, var(--label) 8%, transparent);
+    overflow-x: auto;
+    white-space: nowrap;
+    user-select: all;
+}
+
+.rc-alt-endpoints,
+.rc-serve-sessions {
+    margin-top: 6px;
+    font-size: var(--fs-caption2, 11px);
+    color: var(--label-secondary);
+    font-family: var(--mono);
+}
+
+.rc-alt-label { font-family: var(--sans); }
+
+/* ---------- Pairing / confirm dialog ---------- */
+
+.rc-dialog-card {
+    width: min(560px, 92vw);
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    /* .overlay-card itself carries no padding (its other users — settings,
+       scheduler, skills — wrap content in .overlay-header/.settings-form,
+       which supply their own). This card has neither, so without its own
+       padding the title/body/buttons sit flush against the card's rounded
+       edges. */
+    padding: 18px 20px 20px;
+}
+
+.rc-dialog-title {
+    font-size: var(--fs-body);
+    font-weight: var(--fw-semibold);
+    /* --fg, NOT --label: this card is .overlay-card's hardcoded opaque #fff
+       "whiteboard" (see .overlay-card's own comment + .connect-card's, right
+       below), not a glass surface. --label flips to near-white under
+       html.desktop-is-dark, which made every confirm/pairing dialog's title
+       unreadable whenever the real desktop behind the (unrelated) main
+       window was sampled as dark — the dialog itself never had any dark
+       backdrop under it. */
+    color: var(--fg);
+}
+
+.rc-dialog-body {
+    font-size: var(--fs-subheadline);
+    line-height: var(--lh-callout);
+    color: var(--fg-mute);
+    /* Callers write these bodies as prose with real `\n`/`\n\n` breaks and, in
+       the Connect panel, "  · " bullet lines (see connect-panel.js's
+       closeRemoteSession / endRemoteMachine). Default white-space collapsed
+       every one of them into a single run-on paragraph. Matches
+       .confirm-dialog-body, which already does this. */
+    white-space: pre-line;
+}
+
+.rc-dialog-input,
+.rc-dialog-name {
+    padding: 8px 10px;
+    border: 1px solid rgba(0, 0, 0, 0.08);
+    border-radius: 8px;
+    font: inherit;
+    color: var(--fg);
+    background: rgba(255, 255, 255, 0.40);
+    transition: border-color 180ms var(--ease-glass),
+                box-shadow 180ms var(--ease-glass);
+}
+.rc-dialog-input {
+    width: 100%;
+    font-family: var(--mono);
+    font-size: var(--fs-caption2, 11px);
+    resize: vertical;
+}
+
+.rc-dialog-name { width: 100%; font-family: var(--sans); }
+
+.rc-dialog-input:focus,
+.rc-dialog-name:focus {
+    outline: none;
+    border-color: rgba(184, 175, 196, 0.50);
+    box-shadow: 0 0 0 3px rgba(184, 175, 196, 0.10);
+}
+
+.rc-dialog-status {
+    min-height: 18px;
+    font-size: var(--fs-caption2, 11px);
+    color: var(--fg-mute);
+}
+.rc-dialog-status.ok  { color: var(--tint-strong); }
+.rc-dialog-status.err { color: var(--error-fg, #b3261e); }
+
+.rc-dialog-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+}
+
+/* There is no global `.hidden { display: none }` in this stylesheet — every
+   use is scoped to its component (.overlay.hidden, .settings-toast.hidden, …).
+   These two follow that convention rather than introducing a global rule that
+   could change how existing markup renders. */
+.session-card-remote.hidden { display: none; }
+.rc-dialog-actions button.hidden { display: none; }
+
+/* Keep the two pairing buttons together on the right rather than letting
+   .remote-section-head's space-between fling them to opposite edges. */
+.remote-head-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+
+/* ==========================================================================
+   v6 Connect panel — role selection + As Server / As Client dashboards
+   (docs/connect_panel_design_v6.md). Layered on top of the existing overlay
+   scaffolding so the entrance animation, backdrop, and close-button behavior
+   match the rest of the app. Token usage follows the same vocabulary as
+   .overlay-card, .rc-*, and .settings-* — see the :root block above for the
+   fs, radius, and space custom properties.
+
+   Text/background colors here deliberately use the --fg/--fg-mute family,
+   NOT --label/--label-secondary/--label-tertiary. --label* flips to a
+   near-white value under html.desktop-is-dark (it's meant for glass
+   surfaces sitting directly over the desktop), but .connect-card sits on
+   .overlay-card's hardcoded opaque #fff — flipping text to white there
+   makes it unreadable against the always-white card. --fg* never flips,
+   which is the correct choice for any opaque "whiteboard" panel (see
+   .overlay-card's own comment).
+   ========================================================================== */
+
+.connect-card {
+    width: min(880px, 92vw);
+    display: flex;
+    flex-direction: column;
+}
+
+.connect-header-actions {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+}
+
+.connect-back {
+    background: transparent;
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius-btn-s);
+    padding: 3px 10px;
+    font-size: var(--fs-callout);
+    cursor: default;
+}
+
+.connect-body {
+    overflow-y: auto;
+    padding: var(--space-1) var(--space-4) var(--space-2);
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+}
+
+.connect-page.hidden { display: none; }
+
+/* ---- Role selection page ---------------------------------------------- */
+
+.connect-role-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: var(--space-5);
+    padding: var(--space-6) var(--space-3) var(--space-2);
+}
+
+.connect-role-tile {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    min-height: 180px;
+    padding: var(--space-5) var(--space-5);
+    background: color-mix(in srgb, var(--tint) 14%, transparent);
+    border: 1px solid color-mix(in srgb, var(--tint-strong) 30%, transparent);
+    border-radius: var(--radius-card);
+    cursor: default;
+    transition: background 180ms var(--ease-glass), transform 120ms var(--spring);
+}
+
+.connect-role-tile:hover {
+    background: color-mix(in srgb, var(--tint) 24%, transparent);
+}
+
+.connect-role-tile:active {
+    transform: scale(0.98);
+}
+
+.connect-role-title {
+    font-size: var(--fs-title2);
+    line-height: var(--lh-title2);
+    font-weight: var(--fw-semibold);
+    color: var(--tint-strong);
+}
+
+.connect-role-desc {
+    font-size: var(--fs-callout);
+    line-height: var(--lh-callout);
+    color: var(--fg-mute);
+    text-align: center;
+}
+
+.connect-note {
+    padding: var(--space-3) var(--space-2) var(--space-1);
+    font-size: var(--fs-callout);
+    line-height: var(--lh-callout);
+    color: var(--fg-mute);
+    opacity: 0.8;
+    text-align: center;
+}
+
+/* ---- Dashboard sections (shared) --------------------------------------- */
+
+.connect-panel-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: var(--space-2);
+    padding: 0 var(--space-1) var(--space-1);
+}
+
+/* Base button recipe shared by every plain <button> in the connect card
+   (Exit As Client, Disconnect Client, +Linux, +Windows, per-target
+   Disconnect/Forget/New Session) — mirrors .settings-actions button's
+   padding/border/radius so a button doesn't have to opt into a specific
+   class just to look like a button. .primary / .destructive are color-only
+   overrides on top. */
+.connect-panel-actions button,
+.connect-add-actions button,
+.connect-target-actions button,
+.connect-section h3 button,
+.rc-target-actions button,
+.remote-head-actions button {
+    padding: 6px 14px;
+    border: 1px solid var(--hairline);
+    border-radius: var(--radius-btn);
+    background: color-mix(in srgb, var(--fg) 14%, transparent);
+    color: var(--fg);
+    font: inherit;
+    font-size: var(--fs-callout);
+    cursor: default;
+    box-shadow: 0 0 0 1px var(--shadow-atom-xs),
+                0 1px 2px var(--shadow-atom-s);
+    transition: background 160ms var(--ease-glass), color 160ms var(--ease-glass),
+                transform 120ms var(--spring), box-shadow 160ms var(--ease-glass);
+}
+.connect-panel-actions button:hover:not(:disabled),
+.connect-add-actions button:hover:not(:disabled),
+.connect-target-actions button:hover:not(:disabled),
+.connect-section h3 button:hover:not(:disabled),
+.rc-target-actions button:hover:not(:disabled),
+.remote-head-actions button:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--fg) 20%, transparent);
+    box-shadow: 0 0 0 1px var(--shadow-atom-xs),
+                0 4px 10px var(--shadow-atom-m);
+}
+.connect-panel-actions button:active:not(:disabled),
+.connect-add-actions button:active:not(:disabled),
+.connect-target-actions button:active:not(:disabled),
+.connect-section h3 button:active:not(:disabled),
+.rc-target-actions button:active:not(:disabled),
+.remote-head-actions button:active:not(:disabled) {
+    transform: translateY(1px);
+}
+.connect-target-actions button:disabled,
+.rc-target-actions button:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+}
+
+.connect-panel-actions button.primary,
+.connect-add-actions button.primary,
+.connect-target-actions button.primary,
+.rc-target-actions button.primary,
+.remote-head-actions button.primary {
+    background: color-mix(in srgb, var(--tint-strong) 18%, transparent);
+    border-color: color-mix(in srgb, var(--tint-strong) 45%, transparent);
+    color: var(--tint-strong);
+    font-weight: var(--fw-semibold);
+}
+.connect-panel-actions button.primary:hover:not(:disabled),
+.connect-add-actions button.primary:hover:not(:disabled),
+.connect-target-actions button.primary:hover:not(:disabled),
+.rc-target-actions button.primary:hover:not(:disabled),
+.remote-head-actions button.primary:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--tint-strong) 28%, transparent);
+}
+
+/* Any destructive action anywhere in the card (Exit Server/Client sit in
+   .connect-panel-actions, Disconnect/Forget sit in .connect-target-actions)
+   — scoped to the card rather than one container so both get it. */
+.connect-card button.destructive {
+    background: rgba(220, 130, 130, 0.10);
+    border-color: rgba(220, 130, 130, 0.45);
+    color: var(--error-fg);
+}
+.connect-card button.destructive:hover:not(:disabled) {
+    background: rgba(220, 130, 130, 0.18);
+}
+
+.connect-section {
+    padding: 10px 6px;
+    border-top: 1px solid var(--hairline-soft);
+}
+
+.connect-section:first-child {
+    border-top: none;
+}
+
+/* macOS sidebar group-label recipe (see .ss-header .ss-title): small,
+   semibold, uppercase, modest tracking, muted secondary-label color. */
+.connect-section h3 {
+    font-size: var(--fs-subheadline);
+    line-height: var(--lh-subheadline);
+    font-weight: var(--fw-semibold);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    color: var(--fg-mute);
+    margin: 0 0 var(--space-2) 0;
+    /* Log/Connect New Server headers put an action button on the same row —
+       flex + space-between keeps the label left and the button right without
+       the button inheriting the header's own uppercase/tracking/muted style
+       (it isn't a heading, it's a normal button that happens to share the
+       row). */
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-2);
+}
+.connect-section h3 button {
+    text-transform: none;
+    letter-spacing: normal;
+    font-weight: var(--fw-semibold);
+}
+
+/* ---- Server dashboard: key-value connect info ------------------------- */
+
+.connect-kv {
+    display: grid;
+    grid-template-columns: 90px 1fr auto;
+    align-items: center;
+    gap: 10px;
+    padding: var(--space-1) 0;
+}
+
+.connect-kv label {
+    font-size: var(--fs-callout);
+    color: var(--fg-mute);
+}
+
+.connect-kv code {
+    font-family: var(--mono);
+    font-size: var(--fs-caption2, 11px);
+    color: var(--fg);
+    background: color-mix(in srgb, var(--fg) 8%, transparent);
+    padding: 7px 10px;
+    border-radius: var(--radius-btn-s);
+    user-select: all;
+    /* Wrap long tokens so they don't overflow the row. */
+    word-break: break-all;
+}
+
+.connect-copy {
+    padding: 3px 10px;
+    font-size: var(--fs-caption2, 11px);
+    border-radius: var(--radius-btn-s);
+    cursor: default;
+    border: 1px solid var(--hairline);
+    background: transparent;
+    color: var(--fg-mute);
+    transition: background 160ms var(--ease-glass), color 160ms var(--ease-glass);
+}
+.connect-copy:hover {
+    background: color-mix(in srgb, var(--tint-strong) 14%, transparent);
+    color: var(--tint-strong);
+}
+
+/* ---- Session list (server dashboard) ---------------------------------- */
+
+.connect-session-list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+}
+
+.connect-session-list[data-empty="true"] {
+    padding: var(--space-2) 0;
+}
+
+.connect-session-row {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-2);
+    background: color-mix(in srgb, var(--fg) 5%, transparent);
+    border-radius: var(--radius-btn-s);
+}
+
+/* The served-session row is the ONLY view this machine's operator has of a
+   session running on their hardware — there is no tab for it by design (see
+   stdio_bridge._emit_session). Hence a stacked body rather than one line:
+   name, live status, parked-confirmation warning, newest line said. */
+.connect-session-body {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;             /* lets children ellipsize instead of pushing the
+                                 Close button off the row */
+}
+
+.connect-session-label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    font-size: var(--fs-callout);
+}
+
+.connect-session-title {
+    color: var(--fg);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.connect-session-meta {
+    font-size: var(--fs-footnote);
+    color: var(--fg-mute);
+    font-variant-numeric: tabular-nums;
+}
+
+.connect-session-waiting {
+    font-size: var(--fs-footnote);
+    font-weight: var(--fw-semibold);
+    color: rgb(170, 90, 0);
+}
+
+.connect-session-last {
+    font-size: var(--fs-footnote);
+    color: var(--fg-mute);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.connect-session-last[data-role="error"] {
+    color: var(--error-fg);
+}
+
+.connect-session-close {
+    flex: 0 0 auto;
+    padding: 3px 10px;
+    font-size: var(--fs-caption2, 11px);
+    border-radius: var(--radius-btn-s);
+    border: 1px solid rgba(220, 130, 130, 0.45);
+    background: rgba(220, 130, 130, 0.10);
+    color: var(--error-fg);
+    cursor: default;
+}
+.connect-session-close:hover:not(:disabled) {
+    background: rgba(220, 130, 130, 0.18);
+}
+
+/* ---- Client dashboard: server cards ----------------------------------- */
+
+.connect-add-actions {
+    display: flex;
+    gap: var(--space-2);
+}
+
+.connect-server-list {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+/* Shown while the bridge's boot-time reconnect sweep is running. Deliberately
+   above the cards and visually distinct: it does not decorate the list, it
+   tells the operator that every "Not connected" below it is provisional. */
+.connect-restoring-banner {
+    padding: var(--space-2) var(--space-3);
+    border-radius: var(--radius-btn-s);
+    border: 1px solid color-mix(in srgb, rgb(170, 90, 0) 35%, transparent);
+    background: color-mix(in srgb, rgb(170, 90, 0) 10%, transparent);
+    color: var(--fg);
+    font-size: var(--fs-footnote);
+}
+
+/* Per-card deferred-upgrade banner (a newer Linux package exists but the
+   machine was busy). Sits inside the target card, between its head and its
+   session chips, with the "upgrade now" action inline. */
+.connect-upgrade-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-2);
+    margin: var(--space-2) 0;
+    padding: var(--space-2) var(--space-3);
+    border-radius: var(--radius-btn-s);
+    border: 1px solid color-mix(in srgb, var(--tint-strong) 35%, transparent);
+    background: color-mix(in srgb, var(--tint-strong) 10%, transparent);
+    color: var(--fg);
+    font-size: var(--fs-footnote);
+}
+
+.connect-upgrade-now {
+    flex: 0 0 auto;
+    padding: 3px 10px;
+    font-size: var(--fs-caption2, 11px);
+    border-radius: var(--radius-btn-s);
+    border: 1px solid color-mix(in srgb, var(--tint-strong) 55%, transparent);
+    background: color-mix(in srgb, var(--tint-strong) 18%, transparent);
+    color: var(--fg);
+    cursor: default;
+}
+.connect-upgrade-now:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--tint-strong) 28%, transparent);
+}
+
+.connect-target-card {
+    padding: var(--space-3);
+    background: color-mix(in srgb, var(--fg) 5%, transparent);
+    border-radius: var(--radius-card);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-2);
+}
+
+.connect-target-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: var(--fs-body);
+}
+
+.connect-target-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: var(--radius-circle);
+    background: color-mix(in srgb, var(--fg) 30%, transparent);
+    flex-shrink: 0;
+}
+
+/* Connection state genuinely needs red/amber/green semantics beyond the
+   shared palette — same precedent as .ss-kind-dot's per-component literals. */
+.connect-target-dot[data-state="connected"] { background: #34c759; }
+.connect-target-dot[data-state="connecting"] { background: #ff9f0a; }
+.connect-target-dot[data-state="reconnecting"] { background: #ff9f0a; }
+.connect-target-dot[data-state="error"] { background: var(--error-fg); }
+.connect-target-dot[data-state="offline"] { background: color-mix(in srgb, var(--fg) 30%, transparent); }
+
+.connect-target-name { font-weight: var(--fw-semibold); }
+
+.connect-target-endpoint,
+.connect-target-platform,
+.connect-target-state {
+    font-size: var(--fs-callout);
+    color: var(--fg-mute);
+}
+
+.connect-target-sessions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    /* Every remote session gets a chip until it is explicitly destroyed (see
+       connect-panel.js's header), so a heavy user accumulates them. Scroll
+       rather than cap: a hidden chip could be the one sitting on a parked
+       confirmation, which is exactly the one that must not be hidden. */
+    max-height: 132px;
+    overflow-y: auto;
+}
+
+.connect-target-sessions-empty {
+    font-size: var(--fs-callout);
+    color: var(--fg-mute);
+    opacity: 0.8;
+    padding: 2px 4px;
+}
+
+.connect-session-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 6px 2px 8px;
+    border: 1px solid color-mix(in srgb, var(--tint-strong) 30%, transparent);
+    background: color-mix(in srgb, var(--tint-strong) 12%, transparent);
+    border-radius: var(--radius-pill);
+    font-size: var(--fs-caption2, 11px);
+    max-width: 100%;
+}
+
+/* Task vs chat is informational only — a muted tint, not a status colour, so it
+   never reads as "this one matters and that one doesn't". */
+.connect-session-chip[data-kind="chat"] {
+    border-color: color-mix(in srgb, var(--fg) 24%, transparent);
+    background: color-mix(in srgb, var(--fg) 10%, transparent);
+}
+
+/* A parked confirmation means an agent on the other machine is blocked on a
+   human who cannot see it is being asked. That is the one chip state worth
+   shouting about. */
+.connect-session-chip[data-pending="true"] {
+    background: rgba(255, 159, 10, 0.18);
+    box-shadow: inset 0 0 0 1px rgba(255, 159, 10, 0.45);
+}
+
+.connect-session-chip[data-controllable="false"] {
+    opacity: 0.62;
+}
+
+.connect-chip-badge {
+    flex: 0 0 auto;
+    padding: 0 5px;
+    border-radius: var(--radius-badge);
+    background: color-mix(in srgb, var(--fg) 8%, transparent);
+    font-size: var(--fs-footnote);
+    line-height: 16px;
+    color: var(--fg-mute);
+}
+
+.connect-chip-label {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 220px;
+}
+
+.connect-chip-state {
+    flex: 0 0 auto;
+    font-size: var(--fs-footnote);
+    color: var(--fg-mute);
+    opacity: 0.8;
+}
+
+.connect-chip-waiting {
+    flex: 0 0 auto;
+    font-size: var(--fs-footnote);
+    font-weight: var(--fw-semibold);
+    color: rgb(170, 90, 0);
+}
+
+.connect-chip-play,
+.connect-chip-close {
+    background: transparent;
+    border: none;
+    padding: 0 4px;
+    border-radius: var(--radius-btn-s);
+    font-size: var(--fs-caption2, 11px);
+    cursor: default;
+    color: var(--tint-strong);
+    transition: background 140ms var(--ease-glass), color 140ms var(--ease-glass);
+}
+
+.connect-chip-play:hover:not(:disabled),
+.connect-chip-close:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--tint-strong) 16%, transparent);
+}
+.connect-chip-play:active:not(:disabled),
+.connect-chip-close:active:not(:disabled) {
+    transform: translateY(1px);
+}
+
+.connect-chip-play:disabled,
+.connect-chip-close:disabled {
+    cursor: not-allowed;
+    opacity: 0.35;
+}
+
+.connect-chip-close { color: var(--error-fg); }
+.connect-chip-close:hover:not(:disabled) {
+    background: rgba(220, 130, 130, 0.16);
+}
+
+/* Force-close carries real risk (terminates another controller's session
+   via the pairing credential, sight-unseen) — give it its own destructive
+   weight instead of quietly inheriting .connect-chip-close's plain color,
+   same treatment as .connect-card button.destructive. */
+.connect-chip-force-close {
+    color: var(--error-fg);
+    background: rgba(220, 130, 130, 0.10);
+}
+.connect-chip-force-close:hover:not(:disabled) {
+    background: rgba(220, 130, 130, 0.22);
+}
+
+.connect-target-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    justify-content: flex-end;
+}
+
+/* ---- Log area ---------------------------------------------------------- */
+
+.connect-log {
+    max-height: 120px;
+    overflow-y: auto;
+    padding: var(--space-2) 10px;
+    font-family: var(--mono);
+    font-size: var(--fs-caption2, 11px);
+    line-height: 1.5;
+    background: color-mix(in srgb, var(--fg) 5%, transparent);
+    border-radius: var(--radius-btn-s);
+    white-space: pre-wrap;
+    color: var(--fg-mute);
+}
+
+.connect-empty-hint {
+    font-size: var(--fs-callout);
+    color: var(--fg-mute);
+    opacity: 0.8;
+    padding: var(--space-2) 0;
+}
+
+.connect-log-clear {
+    float: right;
+    padding: 1px 8px;
+    font-size: var(--fs-caption2, 11px);
+    border-radius: var(--radius-btn-s);
+    cursor: default;
+    border: 1px solid var(--hairline);
+    background: transparent;
+    color: var(--fg-mute);
+    transition: background 160ms var(--ease-glass), color 160ms var(--ease-glass);
+}
+.connect-log-clear:hover {
+    background: color-mix(in srgb, var(--tint-strong) 14%, transparent);
+    color: var(--tint-strong);
+}

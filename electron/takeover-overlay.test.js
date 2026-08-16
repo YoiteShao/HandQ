@@ -3,11 +3,17 @@
 // Runner: Node's built-in test module (no extra deps).
 //   node --test electron/takeover-overlay.test.js
 //
-// Regression focus: the revoke hotkey envelope MUST carry the session_id that
-// was supplied on the desktop_takeover_started event. Without it the bridge's
-// _resolve_session_id rejects the user_input with "user_input: missing
-// session_id" and the takeover is never actually revoked. See the bug fixed
-// alongside these tests.
+// Regression focus:
+//   1. The revoke hotkey envelope MUST carry the session_id that was
+//      supplied on the desktop_takeover_started event. Without it the
+//      bridge's _resolve_session_id rejects the user_input with
+//      "user_input: missing session_id" and the takeover is never
+//      actually revoked.
+//   2. Latest-wins session binding (docs/desktop_tool.md §11.2): when a
+//      second started event arrives for a different session while the
+//      window is still up, the hotkey must rebind to that session — and a
+//      hide() for a since-superseded session must be ignored rather than
+//      tearing down the newer session's overlay out from under it.
 
 'use strict';
 
@@ -113,6 +119,24 @@ test('revoke session_id is never dropped (regression: missing session_id)', () =
     assert.notEqual(sent[0].session_id, undefined);
 });
 
+test('a served (rc-) session id round-trips through the revoke envelope', () => {
+    // Part of closing the "remote operator drives this desktop with no local
+    // warning" gap: the被控 side now emits an unstamped machine-level
+    // served_desktop_takeover_started, and main.js feeds evt.served_session_id
+    // here. The overlay treats the id as opaque, so the only thing that must
+    // hold is that an rc- id survives onto the revoke envelope — that is what
+    // lets the bridge's local user_input handler resolve _flows["rc-…"] and
+    // actually stop the remote agent.
+    const { controller, sent, globalShortcut } = harness();
+
+    controller.show('rc-3f2a9c1d8e7b6a5f');
+    globalShortcut.fire(controller.accelerator);
+
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0].kind, 'desktop_takeover_revoked');
+    assert.equal(sent[0].session_id, 'rc-3f2a9c1d8e7b6a5f');
+});
+
 test('each takeover binds its own session_id (hide/show cycle)', () => {
     const { controller, sent, globalShortcut } = harness();
 
@@ -128,18 +152,57 @@ test('each takeover binds its own session_id (hide/show cycle)', () => {
     assert.equal(sent[1].session_id, 'second-session');
 });
 
-test('duplicate started event is idempotent — no second window, sid unchanged', () => {
+test('second started event for a different session rebinds the hotkey (latest-wins), no second window', () => {
     const { controller, windows, sent, globalShortcut } = harness();
 
     controller.show('sid-1');
-    // A duplicate desktop_takeover_started arrives before any hide.
-    controller.show('sid-2-should-be-ignored');
+    // A second desktop_takeover_started for a different session arrives
+    // before any hide — e.g. session A's overlay is still up when session
+    // B's task gets approved. docs/desktop_tool.md §11.2 requires latest-wins.
+    controller.show('sid-2');
 
     assert.equal(windows.length, 1, 'must not create a second overlay window');
     globalShortcut.fire(controller.accelerator);
-    // The first registration wins; the second show() is a no-op so the hotkey
-    // callback still references the original session_id.
-    assert.equal(sent[0].session_id, 'sid-1');
+    // The window isn't recreated, but the hotkey must target the LATEST
+    // session, not the one that happened to create the window.
+    assert.equal(sent[0].session_id, 'sid-2');
+});
+
+test('hide() for a stale/superseded session is ignored — overlay stays bound to the newer session', () => {
+    const { controller, windows, sent, globalShortcut } = harness();
+
+    controller.show('sid-1');
+    controller.show('sid-2'); // rebinds without recreating the window
+    controller.hide('sid-1'); // stale ended event for the superseded session
+
+    assert.ok(controller.isVisible(), 'overlay must stay up for sid-2');
+    assert.equal(windows[0].isDestroyed(), false);
+    assert.ok(globalShortcut.isRegistered(controller.accelerator));
+
+    globalShortcut.fire(controller.accelerator);
+    assert.equal(sent[0].session_id, 'sid-2');
+});
+
+test('hide() with no argument force-hides regardless of current session', () => {
+    const { controller, windows, globalShortcut } = harness();
+
+    controller.show('sid-1');
+    controller.hide(); // e.g. bridge exit / app quit — no session context
+
+    assert.equal(controller.isVisible(), false);
+    assert.ok(windows[0].isDestroyed());
+    assert.equal(globalShortcut.isRegistered(controller.accelerator), false);
+});
+
+test('hide() for the current session tears down normally', () => {
+    const { controller, windows, globalShortcut } = harness();
+
+    controller.show('sid-1');
+    controller.hide('sid-1');
+
+    assert.equal(controller.isVisible(), false);
+    assert.ok(windows[0].isDestroyed());
+    assert.equal(globalShortcut.isRegistered(controller.accelerator), false);
 });
 
 test('show() configures the overlay window as a passthrough fullscreen layer', () => {

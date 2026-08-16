@@ -12,17 +12,22 @@ Outbound message types: token_stream, status, final, error
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import uuid
 import json
 import logging
 import os
+import platform
 import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, TYPE_CHECKING
 
 import yaml
+
+if TYPE_CHECKING:
+    from src.controller_v2.resume_index import ResumeCandidate
 
 # Inherits handlers configured by bridge_main.py. Must NOT call basicConfig.
 logger = logging.getLogger("handq.bridge")
@@ -355,7 +360,7 @@ def _uninstall_post_commit_hook(repo_path: str) -> Dict[str, Any]:
 #       handq_config.yaml              user config (read by bridge_main)
 #       History\                       <- _session_history_root()
 #           <YYYYMMDD-HHMMSS>-<slug>\  one directory per `request`
-#               session_state.json
+#               digest.json            SessionDigest — session_digest.py
 #               executions_logs\
 #               ... (FlowController writes here)
 #
@@ -549,6 +554,25 @@ class _StdioUI:
                "desc": str(desc or "")},
               session_id=self._session_id)
 
+    def show_user_notice(self, message: str, urgent: bool = False) -> None:
+        """Prominent agent→user message. Renderer maps ``kind=agent_notice``
+        to a standalone system bubble (same weight as a network banner), NOT
+        to the scrolling step trace.
+        """
+        _emit({"type": "status", "kind": "agent_notice",
+               "message": str(message or ""),
+               "urgent": bool(urgent)},
+              session_id=self._session_id)
+
+    def show_user_message_echo(self, text: str) -> None:
+        """Replay of the operator's OWN message, published by the被控 server so
+        a reattaching tab can redraw a bubble the local DOM never persisted.
+        Renderer maps ``kind=user_message_echo`` to the same user-role bubble
+        the local submit handler draws synchronously via ``addUserBubble``."""
+        _emit({"type": "status", "kind": "user_message_echo",
+               "text": str(text or "")},
+              session_id=self._session_id)
+
     def show_recall_started(self) -> None:
         """LTM recall in flight. Renderer maps ``kind=recall_started`` to a
         transient 'recalling…' label on the activity strip, superseded by the
@@ -678,10 +702,27 @@ class _StdioUI:
                "reversible": bool(reversible)},
               session_id=self._session_id)
 
+    def show_coordinator_reply(self, text: str) -> None:
+        """The coordinator's complete reply, as one assistant bubble.
+
+        Same envelope :meth:`StdioBridge._on_coordinator_reply` used to emit
+        inline. It became a delegate method so the remote-control path can carry
+        it: ``FlowControllerV2`` delivers this message through the
+        ``on_reply_to_user`` callback rather than the InteractionManager
+        (``flow_controller.py:533``), which means it bypasses whatever delegate is
+        installed. Routing it through the delegate instead lets a被控 session's
+        ``NetworkUIDelegate`` put it on the wire, and lets the控制 side replay it
+        here with no special case. Non-streamed replies and background
+        task-completion summaries arrive only this way.
+        """
+        if not text:
+            return
+        _emit({"type": "status", "kind": "reply", "text": str(text)},
+              session_id=self._session_id)
+
     def show_coordinator_thinking(self) -> None:
         _emit({"type": "status", "kind": "coordinator_thinking_on"},
               session_id=self._session_id)
-
     def clear_coordinator_thinking(self) -> None:
         _emit({"type": "status", "kind": "coordinator_thinking_off"},
               session_id=self._session_id)
@@ -721,12 +762,21 @@ class _StdioUI:
 
     async def _await_user_response(
         self, kind: str, payload: Dict[str, Any], prompt_id: str,
+        timeout: Optional[float] = None,
     ) -> str:
         """Emit a confirmation envelope; await the renderer's response.
 
         Registers a fresh ``asyncio.Future`` under ``prompt_id``; the stdin
         reader thread resolves it via :meth:`deliver_confirmation_response`
         when the user answers in the renderer modal.
+
+        ``timeout`` is ``None`` (unbounded) for risk/tool/secret confirmations
+        — those are deliberately allowed to sit until the user acts. Only the
+        ``ask_human`` caller passes a real deadline (``ASK_HUMAN_TIMEOUT_S``):
+        on expiry the pending future is dropped AND an ``ask_human_expired``
+        envelope is emitted so the renderer closes the stale modal and leaves
+        a transcript record — without this, the modal would linger forever
+        with no signal that the Python side gave up and moved on.
         """
         loop = asyncio.get_running_loop()
         if self._loop is None:
@@ -739,10 +789,29 @@ class _StdioUI:
         _emit(env, session_id=self._session_id)
         _ui_logger.debug("await_user_response: kind=%s id=%s", kind, prompt_id)
         try:
-            return await fut
+            return await asyncio.wait_for(fut, timeout=timeout)
+        except asyncio.TimeoutError:
+            with self._pending_lock:
+                self._pending.pop(prompt_id, None)
+            if kind == "ask_human":
+                _emit(
+                    {"type": "status", "kind": "ask_human_expired", "id": prompt_id},
+                    session_id=self._session_id,
+                )
+            raise
         except asyncio.CancelledError:
             with self._pending_lock:
                 self._pending.pop(prompt_id, None)
+            if kind == "ask_human":
+                # A remote-controlled session's relayed ask_human prompt is
+                # cancelled this way (RemoteSessionBridge.on_confirm_cancel
+                # cancels the local _answer_confirm task when the 被控 side's
+                # own timeout fires) — same envelope as the direct-timeout
+                # branch above so both paths converge on one renderer handler.
+                _emit(
+                    {"type": "status", "kind": "ask_human_expired", "id": prompt_id},
+                    session_id=self._session_id,
+                )
             raise
 
     async def request_risk_confirmation(
@@ -811,19 +880,348 @@ class _StdioUI:
         payload = {"prompt": str(prompt)}
         return await self._await_user_response("secret_input", payload, prompt_id)
 
-    async def request_user_text(self, prompt: str) -> str:
+    async def request_user_form(self, question: str, fields: list) -> Dict[str, Any]:
         """Free-form (non-secret) clarifying question from the agent
-        (``ask_human`` tool). Emits ``kind=ask_human`` — the renderer shows
-        an UNMASKED text field (distinct from the masked ``secret_input``) —
-        and awaits the user's typed answer."""
+        (``ask_human`` tool). Emits ``kind=ask_human`` with the markdown
+        ``question`` plus a ``fields`` list the renderer turns into labeled
+        text/textarea/radio/checkbox controls, and awaits the user's answer.
+
+        The renderer answers with a JSON-encoded ``{field_id: value}`` object
+        string (see ``renderer.js``'s ask_human submit handler). Decoded here
+        rather than at the caller so every ``request_user_form`` caller —
+        local and remote — gets the same dict shape back. A malformed or
+        legacy plain-string reply decodes to ``{"answer": <raw string>}`` so
+        an old renderer build (or a stray non-JSON reply) never crashes the
+        wait; it just loses structure.
+        """
         prompt_id = f"ask-{int(time.time() * 1000)}"
-        payload = {"prompt": str(prompt)}
-        return await self._await_user_response("ask_human", payload, prompt_id)
+        payload = {"question": str(question), "fields": fields or []}
+        from ..tools.ask_human_tool import ASK_HUMAN_TIMEOUT_S
+        try:
+            raw = await self._await_user_response(
+                "ask_human", payload, prompt_id, timeout=ASK_HUMAN_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            return {}
+        try:
+            decoded = json.loads(raw)
+        except (TypeError, ValueError):
+            decoded = None
+        if isinstance(decoded, dict):
+            return decoded
+        return {"answer": raw or ""}
 
 
 # ---------------------------------------------------------------------------
 # Bridge
 # ---------------------------------------------------------------------------
+
+
+class _ServedDesktopNotifier:
+    """Local-side signal that a remote controller is driving THIS desktop.
+
+    Passed to ``NetworkUIDelegate`` as its ``local_delegate``, and deliberately
+    implements only the two takeover methods: ``_mirror_local`` resolves each
+    call with ``getattr(self._local, method, None)`` and skips misses
+    (``network_delegate.py:93``), so a narrow object silently ignores the other
+    fifteen fire-and-forget events. That is the whole point — the被控 machine
+    still gets **no mirror tab**, it just stops being blind to the one event
+    where blindness is a safety problem.
+
+    The gap this closes: the delegate used to be built with
+    ``local_delegate=None``, so ``notify_desktop_takeover_started`` went only
+    over the wire. The Electron overlay (fullscreen border, corner watermark)
+    and the Ctrl+Shift+C revoke hotkey both react to a *locally* emitted
+    takeover envelope, so the person sitting at the machine got no indication
+    at all that another operator's agent was moving their cursor, and no way to
+    stop it — the only revoke channel was the remote operator's own.
+
+    Two things make this safe to emit where the mirror-tab gate would otherwise
+    catch it:
+
+    * The envelope is **unstamped** — it goes through the module-level ``_emit``
+      rather than ``StdioBridge._emit_session``, because this is machine-level
+      news ("someone is driving this box"), exactly like
+      ``remote_serve_state``.
+    * The session id travels as ``served_session_id``, never ``session_id``.
+      ``renderer.js``'s status handler mounts a tab for any envelope carrying a
+      ``session_id`` it has not seen, without looking at ``kind``, so putting
+      the rc- id under that key is precisely the bug that has been fixed twice
+      already. Under a different key the renderer stays blind while
+      ``main.js`` still gets the id it needs to bind the revoke hotkey.
+
+    The hotkey then writes ``user_input``/``desktop_takeover_revoked`` stamped
+    with the rc- sid, which the bridge's ordinary local handler resolves against
+    ``_flows["rc-…"]`` — a real ``FlowControllerV2`` with a real
+    ``DesktopState`` — so a local revoke genuinely stops the remote agent, and
+    the resulting ``notify_desktop_takeover_ended("user_revoked")`` reaches the
+    remote operator through the same ``NetworkUIDelegate``.
+    """
+
+    def __init__(self, session: Any) -> None:
+        self._session = session
+
+    def _emit_takeover(self, kind: str, reason: str) -> None:
+        sid = str(getattr(self._session, "session_id", "") or "")
+        _emit({
+            "type": "status",
+            "kind": kind,
+            # NOT "session_id" — see the class docstring.
+            "served_session_id": sid,
+            "controller_name": str(
+                getattr(self._session, "controller_name", "") or ""
+            ),
+            "title": str(getattr(self._session, "title", "") or ""),
+            "reason": str(reason or ""),
+        })
+
+    def notify_desktop_takeover_started(self, reason: str = "input_action") -> None:
+        self._emit_takeover("served_desktop_takeover_started", reason)
+
+    def notify_desktop_takeover_ended(self, reason: str = "task_ended") -> None:
+        self._emit_takeover("served_desktop_takeover_ended", reason)
+
+
+class _BridgeSessionHost:
+    """被控-side ``SessionHost`` for the Electron host.
+
+    Builds a driven session by calling the bridge's ordinary
+    :meth:`StdioBridge._ensure_flow` and then swapping the delegate. Going
+    through the normal path rather than constructing a ``FlowControllerV2``
+    directly is what makes a remote-driven session a first-class local session:
+    it gets a real timestamped session directory under ``~/HandQ/History``, a
+    per-session ``handq-engine.log``, the shared LLM pool, and a digest
+    checkpointed on every item boundary.
+
+    What it does NOT get is a tab in this machine's own renderer — v6 removed the
+    mirror tab. The enforcement lives in ``StdioBridge._emit_session``, which
+    drops every session-stamped envelope for a sid in ``_served_sessions``; the
+    delegate swap below only covers events that travel through the
+    ``InteractionManager``, and the paths that don't are exactly the ones that
+    grew the dead tab twice. The person sitting at the被控 machine sees what is
+    being done through the Connect panel's As Server dashboard, which reads the
+    server's session registry.
+
+    Reusing the local setup path has a cost that has to be paid back explicitly:
+    it allocates six per-session things beyond the flow, and ``flow.destroy()``
+    frees none of them. :meth:`on_session_destroyed` is that repayment.
+
+    ``FlowControllerV2`` itself satisfies ``RemoteFlowHandle`` (it already has
+    ``on_user_message`` and ``destroy``), so it is returned as-is.
+    """
+
+    def __init__(self, bridge: "StdioBridge") -> None:
+        self._bridge = bridge
+
+    def describe(self) -> Dict[str, str]:
+        return {"name": platform.node(), "platform": sys.platform}
+
+    async def create_flow(self, session: Any, goal: str) -> Any:
+        from ..remote_control.network_delegate import NetworkUIDelegate
+
+        sid = session.session_id
+        bridge = self._bridge
+
+        # Register as served BEFORE building anything. From this point on
+        # ``bridge._emit_session`` drops every session-stamped envelope for this
+        # sid, which is what keeps the被控 machine from growing a dead mirror
+        # tab — see ``StdioBridge._emit_session`` for why this is a gate rather
+        # than a flag threaded through _ensure_flow, and for the two paths that
+        # each defeated the flag version in turn.
+        bridge._served_sessions[sid] = session
+
+        # Reuse the whole local setup path to get a real FlowControllerV2 with
+        # session dir, per-session engine log, LLM pool, digest checkpointing.
+        # The flow exists on THIS machine and drives the agent — the only thing
+        # different from a local session is that the IM delegate pushes events
+        # over the wire instead of onto a local _StdioUI.
+        try:
+            bridge._ensure_flow(sid, goal=goal)
+        except Exception:
+            # Never leave the sid registered as served without a flow: the entry
+            # would silently swallow envelopes for a sid the bridge may later
+            # reuse as an ordinary local session.
+            bridge._served_sessions.pop(sid, None)
+            raise
+        flow = bridge._flows[sid]
+
+        # A NARROW local delegate, not a full one: the server still does not
+        # create a mirror tab (the dashboard observes sessions through the
+        # RemoteControlServer's registry — session.describe() + event_log — not
+        # through a second delegate chain into the renderer, per the v6
+        # "server端不用镜像标签页" decision). What it does now carry locally is
+        # the desktop-takeover pair, so the person at this machine can SEE and
+        # REVOKE a remote operator driving their screen. See
+        # _ServedDesktopNotifier for why that cannot be a stamped envelope.
+        delegate = NetworkUIDelegate(
+            session, local_delegate=_ServedDesktopNotifier(session)
+        )
+        if flow.interaction_manager is not None:
+            flow.interaction_manager.set_delegate(delegate)
+        # The coordinator's one-shot reply and every task-completion summary
+        # arrive through on_reply_to_user, which bypasses the delegate entirely
+        # (flow_controller.py:533). Redirect that sink or the controlling
+        # machine never sees either.
+        bridge._reply_sinks[sid] = delegate.show_coordinator_reply
+
+        # Name this session for the benefit of OTHER sessions. When a local
+        # session's desktop action queues behind this one on the process-wide
+        # ownership lock, the wait message is the only explanation the local user
+        # gets — and "another session" badly understates "an operator on a
+        # different computer is using your mouse". Set here rather than in
+        # FlowControllerV2 because the bridge is the only layer that knows a sid
+        # is served. See desktop_tool._describe_desktop_holder.
+        ctx = getattr(flow, "_ctx", None)
+        desktop_state = getattr(ctx, "desktop_state", None) if ctx is not None else None
+        if desktop_state is not None:
+            controller = str(getattr(session, "controller_name", "") or "").strip()
+            try:
+                desktop_state.label = (
+                    f"a session being driven remotely by {controller}"
+                    if controller else
+                    "a session being driven remotely from another machine"
+                )
+            except Exception:
+                logger.debug("could not label served desktop state for %s", sid,
+                             exc_info=True)
+
+        if not flow.started:
+            await flow.start()
+        bridge._broadcast_serve_state()
+        return flow
+
+    async def handle_user_input(
+        self, session: Any, kind: str, payload: Dict[str, Any]
+    ) -> None:
+        if kind != "desktop_takeover_revoked":
+            logger.warning("remote_control: unknown user_input kind %r", kind)
+            return
+        # Same two-step fallback the local handler uses: prefer this session's
+        # DesktopState, fall back to the module-level toggle if ctx isn't built
+        # yet. A remote operator's panic revoke must not depend on that race.
+        flow = self._bridge._flows.get(session.session_id)
+        ctx = getattr(flow, "_ctx", None) if flow is not None else None
+        desktop_state = getattr(ctx, "desktop_state", None) if ctx is not None else None
+        if desktop_state is not None:
+            desktop_state.revoke_takeover()
+            return
+        from ..tools.desktop_tool import revoke_takeover
+
+        revoke_takeover()
+
+    async def handle_rpc(
+        self, session: Any, action: str, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        if action != "file_undo":
+            raise ValueError(f"unsupported remote rpc {action!r}")
+        flow = self._bridge._flows.get(session.session_id)
+        if flow is None:
+            raise RuntimeError("session has no flow")
+        return await flow.undo_files(payload.get("item_id"))
+
+    async def push_skills(self, skills: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        from ..infrastructure.skills import SkillRegistry
+
+        registry = SkillRegistry.get()
+        results: List[Dict[str, Any]] = []
+        for entry in skills:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name") or "")
+            files = entry.get("files")
+            files = files if isinstance(files, list) else []
+            results.append(registry.receive_skill_push(name, files))
+        return results
+
+    def on_client_released(self) -> None:
+        """Client sent an explicit Disconnect. On Windows the server just goes
+        back to waiting for the next client — the sessions have already been
+        destroyed by the server. Refresh the dashboard so it shows "no client".
+        """
+        try:
+            self._bridge._broadcast_serve_state()
+        except Exception:
+            logger.debug("remote_control: serve-state broadcast after release failed",
+                         exc_info=True)
+
+    async def on_session_destroyed(self, session: Any) -> None:
+        """Release the per-session state ``create_flow`` allocated via
+        ``_ensure_flow``. See ``StdioBridge._purge_remote_session_state`` for why
+        awaiting ``flow.destroy()`` is not enough on its own."""
+        await self._bridge._purge_remote_session_state(session.session_id)
+        try:
+            self._bridge._broadcast_serve_state()
+        except Exception:
+            logger.debug("remote_control: serve-state broadcast after destroy failed",
+                         exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# Session resume — pending-offer bookkeeping (docs/session_resume_design.md §6.4)
+# ---------------------------------------------------------------------------
+#
+# A resume offer is a SOFT prompt surfaced to the renderer, fully decoupled
+# from whether the triggering message actually executes:
+#
+#   * Resume search and ``on_user_message`` are independent — the search
+#     runs first (so a hit's candidate card reaches the wire before the
+#     coordinator's own reply/thinking envelopes, letting the user see
+#     "candidates" and "coordinator answer" as two distinct signals), but
+#     the message is NEVER held — on_user_message always runs right after,
+#     every turn, hit or miss. This deliberately replaced an earlier
+#     "hold the message up to 30s awaiting a decision" model: the user
+#     found it confusing that resume search and the coordinator's own
+#     answer were coupled — asking a normal question and having it hit an
+#     old session's title made the reply itself wait on an unrelated UI
+#     choice. Now they're independent: a hit is a side-channel hint the
+#     user can act on or ignore; it is never a gate on this turn.
+#
+#   * The permanent stop switch (``SessionContext.resume_search_disabled``)
+#     is driven by INTENT's own classification, not by the search hit/miss
+#     itself — see ``StdioBridge._on_coordinator_intent``: the moment a
+#     turn's FINAL intent lane resolves to "queue" (a real task, as opposed
+#     to plain chat or a stop/cancel "interrupt"), the session's identity is
+#     considered settled and searching stops for good, withdrawing whatever
+#     card is showing. Chat keeps searching every turn (§ continuous
+#     search); interrupt is inert (a control command isn't "starting a
+#     task"). The user's explicit "Not resuming" button sets the same flag
+#     directly, independent of INTENT.
+#
+# The _PendingResumeOffer TTL (120s) is a separate, cosmetic concern: how long
+# the renderer keeps showing a card before hiding it. Expiry is checked lazily
+# on lookup (no sweeper) — an expired offer is just gone.
+
+_RESUME_OFFER_TTL_SECONDS = 120.0
+
+# Bound on how long a resume search will wait for the boot-time warm-build
+# to finish (see StdioBridge._resume_index_ready) before giving up and
+# failing open. Cold build (model load + first-time embed of every existing
+# digest) measured ~10.8s at 92 sessions (2026-08-01) — 15s covers that with
+# headroom for a somewhat larger corpus without making a user who types
+# during the boot window wait indefinitely if the warm-build is genuinely
+# stuck.
+_RESUME_INDEX_WAIT_TIMEOUT = 15.0
+
+
+@dataclasses.dataclass
+class _PendingResumeOffer:
+    """One offer surfaced to the renderer after a resume search hit the
+    gate (now re-evaluated on every message in the session, not just the
+    first — see ``StdioBridge._refresh_resume_offer``). Tracked per
+    session_id so a later ``resume_confirm``/``resume_dismiss`` can find it."""
+
+    candidates: List["ResumeCandidate"]
+    expires_at: float  # time.monotonic() deadline
+    # The search query text that produced these candidates — for the
+    # session's first message this is just that message; for any later
+    # message it's the whole conversation-so-far + that message (see
+    # ``_resume_query_text_for_followup``). Kept only for logging/debugging
+    # (e.g. the ``_ensure_flow`` call's ``goal`` fallback when a resumed
+    # candidate has no title of its own) — NOT replayed as a task. §
+    # review-first resume: accepting an offer queues a fixed review
+    # instruction, never this text (see _RESUME_REVIEW_INSTRUCTION) — this
+    # is a "resume this" signal, not task content.
+    goal: str
 
 
 class StdioBridge:
@@ -840,6 +1238,29 @@ class StdioBridge:
     scheduler housekeeping) are NOT session-scoped — they emit without a
     session_id and the renderer treats them as broadcast.
     """
+
+    # ── Remote-control slots, declared at class level ─────────────────────
+    # These are optional subsystems (docs/fleet_scheduling_design.md): a bridge
+    # that never serves and never controls leaves all four untouched. They are
+    # declared here, not only assigned in __init__, because the test suite builds
+    # bridges via ``object.__new__(StdioBridge)`` plus manual attribute wiring
+    # (see tests_v3/test_resume_bridge.py::_make_bare_bridge) — a pattern that
+    # skips __init__ entirely. Class-level defaults keep those instances working
+    # without every read site needing a getattr, and without the test helper
+    # having to track each new field.
+    #
+    # The two dicts being mutable class attributes is safe, not an oversight:
+    # __init__ replaces both with fresh instances, and the only code that
+    # *inserts* into them (_BridgeSessionHost.create_flow) requires a fully
+    # constructed bridge with a running server. Every other access is a
+    # ``.pop(sid, None)``, which is a no-op on an empty dict — so an
+    # __init__-less instance can read and clean up but can never write through
+    # to the shared default.
+    _reply_sinks: Dict[str, Callable[[str], None]] = {}
+    _remote_hub: Optional[Any] = None
+    _remote_server: Optional[Any] = None
+    _remote_server_error: str = ""
+    _served_sessions: Dict[str, Any] = {}
 
     def __init__(self, config_path: str = DEFAULT_CONFIG_PATH) -> None:
         self.config_path: Path = Path(config_path)
@@ -894,6 +1315,58 @@ class StdioBridge:
         self._uis_lock = threading.Lock()
 
         self._shutdown_requested: bool = False
+
+        # Session-resume (docs/session_resume_design.md §6.4). Built once,
+        # in the background, right after boot (see run()) — but a COLD
+        # build (jieba dict + onnx model load + first-time embed of every
+        # existing digest) measured ~10.8s at 92 sessions (2026-08-01), NOT
+        # the "tens of milliseconds" a warm rebuild costs. A first message
+        # can easily arrive before that finishes (measured: 2.3s after
+        # boot in a real repro) — this is the bug _resume_index_ready
+        # exists to close. Typed loosely (not importing
+        # resume_index.ResumeIndex at module load) so fastembed/jieba only
+        # load in the background build task, not on bridge startup.
+        self._resume_index: Optional[Any] = None
+        # Set (success OR failure — see _build_resume_index_background)
+        # once the warm-build finishes. _search_resume_candidates awaits
+        # this (bounded — see _RESUME_INDEX_WAIT_TIMEOUT) instead of
+        # silently skipping when self._resume_index is still None, so a
+        # message that lands during the cold-build window still gets
+        # searched once the index is ready, rather than being invisibly
+        # dropped from resume consideration for its entire session.
+        self._resume_index_ready: asyncio.Event = asyncio.Event()
+        # Pending offers, keyed by the TEMP session_id the offer was
+        # attached to (the just-built parallel session — see module-level
+        # _PendingResumeOffer docstring for why no timer task is needed).
+        self._pending_resume_offers: Dict[str, _PendingResumeOffer] = {}
+
+        # ── Direct control channel (docs/fleet_scheduling_design.md) ──────
+        # Per-session override for where the coordinator's one-shot reply goes.
+        # A local session has no entry and _on_coordinator_reply emits straight
+        # to the renderer; a remote-controlled session installs a sink that also
+        # puts the reply on the wire. See _on_coordinator_reply for why this one
+        # message needs an indirection the other 20 don't.
+        self._reply_sinks: Dict[str, Callable[[str], None]] = {}
+        # 控制 role — paired targets, connections, per-tab bridges. Built lazily
+        # on the first remote-control IPC so a user who never touches the feature
+        # pays nothing (no registry file read, no keyring probe).
+        self._remote_hub: Optional[Any] = None
+        # 被控 role — the listener, when remote_control.serve is on.
+        self._remote_server: Optional[Any] = None
+        self._remote_server_error: str = ""
+        # Sessions on THIS machine that are being driven from elsewhere: local
+        # sid → the ``RemoteSession`` driving it. Populated by
+        # ``_BridgeSessionHost.create_flow`` before the flow is built and
+        # cleared by ``_purge_remote_session_state``. Read by
+        # ``_emit_session``, which is what keeps a served session from ever
+        # stamping an envelope the renderer would turn into a dead mirror tab.
+        self._served_sessions: Dict[str, Any] = {}
+        # v6 Connect panel role tracker — remembers whether the user last
+        # picked "As Server" or "As Client", so a restart opens on the
+        # right dashboard instead of the role-selection page. Loaded lazily
+        # by _get_connect_state so the file read isn't on the boot path for
+        # users who never open the panel.
+        self._connect_state: Optional[Any] = None
 
         logger.info("StdioBridge initialised; config_path=%s",
                     self.config_path)
@@ -989,6 +1462,39 @@ class StdioBridge:
             with self._uis_lock:
                 self._uis[sid] = ui
         return ui
+
+    def _emit_session(self, envelope: Dict[str, Any], session_id: str) -> None:
+        """Emit a session-stamped envelope, unless that session is one this
+        machine is merely *serving* for a remote controller.
+
+        The single gate for the被控 side's "no mirror tab" promise, and it has
+        to be a gate rather than a per-call-site flag. ``renderer.js``'s status
+        handler mounts a tab for ANY envelope carrying a session_id it has not
+        seen, without looking at ``kind`` — so on a machine acting as a server,
+        one stray stamped envelope for a ``rc-`` session is enough to spawn a
+        tab that can never receive content, because everything real for that
+        session goes over the wire through ``NetworkUIDelegate``.
+
+        This has now been fixed twice at individual call sites and regressed
+        both times, most recently via ``_clear_resume_offer``: the delegate swap
+        in ``_BridgeSessionHost.create_flow`` only redirects events that travel
+        through the ``InteractionManager``, and both ``_ensure_flow``'s own
+        ``session_started`` and the resume-card envelopes are direct ``_emit``
+        calls that bypass it entirely. Routing every session-stamped emit
+        through here makes the invariant hold for paths not yet written, which
+        is the only version of it that stays true.
+
+        Unstamped (machine-level) envelopes do not belong here — they are
+        broadcast by definition and go straight to ``_emit``.
+        """
+        if session_id in self._served_sessions:
+            logger.debug(
+                "suppressed %s envelope for served session %s (被控 role has "
+                "no tab for it by design)",
+                envelope.get("kind") or envelope.get("type"), session_id,
+            )
+            return
+        _emit(envelope, session_id=session_id)
 
     def _deliver_confirmation(
         self, sid_hint: Any, prompt_id: str, answer: str,
@@ -1541,7 +2047,15 @@ class StdioBridge:
                 # session (before the FlowController is built). An empty key
                 # causes cryptic errors deep in the LLM stack; surface a
                 # clear message here instead.
-                if sid not in self._flows:
+                is_first_message = sid not in self._flows
+                # A remote-controlled tab runs entirely on the被控 machine,
+                # which has its own key and its own history. Neither the local
+                # API-key guard nor the local resume search applies to it.
+                is_remote_session = (
+                    self._remote_hub is not None
+                    and self._remote_hub.is_remote(sid)
+                )
+                if is_first_message and not is_remote_session:
                     _cfg = self._load_config_dict()
                     if not (((_cfg.get("llm") or {}).get("API_KEY") or "")):
                         _emit(
@@ -1559,10 +2073,45 @@ class StdioBridge:
                             session_id=sid,
                         )
                         return
-                self._ensure_flow(sid, goal=str(goal))
+
+                # Session-resume soft offer (§6.4) — runs AFTER
+                # _ensure_flow/start so the renderer's session is already
+                # mounted when the resume_candidates envelope arrives (the
+                # frontend's _showResumeCandidates looks up sessions.get(sid)
+                # — if the session isn't mounted yet it silently drops the
+                # event, causing the "card never appears" bug). The search
+                # itself doesn't need the flow; only the envelope ordering
+                # matters.
+                await self._ensure_any_flow(sid, str(goal))
                 flow = self._flows[sid]
                 if not flow.started:
                     await flow.start()
+
+                # § coordinator-and-resume-are-independent (2026-08-01):
+                # resume search runs BEFORE on_user_message, in the SAME
+                # coroutine — that ordering alone is what guarantees the
+                # candidate-card envelope (on a hit) reaches the wire
+                # before on_user_message's own thinking-bubble/reply
+                # envelopes, so the user sees "candidates" and "coordinator
+                # answer" as two distinct, correctly-ordered signals. There
+                # is NO manual thinking_on/off here (that used to exist to
+                # paper over a "message held, nothing is really happening"
+                # state that no longer exists) — FlowControllerV2.on_user_message
+                # natively brackets the whole INTENT+reply lifecycle with
+                # notify_coordinator_thinking/clear_coordinator_thinking
+                # (flow_controller.py), so the bubble now purely reflects
+                # "is an LLM call actually in flight", independent of
+                # whether resume happened to hit. The message ALWAYS runs —
+                # a resume hit is a side-channel hint, never a gate on
+                # whether this turn gets processed. Session-resume's own
+                # gate lives in _on_coordinator_intent (fires once INTENT's
+                # final lane is known) — it decides, DELAYED relative to
+                # this call, whether to permanently stop searching.
+                if is_first_message and not is_remote_session:
+                    await self._refresh_resume_offer(
+                        sid, str(goal), trigger_text=str(goal),
+                    )
+
                 # ``on_user_message`` returns the coordinator's
                 # reply string (sync conversational answer); background
                 # agent work proceeds inside the flow's own
@@ -1604,13 +2153,31 @@ class StdioBridge:
                 if kind == "message":
                     text = str(msg.get("text", ""))
                     flow = self._flows.get(sid)
-                    if flow is not None and flow.started:
-                        await flow.on_user_message(text)
-                    else:
+                    if flow is None or not flow.started:
                         logger.warning(
                             "user_input(message) sid=%s before flow started; ignoring",
                             sid,
                         )
+                    else:
+                        # § coordinator-and-resume-are-independent: every
+                        # message keeps searching — not just the first —
+                        # until the session's identity is settled via
+                        # _on_coordinator_intent (a "queue" lane
+                        # permanently disables it) or the "Not resuming"
+                        # button (resume_disable_for_session IPC, same
+                        # flag). The query is the WHOLE conversation so far
+                        # + this message — see
+                        # _resume_query_text_for_followup's docstring for
+                        # why (a user often clarifies across several short
+                        # messages). The message ALWAYS runs, unconditionally,
+                        # right after — a resume hit is a side-channel hint
+                        # shown to the user, never a gate on this turn.
+                        if flow._ctx is not None and not flow._ctx.resume_search_disabled:
+                            query_text = self._resume_query_text_for_followup(flow, text)
+                            await self._refresh_resume_offer(
+                                sid, query_text, trigger_text=text,
+                            )
+                        await flow.on_user_message(text)
                 elif kind == "confirmation":
                     # Normally consumed by the stdin reader fast-path; this
                     # branch covers the (rare) case where the envelope reaches
@@ -1678,6 +2245,88 @@ class StdioBridge:
                        "fatal": False})
                 return
             await self._do_close_session(sid, msg_id)
+            return
+
+        if msg_type in (
+            "remote_control_status",
+            "remote_pair",
+            "remote_probe",
+            "remote_forget",
+            "remote_connect",
+            "remote_disconnect",
+            "remote_push_skills",
+            "remote_bind",
+            "remote_close_session",
+            "remote_pair_linux",
+            # v6 Connect Panel verbs — see docs/connect_v6_reference.md.
+            # The new panel uses these; the older `remote_*` verbs above stay
+            # for now so a mid-transition renderer isn't broken.
+            "connect_start_server",
+            "connect_stop_server",
+            "connect_disconnect_client",
+            "connect_close_session_server_side",
+            "connect_release_target",
+            "connect_exit_client",
+        ):
+            await self._handle_remote_control(msg_type, msg, msg_id)
+            return
+
+        if msg_type == "resume_confirm":
+            # User clicked [Continue] on a resume_candidates offer. sid is
+            # the TEMP session the offer was attached to; session_dir picks
+            # which offered candidate to resume (an offer may carry any
+            # number of candidates above the dense-cos gate — no fixed cap
+            # — so the renderer must echo back which one; no implicit
+            # "always pick #1").
+            sid = self._resolve_session_id(msg)
+            if sid is None:
+                _emit({"type": "error", "id": msg_id, "where": "bridge",
+                       "message": "resume_confirm: missing session_id",
+                       "fatal": False})
+                return
+            session_dir = str(msg.get("session_dir") or "")
+            await self._do_resume_confirm(sid, session_dir, msg_id)
+            return
+
+        if msg_type == "resume_dismiss":
+            # Bridge-side survivor of an earlier three-button design
+            # (Continue / New Task / No Resume) — the frontend currently has
+            # no button wired to this IPC type (the only button left is
+            # "Not resuming" → resume_disable_for_session below). Kept
+            # as pure bookkeeping in case a future UI wants a one-shot
+            # "not this particular offer, but keep asking" affordance
+            # distinct from the permanent opt-out: drop the pending offer
+            # only. Does NOT disable future searches — the next message
+            # searches again (§ continuous search) regardless.
+            sid = self._resolve_session_id(msg)
+            if sid is not None:
+                self._pending_resume_offers.pop(sid, None)
+            _emit({"type": "final", "id": msg_id, "result": {"ok": True}},
+                  session_id=sid)
+            return
+
+        if msg_type == "resume_disable_for_session":
+            # User clicked "Not resuming" — an explicit, permanent opt-out
+            # for THIS session: no more resume searches will run for any
+            # future message here, matching the permanent stop that a
+            # successful resume_confirm (SessionContext.resume_search_disabled)
+            # or a "queue"-lane INTENT classification (_on_coordinator_intent)
+            # already cause. The message that triggered whatever offer is
+            # showing was never held — it already ran, or is running — so
+            # unlike the old hold-model there is nothing to "release"; this
+            # is purely "stop asking", nothing else.
+            sid = self._resolve_session_id(msg)
+            if sid is None:
+                _emit({"type": "error", "id": msg_id, "where": "bridge",
+                       "message": "resume_disable_for_session: missing session_id",
+                       "fatal": False})
+                return
+            flow = self._flows.get(sid)
+            if flow is not None and flow._ctx is not None:
+                flow._ctx.resume_search_disabled = True
+            self._pending_resume_offers.pop(sid, None)
+            _emit({"type": "final", "id": msg_id, "result": {"ok": True}},
+                  session_id=sid)
             return
 
         logger.warning("unknown inbound type=%r id=%s", msg_type, msg_id)
@@ -1936,7 +2585,1016 @@ class StdioBridge:
         self._shared_services = None
         self._shared_helper_services = None
 
-    def _ensure_flow(self, session_id: str, goal: str) -> None:
+    # ------------------------------------------------------------------
+    # Direct control channel — 被控 role (docs/fleet_scheduling_design.md)
+    # ------------------------------------------------------------------
+
+    async def _start_remote_control_server(self) -> bool:
+        """Start listening for remote controllers. Idempotent.
+
+        Returns True when a server is listening on return (including the case
+        where one already was).
+
+        There is no ``serve`` config flag and no automatic start. Listening for
+        remote control is a deliberate, per-run act: the Connect panel's "As
+        Server" button is the only caller, every press mints a fresh token, and
+        nothing about being restarted or upgraded puts a machine into server
+        mode. A persisted "serve: true" used to exist alongside this and start a
+        listener at boot, which meant the panel and a settings checkbox were two
+        answers to the same question — and the boot path minted a token the user
+        was never shown. Config still says *how* to bind (``bind`` / ``port`` /
+        ``max_sessions``), never *whether*.
+
+        Failure is recorded and reported to the renderer rather than raised: a
+        port that will not bind must not stop the machine from being used
+        locally. ``_remote_server_error`` is surfaced by
+        ``remote_control_status`` so the operator sees why the address panel is
+        empty instead of wondering.
+        """
+        if self._remote_server is not None:
+            return True
+        try:
+            from ..remote_control.serving import RemoteControlConfig
+        except Exception:
+            logger.exception("remote_control: package unavailable")
+            return False
+
+        rc_cfg = RemoteControlConfig.from_config(self._load_config_dict())
+
+        try:
+            from ..remote_control.server import RemoteControlServer
+
+            host = _BridgeSessionHost(self)
+            server = RemoteControlServer(
+                token=rc_cfg.resolve_token(),
+                host=host,
+                server_name=platform.node(),
+                max_sessions=rc_cfg.max_sessions,
+            )
+            port = await server.start(rc_cfg.bind, rc_cfg.port)
+            self._remote_server = server
+            self._remote_server_error = ""
+            logger.info(
+                "remote_control: serving on %s:%d (%d session slot(s))",
+                rc_cfg.bind, port, rc_cfg.max_sessions,
+            )
+            return True
+        except Exception as exc:
+            self._remote_server_error = str(exc)
+            logger.exception("remote_control: failed to start the server")
+            return False
+
+    async def _stop_remote_control_server(self) -> None:
+        """Stop listening and end every session being driven from elsewhere.
+
+        Deliberately destructive in one specific way, and it has to be: the
+        remote sessions this machine is hosting cannot outlive their transport,
+        so ``server.stop()`` tells each attached controller ``server_shutdown``
+        and tears the sessions down. That is why the titlebar toggle asks for
+        confirmation when sessions are live rather than just flipping.
+        """
+        server, self._remote_server = self._remote_server, None
+        if server is None:
+            return
+        try:
+            await asyncio.wait_for(server.stop(), timeout=8.0)
+            logger.info("remote_control: stopped serving")
+        except Exception:
+            logger.warning("remote_control: server stop failed", exc_info=True)
+
+    async def _connect_after_pair(self, hub: Any, target_id: str, label: str) -> None:
+        """Bring a just-paired target's direct channel up immediately.
+
+        ``hub.pair``/``hub.pair_linux_over_ssh`` only record the address in the
+        registry — opening the socket is a separate act. Without this call a
+        target paired mid-session would sit in ``state: "offline"`` until the
+        operator clicked Connect, right after they watched the pairing succeed.
+        Never fatal: a failed connect here still leaves the pairing recorded, and
+        the panel shows it as offline with a log line instead of losing the
+        pairing entirely.
+
+        Connecting otherwise happens strictly on demand (the ``remote_connect``
+        IPC type, sent when the client dashboard opens or the operator clicks
+        Connect). There is deliberately no boot-time sweep: "connected" is not a
+        durable property worth restoring — a被控 machine parks its sessions
+        regardless, so nothing is lost by not holding a socket, and it serves one
+        controller at a time, so holding one has a cost. The sweep also had to
+        invent a whole ``restoring`` UI state to explain the 15s-per-machine window
+        in which it misreported every not-yet-tried target as offline.
+        """
+        try:
+            await hub.ensure_client(target_id)
+        except Exception as exc:
+            logger.info("connect: could not connect newly paired %s: %s",
+                        target_id, exc)
+            self._emit_connect_log(
+                "pair", f"{label} 已配对，但连接失败: {exc}",
+                "warn", "client",
+            )
+
+    def _remote_control_address_payload(self) -> Dict[str, Any]:
+        """The被控-side "my control address" panel data.
+
+        Includes the token — it is the whole point of the pairing string — so
+        every path that logs this payload has to redact it. The renderer and
+        Electron main both extend their redaction lists for ``pairing`` /
+        ``token`` for exactly this reason.
+        """
+        from ..remote_control.address import format_address, local_endpoints
+
+        server = self._remote_server
+        if server is None:
+            return {
+                "serving": False,
+                "error": self._remote_server_error,
+                "endpoints": [],
+                "pairing": "",
+                "sessions": [],
+            }
+
+        endpoints = local_endpoints(server.port)
+        primary = endpoints[0] if endpoints else f"127.0.0.1:{server.port}"
+        host, _, port_text = primary.rpartition(":")
+        sessions = [s.describe() for s in server.sessions()]
+        # The one currently-attached controller's name (v6 spec: 1 client ↔ 1
+        # server). "" when nobody is attached. Peek at the first live conn
+        # — the server's own supersede logic guarantees at most one is
+        # actually driving sessions.
+        client_name = ""
+        for conn in server._conns:
+            if getattr(conn, "client_name", "") and not conn.closed:
+                client_name = conn.client_name
+                break
+        return {
+            "serving": True,
+            "error": "",
+            "port": server.port,
+            "endpoints": endpoints,
+            # Convenience fields for the v6 Connect panel — first LAN endpoint
+            # and the raw token, each with its own "Copy" button. Both are
+            # redacted in logs (`token` is in preload.js's redact set;
+            # `pairing` too, and `endpoint` is not a secret).
+            "endpoint": primary,
+            "token": server.token,
+            "pairing": format_address(
+                host, int(port_text), server.token, platform.node()
+            ),
+            "server_name": platform.node(),
+            "client_name": client_name,
+            "sessions": sessions,
+            # Convenience for the titlebar indicator, which only needs a count
+            # and shouldn't have to know the shape of a session descriptor.
+            "session_count": len(sessions),
+            "attached_count": sum(1 for s in sessions if s.get("attached")),
+        }
+
+    def _broadcast_serve_state(self) -> None:
+        """Push the被控 state so the titlebar indicator reflects reality.
+
+        Unstamped (no session_id) because this is machine-level news, not
+        session-level — see ``_emit``'s routing contract. Called whenever the
+        listener starts/stops or a driven session appears/disappears, so the
+        indicator never shows a stale count.
+        """
+        payload = self._remote_control_address_payload()
+        _emit({
+            "type": "status",
+            "kind": "remote_serve_state",
+            "serving": bool(payload.get("serving")),
+            "session_count": int(payload.get("session_count") or 0),
+            "attached_count": int(payload.get("attached_count") or 0),
+            "port": payload.get("port") or 0,
+            "error": payload.get("error") or "",
+        })
+
+    def _emit_connect_log(
+        self, source: str, message: str, level: str = "info",
+        role: str = "client",
+    ) -> None:
+        """Push one line into the Connect panel's Log area.
+
+        The v6 design (§10) is explicit: connection-layer status (SSH
+        bootstrap, deploy, version check, auto-reconnect attempts, pair
+        errors) never appears in a chat bubble — it lands ONLY in the panel's
+        Log area. This helper is the single sink; every site that would have
+        gone through a system bubble now goes through here.
+
+        ``source`` is a short slug for grouping ("ssh", "deploy", "pair",
+        "reconnect", "release"), ``level`` is "info"/"warn"/"error", and
+        ``role`` is "client" or "server" so the panel routes to the right
+        log pane. Machine-level (unstamped) envelope — no session_id.
+        """
+        _emit({
+            "type": "status",
+            "kind": "connect_log",
+            "source": str(source),
+            "level": str(level),
+            "role": str(role),
+            "message": str(message),
+        })
+
+    # ------------------------------------------------------------------
+    # Direct control channel — 控制 role
+    # ------------------------------------------------------------------
+
+    def _get_remote_hub(self) -> Any:
+        """Lazily build the控制-side hub.
+
+        Lazy so a user who never pairs anything never reads the registry file or
+        probes the OS keyring.
+        """
+        if self._remote_hub is None:
+            from ..remote_control.hub import RemoteControlHub
+
+            self._remote_hub = RemoteControlHub(
+                emit=lambda envelope, sid: _emit(envelope, session_id=sid),
+                ui_factory=self._get_or_create_ui,
+                client_name=f"handq-{platform.node()}",
+                on_bridge_released=self._on_remote_bridge_released,
+                on_log=lambda source, message, level: self._emit_connect_log(
+                    source, message, level, "client"
+                ),
+            )
+        return self._remote_hub
+
+    def _on_remote_bridge_released(self, session_id: str) -> None:
+        """The hub tore a bridge down on its own initiative (explicit Disconnect).
+
+        The tab-close path already drops these slots itself, but a release comes
+        from the panel, not from the tab — so without this the ``_flows`` slot
+        keeps a destroyed bridge. ``_ensure_any_flow`` returns early for any
+        occupied slot, so the tab stayed on screen accepting messages that the
+        closed bridge silently discarded.
+        """
+        self._flows.pop(session_id, None)
+        with self._uis_lock:
+            self._uis.pop(session_id, None)
+        self._reply_sinks.pop(session_id, None)
+        self._session_dispatch_locks.pop(session_id, None)
+        self._inflight_by_sid.pop(session_id, None)
+
+    async def _refresh_remote_sessions(self, hub: Any) -> None:
+        """Re-ask every connected target for its live session list, in parallel.
+
+        Sequential would make the panel's open latency the *sum* of every paired
+        machine's round trip; concurrently it is the slowest one, bounded by
+        ``hub.SESSION_REFRESH_TIMEOUT``. Exceptions are absorbed per target —
+        one unreachable machine must not blank the whole panel.
+        """
+        target_ids = [
+            str(t.get("target_id") or "")
+            for t in (hub.list_targets() or [])
+            if isinstance(t, dict) and t.get("state") == "connected"
+        ]
+        if not target_ids:
+            return
+        await asyncio.gather(
+            *(hub.refresh_sessions(tid) for tid in target_ids if tid),
+            return_exceptions=True,
+        )
+
+    def _get_connect_state(self) -> Any:
+        """Lazily load the last-picked Connect role from disk. Same laziness
+        rationale as :meth:`_get_remote_hub` — a user who never opens the
+        Connect panel never pays for a file read on boot.
+        """
+        if self._connect_state is None:
+            from ..remote_control.connect_state import ConnectState
+
+            self._connect_state = ConnectState.load()
+        return self._connect_state
+
+    async def _handle_remote_control(
+        self, msg_type: str, msg: Dict[str, Any], msg_id: Optional[str],
+    ) -> None:
+        """Every remote-control IPC type.
+
+        Grouped into one handler because they share the error contract: every
+        failure comes back as a ``final`` with ``{ok: False, error}`` rather than
+        an ``error`` envelope, so the renderer's RPC helper can settle its
+        promise and show the message inline in the pairing dialog. An ``error``
+        envelope would reject the promise and lose the structured detail.
+        """
+        from ..remote_control.address import AddressError
+        from ..remote_control.client import RemoteControlError
+        from ..remote_control.linux_bootstrap import LinuxDaemonBusyError
+
+        def _reply(result: Dict[str, Any]) -> None:
+            _emit({"type": "final", "id": msg_id, "result": result},
+                  session_id=self._session_id)
+
+        try:
+            if msg_type == "remote_control_status":
+                hub = self._get_remote_hub()
+                # Re-ask each connected server what sessions it actually has
+                # before answering. The panel calls this on open and after every
+                # action, so it is the natural reconcile point: a chip for a
+                # session the other operator closed disappears here, and a
+                # session sitting on a parked confirmation gets its badge. Never
+                # fatal — refresh_sessions swallows a timeout and leaves the last
+                # known chips in place (see its docstring on why an unreachable
+                # machine must not look like an empty one).
+                await self._refresh_remote_sessions(hub)
+                _reply({
+                    "ok": True,
+                    "serving": self._remote_control_address_payload(),
+                    "targets": hub.list_targets(),
+                    # v6: which role the user last picked, so the Connect
+                    # panel can open on that dashboard instead of the
+                    # role-selection page.
+                    "role": self._get_connect_state().role,
+                })
+                return
+
+            if msg_type == "remote_probe":
+                hub = self._get_remote_hub()
+                _reply({"ok": True, **await hub.probe(str(msg.get("pairing") or ""))})
+                return
+
+            if msg_type == "remote_pair":
+                hub = self._get_remote_hub()
+                pairing_name = str(msg.get("name") or "")
+                self._emit_connect_log(
+                    "pair",
+                    f"手动配对 {pairing_name or '(new)'} …",
+                    "info", "client",
+                )
+                target = hub.pair(
+                    str(msg.get("pairing") or ""), name=pairing_name
+                )
+                self._get_connect_state().set_role("client")
+                self._emit_connect_log(
+                    "pair",
+                    f"已配对 {target.name or target.host}",
+                    "info", "client",
+                )
+                await self._connect_after_pair(
+                    hub, target.target_id, target.name or target.host
+                )
+                _reply({
+                    "ok": True,
+                    "target": target.to_public_dict(),
+                    "targets": hub.list_targets(),
+                })
+                return
+
+            if msg_type == "remote_forget":
+                hub = self._get_remote_hub()
+                target = hub.registry.get(str(msg.get("target_id") or ""))
+                removed = hub.forget(str(msg.get("target_id") or ""))
+                if removed and target is not None:
+                    self._emit_connect_log(
+                        "pair",
+                        f"已忘记 {target.name or target.host}",
+                        "info", "client",
+                    )
+                _reply({"ok": removed, "targets": hub.list_targets()})
+                return
+
+            if msg_type == "remote_pair_linux":
+                # Linux only: fetch the address over the SSH channel the deploy
+                # path already uses instead of asking the operator to walk to the
+                # other machine. Reuses remote_handq_tool's install/start
+                # helpers; that tool itself is untouched.
+                hub = self._get_remote_hub()
+                sid = self._resolve_session_id(msg)
+                # Credential prompts (first-time SSH password) surface through
+                # whichever session asked, so they land in a real chat tab.
+                im = None
+                flow = self._flows.get(sid) if sid else None
+                if flow is not None:
+                    im = getattr(flow, "interaction_manager", None)
+                ssh_target = str(msg.get("ssh_target") or "")
+                self._emit_connect_log(
+                    "ssh", f"引导 Linux 目标: {ssh_target} …",
+                    "info", "client",
+                )
+                try:
+                    target = await hub.pair_linux_over_ssh(
+                        ssh_target=ssh_target,
+                        credentials_file=str(msg.get("credentials_file") or ""),
+                        name=str(msg.get("name") or ""),
+                        install=msg.get("install") is not False,
+                        interaction_manager=im,
+                        force=bool(msg.get("force")),
+                        # Upgrade-decision lines (share scan, versions, deploy /
+                        # defer) land in the panel's client log so "why didn't it
+                        # upgrade?" is answerable without SSHing in.
+                        on_log=lambda line: self._emit_connect_log(
+                            "upgrade", line, "info", "client",
+                        ),
+                    )
+                except Exception as exc:
+                    self._emit_connect_log(
+                        "ssh", f"{ssh_target} 引导失败: {exc}",
+                        "error", "client",
+                    )
+                    raise
+                pub = target.to_public_dict()
+                pending = pub.get("upgrade_pending") or {}
+                if pending:
+                    self._emit_connect_log(
+                        "upgrade",
+                        f"{target.name or target.host}: 已连接当前版本 "
+                        f"{pending.get('from') or '未知'}，新版本 "
+                        f"{pending.get('to') or '?'} 待安装（有会话在运行，"
+                        f"结束后可从面板升级）",
+                        "warn", "client",
+                    )
+                self._emit_connect_log(
+                    "ssh",
+                    f"{ssh_target} 引导完成 (监听 {target.host}:{target.port})",
+                    "info", "client",
+                )
+                self._get_connect_state().set_role("client")
+                await self._connect_after_pair(
+                    hub, target.target_id, target.name or target.host
+                )
+                _reply({
+                    "ok": True,
+                    "target": pub,
+                    "targets": hub.list_targets(),
+                })
+                return
+
+            if msg_type == "remote_connect":
+                hub = self._get_remote_hub()
+                client = await hub.ensure_client(str(msg.get("target_id") or ""))
+                # Explicit connect from the panel = user is being a client now.
+                self._get_connect_state().set_role("client")
+                _reply({
+                    "ok": True,
+                    "server_name": client.server_name,
+                    "platform": client.server_platform,
+                    "sessions": client.remote_sessions,
+                    "targets": hub.list_targets(),
+                })
+                return
+
+            if msg_type == "remote_disconnect":
+                # "断开连接" — a passive close, and the ordinary way to stop using
+                # a machine. Drops the socket and nothing else: sessions park on
+                # the被控 side, the pairing and its session records stay,
+                # reconnecting resumes where we left off. Also how you hand the
+                # machine back, since it serves one controller at a time.
+                #
+                # The destructive counterpart is `connect_release_target`, which
+                # the panel confirms first.
+                hub = self._get_remote_hub()
+                target_id = str(msg.get("target_id") or "")
+                await hub.close_client(target_id)
+                self._emit_connect_log(
+                    "disconnect",
+                    f"已断开与 {target_id} 的连接（远端会话保持运行）",
+                    "info", "client",
+                )
+                _reply({"ok": True, "targets": hub.list_targets()})
+                return
+
+            if msg_type == "remote_push_skills":
+                hub = self._get_remote_hub()
+                target_id = str(msg.get("target_id") or "")
+                names = [str(n) for n in (msg.get("names") or []) if str(n)]
+                results = await hub.push_skills_to(target_id, names)
+                _reply({"ok": True, "results": results})
+                return
+
+            if msg_type == "remote_bind":
+                # Renderer declares "this tab is backed by that machine", before
+                # its first `request`. _ensure_any_flow reads this.
+                sid = self._resolve_session_id(msg)
+                if sid is None:
+                    _reply({"ok": False, "error": "remote_bind: missing session_id"})
+                    return
+                hub = self._get_remote_hub()
+                remote_sid = str(msg.get("remote_session_id") or "")
+                hub.bind(
+                    sid,
+                    str(msg.get("target_id") or ""),
+                    remote_session_id=remote_sid,
+                    capability=str(msg.get("capability") or ""),
+                    since_seq=int(msg.get("since_seq") or 0),
+                )
+                # v6 fix: when re-adopting an existing session (remote_session_id
+                # is non-empty), create the bridge NOW and start it so the event
+                # replay arrives immediately — the user should not have to send a
+                # message first to see the remote session's content.
+                if remote_sid:
+                    try:
+                        self._get_or_create_ui(sid)
+                        bridge = await hub.create_bridge(sid)
+                        self._flows[sid] = bridge
+                        await bridge.start()
+                    except Exception as exc:
+                        # If bridge creation fails (server unreachable, stale
+                        # capability, etc.), roll back: remove the binding so
+                        # the tab doesn't pretend to be remote when it isn't.
+                        hub._bindings.pop(sid, None)
+                        hub._bridges.pop(sid, None)
+                        self._flows.pop(sid, None)
+                        logger.warning(
+                            "remote_control: remote_bind adopt failed for %s: %s",
+                            sid, exc)
+                        _reply({"ok": False,
+                                "error": f"无法恢复远端会话: {exc}"})
+                        return
+                _reply({"ok": True, "session_id": sid})
+                return
+
+            if msg_type == "remote_close_session":
+                # Distinct from close_session: this kills the被控-side session
+                # too. Closing the tab alone only detaches (see
+                # RemoteSessionBridge.destroy) — that asymmetry is the "remote
+                # machine behaves like a server" property.
+                #
+                # Two entry shapes: a local tab (session_id present, has an open
+                # bridge) OR a panel chip (target_id + remote_session_id, no
+                # open tab). The chip path is how you terminate a session you
+                # left running yesterday without having to re-open it first.
+                remote_sid = str(msg.get("remote_session_id") or "")
+                target_id = str(msg.get("target_id") or "")
+                if remote_sid and target_id:
+                    hub = self._get_remote_hub()
+                    await hub.close_remote_session_by_id(
+                        target_id, remote_sid, force=bool(msg.get("force"))
+                    )
+                    _reply({"ok": True, "targets": hub.list_targets()})
+                    return
+                sid = self._resolve_session_id(msg)
+                if sid is None:
+                    _reply({"ok": False, "error": "missing session_id"})
+                    return
+                hub = self._get_remote_hub()
+                await hub.close_remote_session(sid)
+                self._flows.pop(sid, None)
+                _reply({"ok": True})
+                return
+
+            # ── v6 Connect Panel verbs ──────────────────────────────────────
+
+            if msg_type == "connect_start_server":
+                # As Server button clicked in the Connect panel. Idempotent:
+                # returns the current address if already listening.
+                started = await self._start_remote_control_server()
+                if not started:
+                    err = (self._remote_server_error
+                           or "无法开始监听（详见 handq-bridge.log）")
+                    self._emit_connect_log("start", err, "error", "server")
+                    _reply({"ok": False, "error": err})
+                    return
+                self._broadcast_serve_state()
+                self._get_connect_state().set_role("server")
+                payload = self._remote_control_address_payload()
+                self._emit_connect_log(
+                    "start",
+                    f"正在监听 {payload.get('endpoint') or ''}",
+                    "info", "server",
+                )
+                _reply({"ok": True, "serving": payload})
+                return
+
+            if msg_type == "connect_stop_server":
+                # Exit Server button in the Connect panel — stops listening and
+                # takes this machine out of server mode entirely. Any active
+                # sessions are destroyed in the process (see server.stop).
+                await self._stop_remote_control_server()
+                self._broadcast_serve_state()
+                # Only clear role if we WERE the server. A machine can be both
+                # a server (this) AND a client (some target); we don't want
+                # stopping the server to also forget "user was doing client
+                # things" if that's actually where they are.
+                cs = self._get_connect_state()
+                if cs.role == "server":
+                    cs.set_role(None)
+                self._emit_connect_log("stop", "server 已停止", "info", "server")
+                _reply({"ok": True})
+                return
+
+            if msg_type == "connect_disconnect_client":
+                # "Disconnect Client" on the As Server dashboard: drops the
+                # controller + destroys its sessions, keeps listening.
+                server = getattr(self, "_remote_server", None)
+                if server is None:
+                    _reply({"ok": False, "error": "not currently serving"})
+                    return
+                destroyed = await server.disconnect_client()
+                self._broadcast_serve_state()
+                self._emit_connect_log(
+                    "disconnect",
+                    f"已断开 client，销毁了 {destroyed} 个 session",
+                    "info", "server",
+                )
+                _reply({"ok": True, "destroyed": destroyed})
+                return
+
+            if msg_type == "connect_close_session_server_side":
+                # "Close" button on a session row in the As Server dashboard.
+                sid = str(msg.get("session_id") or "")
+                if not sid:
+                    _reply({"ok": False, "error": "missing session_id"})
+                    return
+                server = getattr(self, "_remote_server", None)
+                if server is None:
+                    _reply({"ok": False, "error": "not currently serving"})
+                    return
+                ok = await server.close_session_by_id(sid)
+                self._broadcast_serve_state()
+                self._emit_connect_log(
+                    "session",
+                    f"session {sid} {'已销毁' if ok else '关闭失败'}",
+                    "info" if ok else "warn", "server",
+                )
+                _reply({"ok": ok})
+                return
+
+            if msg_type == "connect_release_target":
+                # The ONE destructive action a client can take against a server:
+                # destroy every session it was running for us and end the serving
+                # relationship. On Linux the daemon exits and the pairing is
+                # forgotten; elsewhere the machine keeps listening and the pairing
+                # is kept (see hub.release_target). Non-destructive "stop using it
+                # for now" is `remote_disconnect`.
+                hub = self._get_remote_hub()
+                target_id = str(msg.get("target_id") or "")
+                outcome = await hub.release_target(target_id)
+                self._emit_connect_log(
+                    "release",
+                    f"已结束与 {target_id} 的服务关系"
+                    + ("（配对已移除）" if outcome.get("forgot") else "（配对保留）"),
+                    "info", "client",
+                )
+                if outcome.get("warning"):
+                    self._emit_connect_log(
+                        "release", str(outcome["warning"]), "warn", "client",
+                    )
+                _reply({
+                    "ok": True,
+                    "confirmed": bool(outcome.get("confirmed")),
+                    "forgot": bool(outcome.get("forgot")),
+                    "warning": str(outcome.get("warning") or ""),
+                    "targets": hub.list_targets(),
+                })
+                return
+
+            if msg_type == "connect_exit_client":
+                # "Exit Client Mode" — LOCAL only. Disconnects every socket;
+                # nothing on any remote machine is destroyed and no pairing is
+                # dropped. It used to release every connected target, which made
+                # leaving client mode reach across the network and tear down every
+                # machine in the list.
+                hub = self._get_remote_hub()
+                await hub.exit_client()
+                cs = self._get_connect_state()
+                if cs.role == "client":
+                    cs.set_role(None)
+                self._emit_connect_log(
+                    "disconnect",
+                    "已退出 client 模式：所有连接已断开，远端会话保持运行",
+                    "info", "client",
+                )
+                _reply({"ok": True, "targets": hub.list_targets()})
+                return
+
+        except AddressError as exc:
+            _reply({"ok": False, "error": f"配对地址无法解析: {exc}"})
+            return
+        except LinuxDaemonBusyError as exc:
+            # Distinct kind, not just distinct text: this is the ONE failure
+            # where retrying with a different argument (force=True) is a
+            # legitimate next step rather than "something is broken" — the
+            # renderer's pairing dialog checks this flag to offer a
+            # "强制重启" retry button instead of just showing the error.
+            _reply({"ok": False, "error": str(exc), "busy": True})
+            return
+        except RemoteControlError as exc:
+            _reply({"ok": False, "error": str(exc)})
+            return
+        except Exception as exc:
+            logger.exception("remote_control: %s failed", msg_type)
+            _reply({"ok": False, "error": f"{msg_type} 失败: {exc}"})
+            return
+
+    # ------------------------------------------------------------------
+    # Session resume (docs/session_resume_design.md §6.3/§6.4)
+    # ------------------------------------------------------------------
+
+    async def _build_resume_index_background(self) -> None:
+        """Warm-build the ResumeIndex once at boot, off the message-dispatch
+        path. fastembed/jieba import + model load happens here (not at
+        module import time — see the loose ``Optional[Any]`` typing on
+        ``self._resume_index``), so a slow first-ever model load never
+        delays the bridge announcing itself alive. But it CAN delay a
+        user's actual first message now — see ``_resume_index_ready``:
+        the cold build (model load + first-time embed of every existing
+        digest) measured ~10.8s at 92 sessions, and a first message can
+        land well before that (measured 2.3s after boot in a real repro).
+        ``_search_resume_candidates`` bounded-waits on ``_resume_index_ready``
+        rather than silently skipping, so that message still gets searched.
+
+        This is warm-up, not the only build: ``_search_resume_candidates``
+        rebuilds the index (cheap once the model is warm AND the embedding
+        cache is populated — see resume_index.py's ``_embed_cache``) right
+        before every search, so a session destroyed earlier in the SAME
+        bridge process is visible to resume without needing a restart.
+
+        ``_resume_index_ready`` is set on BOTH the success and failure path
+        below — a permanently-failed warm-build must still release anyone
+        waiting on it (they then see ``self._resume_index is None`` and
+        fail open), never leave them blocked until the bounded-wait timeout.
+        """
+        try:
+            from src.controller_v2.resume_index import ResumeIndex
+
+            index = ResumeIndex()
+            t0 = time.monotonic()
+            await index.build()
+            self._resume_index = index
+            logger.info(
+                "resume index warm-built: %d session(s) in %.2fs",
+                index.size, time.monotonic() - t0,
+            )
+        except Exception:
+            logger.exception(
+                "resume index warm-build failed; resume offers disabled "
+                "this session (fails open — no offers, no crash)",
+            )
+        finally:
+            self._resume_index_ready.set()
+
+    async def _search_resume_candidates(self, query_text: str) -> List["ResumeCandidate"]:
+        """Best-effort resume search for a session's message.
+
+        ``query_text`` is the FULL text to search with — for the session's
+        first message this is just that message; for every later message
+        (see ``_resume_query_text_for_followup``) it's the whole
+        conversation so far joined together, so a user who clarifies across
+        several short messages ("你还记得翻译任务吗" → "QPM" → "翻译") gets
+        a query that accumulates all three, not just whichever one happened
+        to land first. Search itself (dense-cos + BM25) is unchanged —
+        only what text callers feed it differs.
+
+        Rebuilds the index right before searching — with the embedding
+        cache (see resume_index.py's ``_embed_cache``), a rebuild only
+        re-embeds new/changed digests, so this is cheap (~100-200ms at
+        ~80 sessions, measured 2026-08-01) even though it runs on every
+        message. Without the rebuild, a session destroyed earlier in the
+        SAME bridge process is invisible to resume until the bridge
+        restarts — confirmed live: index built once at boot
+        (§_build_resume_index_background), a session destroyed 8 hours
+        later within that same process never entered it. Logs build/search
+        timing at INFO so a live "why did this feel slow" report can be
+        read straight from handq-engine.log without flipping log_level to
+        DEBUG first.
+
+        Returns [] (never raises) when the query is empty, the warm-build
+        never finishes within ``_RESUME_INDEX_WAIT_TIMEOUT`` (build failed
+        or is pathologically slow), or the search itself fails — a missing
+        resume offer is indistinguishable from "no candidates found" by
+        design; this is a soft enhancement, never a hard dependency for a
+        new session to start. Does NOT return [] just because the warm-build
+        hasn't finished YET — see the ``_resume_index_ready`` wait below;
+        that used to be a silent, unlogged miss for any message landing in
+        the ~10s cold-build window (confirmed live 2026-08-01: a user's
+        first message 2.3s after bridge boot got no resume search at all).
+        """
+        if not query_text:
+            return []
+        if self._resume_index is None:
+            try:
+                await asyncio.wait_for(
+                    self._resume_index_ready.wait(),
+                    timeout=_RESUME_INDEX_WAIT_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "resume search: warm-build still not ready after %.0fs; "
+                    "giving up on this message's resume search (fails open)",
+                    _RESUME_INDEX_WAIT_TIMEOUT,
+                )
+                return []
+            if self._resume_index is None:
+                # Event was set on the FAILURE path (see
+                # _build_resume_index_background's finally) — warm-build
+                # ran and errored, not "still running". Nothing to wait
+                # for; fail open.
+                return []
+        t0 = time.monotonic()
+        try:
+            await self._resume_index.build()
+            t_build = time.monotonic()
+            results = await self._resume_index.search(query_text)
+            t_search = time.monotonic()
+            logger.info(
+                "resume search: build=%.0fms search=%.0fms total=%.0fms "
+                "hits=%d index_size=%d",
+                (t_build - t0) * 1000, (t_search - t_build) * 1000,
+                (t_search - t0) * 1000, len(results), self._resume_index.size,
+            )
+            return results
+        except Exception:
+            logger.exception("resume search failed; continuing without an offer")
+            return []
+
+    @staticmethod
+    def _resume_query_text_for_followup(
+        flow: "FlowControllerV2", latest_text: str,
+        prior_messages: Optional[List[str]] = None,
+    ) -> str:
+        """Build the resume search query for a NON-first message: everything
+        the user has said so far, verbatim, followed by the message that just
+        arrived.
+
+        Why the full history and not just latest_text: a user who
+        clarifies across several short messages ("你还记得翻译任务吗" →
+        "QPM" → "翻译") wants each new message to sharpen the search, not
+        replace it — searching only the latest turn throws away everything
+        earlier turns already established. Plain string join, not a
+        digest/summary — this is a search query, not something a user or
+        model ever reads back.
+
+        Two sources of "so far", depending on whether the session is HELD:
+          * Held (fresh session, nothing executed yet) → the caller passes
+            ``prior_messages`` = the accumulated held messages, because those
+            were NEVER fed to on_user_message and so are absent from
+            conversation_history. Without this the follow-up search would see
+            only the latest line and lose the accumulation the hold exists to
+            build.
+          * Not held (a running session's FYI search) → prior_messages is
+            None; fall back to the flow's conversation_history (the executed
+            turns).
+        """
+        if prior_messages is not None:
+            parts = [f"user: {m}" for m in prior_messages]
+        else:
+            history = (
+                flow._orchestrator.conversation_history
+                if flow._orchestrator is not None else []
+            )
+            parts = [f"{turn.get('role', '')}: {turn.get('content', '')}" for turn in history]
+        parts.append(f"user: {latest_text}")
+        return "\n".join(parts)
+
+    def _emit_resume_offer(
+        self, temp_sid: str, goal: str, candidates: List["ResumeCandidate"],
+        trigger_text: str = "",
+    ) -> None:
+        """Register the offer + emit the soft-prompt envelope.
+
+        ``kind=resume_candidates`` is intentionally NOT routed through
+        ``_StdioUI._pending`` (the hard-block confirmation Future
+        mechanism) — per design, ignoring this envelope (typing a new
+        message, or just doing nothing) must have zero effect, which a
+        blocking Future can't express without extra machinery to cancel
+        it out from under an in-flight await.
+
+        The envelope still carries a ``hold_seconds`` field for wire
+        compatibility with the renderer's existing (dormant) countdown
+        code, but it is always ``None`` now — messages are never held
+        awaiting a resume decision (§ coordinator-and-resume-are-independent,
+        2026-08-01); this is a pure FYI card every time.
+
+        ``trigger_text``: the user's own words that produced this offer
+        (clean, NOT the role-prefixed search query) — the renderer quotes
+        it in the panel title so the user knows which message the
+        candidates are a response to.
+        """
+        self._pending_resume_offers[temp_sid] = _PendingResumeOffer(
+            candidates=candidates,
+            expires_at=time.monotonic() + _RESUME_OFFER_TTL_SECONDS,
+            goal=goal,
+        )
+        self._emit_session({
+            "type": "status",
+            "kind": "resume_candidates",
+            "candidates": [
+                {
+                    "session_dir": str(c.session_dir),
+                    "title": c.digest.title,
+                    "updated_at": c.digest.updated_at,
+                    "status": c.digest.status,
+                    # Completion signal for the card (§6.4.1's "已完成 vs
+                    # 中断于第N步"): whether ANY work was left in the queue
+                    # at close time — NOT the digest's top-level
+                    # destroyed/crashed status, which only reflects HOW the
+                    # session ended, not whether its task was finished.
+                    "is_fully_done": (
+                        c.digest.current is None and not c.digest.pending
+                    ),
+                    "final_answer": (
+                        c.digest.completed[-1].get("final_answer", "")
+                        if c.digest.completed else ""
+                    ),
+                    "workspace_files": c.digest.workspace_files,
+                }
+                for c in candidates
+            ],
+            "ttl_seconds": _RESUME_OFFER_TTL_SECONDS,
+            "hold_seconds": None,
+            "trigger_text": trigger_text,
+        }, temp_sid)
+
+    def _clear_resume_offer(self, temp_sid: str) -> None:
+        """Drop any pending offer for temp_sid and tell the renderer to hide
+        the card — the counterpart to _emit_resume_offer for the
+        now-continuous search (§ persistent resume search): a later message
+        in the same session can search from a stronger position (more
+        conversation accumulated) and no longer clear the gate that an
+        earlier message cleared, so a stale card must not linger. No-op
+        (still emits) even if there was nothing pending — idempotent from
+        the renderer's point of view (hiding an already-hidden card is
+        harmless), so callers don't need to track whether a card is
+        currently showing. Also the withdrawal mechanism
+        ``_on_coordinator_intent`` uses once INTENT settles a turn on the
+        "queue" lane — a card left showing after that would be stale.
+
+        That last caller is how this method became the被控 side's dead-mirror-tab
+        bug: ``_ensure_flow`` wires ``on_intent_classified`` for every session
+        including a remotely-driven one, so the first real task on a served
+        session reached here and emitted a ``rc-`` stamped envelope, which the
+        renderer turned into a tab that could never receive anything. The emit
+        now goes through ``_emit_session``, so for a served session this whole
+        method is inert.
+        """
+        self._pending_resume_offers.pop(temp_sid, None)
+        self._emit_session({
+            "type": "status",
+            "kind": "resume_candidates",
+            "candidates": [],
+            "ttl_seconds": _RESUME_OFFER_TTL_SECONDS,
+            "hold_seconds": None,
+        }, temp_sid)
+
+    async def _refresh_resume_offer(
+        self, sid: str, query_text: str, trigger_text: str = "",
+    ) -> bool:
+        """Search + emit-or-clear in one call — the shared step run before
+        BOTH a session's first message (``request``) and every later
+        message (``user_input``, kind=message). Centralized here so both
+        call sites emit/clear the same way instead of duplicating the
+        "candidates truthy?" branch.
+
+        Returns True iff the search HIT (an offer was emitted), False
+        otherwise (the card was cleared) — callers currently don't act on
+        this return value (the message runs unconditionally either way;
+        see the request/user_input branches), but it's kept for callers
+        that want to know without re-deriving it from side effects.
+
+        ``trigger_text`` is the user's clean words (not the role-prefixed
+        ``query_text``) shown in the panel title; defaults to query_text
+        when the caller doesn't distinguish them.
+        """
+        candidates = await self._search_resume_candidates(query_text)
+        if candidates:
+            self._emit_resume_offer(
+                sid, query_text, candidates,
+                trigger_text=trigger_text or query_text,
+            )
+            return True
+        self._clear_resume_offer(sid)
+        return False
+
+    def _pop_valid_resume_offer(self, temp_sid: str) -> Optional[_PendingResumeOffer]:
+        """Pop and return the offer for temp_sid iff it hasn't expired.
+        Lazy-expiry check (see module-level docstring) — a stale entry is
+        just discarded here rather than proactively swept by a timer."""
+        offer = self._pending_resume_offers.pop(temp_sid, None)
+        if offer is None:
+            return None
+        if time.monotonic() > offer.expires_at:
+            return None
+        return offer
+
+    async def _ensure_any_flow(self, session_id: str, goal: str) -> None:
+        """:meth:`_ensure_flow` plus the remote-session branch.
+
+        A tab bound to a remote target gets a ``RemoteSessionBridge`` in the
+        ``_flows`` slot instead of a ``FlowControllerV2``. Everything downstream —
+        ``flow.started``, ``flow.start()``, ``flow.on_user_message()``,
+        ``flow.destroy()``, ``flow._ctx.resume_search_disabled`` — is duck-typed
+        by that class, so the ``request`` / ``user_input`` / ``close_session``
+        handlers need no branch of their own. None of ``_ensure_flow``'s setup
+        applies either (session dir, per-session engine log, LLM service pool):
+        the被控 machine owns all of it.
+
+        Separate from ``_ensure_flow`` because building the bridge has to await a
+        TCP connect, and ``_ensure_flow`` is sync and called from two other
+        (always-local) places.
+        """
+        if session_id in self._flows:
+            return
+        hub = self._remote_hub
+        if hub is not None and hub.is_remote(session_id):
+            # The local _StdioUI still exists and is still the render target —
+            # the bridge replays remote events onto it, stamped with this sid.
+            self._get_or_create_ui(session_id)
+            self._flows[session_id] = await hub.create_bridge(session_id)
+            return
+        self._ensure_flow(session_id, goal=goal)
+
+    def _ensure_flow(
+        self, session_id: str, goal: str,
+        resume_session_dir: Optional[Path] = None,
+    ) -> None:
         if session_id in self._flows:
             return
 
@@ -1949,15 +3607,25 @@ class StdioBridge:
         llm_cfg = cfg.get("llm", {}) or {}
         sess_cfg = cfg.get("session", {}) or {}
 
-        # Allocate this session's directory under %USERPROFILE%\HandQ\History\.
-        # The agent operates inside <session>/<workspace_subdir>/ — that's the
-        # ONLY path the agent's prompt knows about. The session root itself
-        # holds framework metadata (handq-engine.log, executions_logs/) and is
-        # never named in the system prompt. A leading-dot folder name from
-        # yaml (default ".workspace") just becomes a normal subdir on NTFS.
         workspace_subdir = sess_cfg.get("workspace_base", ".workspace") or ".workspace"
-        session_dir = _allocate_session_dir(goal, workspace_subdir=workspace_subdir)
-        agent_workspace = session_dir / workspace_subdir
+        if resume_session_dir is not None:
+            # Resume path (§6.5 "复用既有目录"): the workspace already
+            # exists from the original session — re-point here instead of
+            # allocating a fresh timestamped dir, so ① world state (the
+            # agent's files) and the digest's digest.json stay
+            # exactly where the user's earlier session left them.
+            session_dir = resume_session_dir
+            agent_workspace = session_dir / workspace_subdir
+            agent_workspace.mkdir(exist_ok=True)
+        else:
+            # Allocate this session's directory under %USERPROFILE%\HandQ\History\.
+            # The agent operates inside <session>/<workspace_subdir>/ — that's the
+            # ONLY path the agent's prompt knows about. The session root itself
+            # holds framework metadata (handq-engine.log, executions_logs/) and is
+            # never named in the system prompt. A leading-dot folder name from
+            # yaml (default ".workspace") just becomes a normal subdir on NTFS.
+            session_dir = _allocate_session_dir(goal, workspace_subdir=workspace_subdir)
+            agent_workspace = session_dir / workspace_subdir
 
         # Initialise the HandQ engine logger now that we know the session dir
         # and can read log_level from config.  Must happen before FlowController
@@ -1966,7 +3634,7 @@ class StdioBridge:
         #
         # Per-task engine log lives INSIDE the session dir (not the bridge's
         # launch-scoped log dir) so the user can find a session's full trace
-        # alongside its session_state.json + executions_logs/ without having to
+        # alongside its digest.json + executions_logs/ without having to
         # cross-reference two different roots. The bridge-scoped log
         # (handq-bridge.log under HANDQ_LOG_DIR) is unaffected — it stays where
         # it is for cross-session correlation.
@@ -2064,12 +3732,20 @@ class StdioBridge:
         def _on_reply(text: str) -> None:
             self._on_coordinator_reply(session_id, text)
 
+        # ``on_intent_classified`` callback — session-resume's gate (see
+        # _on_coordinator_intent's docstring). Same closure shape as
+        # _on_reply above: both close over this ``session_id`` local so the
+        # bound method knows which session's state to touch.
+        def _on_intent(intent: str) -> None:
+            self._on_coordinator_intent(session_id, intent)
+
         flow = FlowControllerV2(
             llm_services=consolidated_services,
             working_directory=str(agent_workspace),
             storage_directory=str(session_dir),
             config_path=str(self.config_path),
             on_reply_to_user=_on_reply,
+            on_intent_classified=_on_intent,
             expose_session_storage_in_prompt=False,
             helper_llm_services=helper_services,
             session_id=session_id,
@@ -2084,14 +3760,22 @@ class StdioBridge:
         # uses this path to surface produced files (drag-out / save-to /
         # preview). Emitted exactly once per session at construction time;
         # the path is stable for the session's lifetime.
+        #
+        # Routed through _emit_session, not _emit: for a session this machine is
+        # serving for a remote controller there is no local tab, and this
+        # envelope's sid would be enough to make the renderer invent one (its
+        # status handler mounts on any unseen sid, ignoring ``kind``). That gate
+        # replaced a ``suppress_started_event`` parameter here — the flag was
+        # correct for this one call and did nothing for the next path that
+        # emitted a stamped envelope. See _emit_session.
         try:
-            _emit({
+            self._emit_session({
                 "type": "status",
                 "kind": "session_started",
                 "session_dir": str(session_dir),
                 "workspace_dir": str(agent_workspace),
                 "session_name": goal.strip()[:30] if goal else None,
-            }, session_id=session_id)
+            }, session_id)
         except Exception:
             logger.exception("Failed to emit session_started status event")
 
@@ -2140,11 +3824,88 @@ class StdioBridge:
         (``reply_delta`` / ``reply_done``) is currently unwired — V2
         baseline emits the full reply once. session_id is closed-over when
         the callback is bound in _ensure_flow so multi-session replies
-        land in the correct chat tab."""
+        land in the correct chat tab.
+
+        Routed through a per-session sink rather than emitting inline: a
+        remote-controlled session replaces its sink so this reply reaches the
+        controlling machine too. It has to be intercepted *here* because the
+        callback deliberately bypasses the InteractionManager
+        (``flow_controller.py:533-536`` prefers the callback over the IM), and
+        this is the only message that does — so it is also the only one a
+        delegate swap alone would fail to redirect.
+        """
         if not text:
             return
-        _emit({"type": "status", "kind": "reply", "text": str(text)},
-              session_id=session_id)
+        sink = self._reply_sinks.get(session_id)
+        if sink is not None:
+            try:
+                sink(str(text))
+                return
+            except Exception:
+                logger.warning(
+                    "remote_control: reply sink for %s failed; falling back to "
+                    "the local emit", session_id, exc_info=True,
+                )
+        self._emit_session(
+            {"type": "status", "kind": "reply", "text": str(text)}, session_id
+        )
+
+    def _on_coordinator_intent(self, session_id: str, intent: str) -> None:
+        """``FlowControllerV2.on_intent_classified`` callback — fires the
+        instant Orchestrator settles this turn's FINAL intent lane
+        (chat/queue/interrupt), independent of whether/when
+        ``on_user_message`` returns. This is session-resume's gate:
+
+          * "queue" (a real task starting) → the user's intent is now
+            unambiguous: settle this session's identity as "not resuming",
+            permanently (mirrors the other two permanent-stop paths — a
+            successful resume_confirm and the "Not resuming" button; see
+            SessionContext.resume_search_disabled's docstring) and
+            withdraw whatever candidate card is currently showing — it's
+            now stale, the user has moved on to a real task.
+          * "chat" → deliberately inert. Ordinary conversation doesn't
+            settle the session's identity; resume search keeps running on
+            every subsequent message (§ continuous search) and the card
+            stays live/refreshable.
+          * "interrupt" → also deliberately inert (user-confirmed): a
+            control command ("stop", "cancel") is not "the user has
+            started a real task" — it doesn't carry the same
+            identity-settling weight "queue" does, so it must NOT close
+            the resume gate.
+
+        idempotent: if resume_search_disabled is already True (settled by
+        an earlier turn via any path), this is a no-op — no redundant
+        clear-offer emit on every subsequent queue-lane turn.
+        """
+        if intent != "queue":
+            return
+
+        # v6: this session_id might ALSO be a remote-driven session (the被控
+        # side uses the same self._flows dict, keyed by the same rc-xxx id —
+        # see _BridgeSessionHost.create_flow). If so, record that it stopped
+        # being idle chat, so the controller's panel can badge its chip as a
+        # task. No-op for an ordinary local session: self._remote_server is
+        # None until the user has ever clicked "As Server".
+        #
+        # FIRST, before the resume-gate early-returns below. It used to sit
+        # after them and worked only because the very first "queue" turn is
+        # necessarily also the turn that flips resume_search_disabled — an
+        # ordering coincidence, not a reason. Any future path that pre-sets
+        # that flag (a resumed session, say) would have silently stopped
+        # marking remote sessions as tasks.
+        server = self._remote_server
+        if server is not None:
+            session = server.get_session(session_id)
+            if session is not None:
+                session.mark_task_started()
+
+        flow = self._flows.get(session_id)
+        if flow is None or flow._ctx is None:
+            return
+        if flow._ctx.resume_search_disabled:
+            return
+        flow._ctx.resume_search_disabled = True
+        self._clear_resume_offer(session_id)
 
     # ------------------------------------------------------------------
     # New-session chain — equivalent to `handq new`. Designed for three
@@ -2249,6 +4010,37 @@ class StdioBridge:
         # stops emitting/mutating per-session state before teardown.
         await self._cancel_inflight(session_id)
 
+        # A remote-controlled tab: release the bridge, which DETACHES from the
+        # 被控 session without terminating it. Closing a window here must not
+        # kill work on the other machine — that is the whole "remote machine is a
+        # server" property. Deliberate termination goes through
+        # `remote_close_session`. The seq the tab reached is persisted on the way
+        # out so a later re-adopt resumes from the right place.
+        if self._remote_hub is not None and self._remote_hub.is_remote(session_id):
+            self._flows.pop(session_id, None)
+            with self._uis_lock:
+                self._uis.pop(session_id, None)
+            try:
+                await self._remote_hub.release_bridge(session_id)
+            except Exception:
+                logger.warning(
+                    "remote_control: releasing bridge for %s failed",
+                    session_id, exc_info=True,
+                )
+            self._reply_sinks.pop(session_id, None)
+            self._closing.discard(session_id)
+            # No _force_release_session_locks here: a remote session holds no
+            # local desktop lock — the被控 machine owns that state and releases
+            # it there.
+            self._session_dispatch_locks.pop(session_id, None)
+            self._inflight_by_sid.pop(session_id, None)
+            _emit({"type": "final", "id": msg_id,
+                   "result": {"close_session": "ok", "session_id": session_id,
+                              "elapsed_ms": int((time.monotonic() - t0) * 1000)}},
+                  session_id=session_id)
+            logger.info("close_session (remote) complete; sid=%s", session_id)
+            return
+
         flow = self._flows.pop(session_id, None)
         services = self._services_by_session.pop(session_id, [])
         with self._uis_lock:
@@ -2334,12 +4126,288 @@ class StdioBridge:
             # gone, so the next message for this sid (if any) starts clean.
             self._session_dispatch_locks.pop(session_id, None)
             self._inflight_by_sid.pop(session_id, None)
+            # Remote-control per-session slots. Harmless no-ops for an ordinary
+            # local session; required for one that was being driven from another
+            # machine, so a later session reusing this sid cannot inherit a stale
+            # reply sink pointing at a dead NetworkUIDelegate.
+            self._reply_sinks.pop(session_id, None)
+            # If this was a remotely-driven session being destroyed, refresh
+            # the serve-state broadcast so the dashboard stays honest.
+            if self._remote_server is not None:
+                self._broadcast_serve_state()
             elapsed = (time.monotonic() - t0) * 1000.0
             _emit({"type": "final", "id": msg_id,
                    "result": {"close_session": "ok",
                               "session_id": session_id,
                               "elapsed_ms": round(elapsed, 1)}},
                   session_id=session_id)
+
+    async def _purge_remote_session_state(self, session_id: str) -> None:
+        """Free every per-session slot held for a被控-side remote session.
+
+        The teardown counterpart to ``_BridgeSessionHost.create_flow``. That
+        method deliberately goes through ``_ensure_flow``, which is what makes a
+        remotely-driven session a first-class local one — and therefore also
+        what makes it allocate the same seven things any local session does. Only
+        one of them (the flow) is freed by the server awaiting ``flow.destroy()``;
+        the rest have no other release path, because the被控 machine has no tab
+        for a ``rc-`` session and so no ``close_session`` IPC ever arrives for it.
+        Before this existed, every remote session a machine had ever served
+        stayed pinned for the life of the process: a dead flow in ``_flows``, a
+        per-session LLM service list with live httpx pools, a ``_StdioUI``, a
+        reply sink, a dispatch lock, and a file handler still attached to the
+        ROOT logger.
+
+        Called from the ``on_session_destroyed`` hook, i.e. after the flow is
+        already gone, so it must not destroy it again. It DOES still release the
+        cross-session desktop/browser locks: a remote session runs real tools on
+        this machine and can be holding them, and a wedged teardown that left
+        them held would deadlock every other session on this box — the same
+        reason ``_do_close_session`` does it defensively in a ``finally``.
+        """
+        flow = self._flows.pop(session_id, None)
+        ctx_ref = getattr(flow, "_ctx", None) if flow is not None else None
+        services = self._services_by_session.pop(session_id, [])
+        with self._uis_lock:
+            self._uis.pop(session_id, None)
+
+        handler = self._engine_log_handlers.pop(session_id, None)
+        try:
+            from ..infrastructure.logger import remove_root_file_handler
+            remove_root_file_handler(handler)
+        except Exception:
+            logger.exception(
+                "remote_control: failed to detach engine.log handler for %s",
+                session_id,
+            )
+
+        for i, svc in enumerate(services):
+            try:
+                await asyncio.wait_for(
+                    svc.close(), timeout=self._NEW_SESSION_CLOSE_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "remote_control: svc[%d].close for %s timed out after %.1fs",
+                    i, session_id, self._NEW_SESSION_CLOSE_TIMEOUT,
+                )
+            except Exception:
+                logger.warning(
+                    "remote_control: svc[%d].close for %s failed",
+                    i, session_id, exc_info=True,
+                )
+
+        self._force_release_session_locks(ctx_ref, session_id)
+        self._reply_sinks.pop(session_id, None)
+        self._session_dispatch_locks.pop(session_id, None)
+        self._inflight_by_sid.pop(session_id, None)
+        self._closing.discard(session_id)
+        # LAST, deliberately. While this entry is present ``_emit_session``
+        # suppresses stamped envelopes for the sid, and teardown above can still
+        # produce them (a service close or lock release that logs through a
+        # session-scoped path). Dropping it first would reopen the dead-tab hole
+        # for the duration of the purge.
+        self._served_sessions.pop(session_id, None)
+        logger.info(
+            "remote_control: purged per-session state for served session %s",
+            session_id,
+        )
+
+    # ------------------------------------------------------------------
+    # Session-resume confirm (docs/session_resume_design.md §6.4/§6.5)
+    # ------------------------------------------------------------------
+
+    # Fixed review-task instruction (§ review-first resume): deliberately
+    # does NOT include the verbatim text that triggered the offer — the
+    # trigger is a pure signal ("resume this one"), not new task content
+    # (see _PendingResumeOffer.goal's docstring). INTENT still classifies
+    # this normally (it reads as world-work — inspecting a real workspace —
+    # so it lands on "queue" on its own merits); the "don't act" instruction
+    # is carried in the instruction text itself, the same way any other
+    # task constrains the agent via its own wording, not a side-channel flag.
+    _RESUME_REVIEW_INSTRUCTION = (
+        "You just resumed this session from a saved trajectory (see the "
+        "resume banner above). Review what's been restored — the "
+        "conversation so far, the completed/pending task queue, and the "
+        "current state of the workspace on disk — and write a short summary "
+        "for the user covering: what this session was about, what's already "
+        "been done and verified, and what (if anything) is still "
+        "outstanding. Reading files to refresh your view of the workspace "
+        "is fine. Do NOT start, continue, or verify-by-redoing any task, "
+        "and do NOT call any tool that changes anything (write/edit/shell/"
+        "browser actions, etc.) — this turn is purely informational. Wait "
+        "for the user's next instruction before acting on anything."
+    )
+
+    # First bubble the user sees after confirming — sent verbatim, not
+    # something INTENT is trusted to phrase (see _do_resume_confirm): INTENT
+    # classifies _RESUME_REVIEW_INSTRUCTION into "queue" but its own
+    # response_to_user for a queue lane is never forwarded to the UI (see
+    # Orchestrator._handle_user_message — only the chat lane emits via
+    # _on_reply_to_user), so without this explicit bubble the user would see
+    # nothing until the review task's completion reply lands.
+    _RESUME_REVIEWING_BUBBLE = "↻ Resuming — reviewing the previous session before doing anything else…"
+
+    async def _do_resume_confirm(
+        self, temp_sid: str, session_dir: str, msg_id: Optional[str],
+    ) -> None:
+        """User accepted a resume offer. Tears down whatever's currently
+        running on the TEMP session (§ coordinator-and-resume-are-independent:
+        the message that triggered this offer was NEVER held — it already
+        ran, or is actively running right now — so there is typically real
+        in-flight work to discard, not an idle flow; ``_cancel_inflight``
+        below is exactly the "interrupt a real in-flight request/user_input"
+        mechanism this needs), then rebuilds a flow at the SAME bridge sid
+        pointed at the OLD session_dir, restores its digest, and queues a
+        fixed REVIEW task instead of replaying the message that triggered
+        the offer (§ review-first resume) — the agent looks at what it just
+        got back and reports before doing anything else. The trigger message
+        itself is simply never resurrected: picking a candidate means "I want
+        the old session, not whatever this new ask was" — its work (if any
+        got far enough to produce one) is discarded along with the temp
+        session, same as the old work-discarding always was.
+
+        Same sid, not a new one: the renderer's tab is already showing
+        temp_sid — resuming must not require it to somehow discover a
+        different id (§6.5 "让那条工作线醒过来继续，不是拷贝一份副本").
+        """
+        offer = self._pop_valid_resume_offer(temp_sid)
+        if offer is None:
+            _emit({"type": "error", "id": msg_id, "where": "bridge",
+                   "message": "resume_confirm: no pending offer for this "
+                              "session (expired or already resolved)",
+                   "fatal": False}, session_id=temp_sid)
+            return
+        candidate = next(
+            (c for c in offer.candidates if str(c.session_dir) == session_dir),
+            None,
+        )
+        if candidate is None:
+            _emit({"type": "error", "id": msg_id, "where": "bridge",
+                   "message": "resume_confirm: session_dir does not match "
+                              "any offered candidate",
+                   "fatal": False}, session_id=temp_sid)
+            return
+
+        logger.info(
+            "resume_confirm sequence begin; temp_sid=%s -> session_dir=%s",
+            temp_sid, session_dir,
+        )
+        t0 = time.monotonic()
+
+        # ── Tear down the temp session (same teardown as close_session,
+        #    minus its close_session-shaped final emit) ────────────────
+        self._closing.add(temp_sid)
+        await self._cancel_inflight(temp_sid)
+        temp_flow = self._flows.pop(temp_sid, None)
+        temp_services = self._services_by_session.pop(temp_sid, [])
+        ctx_ref = getattr(temp_flow, "_ctx", None) if temp_flow is not None else None
+        handler = self._engine_log_handlers.pop(temp_sid, None)
+        try:
+            from ..infrastructure.logger import remove_root_file_handler
+            remove_root_file_handler(handler)
+        except Exception:
+            logger.exception(
+                "resume_confirm[sid=%s]: failed to detach engine.log handler",
+                temp_sid,
+            )
+        try:
+            if temp_flow is not None:
+                try:
+                    await asyncio.wait_for(temp_flow.destroy(), timeout=2.5)
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "resume_confirm[sid=%s]: temp flow.destroy timed out (2.5s)",
+                        temp_sid,
+                    )
+                except Exception:
+                    logger.warning(
+                        "resume_confirm[sid=%s]: temp flow.destroy failed",
+                        temp_sid, exc_info=True,
+                    )
+            for i, svc in enumerate(temp_services):
+                try:
+                    await asyncio.wait_for(
+                        svc.close(), timeout=self._NEW_SESSION_CLOSE_TIMEOUT,
+                    )
+                except Exception:
+                    logger.warning(
+                        "resume_confirm[sid=%s]: temp svc[%d].close failed",
+                        temp_sid, i, exc_info=True,
+                    )
+        finally:
+            self._force_release_session_locks(ctx_ref, temp_sid)
+            self._closing.discard(temp_sid)
+
+        # ── Rebuild at the SAME sid, pointed at the OLD session_dir ─────
+        try:
+            self._ensure_flow(
+                temp_sid, goal=candidate.digest.title or "resume",
+                resume_session_dir=candidate.session_dir,
+            )
+            flow = self._flows[temp_sid]
+            # _ensure_flow's own session_started envelope named the tab
+            # after the NEW trigger message (offer.goal) — override with the
+            # OLD session's actual title so the tab reflects what's really
+            # continuing, not what the user just typed to trigger it.
+            if candidate.digest.title:
+                self._emit_session({
+                    "type": "status", "kind": "session_started",
+                    "session_dir": str(candidate.session_dir),
+                    "workspace_dir": flow.working_directory,
+                    "session_name": candidate.digest.title.strip()[:30],
+                }, temp_sid)
+            await flow.start(resume_digest=candidate.digest)
+
+            # This session's identity is now settled — never search again
+            # (the other permanent-stop path is the "No Resume" button; see
+            # SessionContext.resume_search_disabled's docstring).
+            if flow._ctx is not None:
+                flow._ctx.resume_search_disabled = True
+
+            # ── Review-first (§ review-first resume): announce, THEN queue
+            #    the review — not the trigger message — as a real task. ──
+            self._forward_reply_to_ui_for(flow, self._RESUME_REVIEWING_BUBBLE)
+            # on_user_message runs the review instruction through the normal
+            # INTENT lane (expected to land on "queue" — it reads as
+            # inspecting a real workspace); its own response_to_user is
+            # intentionally unused here (queue-lane replies aren't forwarded
+            # to the UI anyway — see _RESUME_REVIEWING_BUBBLE's docstring).
+            # The task's actual completion reply (the summary) reaches the
+            # UI later, asynchronously, via the flow's own on_reply_to_user
+            # wiring once PersistentAgent finishes the item — same path
+            # every other task's completion reply already takes.
+            await flow.on_user_message(self._RESUME_REVIEW_INSTRUCTION)
+
+            elapsed = (time.monotonic() - t0) * 1000.0
+            _emit({
+                "type": "final", "id": msg_id,
+                "result": {
+                    "resume_confirm": "ok",
+                    "session_dir": str(candidate.session_dir),
+                    "elapsed_ms": round(elapsed, 1),
+                },
+            }, session_id=temp_sid)
+        except Exception as exc:
+            logger.exception(
+                "resume_confirm[sid=%s]: rebuild against %s failed",
+                temp_sid, session_dir,
+            )
+            _emit({"type": "error", "id": msg_id, "where": "engine",
+                   "message": f"resume_confirm failed: {exc}", "fatal": True},
+                  session_id=temp_sid)
+
+    @staticmethod
+    def _forward_reply_to_ui_for(flow: "FlowControllerV2", text: str) -> None:
+        """Send one assistant-bubble-shaped reply through the SAME path a
+        normal coordinator/task-completion reply takes (FlowControllerV2's
+        own ``_forward_reply_to_ui``), instead of calling ``_emit`` directly
+        here — keeps this bubble indistinguishable from any other reply on
+        the renderer side (same envelope shape, same fallback-to-inline-event
+        behaviour if no ``on_reply_to_user`` callback is wired)."""
+        flow._forward_reply_to_ui(text)
+
+
 
     # ------------------------------------------------------------------
     # Shutdown chain (per backend_surface.md §1)
@@ -2356,6 +4424,28 @@ class StdioBridge:
             return (time.monotonic() - t0) * 1000.0
 
         try:
+            # Remote control first, before any flow teardown. On the控制 side
+            # this detaches cleanly and persists each session's replay position;
+            # on the被控 side it tells every attached controller *why* their
+            # sessions are ending (server_shutdown) instead of letting them see a
+            # bare socket close and start reconnecting to a process that is gone.
+            if self._remote_hub is not None:
+                t0 = time.monotonic()
+                try:
+                    await asyncio.wait_for(self._remote_hub.close(), timeout=5.0)
+                    logger.info("shutdown: remote hub closed (%.2f ms)", _step_ms(t0))
+                except Exception:
+                    logger.warning("shutdown: remote hub close failed", exc_info=True)
+                self._remote_hub = None
+            if self._remote_server is not None:
+                t0 = time.monotonic()
+                try:
+                    await asyncio.wait_for(self._remote_server.stop(), timeout=8.0)
+                    logger.info("shutdown: remote server stopped (%.2f ms)", _step_ms(t0))
+                except Exception:
+                    logger.warning("shutdown: remote server stop failed", exc_info=True)
+                self._remote_server = None
+
             # Tear down every live session's flow + service pool. Each
             # destroy/close is independent — one stuck flow doesn't block
             # the others.
@@ -2530,6 +4620,36 @@ class StdioBridge:
         )
         reader.start()
         logger.info("event loop online; awaiting messages")
+
+        # Kick off the resume index build in the background (§6.4) —
+        # fire-and-forget, never awaited on the boot path. A first message
+        # arriving before this finishes just gets no resume offer (fails
+        # open), which is the correct behaviour for a soft, non-blocking
+        # search: there is nothing to gate here, only something to skip
+        # gracefully if it isn't ready yet.
+        asyncio.create_task(
+            self._build_resume_index_background(), name="resume-index-build",
+        )
+
+        # Deliberately NOT starting the被控-side listener here. A machine goes
+        # into server mode only when someone presses "As Server" in the Connect
+        # panel (connect_start_server), never because it was restarted or
+        # upgraded — see _start_remote_control_server's docstring. The client
+        # side does auto-resume, below: reconnecting to machines we already
+        # paired with is recovering a relationship the user set up, whereas
+        # auto-listening would be opening this machine up on its behalf.
+
+        # Tell the renderer the initial被控 state so the titlebar indicator is
+        # correct from the first paint rather than only after the first toggle.
+        self._broadcast_serve_state()
+
+        # No boot-time client reconnect sweep. Connecting to a paired target is
+        # on demand now (the Connect panel's ``remote_connect``, fired when its
+        # client dashboard opens or the operator clicks Connect): a被控 machine
+        # parks its sessions whether or not we hold a socket, so nothing is lost
+        # by not restoring one at boot, and it serves one controller at a time,
+        # so eagerly grabbing sockets for every paired machine at startup would
+        # lock others out of machines this user isn't even looking at.
 
         first_msg_seen = False
         while True:

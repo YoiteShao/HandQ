@@ -1,6 +1,6 @@
 {
   "name": "handq-electron",
-  "version": "1.5.5",
+  "version": "1.6.0",
   "description": "Your AI-driven integration engineer",
   "main": "main.js",
   "private": true,
@@ -54,6 +54,13 @@
       {
         "from": "../Skill",
         "to": "Skill",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "../assets/models",
+        "to": "assets/models",
         "filter": [
           "**/*"
         ]

@@ -143,13 +143,23 @@
         return s.length > limit ? s.slice(0, limit) + '…(' + s.length + ')' : s;
     };
 
+    // Keys whose values must never reach a log file. Beyond the LLM API key
+    // this covers the remote-control bearer token and the
+    // `handq://host:port/token` pairing string that embeds it — both travel
+    // through the remote_* envelopes, and holding a machine's token is enough to
+    // open agent sessions on it. `capability` is the per-session equivalent.
+    const _REDACT_KEYS = new Set([
+        'API_KEY', 'api_key', 'api_key_env',
+        'token', 'pairing', 'capability', 'remote_control_token',
+    ]);
+
     window.__handqRedact = function (value) {
         if (!value || typeof value !== 'object') return value;
         if (Array.isArray(value)) return value.map(window.__handqRedact);
         const out = {};
         for (const k of Object.keys(value)) {
             const v = value[k];
-            if (k === 'API_KEY' || k === 'api_key' || k === 'api_key_env') {
+            if (_REDACT_KEYS.has(k)) {
                 out[k] = (v === undefined || v === null || v === '') ? v : '<redacted>';
             } else if (v && typeof v === 'object') {
                 out[k] = window.__handqRedact(v);
@@ -165,6 +175,48 @@
             e.preventDefault();
             togglePanel();
         }
+        // ── Ctrl+Shift+P / Ctrl+Shift+; : Performance mode A/B toggle ──
+        if (e.ctrlKey && e.shiftKey && (e.key === 'P' || e.key === 'p' || e.key === ';')) {
+            e.preventDefault();
+            document.documentElement.classList.toggle('perf-mode');
+            const on = document.documentElement.classList.contains('perf-mode');
+            window.__handqLog('INFO', `perf-mode ${on ? 'ON' : 'OFF'}`);
+        }
+    });
+})();
+
+// ----- Window-resize compositor relief -------------------------------------
+// Until now NOTHING in the stylesheet reacted to a plain OS window resize,
+// even though a resize is the most expensive thing this UI does: every frame
+// Chromium re-lays-out the document AND re-rasterizes each backdrop-filter
+// region at its new size, several of which are 30px blurs spanning most of
+// the window.
+//
+// The reason this shows up as "everything involving a size change feels
+// choppy" is that a window resize is not a rare, deliberate act here — the
+// auto-resize IPC (see _sendAutoResizeIpc) fires one on session create and
+// close, on rail open and close, and on every sidebar toggle. The two
+// existing suppression scopes miss all of that: body.card-width-instant is
+// added only by the sidebar's own toggle path, and html.vt-active only for
+// the duration of a View Transition.
+//
+// html.window-resizing is set on the first resize tick and cleared a beat
+// after the last one, so it also covers DWM's trailing frames rather than
+// snapping the glass back mid-animation. The paired CSS block flattens the
+// expensive surfaces for exactly that span.
+(function () {
+    let clearTimer = 0;
+    // Long enough to bridge the gap between DWM animation frames (which can
+    // stutter under load) without leaving the glass flat after the resize
+    // has visibly finished.
+    const CLEAR_DELAY_MS = 140;
+    window.addEventListener('resize', () => {
+        if (!clearTimer) document.documentElement.classList.add('window-resizing');
+        clearTimeout(clearTimer);
+        clearTimer = setTimeout(() => {
+            clearTimer = 0;
+            document.documentElement.classList.remove('window-resizing');
+        }, CLEAR_DELAY_MS);
     });
 })();
 
@@ -236,13 +288,36 @@
         stdio_loop_ready:        'ready',
     };
 
+    // bridge_main.py's _timed_import() reports raw dotted Python module
+    // paths (e.g. "src.infrastructure.long_term_memory") in its importing/
+    // imported boot_progress events. Those read as source code to a user
+    // watching the boot screen, so map the known ones to plain nouns.
+    // Anything not in this table (a future import bridge_main.py adds)
+    // falls back to its last dotted segment with underscores turned into
+    // spaces, rather than the full module path.
+    const MODULE_FRIENDLY_NAMES = {
+        'src.bridge.stdio_bridge':             'core services',
+        'src.infrastructure.skills':           'skills',
+        'src.infrastructure.long_term_memory': 'memory',
+        'src.infrastructure.personality':      'activity monitor',
+        'src.infrastructure.scheduler':        'scheduler',
+    };
+
+    function friendlyModuleName(mod) {
+        const raw = String(mod || '');
+        const known = MODULE_FRIENDLY_NAMES[raw];
+        if (known) return known;
+        const last = raw.split('.').pop() || 'component';
+        return last.replace(/_/g, ' ');
+    }
+
     function formatPhase(evt) {
         const phase = String(evt && evt.phase || '');
         let base = BOOT_PHASE_LABELS[phase] || phase.replace(/_/g, ' ');
         if (phase === 'importing' && evt.module) {
-            base = 'loading ' + String(evt.module);
+            base = 'loading ' + friendlyModuleName(evt.module);
         } else if (phase === 'imported' && evt.module) {
-            base = 'loaded ' + String(evt.module) +
+            base = 'loaded ' + friendlyModuleName(evt.module) +
                    (evt.took_ms ? ' (' + evt.took_ms + 'ms)' : '');
         } else if (phase === 'imports_done' && evt.took_ms) {
             base = 'all modules loaded (' + evt.took_ms + 'ms)';
@@ -352,6 +427,11 @@
     const cfgPersEnabled = document.getElementById('cfg-pers-enabled');
     const cfgPersExcludedApps = document.getElementById('cfg-pers-excluded-apps');
     const cfgPersGitHookRepos = document.getElementById('cfg-pers-git-hook-repos');
+    // Remote control has no settings fields. Becoming a server, pairing,
+    // opening and destroying remote sessions are all actions with immediate
+    // effect on another machine, so they live in the Connect panel
+    // (connect-panel.js) — not in a form you Save. See the comment block where
+    // this fieldset used to be in index.html for what was removed and why.
 
     // Hotkey field
     const cfgHotkey = document.getElementById('cfg-hotkey');
@@ -430,6 +510,11 @@
             // null. The owning sid IS this session, so the answer is always
             // stamped with `sid` (never the globally-active tab).
             pendingConfirm: null,
+            // Session-resume state (rendering moved to right sidebar —
+            // session-sidebar.js; these fields just track the bridge-side
+            // offer lifecycle for IPC routing).
+            pendingResume: null,  // {candidates:[...]} while an offer shows
+            _resumeTimeoutId: null, // cosmetic TTL auto-hide timer
             // Per-session activity-strip state ("idle"|"thinking"|"executing").
             sessionState: 'idle',
             // Current pill text (separate from sessionState so tooltips
@@ -471,6 +556,19 @@
             // session's card, or null while it's on the main stage. Set by
             // _moveToRail / cleared by _occupyMainSlot.
             _railWrap: null,
+            // Scroll-restore state captured when this card leaves the main
+            // stage (main → rail). appendChild reparenting resets the
+            // .session-card-body scrollTop to 0, and the rail thumbnail's CSS
+            // `zoom` perturbs the scroll coordinate system, so we snapshot the
+            // MAIN-stage scroll offset on the way out and restore it on the way
+            // back in (see _moveToRail / _occupyMainSlot). Null until the card
+            // has been to the rail at least once.
+            _savedScrollTop: null,
+            // Whether the reader was pinned to the bottom (following the live
+            // stream) when the card left main. If so we re-pin to the latest
+            // bottom on return rather than restoring the stale absolute offset,
+            // so content that arrived while off-stage stays followed.
+            _savedAtBottom: false,
         };
     }
 
@@ -511,6 +609,11 @@
             return;
         }
         document.documentElement.dataset.vtScope = 'session';
+        // Disable per-card backdrop-filter unconditionally during the
+        // position interpolation — prevents re-blur every frame of the
+        // transition. Used to be perf-mode-only; the cost applies
+        // equally regardless of perf-mode, so it's unconditional now.
+        document.documentElement.classList.add('vt-active');
         let transition;
         try {
             transition = document.startViewTransition(mutate);
@@ -518,10 +621,12 @@
             window.__handqLog('WARN', 'startViewTransition threw', { err: err && err.message });
             mutate();
             delete document.documentElement.dataset.vtScope;
+            document.documentElement.classList.remove('vt-active');
             return;
         }
         try { await transition.finished; } catch (_) { /* aborted transitions are ok */ }
         delete document.documentElement.dataset.vtScope;
+        document.documentElement.classList.remove('vt-active');
     }
 
     function sessionState(sid) {
@@ -570,12 +675,29 @@
         title.addEventListener('dblclick', () => _startRenameSession(sid));
         const pill = el('span', 'session-card-pill', 'idle');
 
-        const cardClose = el('button', 'session-card-close', '×');
+        // Remote-control badge — hidden for a local session, and the ONLY
+        // chrome that distinguishes a remote tab. Everything else about the
+        // card is identical because the bridge replays the remote machine's UI
+        // events through the same delegate a local session uses.
+        const remoteBadge = el('span', 'session-card-remote hidden');
+
+        const cardClose = el('button', 'session-card-close');
         cardClose.type = 'button';
         cardClose.setAttribute('aria-label', 'Close session');
         cardClose.title = 'Close session';
+        // SVG cross instead of the '×' text glyph — the glyph's ink isn't
+        // centered in its own em-box in the system font (reads visibly
+        // off-center in a 22px circle), same reason the titlebar close
+        // button (#tb-close) uses two drawn lines instead of a character.
+        cardClose.innerHTML =
+            '<svg viewBox="0 0 12 12" aria-hidden="true">' +
+            '<line x1="3" y1="3" x2="9" y2="9" stroke="currentColor" ' +
+            'stroke-width="1.4" stroke-linecap="round"/>' +
+            '<line x1="9" y1="3" x2="3" y2="9" stroke="currentColor" ' +
+            'stroke-width="1.4" stroke-linecap="round"/></svg>';
         head.appendChild(title);
         head.appendChild(pill);
+        head.appendChild(remoteBadge);
         head.appendChild(cardClose);
 
         // Body: the scroll container where chat bubbles + activity groups go.
@@ -615,6 +737,7 @@
         s.pane = body;
         s.titleEl = title;
         s.pillEl = pill;
+        s.remoteBadgeEl = remoteBadge;
         s.confirmEl = confirm;
         s.composerInput = ta;
         // Min/max buttons removed from the card header — kept as null refs
@@ -703,7 +826,7 @@
         const sid = (opts && opts.sid) || _uuid();
         const name = (opts && opts.name) || _autoNameForNewSession();
         _mountSession(sid, name);
-        switchSession(sid);
+        switchSession(sid, opts && opts.originRect);
         return sid;
     }
 
@@ -712,13 +835,15 @@
     // whether a sid is a fresh mount, a main-stage occupant, or a rail
     // thumbnail. This is what lets old call sites (lazy-mount, the card's
     // own mousedown handler, closeSession's neighbour-switch) keep working
-    // unchanged after the Stage-Manager rewrite below.
-    function switchSession(sid) {
+    // unchanged after the Stage-Manager rewrite below. `originRect` is only
+    // meaningful for the "brand new" branch (see _placeSession's Genie
+    // entrance) — existing main/rail sessions ignore it.
+    function switchSession(sid, originRect) {
         const s = sessions.get(sid);
         if (!s) return;
         if (s.slot === 'main') { _focusMainSession(sid); return; }
         if (s.slot === 'rail') { _promoteFromRail(sid); return; }
-        _placeSession(sid); // brand new, never placed yet
+        _placeSession(sid, originRect); // brand new, never placed yet
     }
 
     // ── Stage-Manager placement state machine ─────────────────────────────
@@ -776,6 +901,27 @@
             const occ = occSid && sessions.get(occSid);
             if (occ && occ.card) conversation.appendChild(occ.card);
         }
+        // Restore this card's main-stage scroll position. The appendChild
+        // above just reparented the card back into #conversation, which reset
+        // its .session-card-body scrollTop to 0 (and it was under a `zoom`
+        // transform while in the rail). We captured the pre-move offset in
+        // _moveToRail; re-apply it now. If the reader was pinned to the bottom
+        // when the card left, re-pin to the CURRENT bottom instead so any
+        // content that streamed in off-stage stays followed. Deferred to the
+        // next frame: the card's real (un-zoomed) layout — and thus its final
+        // scrollHeight — isn't settled until after this synchronous reparent
+        // and the caller's _updateLayout have committed.
+        if (s._savedScrollTop !== null && s.pane) {
+            const pane = s.pane;
+            const wantBottom = s._savedAtBottom;
+            const savedTop = s._savedScrollTop;
+            s._savedScrollTop = null;
+            s._savedAtBottom = false;
+            requestAnimationFrame(() => {
+                if (wantBottom) pane.scrollTop = pane.scrollHeight;
+                else pane.scrollTop = savedTop;
+            });
+        }
     }
 
     // Moves sid's card DOM node into a rail thumbnail wrapper. Also clears
@@ -787,6 +933,21 @@
     function _moveToRail(sid) {
         const s = sessions.get(sid);
         if (!s || !stageRailList) return;
+        // Snapshot this card's scroll position while it's STILL on the main
+        // stage (un-zoomed, real coordinates) so _occupyMainSlot can restore
+        // it when the card is promoted back. The upcoming reparent into the
+        // rail wrapper would otherwise reset scrollTop to 0, and the rail's
+        // `zoom` makes the offset read while docked there meaningless.
+        // `_savedAtBottom` records whether the reader was following the live
+        // tail (within a small tolerance) so we re-pin to the newest bottom on
+        // return rather than a stale absolute offset.
+        if (s.pane) {
+            const pane = s.pane;
+            const distanceFromBottom =
+                pane.scrollHeight - pane.scrollTop - pane.clientHeight;
+            s._savedAtBottom = distanceFromBottom <= 8;
+            s._savedScrollTop = pane.scrollTop;
+        }
         // Clear any stale mainSlot reference to this sid so slot state
         // stays consistent even when callers forget.
         for (let i = 0; i < mainSlots.length; i++) {
@@ -863,11 +1024,38 @@
     // explicitly (rather than routing through _findFreeMainSlot) so no
     // future refactor accidentally reintroduces "if there's a free slot
     // just use it" logic and revives the 2-cards-in-main layout.
-    function _placeSession(sid) {
+    //
+    // `originRect` (the "+New" button's on-screen rect, passed down from
+    // createSession/switchSession) triggers the Genie entrance: the new
+    // card grows from the button instead of the plain liquid-entrance
+    // fade, and the evicted card (if any) shrinks toward its rail slot on
+    // the same shared timeline instead of running its own independently-
+    // timed keyframe. Omitted or under prefers-reduced-motion, this falls
+    // straight back to the pre-existing CSS entrance/rail-width behavior.
+    function _placeSession(sid, originRect) {
         const currentSid = mainSlots[0];
+        const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+        const doGenie = !!originRect && !reduced;
+        const railWasEmpty = !stageRailList || stageRailList.children.length === 0;
+
+        let evictedSid = null;
+        let evictedOldRect = null;
         if (currentSid && currentSid !== sid) {
+            const evictedS = sessions.get(currentSid);
+            if (doGenie && evictedS && evictedS.card) {
+                // Measure BEFORE the move — this is the card's real
+                // on-stage rect, which _moveToRail is about to invalidate.
+                evictedOldRect = evictedS.card.getBoundingClientRect();
+                evictedSid = currentSid;
+            }
             mainSlots[0] = null;
             _moveToRail(currentSid);
+            if (doGenie && evictedSid) {
+                const wrap = sessions.get(evictedSid)._railWrap;
+                // _playGenieEntrance's own WAAPI transform replaces this
+                // mount-time keyframe for this specific placement.
+                if (wrap) wrap.style.animation = 'none';
+            }
         }
         // Belt-and-suspenders: also flush any stray occupant of slot 1 (a
         // leftover from historical 2-slot placement that a stale in-memory
@@ -880,9 +1068,94 @@
             mainSlots[1] = null;
             _moveToRail(strayS1);
         }
+
+        const newS = sessions.get(sid);
+        // Only true when this placement is the one making the rail go
+        // from empty to non-empty — that's the only case where the rail's
+        // own width needs to animate at all.
+        const railOpening = doGenie && evictedSid && railWasEmpty;
+        if (doGenie && newS && newS.card) {
+            // Genie's own WAAPI transform+opacity replaces liquid-entrance
+            // for this specific placement.
+            newS.card.style.animation = 'none';
+        }
+        if (railOpening && stageRail) {
+            // Suspend the rail's CSS width transition — _playGenieEntrance
+            // drives the same width change via Element.animate() on the
+            // same shared timeline as the card transforms below, instead
+            // of letting _updateLayout's data-empty flip trigger the CSS
+            // transition on its own independent clock. Both must happen
+            // BEFORE the animate() call below: .stage-rail[data-empty=
+            // "true"]'s width:0 is !important and outranks a WAAPI
+            // animation outright, and data-empty otherwise wouldn't flip
+            // to "false" until _updateLayout runs at the end of this
+            // function — after the animation has already started.
+            stageRail.classList.add('genie-active');
+            stageRail.dataset.empty = 'false';
+        }
+
         _occupyMainSlot(0, sid);
         _focusMainSession(sid);
+
+        if (doGenie && newS && newS.card) {
+            _playGenieEntrance(newS.card, originRect, evictedSid, evictedOldRect, railOpening);
+        }
+
         _updateLayout();
+    }
+
+    const GENIE_DURATION = 320;
+    // WAAPI easing can't reference CSS custom properties — this literal
+    // mirrors --ease-mac-pop (styles.css).
+    const GENIE_EASING = 'cubic-bezier(0.16, 1, 0.3, 1)';
+    // Must match .stage-rail's declared width in styles.css.
+    const GENIE_RAIL_WIDTH = 160;
+
+    // Orchestrates the Genie new-session entrance on one shared timeline:
+    // the new card scales up from the "+New" button's screen position,
+    // the evicted card (if any) shrinks toward its rail thumbnail, and the
+    // rail itself widens if it was empty — all via Element.animate() calls
+    // issued synchronously in this one function call, rather than each
+    // running its own independently-timed CSS transition/keyframe (which
+    // is what made the un-fixed +New flow read as 3-4 separate stutters
+    // instead of one coherent motion).
+    function _playGenieEntrance(newCard, originRect, evictedSid, evictedOldRect, railOpening) {
+        const newRect = newCard.getBoundingClientRect();
+        const dx = (originRect.left + originRect.width / 2) - (newRect.left + newRect.width / 2);
+        const dy = (originRect.top + originRect.height / 2) - (newRect.top + newRect.height / 2);
+        const newAnim = newCard.animate([
+            { transform: `translate(${dx}px, ${dy}px) scale(0.06)`, opacity: 0 },
+            { transform: 'translate(0, 0) scale(1)', opacity: 1 },
+        ], { duration: GENIE_DURATION, easing: GENIE_EASING, fill: 'both' });
+        newAnim.finished.catch(() => {}).then(() => { try { newAnim.cancel(); } catch (_) { /* ignore */ } });
+
+        if (evictedSid && evictedOldRect) {
+            const evictedS = sessions.get(evictedSid);
+            const wrap = evictedS && evictedS._railWrap;
+            if (wrap) {
+                const wrapRect = wrap.getBoundingClientRect();
+                const wdx = evictedOldRect.left - wrapRect.left;
+                const wdy = evictedOldRect.top - wrapRect.top;
+                const wsx = evictedOldRect.width / Math.max(1, wrapRect.width);
+                const wsy = evictedOldRect.height / Math.max(1, wrapRect.height);
+                const evictAnim = wrap.animate([
+                    { transform: `translate(${wdx}px, ${wdy}px) scale(${wsx}, ${wsy})` },
+                    { transform: 'none' },
+                ], { duration: GENIE_DURATION, easing: GENIE_EASING, fill: 'both' });
+                evictAnim.finished.catch(() => {}).then(() => { try { evictAnim.cancel(); } catch (_) { /* ignore */ } });
+            }
+        }
+
+        if (railOpening && stageRail) {
+            const railAnim = stageRail.animate([
+                { width: '0px' },
+                { width: GENIE_RAIL_WIDTH + 'px' },
+            ], { duration: GENIE_DURATION, easing: GENIE_EASING, delay: 40, fill: 'both' });
+            railAnim.finished.catch(() => {}).then(() => {
+                try { railAnim.cancel(); } catch (_) { /* ignore */ }
+                stageRail.classList.remove('genie-active');
+            });
+        }
     }
 
     // Same placement logic as _placeSession, but for a session that's
@@ -1017,6 +1290,15 @@
         // Kill the floating pop-out editor if it was pointed at this session
         // — its backing textarea is about to be removed from the DOM.
         try { _FloatingComposer.destroyFor(sid); } catch (_) { /* ignore */ }
+        // v6 fix: tell remote-control.js this sid is gone so its own
+        // remoteSessions bookkeeping (local tab ↔ rc-xxx) drops the entry.
+        // Without this, a stale entry survives the tab close and the Connect
+        // panel's session chip ▶ later finds it, calls switchSession on a
+        // dead sid (silent no-op), and re-adopt looks broken — see
+        // remote-control.js's notifyLocalTabClosed for the full explanation.
+        if (window.HandQRemote && window.HandQRemote.notifyLocalTabClosed) {
+            window.HandQRemote.notifyLocalTabClosed(sid);
+        }
         // Send close_session to bridge so flow.destroy() releases resources.
         try {
             handq.sendRequest({ type: 'close_session', session_id: sid });
@@ -1059,6 +1341,48 @@
         });
     }
 
+    // Rail's rendered width while visible. Must match .stage-rail's `width`
+    // in styles.css, which is in turn coupled to main.js's
+    // AUTO_RESIZE_RAIL_DELTA — see the comment on that CSS rule for the three
+    // values that have to move together.
+    const RAIL_WIDTH_PX = 160;
+
+    function _chatRegionW() {
+        const el = document.getElementById('chat-region');
+        return el ? el.getBoundingClientRect().width : 0;
+    }
+
+    // "How wide can the rail be right now while the chat region keeps the
+    // width cardW?" Mirror image of session-sidebar.js's _rawDriven. Any
+    // constant this misses is absorbed by the drive's start-up calibration,
+    // so it only has to be right about the terms that MOVE.
+    function _railRawDriven(cardW) {
+        const mainEl = document.querySelector('.main');
+        if (!mainEl) return 0;
+        const sb = document.getElementById('session-sidebar');
+        let sbExtras = 0;
+        if (sb) {
+            const w = sb.getBoundingClientRect().width;
+            if (w > 0) sbExtras = w + 10;   // sidebar + its margin-right
+        }
+        return mainEl.getBoundingClientRect().width - sbExtras - cardW - 10;
+    }
+
+    function _startRailReveal(startW, finalW, cardW) {
+        if (!stageRail || !window.HandQLayoutDrive) return;
+        window.HandQLayoutDrive.start({
+            el: stageRail,
+            prop: '--rail-driven-w',
+            cls: 'rail-driving',
+            startW: startW,
+            finalW: finalW,
+            solve: () => _railRawDriven(cardW),
+            // Nothing to pin at the end: the rail's settled width comes
+            // straight from CSS (160px, or 0 via [data-empty="true"]), unlike
+            // the sidebar whose width is dynamic and lives in an inline style.
+        });
+    }
+
     function _updateLayout() {
         // Rail collapses to zero width when nothing is minimized — same
         // "no dead stub" idiom as .session-sidebar[data-collapsed].
@@ -1066,7 +1390,25 @@
         // current-tick so the DOM is consistent for the next paint. Only
         // the window-resize IPC is deferred (see below).
         const railEmpty = !stageRailList || stageRailList.children.length === 0;
-        if (stageRail) stageRail.dataset.empty = railEmpty ? 'true' : 'false';
+        if (stageRail) {
+            const wasEmpty = stageRail.dataset.empty === 'true';
+            const nextEmpty = !!railEmpty;
+            if (wasEmpty === nextEmpty) {
+                stageRail.dataset.empty = nextEmpty ? 'true' : 'false';
+            } else {
+                // Real toggle: measure the pre-flip geometry, then hand the
+                // width to layout-drive.js for the duration of the window
+                // resize this same _updateLayout is about to request. Without
+                // it the rail animates on its own clock while the window
+                // animates on DWM's, and the flex:1 chat region in between
+                // absorbs the difference — ~30px of bulge-then-settle on a
+                // card whose width a rail toggle shouldn't change at all.
+                const startW = stageRail.getBoundingClientRect().width;
+                const cardW0 = _chatRegionW();
+                stageRail.dataset.empty = nextEmpty ? 'true' : 'false';
+                _startRailReveal(startW, nextEmpty ? 0 : RAIL_WIDTH_PX, cardW0);
+            }
+        }
 
         // Minimize/maximize only make sense once >1 session exists at all
         // — the literal condition the user specified — independent of how
@@ -1120,14 +1462,15 @@
         // Read `sidebarEl.style.width` (the TARGET set by
         // _refreshSidebarWidth), NOT `getBoundingClientRect().width` (the
         // currently-animating value). This IPC is rAF-batched, so by the
-        // time it fires the CSS width transition has already started —
-        // getBoundingClientRect returns the mid-animation width (say
-        // ~100px into a 0→512 transition), which would make main.js
-        // grow the window by only that mid value instead of the full
-        // target, leaving chat-card squeezed and the 4:2.5 ratio broken.
-        // Inline style.width is the authoritative post-animation target
-        // set synchronously in _setCollapsed's open path before the
-        // transition begins. Fall back to getBoundingClientRect only if
+        // time it fires the sidebar's reveal is already in flight and
+        // getBoundingClientRect returns a mid-animation width (say ~100px
+        // into a 0→512 reveal), which would make main.js grow the window by
+        // only that intermediate amount, leaving chat-card squeezed and the
+        // 4:2.5 ratio broken. Inline style.width stays authoritative for the
+        // whole reveal: _setCollapsed's open path writes it synchronously
+        // before starting the drive, and session-sidebar.js's _startReveal /
+        // _driveReveal animate through a --ss-driven-w custom property
+        // instead of touching it. Fall back to getBoundingClientRect only if
         // no inline width is set (should not happen with the current
         // session-sidebar.js, but keeps rare paths safe).
         // When the sidebar is closed it's out of layout (width:0 via
@@ -1170,6 +1513,17 @@
     // Fired from session-sidebar.js's _setCollapsed via a CustomEvent
     // (decoupled — no direct import).
     window.addEventListener('session-sidebar-toggle', () => {
+        // Fires immediately, including in perf-mode. This used to be delayed
+        // by 370ms under perf-mode so the native window resize wouldn't
+        // overlap the sidebar's own CSS width transition. That reasoning is
+        // obsolete: the sidebar no longer animates its width independently
+        // — session-sidebar.js's _driveReveal DERIVES the sidebar's width
+        // from the window's actual width every frame, precisely so the two
+        // can't drift apart. Delaying the resize now starves the drive of
+        // the signal it follows: it would see a motionless window, sit at
+        // its start width until the 700ms bail-out, and only then would the
+        // window jump — squeezing the chat card exactly as before. The
+        // resize must lead, not trail.
         try { _updateLayout(); } catch (_) { /* ignore */ }
     });
 
@@ -1998,6 +2352,21 @@
         return s;
     }
 
+    // Lightweight formatter for short, mostly-single-paragraph strings that
+    // never went through renderMarkdown: system/error/notice bubbles and the
+    // right-hand activity feed. These carry free-form LLM text (decision
+    // reasoning, notify_user messages, tool result summaries) that can
+    // contain **bold** or literal newlines, but block constructs (headings,
+    // lists, tables) don't apply here — inline formatting plus explicit
+    // <br> for line breaks is enough, and cheaper than the full block parser.
+    function renderInlineHtml(text) {
+        return renderMarkdownInline(escapeHtml(text || '')).replace(/\n/g, '<br>');
+    }
+    // Exposed for session-sidebar.js (loads before this file, but only
+    // calls in at event time, well after both scripts have finished
+    // executing) so the activity feed formats the same way chat bubbles do.
+    window.HandQFormat = { renderInline: renderInlineHtml };
+
     function renderMarkdown(md) {
         if (!md) return '';
 
@@ -2478,7 +2847,9 @@
 
     function addSystemBubble(text) {
         const bubble = el('div', 'bubble system');
-        bubble.appendChild(el('div', 'bubble-body', text || ''));
+        const body = el('div', 'bubble-body');
+        body.innerHTML = renderInlineHtml(text || '');
+        bubble.appendChild(body);
         const pane = _dispatchPane();
         pane.appendChild(bubble);
         scrollToBottom();
@@ -2489,9 +2860,12 @@
         // in every mounted session pane so the user sees it regardless of
         // which tab is active. Without this, the bubble only appears in
         // activeSid and background sessions have no visibility.
+        const html = renderInlineHtml(text || '');
         for (const [, s] of sessions) {
             const bubble = el('div', 'bubble system global-notice');
-            bubble.appendChild(el('div', 'bubble-body', text || ''));
+            const body = el('div', 'bubble-body');
+            body.innerHTML = html;
+            bubble.appendChild(body);
             s.pane.appendChild(bubble);
         }
         scrollToBottom();
@@ -2508,7 +2882,9 @@
     function addErrorBubble(message, where) {
         const bubble = el('div', 'bubble error');
         const prefix = where ? '[' + where + '] ' : '';
-        bubble.appendChild(el('div', 'bubble-body', prefix + (message || '(no message)')));
+        const body = el('div', 'bubble-body');
+        body.innerHTML = renderInlineHtml(prefix + (message || '(no message)'));
+        bubble.appendChild(body);
         const pane = _dispatchPane();
         pane.appendChild(bubble);
         scrollToBottom();
@@ -2565,6 +2941,67 @@
 
     // Build the inline confirmation controls inside a session's confirm host
     // exactly once; wire the buttons to that session's sid. Returns the refs.
+
+    // ask_human structured fields — rendered fresh into `fieldsHost` on every
+    // showConfirmationModal call (the field set differs per agent call, so
+    // unlike the rest of the confirm card this can't be built once and reused).
+    // Returns one {id, type, controls} descriptor per field for
+    // _collectAskHumanAnswers to read back at submit time.
+    function _renderAskHumanFields(fieldsHost, fields) {
+        fieldsHost.textContent = '';
+        fieldsHost.classList.remove('hidden');
+        const metas = [];
+        for (const f of fields) {
+            const wrap = el('div', 'scc-field');
+            if (f.label) wrap.appendChild(el('div', 'scc-field-label', f.label));
+            if (f.type === 'radio' || f.type === 'checkbox') {
+                const opts = el('div', 'scc-field-options');
+                const controls = [];
+                for (const opt of (f.options || [])) {
+                    const row = document.createElement('label');
+                    row.className = 'scc-field-option';
+                    const input = document.createElement('input');
+                    input.type = f.type;
+                    input.name = 'field-' + f.id;
+                    input.value = opt;
+                    row.appendChild(input);
+                    row.appendChild(el('span', null, opt));
+                    opts.appendChild(row);
+                    controls.push(input);
+                }
+                wrap.appendChild(opts);
+                metas.push({ id: f.id, type: f.type, controls });
+            } else {
+                const input = f.type === 'textarea'
+                    ? document.createElement('textarea')
+                    : document.createElement('input');
+                if (f.type !== 'textarea') input.type = 'text';
+                input.className = 'scc-field-input';
+                if (f.type === 'textarea') input.rows = 3;
+                if (f.placeholder) input.placeholder = f.placeholder;
+                wrap.appendChild(input);
+                metas.push({ id: f.id, type: f.type, controls: [input] });
+            }
+            fieldsHost.appendChild(wrap);
+        }
+        return metas;
+    }
+
+    function _collectAskHumanAnswers(fieldMetas) {
+        const out = {};
+        for (const m of (fieldMetas || [])) {
+            if (m.type === 'radio') {
+                const picked = m.controls.find((c) => c.checked);
+                out[m.id] = picked ? picked.value : '';
+            } else if (m.type === 'checkbox') {
+                out[m.id] = m.controls.filter((c) => c.checked).map((c) => c.value);
+            } else {
+                out[m.id] = m.controls[0] ? m.controls[0].value : '';
+            }
+        }
+        return out;
+    }
+
     function _ensureConfirmUI(s) {
         if (s.confirmUI) return s.confirmUI;
         const host = s.confirmEl;
@@ -2572,6 +3009,7 @@
         const titleEl = el('div', 'scc-title');
         const descEl = el('div', 'scc-desc');
         const decisionEl = el('pre', 'scc-decision hidden');
+        const fieldsHost = el('div', 'scc-fields hidden');
         const secretWrap = el('label', 'scc-secret-wrap hidden');
         const secretLabel = el('span', 'scc-secret-label', 'Value:');
         const secretIn = document.createElement('input');
@@ -2582,61 +3020,60 @@
         const guidanceEl = document.createElement('textarea');
         guidanceEl.className = 'scc-guidance hidden';
         guidanceEl.rows = 2;
-        guidanceEl.placeholder = 'Optional guidance for the agent…';
+        guidanceEl.placeholder = 'Optional guidance for the agent (leave blank to just approve)…';
         const actions = el('div', 'scc-actions');
         const rejectBtn = el('button', 'scc-reject', 'Reject');
         rejectBtn.type = 'button';
-        const guidBtn = el('button', 'scc-guid', 'Cancel guidance');
-        guidBtn.type = 'button';
         const submitBtn = el('button', 'scc-submit primary', 'Approve');
         submitBtn.type = 'button';
         actions.appendChild(rejectBtn);
-        actions.appendChild(guidBtn);
         actions.appendChild(submitBtn);
         card.appendChild(titleEl);
         card.appendChild(descEl);
         card.appendChild(decisionEl);
+        card.appendChild(fieldsHost);
         card.appendChild(secretWrap);
         card.appendChild(guidanceEl);
         card.appendChild(actions);
         host.appendChild(card);
 
         const sid = s.sid;
+        // No dedicated button for the guidance box — typing into it
+        // re-labels Approve to "Send guidance" so the button never claims
+        // to approve when a click would actually just send a note instead
+        // (a real click would previously silently do that while still
+        // reading "Approve"). approveLabel is stashed by showConfirmationModal.
+        guidanceEl.addEventListener('input', () => {
+            const hasText = !!(guidanceEl.value || '').trim();
+            const approveLabel = (s.pendingConfirm && s.pendingConfirm.approveLabel) || 'Approve';
+            submitBtn.textContent = hasText ? 'Send guidance' : approveLabel;
+        });
         submitBtn.addEventListener('click', () => {
             const kind = s.pendingConfirm && s.pendingConfirm.kind;
-            if (kind === 'secret_input' || kind === 'ask_human') {
+            if (kind === 'ask_human') {
+                const answers = _collectAskHumanAnswers(s.pendingConfirm.fieldMetas);
+                sendConfirmationAnswer(sid, JSON.stringify(answers));
+            } else if (kind === 'secret_input') {
                 sendConfirmationAnswer(sid, secretIn.value || '');
-            } else if (!guidanceEl.classList.contains('hidden')) {
-                const text = (guidanceEl.value || '').trim();
-                sendConfirmationAnswer(sid, text || 'yes');
+            } else if (!guidanceEl.classList.contains('hidden') && (guidanceEl.value || '').trim()) {
+                sendConfirmationAnswer(sid, guidanceEl.value.trim());
             } else {
                 sendConfirmationAnswer(sid, 'yes');
             }
         });
         rejectBtn.addEventListener('click', () => sendConfirmationAnswer(sid, 'no'));
-        guidBtn.addEventListener('click', () => {
-            if (guidanceEl.classList.contains('hidden')) {
-                guidanceEl.classList.remove('hidden');
-                guidBtn.textContent = 'Cancel guidance';
-                try { guidanceEl.focus(); } catch (_) { /* ignore */ }
-            } else {
-                guidanceEl.classList.add('hidden');
-                guidanceEl.value = '';
-                guidBtn.textContent = 'Provide guidance';
-            }
-        });
         secretIn.addEventListener('keydown', (e) => {
             const kind = s.pendingConfirm && s.pendingConfirm.kind;
-            if (e.key === 'Enter' && (kind === 'secret_input' || kind === 'ask_human')) {
+            if (e.key === 'Enter' && kind === 'secret_input') {
                 e.preventDefault();
                 sendConfirmationAnswer(sid, secretIn.value || '');
             }
         });
 
         s.confirmUI = {
-            card, titleEl, descEl, decisionEl,
+            card, titleEl, descEl, decisionEl, fieldsHost,
             secretWrap, secretIn, guidanceEl,
-            rejectBtn, guidBtn, submitBtn,
+            rejectBtn, submitBtn,
         };
         return s.confirmUI;
     }
@@ -2656,27 +3093,38 @@
 
         if (evt.kind === 'secret_input') {
             ui.titleEl.textContent = 'Input required';
+            ui.descEl.classList.remove('md-rendered');
             ui.descEl.textContent = String(evt.prompt || 'Enter value:');
             _renderDecisionInto(ui.decisionEl, null);
+            ui.fieldsHost.classList.add('hidden');
+            ui.fieldsHost.textContent = '';
             ui.secretWrap.classList.remove('hidden');
             ui.secretIn.value = '';
             try { ui.secretIn.type = 'password'; } catch (_) { /* ignore */ }
             ui.guidanceEl.classList.add('hidden');
             ui.guidanceEl.value = '';
             ui.rejectBtn.classList.add('hidden');
-            ui.guidBtn.classList.add('hidden');
             ui.submitBtn.textContent = 'Submit';
         } else if (evt.kind === 'ask_human') {
             ui.titleEl.textContent = 'Question from agent';
-            ui.descEl.textContent = String(evt.prompt || 'The agent has a question:');
+            const question = String(evt.question || evt.prompt || 'The agent has a question:');
+            try {
+                ui.descEl.innerHTML = renderMarkdown(question);
+                ui.descEl.classList.add('md-rendered');
+            } catch (_) {
+                ui.descEl.classList.remove('md-rendered');
+                ui.descEl.textContent = question;
+            }
             _renderDecisionInto(ui.decisionEl, null);
-            ui.secretWrap.classList.remove('hidden');
+            const fields = Array.isArray(evt.fields) && evt.fields.length
+                ? evt.fields
+                : [{ id: 'answer', label: '', type: 'textarea' }];
+            s.pendingConfirm.fieldMetas = _renderAskHumanFields(ui.fieldsHost, fields);
+            ui.secretWrap.classList.add('hidden');
             ui.secretIn.value = '';
-            try { ui.secretIn.type = 'text'; } catch (_) { /* ignore */ }
             ui.guidanceEl.classList.add('hidden');
             ui.guidanceEl.value = '';
             ui.rejectBtn.classList.add('hidden');
-            ui.guidBtn.classList.add('hidden');
             ui.submitBtn.textContent = 'Send';
         } else {
             const isRisk = evt.kind === 'risk_confirmation';
@@ -2695,6 +3143,7 @@
                     ? 'Grant desktop control for this task?'
                     : 'Confirm ' + (evt.tool || 'tool') + ' execution'));
             const description = evt.description ? String(evt.description) : '';
+            ui.descEl.classList.remove('md-rendered');
             if (isRisk || description) {
                 ui.descEl.textContent = description;
             } else {
@@ -2703,15 +3152,17 @@
                     '" with the parameters below.';
             }
             _renderDecisionInto(ui.decisionEl, evt.decision);
+            ui.fieldsHost.classList.add('hidden');
+            ui.fieldsHost.textContent = '';
             ui.secretWrap.classList.add('hidden');
             ui.secretIn.value = '';
             ui.guidanceEl.classList.remove('hidden');
             ui.guidanceEl.value = '';
             ui.rejectBtn.classList.remove('hidden');
-            ui.guidBtn.classList.remove('hidden');
-            ui.guidBtn.textContent = 'Cancel guidance';
-            ui.submitBtn.textContent = customApprove
+            const approveLabel = customApprove
                 || (isDesktopTakeover ? 'Approve task-wide' : 'Approve');
+            s.pendingConfirm.approveLabel = approveLabel;
+            ui.submitBtn.textContent = approveLabel;
             if (isDesktopTakeover) ui.card.classList.add('desktop-takeover');
         }
 
@@ -2720,16 +3171,51 @@
         if (sid !== activeSid) {
             s.unread = true;
         }
-        if (evt.kind === 'secret_input' || evt.kind === 'ask_human') {
+        if (evt.kind === 'secret_input') {
             try { ui.secretIn.focus(); } catch (_) { /* ignore */ }
+        } else if (evt.kind === 'ask_human') {
+            try {
+                const first = ui.fieldsHost.querySelector('input, textarea');
+                if (first) first.focus();
+            } catch (_) { /* ignore */ }
         }
         try { s.confirmEl.scrollIntoView({ block: 'nearest' }); } catch (_) { /* ignore */ }
+    }
+
+    function _describeConfirmationAnswer(kind, answer, fieldMetas) {
+        // Human-readable echo of what the user just submitted, for the
+        // chat-bubble record added by sendConfirmationAnswer. Keeps secrets
+        // masked and turns the ask_human JSON blob back into readable text.
+        if (kind === 'secret_input') {
+            return answer ? '(value submitted, hidden)' : '(submitted empty)';
+        }
+        if (kind === 'ask_human') {
+            let parsed = {};
+            try { parsed = JSON.parse(answer || '{}'); } catch (_) { /* ignore */ }
+            const metas = Array.isArray(fieldMetas) ? fieldMetas : [];
+            if (metas.length <= 1) {
+                const only = metas[0];
+                const val = only ? parsed[only.id] : Object.values(parsed)[0];
+                return Array.isArray(val) ? (val.join(', ') || '(none selected)') : String(val || '(no answer)');
+            }
+            return metas.map((m) => {
+                const val = parsed[m.id];
+                const shown = Array.isArray(val) ? (val.join(', ') || '(none)') : String(val || '(none)');
+                return (m.label || m.id) + ': ' + shown;
+            }).join('\n');
+        }
+        // risk / tool confirmation
+        if (answer === 'yes') return 'Approved';
+        if (answer === 'no') return 'Rejected';
+        return 'Guidance: ' + answer;
     }
 
     function sendConfirmationAnswer(sid, answer) {
         const s = sessions.get(sid);
         if (!s || !s.pendingConfirm) return;
         const promptId = s.pendingConfirm.id;
+        const kind = s.pendingConfirm.kind;
+        const fieldMetas = s.pendingConfirm.fieldMetas;
         try {
             handq.sendRequest({
                 type: 'user_input',
@@ -2744,6 +3230,135 @@
         }
         s.pendingConfirm = null;
         if (s.confirmEl) s.confirmEl.classList.add('hidden');
+
+        // Leave a durable record of the answer in the chat itself — the
+        // modal disappears immediately, so without this the user's own
+        // reply to ask_human/risk/tool prompts had zero trace in the
+        // conversation thread.
+        const prevDispatch = _dispatchSid;
+        _dispatchSid = sid;
+        try {
+            addUserBubble(_describeConfirmationAnswer(kind, String(answer || ''), fieldMetas));
+        } finally {
+            _dispatchSid = prevDispatch;
+        }
+    }
+
+    // ask_human's 30-minute deadline expired (locally, or because a
+    // Connect-panel remote session's own timeout cancelled the relayed
+    // prompt — both paths converge on the same ask_human_expired envelope,
+    // see stdio_bridge.py's _await_user_response). Close the stale modal and
+    // leave a durable transcript record instead of letting it linger with no
+    // signal that the agent already moved on with a default.
+    function _closeExpiredAskHuman(evt) {
+        const sid = _resolveSid(evt);
+        const s = sessions.get(sid);
+        if (!s) return;
+        // Guard against a race: if the user answered in the last instant
+        // before expiry, sendConfirmationAnswer already cleared pendingConfirm,
+        // so a slightly-late expiry envelope for THAT id becomes a no-op
+        // rather than wrongly closing a fresh, unrelated modal.
+        if (!s.pendingConfirm || s.pendingConfirm.id !== String(evt.id || '')) return;
+        s.pendingConfirm = null;
+        if (s.confirmEl) s.confirmEl.classList.add('hidden');
+        addSystemBubble('⊗ A question was asked but went unanswered for 30 minutes — the agent proceeded with a default.');
+    }
+
+    // ── Session-resume candidate card (§6.4.1) ──────────────────────────────
+    //
+    // A SOFT offer, not a modal: the user can accept, explicitly dismiss, or
+    // just ignore it (type a new message / let it expire) with zero effect
+    // in the last two cases — see docs/session_resume_design.md §2.4/§6.4.
+    // Deliberately NOT built on the confirmation-Future machinery above
+    // (_ensureConfirmUI/sendConfirmationAnswer): that path assumes exactly
+    // one pending question that MUST be answered before anything else in
+    // that session proceeds, which is the opposite of what this needs.
+
+    // Resume candidate rendering moved to the RIGHT sidebar panel
+    // (session-sidebar.js's showResumeCandidates / hideResume). The old
+    // _ensureResumeUI / _renderResumeCandidateRow functions lived here but
+    // are removed — rendering now lives in session-sidebar.js so the
+    // candidates have more space and don't overflow the session card.
+
+    function _showResumeCandidates(evt) {
+        const sid = _resolveSid(evt);
+        const s = sessions.get(sid);
+        if (!s) {
+            window.__handqLog('ERROR', 'resume_candidates for unknown session',
+                { sid });
+            return;
+        }
+        const candidates = Array.isArray(evt.candidates) ? evt.candidates : [];
+        if (!candidates.length) {
+            // Continuous search (§ interaction upgrade) means a LATER
+            // message can legitimately un-hit the gate after an earlier
+            // one hit it — the bridge sends this same envelope with an
+            // empty array as the explicit "clear" signal.
+            if (s.pendingResume) _hideResumeCard(s);
+            return;
+        }
+
+        s.pendingResume = { candidates };
+
+        // Delegate rendering to the right-side session detail panel.
+        const holdSeconds = Number(evt.hold_seconds) || 0;
+        const triggerText = String(evt.trigger_text || '');
+        if (window.SessionSidebar) {
+            window.SessionSidebar.showResumeCandidates(sid, candidates, holdSeconds, {
+                onConfirm: (sessionDir) => _sendResumeConfirm(sid, sessionDir),
+                onNotResuming: () => _notResuming(sid),
+            }, triggerText);
+        }
+
+        // Soft auto-dismiss on the backend's own TTL (default 120s).
+        const ttlMs = (Number(evt.ttl_seconds) || 120) * 1000;
+        if (s._resumeTimeoutId) clearTimeout(s._resumeTimeoutId);
+        s._resumeTimeoutId = setTimeout(() => {
+            if (s.pendingResume) _hideResumeCard(s);
+        }, ttlMs);
+    }
+
+    function _hideResumeCard(s) {
+        s.pendingResume = null;
+        if (s._resumeTimeoutId) {
+            clearTimeout(s._resumeTimeoutId);
+            s._resumeTimeoutId = null;
+        }
+        if (window.SessionSidebar) {
+            window.SessionSidebar.hideResume(s.sid);
+        }
+    }
+
+    function _sendResumeConfirm(sid, sessionDir) {
+        const s = sessions.get(sid);
+        if (!s || !s.pendingResume) return;
+        try {
+            handq.sendRequest({
+                type: 'resume_confirm',
+                session_id: sid,
+                session_dir: String(sessionDir || ''),
+            });
+        } catch (e) {
+            window.__handqLog('ERROR', 'resume_confirm send failed',
+                { sid, error: String(e) });
+        }
+        _hideResumeCard(s);
+    }
+
+    // "Not resuming" — merged New Task + No Resume: runs the held message
+    // as a new task + permanently stops resume searching for this session
+    // (session identity is now settled). Sends resume_disable_for_session
+    // which does both on the bridge side.
+    function _notResuming(sid) {
+        const s = sessions.get(sid);
+        if (!s) return;
+        try {
+            handq.sendRequest({ type: 'resume_disable_for_session', session_id: sid });
+        } catch (e) {
+            window.__handqLog('ERROR', 'resume_disable_for_session send failed',
+                { sid, error: String(e) });
+        }
+        _hideResumeCard(s);
     }
 
     // ----- bridge events ---------------------------------------------------
@@ -2785,9 +3400,14 @@
         const btnHide = document.createElement('button');
         btnHide.type = 'button';
         btnHide.className = 'terminal-btn-close';
-        btnHide.title = 'Close';
+        btnHide.title = 'Close session';
         btnHide.textContent = '×';
-        btnHide.addEventListener('click', hideTerminalPanel);
+        // Closes ONLY the current (active) tab — not the whole panel. It is
+        // hidden by CSS while the active session is still alive (see
+        // updatePanelCloseVisibility), so this can only fire on a dead session.
+        btnHide.addEventListener('click', () => {
+            if (_activeSessionId) removeSessionTerminal(_activeSessionId);
+        });
 
         controls.appendChild(btnMin);
         controls.appendChild(btnHide);
@@ -2807,10 +3427,30 @@
         _terminalPanelEl.appendChild(resizeHandle);
         document.body.appendChild(_terminalPanelEl);
 
-        // Re-fit active terminal on resize
-        const ro = new ResizeObserver(() => {
+        // Re-fit active terminal on resize, throttled with a trailing call.
+        //
+        // fitAddon.fit() measures the viewport and, on any cols/rows change,
+        // calls terminal.resize() — which reflows the ENTIRE scrollback buffer
+        // and re-renders. Running that once per frame for the whole of a
+        // window resize is the most expensive thing in the renderer while the
+        // terminal panel is open, and the intermediate fits are all superseded
+        // anyway. A pure trailing debounce would be wrong in the other
+        // direction: dragging the panel's OWN resize handle would then leave
+        // the text un-reflowed until the pointer stopped. Throttling keeps the
+        // drag tracking at a reflow rate a human reads as "keeping up", and
+        // the trailing call guarantees the settled geometry is exact.
+        let fitTimer = 0;
+        let lastFitTs = 0;
+        const FIT_MIN_INTERVAL_MS = 120;
+        const doFit = () => {
+            lastFitTs = performance.now();
             const entry = _sessionTerminals.get(_activeSessionId);
-            if (entry) requestAnimationFrame(() => entry.fitAddon.fit());
+            if (entry) entry.fitAddon.fit();
+        };
+        const ro = new ResizeObserver(() => {
+            if (performance.now() - lastFitTs >= FIT_MIN_INTERVAL_MS) doFit();
+            clearTimeout(fitTimer);
+            fitTimer = setTimeout(() => { fitTimer = 0; doFit(); }, FIT_MIN_INTERVAL_MS);
         });
         ro.observe(_terminalBodyEl);
 
@@ -2879,8 +3519,10 @@
             truncate(description || command || sessionId, 20)
         );
         tab.appendChild(label);
-        const tabClose = document.createElement('span');
+        const tabClose = document.createElement('button');
+        tabClose.type = 'button';
         tabClose.className = 'tab-close';
+        tabClose.setAttribute('aria-label', 'Close terminal tab');
         tabClose.textContent = '×';
         tabClose.addEventListener('click', (e) => {
             e.stopPropagation();
@@ -2912,6 +3554,9 @@
         if (entry) {
             requestAnimationFrame(() => entry.fitAddon.fit());
         }
+        // The panel-level × tracks the active session's liveness — refresh it
+        // whenever the active session changes.
+        updatePanelCloseVisibility();
     }
 
     function writeSessionData(sessionId, text) {
@@ -2967,12 +3612,15 @@
         }
     }
 
+    // Controls whether the panel-level × (close) button is shown. With
+    // concurrent sessions the panel is shared, so the button must reflect the
+    // CURRENTLY VISIBLE (active) session, not "is any session alive". A dead
+    // active session gets a close button even while other tabs keep running.
     function updatePanelCloseVisibility() {
         if (!_terminalPanelEl) return;
-        const hasAlive = [..._sessionTerminals.values()].some(
-            e => !e.tab.classList.contains('dead')
-        );
-        _terminalPanelEl.classList.toggle('has-alive', hasAlive);
+        const active = _sessionTerminals.get(_activeSessionId);
+        const activeAlive = !!active && !active.tab.classList.contains('dead');
+        _terminalPanelEl.classList.toggle('active-alive', activeAlive);
     }
 
     function removeSessionTerminal(sessionId) {
@@ -3031,12 +3679,29 @@
 
         document.addEventListener('mouseup', () => { dragging = false; });
 
+        // rAF-batched. Windows fires `resize` faster than the compositor's
+        // frame rate during a DWM animated resize, and the raw handler did
+        // three forced layout reads (getBoundingClientRect here, then
+        // offsetWidth/offsetHeight inside clampPosition) followed by two style
+        // writes — a read/write thrash repeated several times per frame for a
+        // panel that needs re-clamping at most once per frame. The write is
+        // also skipped when the clamp is a no-op, which is the common case:
+        // the panel is only near a window edge some of the time.
+        let clampRaf = 0;
         window.addEventListener('resize', () => {
-            if (panel.classList.contains('hidden')) return;
-            const rect = panel.getBoundingClientRect();
-            const clamped = clampPosition(rect.left, rect.top);
-            panel.style.left = clamped.left + 'px';
-            panel.style.top = clamped.top + 'px';
+            if (clampRaf) return;
+            clampRaf = requestAnimationFrame(() => {
+                clampRaf = 0;
+                if (panel.classList.contains('hidden')) return;
+                const rect = panel.getBoundingClientRect();
+                const clamped = clampPosition(rect.left, rect.top);
+                if (Math.abs(clamped.left - rect.left) >= 1) {
+                    panel.style.left = clamped.left + 'px';
+                }
+                if (Math.abs(clamped.top - rect.top) >= 1) {
+                    panel.style.top = clamped.top + 'px';
+                }
+            });
         });
     }
 
@@ -3073,6 +3738,62 @@
             }
         });
     }
+
+    // ── Overlay-card drag-to-resize (Settings/Connect/Remote/Admin/
+    // Schedules/Skills panels) ────────────────────────────────────────────
+    //
+    // Unlike the terminal/composer floaters above, overlay-cards are
+    // centered by their `.overlay` flex container rather than absolutely
+    // positioned — so resizing only needs to grow/shrink the card itself
+    // (recentering falls out of the flex layout for free), and the size
+    // that matters to persist is width/height, not position.
+    function initOverlayCardResize(handle) {
+        const card = handle.closest('.overlay-card');
+        const overlay = handle.closest('.overlay');
+        if (!card || !overlay) return;
+        const storeKey = 'handq:overlay:size:' + overlay.id;
+        let resizing = false, startX, startY, startW, startH;
+
+        try {
+            const saved = JSON.parse(localStorage.getItem(storeKey) || 'null');
+            if (saved && saved.w && saved.h) {
+                card.style.width = saved.w + 'px';
+                card.style.height = saved.h + 'px';
+            }
+        } catch { /* corrupt/absent — fall back to the CSS default size */ }
+
+        handle.addEventListener('mousedown', (e) => {
+            resizing = true;
+            startX = e.clientX;
+            startY = e.clientY;
+            const rect = card.getBoundingClientRect();
+            startW = rect.width;
+            startH = rect.height;
+            document.body.classList.add('overlay-resizing');
+            e.preventDefault();
+        });
+
+        document.addEventListener('mousemove', (e) => {
+            if (!resizing) return;
+            const maxW = window.innerWidth * 0.98;
+            const maxH = window.innerHeight * 0.94;
+            const newW = Math.max(420, Math.min(startW + (e.clientX - startX), maxW));
+            const newH = Math.max(320, Math.min(startH + (e.clientY - startY), maxH));
+            card.style.width = newW + 'px';
+            card.style.height = newH + 'px';
+        });
+
+        document.addEventListener('mouseup', () => {
+            if (!resizing) return;
+            resizing = false;
+            document.body.classList.remove('overlay-resizing');
+            localStorage.setItem(storeKey, JSON.stringify({
+                w: card.offsetWidth,
+                h: card.offsetHeight,
+            }));
+        });
+    }
+    document.querySelectorAll('.overlay-resize-handle').forEach(initOverlayCardResize);
 
     // Task-plan + agent-todo panels used to render inline at the top of
     // each session's chat pane; they now live in the right-hand detail
@@ -3199,6 +3920,11 @@
 
         const args = Array.isArray(evt.args) ? evt.args : [];
 
+        if (evt.kind === 'ask_human_expired') {
+            _closeExpiredAskHuman(evt);
+            return;
+        }
+
         if (evt.kind === 'risk_confirmation' ||
             evt.kind === 'tool_confirmation' ||
             evt.kind === 'secret_input' ||
@@ -3207,6 +3933,18 @@
             // envelopes are not informational status updates.
             try { showConfirmationModal(evt); }
             catch (e) { window.__handqLog('ERROR', 'showConfirmationModal failed',
+                                           { error: String(e) }); }
+            return;
+        }
+
+        if (evt.kind === 'resume_candidates') {
+            // Soft offer (§6.4) — unlike the hard-block modal above, this
+            // does NOT prevent normal dispatch from continuing: the temp
+            // session it's attached to is already running its own work in
+            // parallel, and subsequent status events (state_changed, reply,
+            // etc.) for the SAME sid must keep rendering normally.
+            try { _showResumeCandidates(evt); }
+            catch (e) { window.__handqLog('ERROR', '_showResumeCandidates failed',
                                            { error: String(e) }); }
             return;
         }
@@ -3266,7 +4004,7 @@
             const reasoning = args[1] || '';
             const s = _dispatchSession();
             if (s) s.lastThinking = reasoning;
-            pushActivity('💭', 'thinking' + (iter ? ' · iter ' + iter : ''), reasoning);
+            pushActivity('▶', 'thinking' + (iter ? ' · iter ' + iter : ''), reasoning);
             setWorking('thinking: ' + truncate(reasoning, 120));
         } else if (evt.kind === 'tool_execution_started') {
             const iter   = args[0] || '';
@@ -3317,6 +4055,13 @@
             for (const sid of sessions.keys()) _forceFinalizePendingActivity(sid);
         } else if (evt.kind === 'reply') {
             addAssistantTextBubble(evt.text || '');
+        } else if (evt.kind === 'user_message_echo') {
+            // Replay of the operator's OWN past message (see
+            // stdio_bridge.py's _StdioUI.show_user_message_echo) — the local
+            // DOM bubble from addUserBubble's synchronous submit-time call
+            // never persists across a tab close, so a reattach redraws it
+            // through this same event stream instead.
+            addUserBubble(evt.text || '');
         } else if (evt.kind === 'reply_delta') {
             // Coordinator is streaming a chat reply. Always clear the chat-side
             // thinking bubble so the streaming text replaces it. The activity
@@ -3400,29 +4145,51 @@
                 ? ' (' + evt.attempts_left + ' attempt' + (evt.attempts_left !== 1 ? 's' : '') + ' remaining)'
                 : '';
             const errSummary = (evt.message || 'API server issue') + retryIn + attLeft;
-            addGlobalSystemBubble('⏳ ' + errSummary
+            addGlobalSystemBubble('○ ' + errSummary
                 + '\nThis is a temporary API server issue, not a HandQ problem.'
                 + ' Retrying automatically — please wait.');
-            pushActivity('⏳', 'API retry', errSummary);
+            pushActivity('○', 'API retry', errSummary);
             setPill('retrying…');
         } else if (evt.kind === 'llm_fallback') {
             const fromModel = String(evt.from_model || '?');
             const toModel   = String(evt.to_model   || '?');
-            const reason    = evt.error ? ' — ' + evt.error : '';
-            addGlobalSystemBubble('↪ ' + fromModel + ' failed; trying ' + toModel + reason);
+            // The error belongs to fromModel — it is WHY we are falling back.
+            // Appending it after "trying <toModel>" read as if toModel had
+            // failed: a 2026-08-03 429 for claude-4-6-sonnet rendered as
+            // "↪ claude-4-6-sonnet failed; trying claude-4-5-sonnet — Rate
+            // limit exceeded for model: anthropic::claude-4-6-sonnet" and was
+            // reported as a fallback bug. Bind the reason to its own model.
+            const reason    = evt.error ? ' (' + evt.error + ')' : '';
+            addGlobalSystemBubble('↪ ' + fromModel + ' failed' + reason + '; trying ' + toModel);
             pushActivity('↪', 'Model fallback', fromModel + ' → ' + toModel);
+        } else if (evt.kind === 'agent_notice') {
+            // The agent is telling the user something it needs them to know
+            // NOW (e.g. "stop clicking that button while I reboot the device").
+            // Deliberately a standalone system bubble, not a step bubble — a
+            // step bubble scrolls away inside the tool trace, which is
+            // exactly how the 2026-08-03 run lost its own critical
+            // instruction. Unlike its neighbors below (llm_fallback,
+            // llm_server_error, network_*), this envelope DOES carry a real
+            // session_id (stamped by show_user_notice) — it's this session's
+            // agent addressing this session's user, so it renders only into
+            // the dispatch session's own pane via addSystemBubble, not
+            // broadcast into every open tab.
+            const urgent = !!evt.urgent;
+            addSystemBubble((urgent ? '⚠ ' : '↩ ') + String(evt.message || ''));
+            pushActivity(urgent ? '⚠' : '↩', 'Agent notice',
+                         String(evt.message || '').slice(0, 80));
         } else if (evt.kind === 'network_down') {
-            addGlobalSystemBubble('📡 ' + (evt.message || '网络中断，等待恢复…')
+            addGlobalSystemBubble('⊗ ' + (evt.message || '网络中断，等待恢复…')
                 + '\nHandQ will resume automatically once the connection is restored.');
-            pushActivity('📡', 'Network down', 'waiting for LLM endpoint');
+            pushActivity('⊗', 'Network down', 'waiting for LLM endpoint');
             setPill('offline…');
         } else if (evt.kind === 'network_waiting') {
             const retryIn = (typeof evt.retry_in === 'number' && evt.retry_in > 0)
                 ? evt.retry_in + 's' : '…';
-            pushActivity('📡', 'Still offline', 'attempt ' + (evt.attempt || '?') + ', next probe in ' + retryIn);
+            pushActivity('⊗', 'Still offline', 'attempt ' + (evt.attempt || '?') + ', next probe in ' + retryIn);
         } else if (evt.kind === 'network_restored') {
-            addGlobalSystemBubble('✅ ' + (evt.message || '网络已恢复，继续执行'));
-            pushActivity('✅', 'Network restored', 'resuming');
+            addGlobalSystemBubble('✓ ' + (evt.message || '网络已恢复，继续执行'));
+            pushActivity('✓', 'Network restored', 'resuming');
             setPill('working…');
         }
     }
@@ -3501,9 +4268,11 @@
 
         if (evt.result && typeof evt.result.success === 'boolean') {
             const summary = el('div', 'bubble system');
-            summary.appendChild(el('div', 'bubble-body',
+            const summaryBody = el('div', 'bubble-body');
+            summaryBody.innerHTML = renderInlineHtml(
                 (evt.result.success ? '✓ ' : '✗ ') +
-                (evt.result.message || '(no message)')));
+                (evt.result.message || '(no message)'));
+            summary.appendChild(summaryBody);
             _dispatchPane().appendChild(summary);
             scrollToBottom();
         }
@@ -3571,6 +4340,21 @@
         const text = (rawText || '').trim();
         if (!text) return;
 
+        // NOTE: we intentionally do NOT tear down the resume card here.
+        // Under the current "coordinator and resume are independent" model
+        // (§ resume — HANDQ_DESIGN §2.16, 2026-08-01) every user message
+        // re-triggers a fresh continuous search on the bridge, and that
+        // search sends back EITHER a refreshed candidate set (which
+        // showResumeCandidates renders wholesale, replacing the old card)
+        // OR an explicit empty-array clear (which _showResumeCandidates
+        // translates into _hideResumeCard). Preemptively hiding here just
+        // makes the sidebar flash "close → open" every time the user
+        // continues to chat while an offer is up, which reads as a bug
+        // even though the card is about to come back with the very next
+        // envelope. The stale-card window (a few hundred ms while the
+        // bridge re-searches) is short enough that leaving the previous
+        // card in place is preferable to the flicker.
+
         // Dismiss the floating pop-out editor if it's open for this session —
         // the user has committed the draft, no reason to keep the panel.
         try { _FloatingComposer.closeFor(sid); } catch (_) { /* ignore */ }
@@ -3636,6 +4420,34 @@
                 tbMax.setAttribute('title', maxed ? 'Restore' : 'Maximize');
             });
         }
+        // Dim titlebar chrome when the window loses OS focus, like a real
+        // native window's inactive-title state.
+        if (typeof winCtl.onActiveState === 'function') {
+            winCtl.onActiveState((state) => {
+                document.documentElement.classList.toggle('window-inactive', !(state && state.active));
+            });
+        }
+        // Double-click anywhere on the bare drag surface maximizes/restores,
+        // matching every native titlebar. Bails if the dblclick landed on a
+        // real control (window buttons, the brand island, the serve
+        // indicator) so their own click handlers stay the only thing that
+        // fires there.
+        //
+        // Listens on 'mousedown' rather than 'dblclick': -webkit-app-region:
+        // drag hands the initial mousedown to the OS for native window-move
+        // simulation, and Chromium does not reliably follow through with the
+        // composite click/dblclick DOM events afterward on that region — so
+        // a 'dblclick' listener here silently never fires. MouseEvent.detail
+        // on 'mousedown' still carries the OS's live click-count (1, 2, 3…)
+        // regardless of that, so it's the reliable signal to key off.
+        const titlebarEl = document.getElementById('titlebar');
+        if (titlebarEl) {
+            titlebarEl.addEventListener('mousedown', (e) => {
+                if (e.button !== 0 || e.detail < 2) return;
+                if (e.target.closest('.tb-btn, .titlebar-island, .titlebar-new-btn, .titlebar-serve-indicator')) return;
+                winCtl.toggleMaximize();
+            });
+        }
     } else {
         window.__handqLog('WARN', 'windowControls preload bridge missing');
     }
@@ -3654,16 +4466,42 @@
 
     function collapseIsland() {
         if (!island || !island.classList.contains('expanded')) return;
+        // island-morphing: suppresses the SVG url() distortion filter for
+        // the duration of the width/height morph (see styles.css) — that
+        // filter isn't GPU-compositable, so animating geometry underneath
+        // it forces a re-rasterize every frame. 400ms covers the 380ms
+        // CSS transition plus a little settle margin.
+        island.classList.add('island-morphing');
         island.classList.remove('expanded');
+        island.style.height = '';   // back to the collapsed rule's 20px
         if (islandTrigger) islandTrigger.setAttribute('aria-expanded', 'false');
         if (islandMenu) islandMenu.setAttribute('aria-hidden', 'true');
+        setTimeout(() => island.classList.remove('island-morphing'), 400);
     }
 
     function expandIsland() {
         if (!island || island.classList.contains('expanded')) return;
+        island.classList.add('island-morphing');
         island.classList.add('expanded');
+        // The expanded height is NOT a fixed CSS value — styles.css used to
+        // hardcode 140px, tuned for exactly 3 menu items, and clipped the
+        // bottom item the moment a 4th was added (Remote machines). Measuring
+        // the real content here means adding/removing items in the future
+        // needs no CSS changes at all.
+        //
+        // `.titlebar-island` is a column flexbox holding BOTH the trigger
+        // button and the menu <ul> as siblings — the island's total height is
+        // trigger + menu, not menu alone. scrollHeight is read on each
+        // (rather than offsetHeight) because the menu is still
+        // `opacity:0`/`pointer-events:none` at this instant; scrollHeight
+        // reflects the laid-out content regardless of that.
+        if (islandTrigger && islandMenu) {
+            const total = islandTrigger.scrollHeight + islandMenu.scrollHeight;
+            island.style.height = total + 'px';
+        }
         if (islandTrigger) islandTrigger.setAttribute('aria-expanded', 'true');
         if (islandMenu) islandMenu.setAttribute('aria-hidden', 'false');
+        setTimeout(() => island.classList.remove('island-morphing'), 400);
     }
 
     if (island && islandTrigger) {
@@ -3806,8 +4644,13 @@
     // OTHER VT wrappers (minimize/maximize/promote-from-rail/close) stay —
     // those genuinely benefit from FLIP because they animate an existing
     // card between two positions, which liquid-entrance can't express.
-    document.getElementById('sc-new-session').addEventListener('click', () => {
-        const sid = createSession();
+    //
+    // originRect (the button's own on-screen position) feeds _placeSession's
+    // Genie entrance — the new card grows from the button instead of just
+    // fading in place. See _playGenieEntrance.
+    document.getElementById('sc-new-session').addEventListener('click', (e) => {
+        const originRect = e.currentTarget.getBoundingClientRect();
+        const sid = createSession({ originRect });
         window.__handqLog('INFO', 'sc-new-session clicked', { sid });
     });
 
@@ -4111,6 +4954,12 @@
             .split('\n').map((s) => s.trim()).filter(Boolean);
         out.personalization = persCfg;
 
+        // No remote-control fields. `out` is a deep copy of the config we
+        // loaded, so any existing `remote_control:` section is preserved
+        // untouched — the settings form neither reads nor writes it. That is the
+        // point: the section is advanced/yaml-only now, and a form that
+        // round-tripped it would silently rewrite a hand-edited security switch.
+
         out.llm = llm;
         out.session = sess;
         out.interaction_switches = switches;
@@ -4278,4 +5127,202 @@
     scSettings.addEventListener('click', () => { loadHotkeyToForm(); });
     settingsLoadBtn.addEventListener('click', () => { loadHotkeyToForm(); });
     settingsForm.addEventListener('submit', () => { saveHotkeyIfChanged(); });
+
+    // ----- Remote control surface ---------------------------------------------
+    //
+    // A remote session's chat, tool cards, confirmations, task plan and activity
+    // feed all work with no code here: the bridge replays the remote machine's
+    // UI events onto this session's _StdioUI, so they arrive as the same
+    // envelopes a local session produces. The only visible difference a tab
+    // needs is a connection badge — chiefly so a dropped link reads as
+    // "reconnecting, the remote agent is still working" instead of as a failure.
+
+    const REMOTE_BADGE = {
+        pending:      { text: '⇄ 连接中',  cls: 'pending' },
+        connected:    { text: '⇄ 已连接',  cls: 'connected' },
+        reconnecting: { text: '⇄ 重连中',  cls: 'reconnecting' },
+        superseded:   { text: '⇄ 已被接管', cls: 'superseded' },
+        closed:       { text: '⇄ 已结束',  cls: 'closed' },
+        failed:       { text: '⇄ 连接失败', cls: 'failed' },
+    };
+
+    function markRemoteSessionState(sid, state, detail) {
+        const s = sessions.get(sid);
+        if (!s || !s.remoteBadgeEl) return;
+        const spec = REMOTE_BADGE[state] || REMOTE_BADGE.pending;
+        const badge = s.remoteBadgeEl;
+        badge.className = 'session-card-remote ' + spec.cls;
+        badge.textContent = spec.text;
+        badge.title = detail
+            ? `${spec.text} · ${detail}`
+            : spec.text;
+        if (s.card) s.card.dataset.remoteState = state;
+        // Reconnecting is worth one activity row: the user needs to know why the
+        // stream went quiet, and that it is expected to resume.
+        if (state === 'reconnecting') {
+            pushActivity('⇄', '远程连接中断', detail || '正在自动重连');
+        } else if (state === 'connected' && s.card
+                   && s.card.dataset.remoteWasDown === '1') {
+            s.card.dataset.remoteWasDown = '';
+            pushActivity('⇄', '远程连接已恢复', detail || '');
+        }
+        if (state === 'reconnecting' && s.card) s.card.dataset.remoteWasDown = '1';
+    }
+
+    if (window.HandQRemote) {
+        try {
+            window.HandQRemote.init();
+        } catch (err) {
+            window.__handqLog('ERROR', 'HandQRemote.init failed',
+                { error: String(err && err.message) });
+        }
+    }
+
+    // v6 Connect panel — new full-screen overlay for role selection + As
+    // Server / As Client dashboards. Runs alongside HandQRemote, which still
+    // owns the pairing dialogs and the local-tab ⇄ rc-session index this panel
+    // delegates to (newSession / focusOrMount / addManual / addLinuxAuto).
+    if (window.HandQConnect) {
+        try {
+            window.HandQConnect.init();
+        } catch (err) {
+            window.__handqLog('ERROR', 'HandQConnect.init failed',
+                { error: String(err && err.message) });
+        }
+    }
+
+    // Surface the handful of renderer internals the remote-control module needs.
+    // Deliberately narrow — it drives sessions through the same public entry
+    // points the UI itself uses, rather than reaching into `sessions`.
+    window.HandQRenderer = {
+        createSession,
+        switchSession,
+        closeSession,
+        markRemoteSessionState,
+        addGlobalSystemBubble,
+        hasSession: (sid) => sessions.has(sid),
+    };
 })();
+
+// ----- Custom glass tooltip (replaces native title="" popups) --------------
+//
+// Chromium's default title= tooltip is an unstyled OS box that clashes with
+// the liquid-glass aesthetic. A single shared floating element is driven via
+// mouseover/mouseout delegation on document — one element, not one listener
+// per node, so both DOM present at load AND session cards/list rows created
+// later at runtime pick up tooltip behavior for free.
+//
+// Migration from title= to data-tooltip happens lazily on first hover
+// (rather than a one-time DOMContentLoaded sweep) specifically because many
+// callers across renderer.js/session-sidebar.js set `.title = '...'` on
+// buttons they create well after page load (session close/send buttons,
+// terminal panel controls, resume-card actions) — a one-time sweep would
+// miss all of those.
+(function () {
+    const tip = document.getElementById('hq-tooltip');
+    if (!tip) return;
+
+    let showTimer = 0;
+    let hideTimer = 0;
+    let activeEl = null;
+
+    function migrate(el) {
+        const t = el.getAttribute('title');
+        if (t) {
+            el.setAttribute('data-tooltip', t);
+            el.removeAttribute('title');
+        }
+        return el.getAttribute('data-tooltip');
+    }
+
+    function place(el) {
+        const r = el.getBoundingClientRect();
+        tip.style.left = '0px';
+        tip.style.top = '0px';
+        tip.classList.remove('hidden');
+        const tw = tip.offsetWidth;
+        let left = r.left + (r.width - tw) / 2;
+        left = Math.max(4, Math.min(left, window.innerWidth - tw - 4));
+        const top = r.bottom + 6;
+        tip.style.left = left + 'px';
+        tip.style.top = top + 'px';
+    }
+
+    function show(el, text) {
+        activeEl = el;
+        tip.textContent = text;
+        place(el);
+    }
+
+    function hide() {
+        activeEl = null;
+        tip.classList.add('hidden');
+    }
+
+    document.addEventListener('mouseover', (e) => {
+        const el = e.target.closest('[title], [data-tooltip]');
+        if (!el || el === activeEl) return;
+        const text = migrate(el);
+        if (!text) return;
+        clearTimeout(hideTimer);
+        clearTimeout(showTimer);
+        showTimer = setTimeout(() => show(el, text), 150);
+    });
+
+    document.addEventListener('mouseout', (e) => {
+        const el = e.target.closest('[data-tooltip]');
+        if (!el) return;
+        clearTimeout(showTimer);
+        hideTimer = setTimeout(hide, 150);
+    });
+
+    // Any click/scroll invalidates the current position rather than
+    // tracking it live — tooltips are momentary, not worth a rAF loop.
+    window.addEventListener('scroll', hide, true);
+    document.addEventListener('mousedown', hide);
+})();
+
+// ----- Compositor prewarm for the sidebar's glass surfaces -----------------
+//
+// The right sidebar boots collapsed (data-collapsed="true", .ss-inner
+// display:none — index.html/styles.css). The FIRST time it opens, Chromium
+// paints .ss-section's backdrop-filter (blur+saturate) for the very first
+// time ever — allocating an offscreen compositor buffer at that paint,
+// which is measurably more expensive than every subsequent open (which
+// reuses an already-warm buffer at the same size). That one-time cost is
+// exactly the "first toggle is janky, then it's smooth" pattern users hit.
+//
+// Fix: paint an identical blurred surface once, off-screen and invisible,
+// during idle time after boot — same border-radius/background/blur recipe
+// as .ss-section, sized to the real sidebar's current width so the
+// compositor buffer Chromium allocates is the one actually reused on first
+// real open. visibility:hidden (not display:none) keeps it in the paint
+// pipeline without making it interactive or visible; removed right after
+// the paint has had a frame to land.
+(function () {
+    function prewarm() {
+        const sidebar = document.getElementById('session-sidebar');
+        if (!sidebar) return;
+        const w = sidebar.getBoundingClientRect().width || 320;
+        const ghost = document.createElement('div');
+        ghost.className = 'ss-section';
+        ghost.style.position = 'fixed';
+        ghost.style.left = '-9999px';
+        ghost.style.top = '0';
+        ghost.style.width = w + 'px';
+        ghost.style.height = '120px';
+        ghost.style.visibility = 'hidden';
+        ghost.style.pointerEvents = 'none';
+        document.body.appendChild(ghost);
+        requestAnimationFrame(() => {
+            requestAnimationFrame(() => ghost.remove());
+        });
+    }
+    if ('requestIdleCallback' in window) {
+        requestIdleCallback(prewarm, { timeout: 2000 });
+    } else {
+        setTimeout(prewarm, 800);
+    }
+})();
+
+

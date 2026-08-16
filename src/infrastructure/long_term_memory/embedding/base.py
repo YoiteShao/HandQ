@@ -103,12 +103,15 @@ def from_config(config: dict) -> EmbeddingProvider:
             return _FTSOnlyProvider()
 
     if kind == C.PROVIDER_ONNX_LOCAL:
-        # P2 — not yet implemented. Documented in 02_handq_design.md.
-        _logger.warning(
-            "EMBEDDING_PROVIDER=%s not implemented yet; falling back to %s",
-            C.PROVIDER_ONNX_LOCAL, C.PROVIDER_FTS_ONLY,
-        )
-        return _FTSOnlyProvider()
+        try:
+            from .onnx_local import OnnxEmbedder
+            return OnnxEmbedder()
+        except Exception:
+            _logger.exception(
+                "OnnxEmbedder construction failed; falling back to %s",
+                C.PROVIDER_FTS_ONLY,
+            )
+            return _FTSOnlyProvider()
 
     _logger.warning(
         "unknown EMBEDDING_PROVIDER=%r; falling back to %s",

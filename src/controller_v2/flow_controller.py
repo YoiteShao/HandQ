@@ -21,6 +21,7 @@ infrastructure/ssh_setup.py ensure_ssh_credentials_lazy) when the agent calls
 them with ``ssh_target``. Tool selection is the agent's own job via claim_tool.
 """
 import asyncio
+import os
 from typing import Any, Callable, Dict, List, Optional
 
 from ..infrastructure.llm_service import LLMService
@@ -33,8 +34,9 @@ from ..tools.file_state import FileState
 from ..tools.session_tool import SessionRegistry
 from ..tools.ssh_tool import SshConnectionPool
 from .interaction_manager import InteractionManager
-from .session_context import SessionContext
-from .task_channel import TaskChannel, TaskSpec
+from .session_context import GoalState, SessionContext
+from .session_digest import SessionDigest
+from .task_channel import TaskChannel, TaskResult, TaskSpec
 from .orchestrator import Orchestrator
 from .persistent_agent import PersistentAgent
 from .rewind_store import RewindStore
@@ -57,6 +59,7 @@ class FlowControllerV2:
         storage_directory: Optional[str] = None,
         config_path: Optional[str] = None,
         on_reply_to_user: Optional[Callable[[str], None]] = None,
+        on_intent_classified: Optional[Callable[[str], None]] = None,
         expose_session_storage_in_prompt: bool = True,
         helper_llm_services: Optional[List[LLMService]] = None,
         session_id: Optional[str] = None,
@@ -86,6 +89,11 @@ class FlowControllerV2:
         self.logger = get_logger()
 
         self._on_reply_to_user = on_reply_to_user
+        # Passed straight through to Orchestrator's own on_intent_classified
+        # (see its docstring) — unlike on_reply_to_user, this one has no IM/UI
+        # fallback: it's a bridge-internal signal (session-resume's gate),
+        # never something the renderer itself needs to render directly.
+        self._on_intent_classified = on_intent_classified
         # When False, PersistentAgent's prompt env block lists only
         # working_directory and omits the session-storage root. Used by the
         # Windows GUI bridge so the agent's mental model is "workspace =
@@ -113,20 +121,29 @@ class FlowControllerV2:
 
     # ── Public API ───────────────────────────────────────────────────────────
 
-    async def start(self) -> None:
+    async def start(self, resume_digest: Optional[SessionDigest] = None) -> None:
         """Bootstrap all components and start loops.
 
         After this returns:
-          - TaskChannel created (empty)
+          - TaskChannel created (empty, or restored from resume_digest)
           - Orchestrator created (INTENT classification + mechanical queueing)
           - PersistentAgent loop is running (blocked on empty task channel)
           - System idle, awaiting user messages via on_user_message()
+
+        ``resume_digest``, when given, is a previously-saved SessionDigest
+        (session_digest.py) whose trajectory — verbatim conversation,
+        completed/pending task queue, standing goal, agent summary — is
+        grafted onto the freshly-built components (§6.5). Deliberately NOT
+        restored: ``_turns`` (the agent's per-item working memory) and any
+        live OS handle — the agent starts with a clean working memory and
+        re-observes the world via tool calls, per design §4.
         """
         if self._started:
             return
 
         self.logger.info(
-            "[FlowControllerV2] Starting session",
+            "[FlowControllerV2] Starting session"
+            + (" (resuming)" if resume_digest is not None else ""),
             component="FlowControllerV2",
         )
 
@@ -173,6 +190,7 @@ class FlowControllerV2:
             on_state_changed=self._forward_state_to_ui,
             on_recall_started=self._forward_recall_started_to_ui,
             on_task_complete=self._on_task_complete_cleanup,
+            on_intent_classified=self._on_intent_classified,
             session_dir=self.storage_directory,
             session_ctx=self._ctx,
         )
@@ -195,12 +213,72 @@ class FlowControllerV2:
         # transitions via _forward_state_to_ui).
         self._task_channel.on_tasks_changed(self._forward_task_plan_to_ui)
 
+        # Crash safety net for SessionDigest (see docs/session_resume_design.md
+        # §6.2): destroy() writes the authoritative "destroyed" digest, but if
+        # the process dies before destroy() ever runs, this callback still
+        # leaves a "crashed" digest checkpointed at the last completed item
+        # boundary — better than nothing on disk at all.
+        self._task_channel.on_item_done(self._on_item_done_checkpoint)
+
+        if resume_digest is not None:
+            await self._restore_from_digest(resume_digest)
+
         self._agent_task = asyncio.create_task(
             self._agent.run_loop(),
             name="persistent_agent_loop",
         )
 
         self._started = True
+
+    async def _restore_from_digest(self, digest: SessionDigest) -> None:
+        """Graft a SessionDigest's trajectory onto the just-built components
+        (§6.5) — MUST run before the agent loop starts, so the restored
+        queue is what the loop picks up on its very first
+        ``wait_for_current_item()``.
+
+        Only §3's "③ 轨迹" is restored here: conversation, task queue,
+        standing goal, agent summary. ``_turns`` (②) is deliberately left
+        untouched — PersistentAgent starts with an empty working memory and
+        re-observes the world via tool calls (design §4).
+        """
+        assert self._orchestrator is not None and self._task_channel is not None
+        assert self._agent is not None and self._ctx is not None
+
+        self._orchestrator.restore_conversation(digest.conversation)
+        await self._task_channel.restore_queue({
+            "completed": digest.completed,
+            "current": digest.current,
+            "pending": digest.pending,
+        })
+        if digest.active_tools:
+            self._task_channel.activate_tools(digest.active_tools)
+        if digest.active_goal:
+            try:
+                self._ctx.active_goal = GoalState(
+                    condition=digest.active_goal.get("condition", ""),
+                    iterations=int(digest.active_goal.get("iterations", 0)),
+                    baseline_result_count=int(
+                        digest.active_goal.get("baseline_result_count", 0)
+                    ),
+                )
+            except Exception:
+                self.logger.warning(
+                    "[FlowControllerV2] resume: failed to restore active_goal; "
+                    "continuing without a standing goal",
+                    component="FlowControllerV2",
+                )
+        if digest.agent_summary:
+            self._agent.restore_summary(digest.agent_summary)
+
+        # One-shot banner (§6.6) — consumed by the agent's very first
+        # post-resume _build_messages call, then cleared automatically.
+        self._agent.set_resume_banner(
+            "[会话续接] 本 session 曾经活跃，现已重开。你的逐轮工作记忆没有被搬过来，"
+            "但轨迹是完整的：下方是至此的对话、已完成任务及其已验证结果、以及尚未完成"
+            "的部分。磁盘上的 workspace 与上次关闭时完全一致。在对任何你\"记得\"的文件或"
+            "远端状态动手前，请先重读 / 重新观察——把恢复的摘要当作地图，而不是当作"
+            "当前的 ground truth。"
+        )
 
     @staticmethod
     def _resolve_scheduler() -> Optional[object]:
@@ -270,6 +348,11 @@ class FlowControllerV2:
                     self._ctx.execution_recorder.write_session_end(success=True)
                 except Exception:
                     pass
+            # Flush the resume digest BEFORE tearing anything down — this is
+            # the authoritative "destroyed" checkpoint (see §6.2). Everything
+            # it reads (_orchestrator, _task_channel, _agent, _ctx) is still
+            # alive at this point.
+            self._checkpoint_digest(status="destroyed")
             try:
                 await self._ctx.close()
             except Exception:
@@ -344,6 +427,98 @@ class FlowControllerV2:
         except Exception:
             self.logger.warning(
                 "[FlowControllerV2] _signal_interrupt failed",
+                component="FlowControllerV2",
+            )
+
+    # ── Internal: session-resume digest (session_digest.py) ─────────────────
+
+    def _on_item_done_checkpoint(self, result: TaskResult) -> None:
+        """on_item_done callback — crash-safety checkpoint at every item
+        boundary (see docs/session_resume_design.md §6.2). Synchronous, same
+        calling convention as Orchestrator._on_item_done_sync — TaskChannel
+        invokes callbacks synchronously from mark_current_done."""
+        self._checkpoint_digest(status="crashed")
+
+    def _checkpoint_digest(self, status: str) -> None:
+        """Assemble and save a SessionDigest from the currently-live
+        components. Best-effort: any failure is logged and swallowed so a
+        broken checkpoint never blocks item completion or session teardown.
+
+        No-op before start() has wired everything up, or after destroy()
+        has already torn them down (all four components are required).
+        """
+        if (
+            self._ctx is None
+            or self._task_channel is None
+            or self._orchestrator is None
+            or self._agent is None
+        ):
+            return
+        try:
+            import time as _time
+
+            workspace_dir = self._ctx.working_directory or ""
+            workspace_files: List[str] = []
+            if workspace_dir and os.path.isdir(workspace_dir):
+                try:
+                    workspace_files = [
+                        name for name in os.listdir(workspace_dir)
+                        if os.path.isfile(os.path.join(workspace_dir, name))
+                    ]
+                except OSError:
+                    pass
+
+            conversation = [
+                {
+                    "role": turn.get("role", ""),
+                    "content": SessionDigest.cap(turn.get("content", "")),
+                }
+                for turn in self._orchestrator.conversation_history
+            ]
+            queue_snapshot = self._task_channel.snapshot_queue()
+            for result in queue_snapshot.get("completed", []) or []:
+                if result.get("final_answer"):
+                    result["final_answer"] = SessionDigest.cap(result["final_answer"])
+
+            goal = self._ctx.active_goal
+            title = conversation[0]["content"] if conversation else ""
+            now = _time.strftime("%Y-%m-%d %H:%M:%S")
+            # Preserve created_at across repeated checkpoints (item-boundary
+            # crash-safety net fires many times per session) — only the very
+            # first checkpoint should stamp it; every later one just advances
+            # updated_at. Falls back to `now` when this is the first checkpoint.
+            prior = SessionDigest.load(self.storage_directory)
+            created_at = prior.created_at if prior is not None else now
+
+            digest = SessionDigest(
+                session_id=self._session_id or "",
+                title=title,
+                created_at=created_at,
+                updated_at=now,
+                workspace_dir=workspace_dir,
+                workspace_files=workspace_files,
+                status=status,
+                conversation=conversation,
+                completed=queue_snapshot.get("completed", []),
+                current=queue_snapshot.get("current"),
+                pending=queue_snapshot.get("pending", []),
+                active_tools=sorted(self._task_channel.active_tools),
+                active_goal=(
+                    {
+                        "condition": goal.condition,
+                        "iterations": goal.iterations,
+                        "baseline_result_count": goal.baseline_result_count,
+                        "created_at": str(goal.created_at),
+                    }
+                    if goal is not None else None
+                ),
+                agent_summary=self._agent.export_summary(),
+            )
+            digest.save(self.storage_directory)
+        except Exception:
+            self.logger.warning(
+                "[FlowControllerV2] _checkpoint_digest(status=%s) failed; "
+                "continuing without a persisted digest for this checkpoint" % status,
                 component="FlowControllerV2",
             )
 

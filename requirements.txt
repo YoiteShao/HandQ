@@ -114,3 +114,22 @@ pdfplumber>=0.11.0
 # shared HandQ browser_profile), so we don't need msal here. httpx (already
 # above) handles the OAuth refresh-token exchange and Graph requests; playwright
 # (already above for browser_tool) handles the one-time bootstrap.
+
+# ── Session resume (controller_v2/resume_index.py) ───────────────────────────
+# Local BM25+dense retrieval over destroyed-session digests — see
+# docs/session_resume_design.md §6.3/§6.3.1. Both legs are fully local/CPU;
+# no remote embedding call, no cold start.
+
+# Chinese word segmentation for the BM25 leg. Plain FTS5 unicode61 treats a
+# whole CJK run as one token; jieba splits it into real content words AND
+# splits CJK<->ASCII boundaries ("QPM软件" -> "QPM", "软件").
+jieba>=0.42.1
+
+# Local embedding runtime (pure onnxruntime, no torch). Loads
+# BAAI/bge-small-zh-v1.5 (~90MB), selected after a 3-model + web shootout in
+# §6.3.1 — best hit rate, smallest, ~2ms/query, zero cold start. Used here by
+# resume_index.py's dense leg AND by
+# infrastructure/long_term_memory/embedding/onnx_local.py (EMBEDDING_PROVIDER
+# = PROVIDER_ONNX_LOCAL, the LTM subsystem's live embedder).
+fastembed>=0.3.0
+

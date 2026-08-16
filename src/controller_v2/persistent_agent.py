@@ -18,7 +18,9 @@ Feature set:
 """
 import asyncio
 import json
+import os
 import re
+from datetime import datetime
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set
 
 from ..infrastructure.anthropic_streaming_service import (
@@ -53,6 +55,7 @@ from .agent_utils import (
     TurnDigest,
     ProgressConcern,
     IterationAdvisor,
+    CompletionAudit,
     format_tool_entry,
     resolve_obs_budget,
     SUPERSEDABLE_TOOL_ACTIONS,
@@ -74,7 +77,15 @@ from ..tools.desktop_tool import (
 )
 
 
-MAX_ITEM_ITERATIONS = 999
+MAX_ITEM_ITERATIONS = 400
+
+# Sentinel returned as TurnOutcome.error from _think_streaming when the user
+# interrupts mid-stream. It defeats is_completion (which would otherwise let
+# _item_loop treat "user pressed stop" as "task done, final_answer='stream
+# interrupted'"), and it's routed to the interrupt handler in _item_loop
+# rather than the generic LLM-API-error branch so the item ends as
+# "Interrupted by user", not "LLM API error".
+INTERRUPTED_BY_USER_MID_STREAM = "INTERRUPTED_BY_USER_MID_STREAM"
 
 
 class PersistentAgent:
@@ -121,7 +132,63 @@ class PersistentAgent:
 
         # LLM services
         self._services: List[LLMService] = list(llm_services)
-        self._obs_budget_chars: int = resolve_obs_budget(self._services[0].context_window)
+        # Size the observation budget to the SMALLEST context window in the
+        # fallback chain, not services[0]'s. Any service in the pool may end up
+        # serving the request, and the budget is only corrected downward after a
+        # stream OPENS successfully (`_update_obs_budget_for_service` via
+        # `on_service_selected`) — which never happens when the request is
+        # rejected at open. Sizing off services[0] was therefore
+        # "shoot first, resize later":
+        #
+        #   2026-08-03 flash-meta run — agent_models[0] was
+        #   `claude-4-6-sonnet:1M` (1M window → budget 2,945,250 chars), so the
+        #   agent legitimately grew history to ~1.11M chars. The moment
+        #   claude-4-6-sonnet's tokens_per_day quota died, traffic moved to a
+        #   200k sibling and every request came back
+        #   "Input is too long for requested model" — the payload was 5x the
+        #   serving model's window and nothing had ever measured it against
+        #   that window. Taking the min makes the first request already fit
+        #   every hop, so the 400 cannot happen at all.
+        self._obs_budget_chars: int = resolve_obs_budget(
+            min(svc.context_window for svc in self._services)
+        )
+        # Hard ceiling for the life of the agent. `_turns` is state SHARED
+        # across every hop of the fallback chain, so the budget may never be
+        # raised above what the smallest hop can accept — even while a
+        # large-window service is happily serving. Without this ceiling
+        # `_update_obs_budget_for_service` would push the budget back up to
+        # the 1M model's 2.9M chars on its first successful stream and
+        # re-arm the exact failure above.
+        self._obs_budget_ceiling: int = self._obs_budget_chars
+        # PTL-recovery bookkeeping (see the ladder in the item loop).
+        # `_skip_next_compaction` grants exactly one iteration of reprieve so
+        # the free request trim can be tried before semantic compaction;
+        # `_ptl_backoffs` bounds the budget-backoff arm per item.
+        self._skip_next_compaction: bool = False
+        self._ptl_backoffs: int = 0
+
+        # Token-based compaction trigger (CC parity). `_last_input_tokens` is
+        # the most recent REAL token count from the API response's `usage`
+        # (input_tokens + cache_read); updated every turn by _log_context_pressure.
+        # Compaction checks this against `_compact_threshold_tokens` (derived from
+        # the CC formula: effectiveWindow − outputReserve − margin). Using real
+        # token counts instead of char estimates eliminates the instability that
+        # chars introduce (chars/token varies by content type — code ≈1.4, prose ≈1.8,
+        # JSON ≈2.0 — so a char threshold oscillates depending on what the agent
+        # happens to be reading).
+        self._context_window_tokens: int = min(
+            svc.context_window for svc in self._services
+        )
+        self._last_input_tokens: int = 0
+        # CC formula: compactThreshold = window − outputReserve − 13000
+        _output_reserve = min(20_000, self._context_window_tokens // 5)
+        self._compact_threshold_tokens: int = (
+            self._context_window_tokens - _output_reserve - 13_000
+        )
+        # Item-boundary fires earlier (80% of compact threshold).
+        self._item_boundary_threshold_tokens: int = int(
+            self._compact_threshold_tokens * 0.84
+        )
 
         # Conversation state (replaces old _observations/_assistant_messages/_obs_group_sizes).
         # Out-of-band events (background-task completions, context-truncation
@@ -213,7 +280,33 @@ class PersistentAgent:
 
         # Progress / anti-repeat (merged into IterationAdvisor)
         self._advisor = IterationAdvisor()
+        # Mechanical completion audit: unresolved background work + verification
+        # bullets citing values no tool ever emitted (the 2026-08-01 fabricated
+        # flash delivery). Fed alongside _advisor, plus the out-of-band
+        # background completion observations in _poll_completed_background_tasks.
+        self._completion_audit = CompletionAudit()
         self._conversation_summary: Optional[str] = None
+        # CC-parity compaction circuit breakers (claude.exe §3.6).
+        #   * consecutive LLM-compaction failures → after N, stop trying the LLM
+        #     summarizer for the rest of the session (fall straight to the
+        #     rule-based summary), so a persistently-failing summarizer can't burn
+        #     a model call on every compaction.
+        #   * thrashing → if a compaction is followed within a few turns by
+        #     another budget breach, the working set is too large for summarizing
+        #     to help; after N such episodes, surface it to the user instead of
+        #     silently re-summarizing forever.
+        self._compact_consecutive_failures: int = 0
+        self._compact_llm_disabled: bool = False
+        self._compact_iteration_history: List[int] = []
+        self._compact_thrash_episodes: int = 0
+        self._compact_thrash_warned: bool = False
+
+        # Session-resume banner (see session_digest.py / flow_controller.py
+        # resume path). Set once by the caller right after a resumed session
+        # restores its state; consumed and cleared by the very next
+        # _build_messages call so it appears exactly once at the top of the
+        # first post-resume turn, not on every subsequent turn.
+        self._resume_banner: Optional[str] = None
 
         # Per-item static context — set in _execute_item, consumed by every
         # _build_messages call until the next item begins. Keeps the task
@@ -320,6 +413,36 @@ class PersistentAgent:
                 "Discovery Results', which may go to your OS temp directory."
             )
         env_parts.append(get_platform_context())
+        # Input-injection capability, probed ONCE at session start. See
+        # desktop_tool.probe_input_injection for why this is worth a line of
+        # prompt: without it the agent can spend an hour optimizing pointer
+        # coordinates on a session that has no interactive desktop at all.
+        try:
+            from ..tools.desktop_tool import probe_input_injection
+            _probe = probe_input_injection()
+            if not _probe.get("available", True):
+                env_parts.append(
+                    "GUI INPUT INJECTION IS UNAVAILABLE in this session: "
+                    f"{_probe.get('detail', 'no foreground window')}. "
+                    "Mouse/keyboard injection (desktop_click_at, "
+                    "desktop_find_and_click, desktop_type_text, drag, scroll, "
+                    "hotkey, and any SendInput / PostMessage / "
+                    "SetForegroundWindow trick you might write yourself) will "
+                    "NOT work here, and no amount of re-aiming, maximizing or "
+                    "re-trying will change that — it is a property of the "
+                    "session, not of your coordinates. Do not spend turns on "
+                    "it. Reach the application another way: its own automation "
+                    "API or SDK, a CLI, a config file, Chrome DevTools Protocol "
+                    "for Electron/Chromium apps, or ask the user to perform the "
+                    "one click you cannot. desktop_screenshot and "
+                    "desktop_list_windows still work for OBSERVATION."
+                )
+            else:
+                env_parts.append(
+                    f"GUI input injection: available ({_probe.get('detail', '')})."
+                )
+        except Exception:
+            pass
         if self._services:
             env_parts.append(f"You are powered by the model: {self._services[0].model}")
         # Sent as TWO separate system blocks (not one concatenated string) so
@@ -333,6 +456,27 @@ class PersistentAgent:
         self._system_prompt_env = "## Environment\n\n" + "\n".join(env_parts)
 
     # ── Public API ───────────────────────────────────────────────────────────
+
+    def export_summary(self) -> Optional[str]:
+        """Return the agent's current compaction summary, for a SessionDigest
+        checkpoint. Read-only — does not clear or mutate anything."""
+        return self._conversation_summary
+
+    def restore_summary(self, summary: Optional[str]) -> None:
+        """Reinstate a previously exported summary on a resumed session.
+
+        This is the one piece of "belief" a resume carries over (see
+        docs/session_resume_design.md §6.5) — it's the same summary the
+        agent was already operating on at close time, not a fresh
+        re-narration, so its provenance/quality is unchanged.
+        """
+        self._conversation_summary = summary
+
+    def set_resume_banner(self, text: str) -> None:
+        """Arm a one-shot banner to be woven into the very next
+        _build_messages call, then cleared (see _resume_banner docstring
+        at __init__)."""
+        self._resume_banner = text
 
     async def run_loop(self) -> None:
         """Run the persistent loop. Blocks forever until CancelledError."""
@@ -375,6 +519,9 @@ class PersistentAgent:
     async def _execute_item(self, item: TaskSpec) -> None:
         """Execute a single task item with full feature parity."""
         self._advisor.reset_for_item()
+        # Seed the audit's sourced-token set with the item instruction so
+        # identifiers the USER supplied stay quotable in verification.
+        self._completion_audit.reset_for_item(item.instruction or "")
         self._current_item_turn_count = 0
 
         # Item-static context — persisted until the next item begins.
@@ -461,6 +608,18 @@ class PersistentAgent:
     async def _item_loop(self, item: TaskSpec) -> TaskResult:
         """Per-item OTA loop."""
         instruction = item.instruction
+        # Persist the task verbatim before doing anything with it, so the exact
+        # original wording survives compaction and is recoverable by `read`.
+        # Skip mechanical re-queues (standing-goal check-ins, schedule_wakeup
+        # ticks) — they replay the SAME instruction text the user never
+        # re-typed, so logging them here would fill this "verbatim user
+        # instructions" log with dozens of duplicate TASK entries over a long
+        # check-in/wakeup loop instead of the one real user message that
+        # started it.
+        if item.goal_iteration is None and item.wakeup_iteration is None:
+            self._append_instruction_log(
+                instruction, kind="TASK", item_id=item.item_id,
+            )
         iteration = 0
         _tools_used: list = []
         # Bookkeeping-only tools (planning, reading a recipe, adjusting the tool
@@ -494,6 +653,9 @@ class PersistentAgent:
         # it is a safety net, independent of upstream correctness.
         _completion_guard_rejections = 0
         _COMPLETION_GUARD_MAX_REJECTIONS = 3
+        # Fresh budget-backoff allowance per item: a shrink forced by one
+        # oversized item should not deny the next item its own cheap retries.
+        self._ptl_backoffs = 0
 
         while iteration < self._max_item_iterations:
             iteration += 1
@@ -522,7 +684,14 @@ class PersistentAgent:
             # ── 1. Background + Compact ─────────────────────────────────────
             self._poll_completed_background_tasks()
             self._drain_pending_file_notices()
-            await self._compact_conversation()
+            # One-iteration reprieve granted by the PTL ladder below: it just
+            # shrank the budget and wants the FREE, non-destructive request
+            # trim (_budget_enforced_turns) to get its chance before semantic
+            # compaction is allowed to collapse _turns.
+            if self._skip_next_compaction:
+                self._skip_next_compaction = False
+            else:
+                await self._compact_conversation()
 
             # ── 2. Reminders (via IterationAdvisor) ────────────────────────
             reminder = self._advisor.get_reminder()
@@ -546,20 +715,71 @@ class PersistentAgent:
             # ── 4. Error handling (PTL recovery) ─────────────────────────────
             if turn_result.is_error:
                 err_msg = turn_result.error or ""
+                # Mid-stream user interrupt — surface it as an interrupt exit,
+                # not as an LLM API error. The stream handler sets this
+                # sentinel INSTEAD of leaving error=None (which would trip
+                # is_completion and mark the item succeeded with
+                # final_answer='LLM stream interrupted'). Ack the coordinator
+                # flag exactly the way the step-0 interrupt check does, then
+                # return the same INTERRUPTED_BY_COORDINATOR TaskResult shape.
+                if err_msg == INTERRUPTED_BY_USER_MID_STREAM:
+                    interrupt_reason = self._task_channel.acknowledge_interrupt()
+                    self.logger.info(
+                        f"[{iteration}][Interrupt] Mid-stream interrupt for item={item.item_id}"
+                        f"{f': {interrupt_reason}' if interrupt_reason else ''}",
+                        component="PersistentAgent",
+                    )
+                    issue_msg = INTERRUPTED_BY_COORDINATOR
+                    if interrupt_reason:
+                        issue_msg = f"{INTERRUPTED_BY_COORDINATOR}: {interrupt_reason}"
+                    return TaskResult(
+                        item_id=item.item_id,
+                        success=False,
+                        issues=[issue_msg],
+                        iterations=iteration,
+                        token_usage=_token_usage,
+                    )
                 if err_msg.startswith(LLM_API_ERROR_TAG):
                     raw_error = err_msg[len(LLM_API_ERROR_TAG) + 1:].strip()
 
                     if raw_error.startswith("PTL:"):
-                        min_budget = resolve_obs_budget(
-                            min(svc.context_window for svc in self._services)
-                        )
-                        if self._obs_budget_chars > min_budget:
+                        # Step 0 — CHEAP, NON-DESTRUCTIVE, and tried first.
+                        # Back the observation budget off by a step and retry.
+                        # `_build_messages` already runs
+                        # `_budget_enforced_turns()`, which drops oldest turns
+                        # from THIS REQUEST while `_turns` stays intact:
+                        # milliseconds, no LLM call, no history lost.
+                        #
+                        # Reaching a PTL at all now means the char budget
+                        # under-measured the real token cost (chars/token
+                        # miscalibration, unmeasured tool-schema bulk, a grown
+                        # summary/prelude) — so stepping the budget down is
+                        # exactly the right correction, and it is the one the
+                        # ladder previously skipped.
+                        #
+                        # 2026-08-03: the ladder went straight to
+                        # `_compact_conversation()` and spent 95s collapsing
+                        # 234 turns -> 5 (summary capped at 11,325 chars) at
+                        # turn 234 of a 248-turn run.
+                        if (
+                            self._ptl_backoffs < self._PTL_MAX_BACKOFFS
+                            and self._obs_budget_chars > self._PTL_BUDGET_FLOOR_CHARS
+                        ):
+                            new_budget = max(
+                                int(self._obs_budget_chars * self._PTL_BACKOFF_FACTOR),
+                                self._PTL_BUDGET_FLOOR_CHARS,
+                            )
+                            self._ptl_backoffs += 1
                             self.logger.info(
-                                f"[{iteration}] PTL — shrinking obs budget "
-                                f"{self._obs_budget_chars:,} -> {min_budget:,}",
+                                f"[{iteration}] PTL — obs budget backoff "
+                                f"{self._ptl_backoffs}/{self._PTL_MAX_BACKOFFS}: "
+                                f"{self._obs_budget_chars:,} -> {new_budget:,} chars; "
+                                f"retrying with a free request trim (history kept).",
                                 component="PersistentAgent",
                             )
-                            self._obs_budget_chars = min_budget
+                            self._obs_budget_chars = new_budget
+                            self._skip_next_compaction = True
+                            continue
 
                         turns_before = len(self._turns)
                         await self._compact_conversation()
@@ -799,6 +1019,56 @@ class PersistentAgent:
                     _completion_guard_rejections += 1
                     continue
 
+                # Completion-audit guard: the completion is well-formed AND
+                # backed by real tool calls, but its CONTENT is not observable.
+                # Two mechanical checks (see agent_utils.CompletionAudit):
+                #   * a background task launched this item was never once seen
+                #     in a terminal state — "still running" is not "succeeded";
+                #   * a `verification` bullet quotes a percentage / timestamp /
+                #     SCREAMING_SNAKE status that appears in no tool output and
+                #     in nothing the user supplied — i.e. it was invented.
+                # The 2026-08-01 flash trace passed both existing guards and
+                # shipped "DEVICE_NO_ERROR (0), progress 4.96%->99.94% at
+                # 13:37:37" with ten background tasks still marked running.
+                # Bounded by the same _COMPLETION_GUARD_MAX_REJECTIONS cap, so
+                # a false positive costs a few corrective turns, never a spin.
+                _audit_failure = self._completion_audit.audit(
+                    turn_result.verification
+                )
+                if _audit_failure:
+                    self.logger.warning(
+                        f"[{iteration}] Completion audit rejected: "
+                        f"{_audit_failure[:300]}",
+                        component="PersistentAgent",
+                    )
+                    guard_obs = ToolResult(
+                        success=False, output=None,
+                        tool_name="completion_guard", tool_parameters={},
+                        error=_audit_failure,
+                    )
+                    if self.execution_recorder:
+                        self.execution_recorder.write_turn(
+                            turn=self.current_iteration,
+                            step_id=item.item_id,
+                            decision=turn_result,
+                            tool_results=[guard_obs],
+                            token_usage=_iter_token_usage,
+                            retiered=self._last_build_retiered,
+                            totals=self._last_build_totals,
+                        )
+                    self._persist_event_observations(
+                        [guard_obs],
+                        note=(
+                            "(My completion was rejected by the audit: I either "
+                            "left background work unobserved or cited a value no "
+                            "tool actually reported. I must observe the real "
+                            "result or drop the unsourced claim — not restate an "
+                            "inference as an observation.)"
+                        ),
+                    )
+                    _completion_guard_rejections += 1
+                    continue
+
                 self.logger.info(
                     f"[{iteration}] Item complete: {turn_result.reasoning[:100]}",
                     component="PersistentAgent",
@@ -933,6 +1203,7 @@ class PersistentAgent:
             has_wait_interval = False
             for tr in tool_results:
                 self._advisor.record_tool_result(tr)
+                self._completion_audit.record_tool_result(tr)
                 if tr.tool_name == "wait_interval" and tr.success:
                     has_wait_interval = True
             info_gain = self._advisor.record_progress_signal(
@@ -1066,6 +1337,39 @@ class PersistentAgent:
             _stream_error: Optional[Exception] = None
             try:
                 async for event in stream_gen:
+                    # ── Mid-stream interrupt check ──────────────────────────────
+                    # The outer iteration loop only checks at step 0; an LLM
+                    # stream can run for minutes.  Peek at the flag each chunk so
+                    # user-initiated interrupts land promptly.
+                    if self._task_channel.check_interrupt():
+                        # Cancel any tool tasks already dispatched on this turn —
+                        # both sibling error-return paths (stream_error at
+                        # ~L1459, no-done-event at ~L1484) do the same. Without
+                        # this, in-flight write/edit/shell coroutines keep
+                        # running detached, their results never collected.
+                        for _, task in running_tasks:
+                            task.cancel()
+                        try:
+                            # Best-effort: close the async generator to release
+                            # the HTTP connection back to the pool immediately.
+                            await stream_gen.aclose()
+                        except Exception:
+                            pass
+                        # CRITICAL: this MUST NOT be TurnOutcome.is_completion,
+                        # or _item_loop turns "user pressed stop" into "task
+                        # succeeded, final_answer='LLM stream interrupted'".
+                        # is_completion = not tool_calls and not error, and the
+                        # per-item speculative-completion guard doesn't help
+                        # (grounding_tools_used is per-item, so any prior
+                        # grounding call satisfies it). Setting `error` bypasses
+                        # is_completion; the outer loop's step-0 interrupt
+                        # check on the next iteration then acknowledges the
+                        # interrupt properly via the coordinator path.
+                        return TurnOutcome(
+                            reasoning="LLM stream interrupted by user.",
+                            error=INTERRUPTED_BY_USER_MID_STREAM,
+                        ), [], TokenUsage()
+
                     if isinstance(event, StreamToolCallEvent):
                         tc = ToolCall(call_id=event.call_id, tool_name=event.tool_name, parameters=event.args)
                         stream_tool_calls.append(tc)
@@ -1098,6 +1402,7 @@ class PersistentAgent:
                         llm_result = event.result
                         reasoning = llm_result.content or ""
                         _thinking_blocks = llm_result.thinking_blocks or []
+                        self._log_context_pressure(llm_result)
 
                         if stream_tool_calls:
                             _asst_msg = {
@@ -1199,20 +1504,41 @@ class PersistentAgent:
                 pass
 
             if _stream_error is not None:
-                try:
-                    self._interaction_manager.display_error(
-                        f"LLM stream error: {type(_stream_error).__name__}: {_stream_error}"
-                    )
-                except Exception:
-                    pass
+                # Classify BEFORE telling the user anything. A prompt-too-long
+                # is a routine, self-healing condition — the PTL ladder in
+                # `_item_loop` backs the budget off and retries, usually
+                # transparently. Announcing it via `display_error` first painted
+                # a red fatal "LLM stream error: BadRequestError ..." bubble for
+                # an error that was about to be recovered: on 2026-08-03 the
+                # user reported the agent "无法补救" while the log shows the very
+                # next lines recovering and the run continuing for 14 more
+                # turns. Surface it as progress, not failure.
+                _is_ptl = self._services[0]._is_prompt_too_long_error(_stream_error)
+                if _is_ptl:
+                    try:
+                        self._interaction_manager.notify_inline_event(
+                            "context",
+                            "Prompt exceeded the model's context window — "
+                            "trimming context and retrying automatically.",
+                        )
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        self._interaction_manager.display_error(
+                            f"LLM stream error: {type(_stream_error).__name__}: {_stream_error}"
+                        )
+                    except Exception:
+                        pass
                 self.logger.warning(
-                    f"[{self.current_iteration}][ThinkStream] Stream error: {_stream_error}",
+                    f"[{self.current_iteration}][ThinkStream] Stream error"
+                    f"{' (PTL — recoverable)' if _is_ptl else ''}: {_stream_error}",
                     component="PersistentAgent",
                 )
                 for _, task in running_tasks:
                     task.cancel()
 
-                if self._services[0]._is_prompt_too_long_error(_stream_error):
+                if _is_ptl:
                     return TurnOutcome(reasoning="Prompt too long.", error=f"{LLM_API_ERROR_TAG}:PTL: {_stream_error}"), [], TokenUsage()
 
                 if not stream_tool_calls:
@@ -1275,8 +1601,39 @@ class PersistentAgent:
         # observations contributes only a bare assistant message, which both
         # risks two consecutive assistant messages at the API (Anthropic 400)
         # and carries nothing not already captured in the ItemResult / summary.
+        #
+        # Capture any pending user message into this turn's interjection field.
+        # It is consumed (cleared + logged) ONLY when a turn actually lands to
+        # carry it: the guard below skips obs-less completion turns, and clearing
+        # unconditionally would drop the user's message on the floor — neither in
+        # the channel for the next turn nor in any ConversationTurn. Leaving it
+        # in the channel means the next turn that does land picks it up.
+        # Capture any pending user messages into this turn's interjection
+        # field. They are consumed (cleared + logged) ONLY when a turn
+        # actually lands to carry them: the guard below skips obs-less
+        # completion turns, and clearing unconditionally would drop the
+        # user's message on the floor — neither in the channel for the next
+        # turn nor in any ConversationTurn. Leaving them in the channel means
+        # the next turn that does land picks them up. Peek/clear (not a
+        # single atomic drain) so a turn that fails to land leaves the queue
+        # untouched — see TaskChannel.peek_pending_user_messages.
+        _pending_user_msgs = self._task_channel.peek_pending_user_messages()
+
         if _asst_msg is not None and (_asst_msg.get("tool_calls") or tool_results):
-            self._turns.append(ConversationTurn(assistant_message=_asst_msg, observations=tool_results))
+            if _pending_user_msgs:
+                # Drain the whole queue now — every peeked message is
+                # accounted for by _drain_pending_interjections (carried as a
+                # true interjection, or recognised as this item's own
+                # instruction and dropped). Reassign _pending_user_msgs so the
+                # ConversationTurn below carries only the kept ones.
+                _pending_user_msgs = self._drain_pending_interjections(
+                    _pending_user_msgs
+                )
+            self._turns.append(ConversationTurn(
+                assistant_message=_asst_msg,
+                observations=tool_results,
+                user_interjection=list(_pending_user_msgs),
+            ))
             self._current_item_turn_count += 1
             self._log_observations(tool_results)
 
@@ -1300,14 +1657,22 @@ class PersistentAgent:
 
             [system]
             [skill prelude ...]      append-only, last message cache-anchored
-            [user: session context]  summary + cross-item boundary
+            [user: task + context]   TASK + summary + cross-item boundary
             [assistant/tool turns ]  append-only conversation trace
-            [user: current item   ]  item block + LTM + host hint + reminder + action
+            [user: volatile      ]   LTM (first turn) + todo + reminder
 
-        The per-item instruction sits at the BOTTOM so the model's freshest
-        context is the current task — not the previous item's trailing tool
-        results — and so the growing turn trace stays a cacheable prefix instead
-        of being pushed below an instruction block that changes every item.
+        CC-form (Claude Code parity): the task is the FIRST user message of the
+        conversation and stays there — CC's ``messages[0]`` is the user's request
+        and the array is append-only, so the task is never moved and never
+        restated. HandQ previously re-rendered the instruction at the BOTTOM of
+        every turn (`[Continuing: ...]`), which cost the full instruction once
+        per turn and read like a fresh directive. Now it sits once in the
+        cache-anchored top block, byte-stable for the whole item.
+
+        Mid-task user messages ride in the turn trace at their arrival position
+        (``ConversationTurn.user_interjection``), also CC-form. Every instruction
+        is additionally appended verbatim to the on-disk instruction log so it
+        survives compaction — see ``_append_instruction_log``.
         """
         messages: List[Dict[str, Any]] = [
             {"role": "system", "content": self._system_prompt_core},
@@ -1333,6 +1698,7 @@ class PersistentAgent:
         # trace will actually be emitted.
         turns = self._budget_enforced_turns()
         self._supersede_stale(turns)
+        self._dedup_identical_outputs(turns)
         # Sole observation-elision layer (CC-aligned microcompact): under
         # budget pressure, replace old re-derivable tool RESULTS with a
         # one-line re-read hint via `superseded_note`. tool_use blocks are
@@ -1352,18 +1718,23 @@ class PersistentAgent:
         # the agent grounded orientation on every turn (not just iter 0) at the
         # position where attention is strongest.
         top_parts: List[str] = []
+        if self._resume_banner:
+            top_parts.append(self._resume_banner)
+            self._resume_banner = None
+        # CC-form: the task is the FIRST user message of the conversation and it
+        # STAYS there — Claude Code's messages[0] is the user's request and the
+        # array is append-only, so the task never moves and is never restated.
+        # It lives in this cache-anchored top block (byte-stable for the whole
+        # item) rather than being re-rendered at the bottom every turn, which is
+        # what the old `[Continuing: ...]` line did.
+        top_parts.append(
+            self._current_item_block or f"[Task]\n{instruction}"
+        )
         if self._conversation_summary:
-            top_parts.append(
-                f"---\n[Earlier session progress]\n{self._conversation_summary}\n---"
-            )
+            top_parts.append(f"---\n{self._render_compaction_wrapper()}\n---")
         boundary = self._task_channel.get_recent_results_for_agent(limit=10)
         if boundary:
             top_parts.append(boundary)
-        # Anthropic requires a user message before the first turn in the trace.
-        # Guard also fires when skill_messages exist (last skill msg is assistant),
-        # so we always need a user message bridging to the turn trace.
-        if turns and not top_parts:
-            top_parts.append(self._current_item_block or f"[Current Task]\n{instruction}")
         if top_parts:
             content = "\n\n".join(top_parts)
             # Cache breakpoint #4 (of Anthropic's 4-per-request max — the
@@ -1394,7 +1765,43 @@ class PersistentAgent:
         # This replaces the former turn-distance three-tier loop, whose tier-3
         # stripped tool_calls purely by age (not budget) — live-confirmed to
         # make a weak model lose its own edit and loop hunting a phantom bug.
+        # Budget-truncation notice: if _budget_enforced_turns dropped N turns
+        # off the head this build, tell the model so — otherwise it reads the
+        # remaining trace as if it were the complete history and re-does work
+        # or contradicts settled state. Mirrors the explicit notice the PTL
+        # recovery path already emits via _hard_drop_turns; the difference is
+        # that this path is silent AND runs every turn under budget pressure,
+        # not just as a last resort. No persistence: we don't mutate _turns
+        # (this function is a read-only view of it), so we render the notice
+        # inline every build until the turns come back under budget. The turn
+        # trace below is not byte-stable across builds anyway (microcompact
+        # rewrites it), so no cache-anchor invariant is broken.
+        _dropped_count = len(self._turns) - len(turns)
+        if _dropped_count > 0:
+            _dropped_chars = sum(
+                t.total_obs_chars() for t in self._turns[:_dropped_count]
+            )
+            messages.append({
+                "role": "user",
+                "content": (
+                    f"[Context truncation: {_dropped_count} earlier turn(s) "
+                    f"dropped from this request to fit the observation budget "
+                    f"({_dropped_chars:,} chars). The trace below starts mid-"
+                    f"item; earlier reasoning and observations are not visible "
+                    f"this turn. Do not re-run work whose results you can only "
+                    f"cite from the summary above; if a fact was in a dropped "
+                    f"turn and you need it, re-observe rather than guess.]"
+                ),
+            })
+
         for turn in turns:
+            # If this turn had user interjection(s), render them as a single
+            # user message BEFORE the assistant response (they arrived before
+            # the LLM was called). Multiple messages that arrived between
+            # turns are newline-joined, each still individually logged.
+            if turn.user_interjection:
+                _interjection_text = "\n".join(turn.user_interjection)
+                messages.append({"role": "user", "content": f"[User]: {_interjection_text}"})
             messages.append(turn.assistant_message)
             if turn.has_tool_calls:
                 tc_list = turn.assistant_message.get("tool_calls", [])
@@ -1410,36 +1817,14 @@ class PersistentAgent:
                     obs.to_tool_result_json() for obs in turn.observations
                 )
                 messages.append({"role": "user", "content": combined})
-
-        # Bottom instruction message — placed last so it is the model's freshest
-        # context. On the first turn of an item, include full task block + LTM +
-        # host context. On subsequent turns, abbreviate to avoid repeating static
-        # content the model has already reasoned about.
-        #
-        # User's verbatim latest message is prepended on every turn (not just
-        # iter 0). Bundling user-msg + item block at the high-attention bottom
-        # position keeps the agent grounded across long items (100+ iter) where
-        # the trace above may have drifted from the user's original intent.
-        # `_latest_user_message` is last-write-wins: mid-flight instructions
-        # ("also do X", "actually only on gv") overwrite the initial message,
-        # but the initial content is already captured in the mechanically
-        # enqueued item.instruction, so overwriting is safe.
+        # Bottom block — volatile only. The task itself now lives in the
+        # cache-anchored TOP block (CC-form: task at position 0, never
+        # restated), so nothing here repeats the instruction. What remains is
+        # genuinely per-turn: the item's LTM recall on its first turn, plus the
+        # agent's own todo and the advisor reminder.
         bottom_parts: List[str] = []
-        user_msg = self._task_channel.get_latest_user_message()
-        if user_msg:
-            bottom_parts.append(
-                "[User Directive — verbatim; honor this over any paraphrased "
-                "reformulation]\n"
-                f'"{user_msg}"'
-            )
-        if self._current_item_turn_count == 0:
-            bottom_parts.append(
-                self._current_item_block or f"[Current Task]\n{instruction}"
-            )
-            if self._current_ltm_block:
-                bottom_parts.append(self._current_ltm_block)
-        else:
-            bottom_parts.append(f"[Continuing: {instruction[:120]}]")
+        if self._current_item_turn_count == 0 and self._current_ltm_block:
+            bottom_parts.append(self._current_ltm_block)
         # Reminder section (advisor reminder + the agent's own todo).
         reminder_section_parts: List[str] = []
         # Agent-owned todo — the agent's OWN plan written via `todo_write`, fed
@@ -1454,7 +1839,12 @@ class PersistentAgent:
             reminder_section_parts.append(reminder)
         if reminder_section_parts:
             bottom_parts.append("\n\n".join(reminder_section_parts))
-        messages.append({"role": "user", "content": "\n\n".join(bottom_parts)})
+        # Only emit the bottom message when there is something volatile to say.
+        # Since the task moved to the TOP block, this can now legitimately be
+        # empty (no LTM on a later turn, no todo, no reminder) — appending an
+        # empty-content user message would be rejected by the API.
+        if bottom_parts:
+            messages.append({"role": "user", "content": "\n\n".join(bottom_parts)})
 
         # Record the total context size this build so the ExecutionRecorder's
         # turn record can track context growth. (`_last_build_retiered` was set
@@ -1500,6 +1890,140 @@ class PersistentAgent:
             + "\n\n".join(parts)
         )
 
+    # ── User-instruction log (durable read-back after compaction) ────────────
+    #
+    # CC parity: Claude Code's post-compaction wrapper carries a pointer to the
+    # full transcript on disk ("If you need specific details from before
+    # compaction, read the full transcript at: {path}"). This is HandQ's
+    # equivalent — an append-only, verbatim, tagged log of every instruction the
+    # user gave. Compaction summarizes prose and MAY paraphrase or drop a
+    # mid-task correction; this file leaves the original recoverable with a
+    # plain `read`. The agent is TOLD the path (in the post-compaction wrapper)
+    # but is never required to read it — that is its own call.
+    _INSTRUCTION_LOG_NAME = "user_instructions.md"
+
+    def _instruction_log_path(self) -> Optional[str]:
+        base = self.storage_directory or self.working_directory
+        if not base:
+            return None
+        return os.path.join(base, self._INSTRUCTION_LOG_NAME)
+
+    def _append_instruction_log(
+        self,
+        text: str,
+        *,
+        kind: str,
+        item_id: str = "",
+        turn: Optional[int] = None,
+    ) -> None:
+        """Append one verbatim user instruction to the on-disk log.
+
+        ``kind`` is ``"TASK"`` (an item instruction) or ``"INTERJECTION"`` (a
+        mid-task message). Best-effort: any IO failure is swallowed — the log is
+        a convenience for the agent, never a correctness dependency.
+        """
+        path = self._instruction_log_path()
+        if not path or not (text or "").strip():
+            return
+        try:
+            new_file = not os.path.exists(path)
+            stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            where = f" — item {item_id}" if item_id else ""
+            if turn is not None:
+                where += f", turn {turn}" if where else f" — turn {turn}"
+            with open(path, "a", encoding="utf-8", newline="\n") as fh:
+                if new_file:
+                    fh.write(
+                        "# User Instructions Log\n\n"
+                        "Every instruction the user gave in this session, verbatim, "
+                        "in the order received.\n"
+                        "Read this if you need the exact original wording after a "
+                        "context compaction.\n"
+                    )
+                fh.write(f"\n## [{stamp}] {kind}{where}\n\n{text.rstrip()}\n")
+        except Exception:
+            pass
+
+    def _drain_pending_interjections(self, pending: List[str]) -> List[str]:
+        """Consume the pending-user-message queue, returning true interjections.
+
+        Clears the channel queue, filters out any message that is really the
+        CURRENT item's own instruction, logs the survivors as INTERJECTION,
+        and returns them (for the ConversationTurn.user_interjection field).
+
+        Why the filter: the Orchestrator appends EVERY task-lane message to
+        the pending queue (so genuine mid-task follow-ups like "also do B"
+        reach the running agent) AND separately enqueues it as the item's
+        TaskSpec. So the very message that STARTED an item lands in BOTH
+        places. That message is already delivered to the LLM via
+        _current_item_block (messages[0]) and logged as TASK at item start —
+        carrying it here too would double-render the task in the turn trace
+        and write a duplicate INTERJECTION entry in user_instructions.md
+        immediately after the TASK entry (item_id + text identical). Only
+        messages whose text differs from the running item's instruction are
+        real interjections.
+
+        Must be called only when the turn actually lands (see the peek/clear
+        split in TaskChannel) — clearing here consumes the queue.
+        """
+        self._task_channel.clear_pending_user_messages()
+        _cur = self._task_channel.get_current_item()
+        _cur_instr = (_cur.instruction if _cur is not None else "").strip()
+        _cur_id = _cur.item_id if _cur is not None else ""
+        kept = [msg for msg in pending if msg.strip() != _cur_instr]
+        for msg in kept:
+            self._append_instruction_log(
+                msg,
+                kind="INTERJECTION",
+                item_id=_cur_id,
+                turn=self.current_iteration,
+            )
+        return kept
+
+    def _render_compaction_wrapper(self) -> str:
+        """Wrap the conversation summary CC-style, with a read-back pointer.
+
+        CC parity — Claude Code injects the summary inside a fixed envelope:
+        "This session is being continued from a previous conversation that ran
+        out of context…", the summary body, a pointer to the full transcript on
+        disk ("If you need specific details from before compaction…, read the
+        full transcript at: {path}"), a note when recent messages were kept
+        verbatim, and a closing "Resume directly — do not acknowledge the
+        summary".
+
+        Two deliberate deviations from CC's wording, recorded here so they don't
+        later read as drift:
+          * The pointer targets HandQ's verbatim instruction log rather than a
+            raw transcript — it is the small, high-signal artifact (exactly what
+            the user said, character-for-character) instead of a multi-MB JSONL
+            the agent would burn context reading.
+          * CC's envelope says "without asking the user any further questions".
+            HandQ runs autonomously and has a real ask/notify channel, so
+            suppressing it outright would be a regression; we keep the
+            resume-directly intent and drop the don't-ask clause.
+        """
+        parts = [
+            "This session is being continued from a previous conversation that "
+            "ran out of context. The summary below covers the earlier portion of "
+            "the conversation.",
+            "",
+            self._conversation_summary,
+            "",
+            "Recent messages are preserved verbatim below.",
+        ]
+        log_path = self._instruction_log_path()
+        if log_path and os.path.exists(log_path):
+            parts.append(
+                "If you need the user's exact original wording from before "
+                "compaction, every instruction is recorded verbatim at: "
+                f"{log_path}"
+            )
+        parts.append(
+            "Continue the work from where it left off. Resume directly — do not "
+            "acknowledge this summary."
+        )
+        return "\n".join(parts)
+
     def _render_agent_todo_block(self) -> str:
         """Render the agent's own todo (written via `todo_write`) as a status block.
 
@@ -1520,6 +2044,48 @@ class PersistentAgent:
             lines.append(f"  {g} {content}")
         return "\n".join(lines)
 
+    def _log_context_pressure(self, llm_result: Any) -> None:
+        """Log REAL token usage next to the char-based estimate every turn.
+
+        The 2026-08-03 flash-meta run produced a 763-line engine log containing
+        exactly ZERO token counts — `prompt_tokens` and `input_tokens` appear 0
+        times. Every budget decision the agent makes is denominated in chars, so
+        when the request was rejected as "Input is too long" there was no way,
+        from the log alone, to see how far off the char estimate had been or
+        which model's window had been exceeded. `LLMChatResult.token_usage` has
+        carried the real numbers all along; nothing was reading them.
+
+        Emitting `chars_per_token` here makes `resolve_obs_budget`'s constant
+        empirically auditable instead of a guess: if this line consistently
+        reports e.g. 1.4 while the constant says 2.0, the budget is over-issuing
+        and the constant should come down.
+        """
+        try:
+            usage = getattr(llm_result, "token_usage", None)
+            if usage is None:
+                return
+            in_tok = int(getattr(usage, "input_tokens", 0) or 0)
+            cache_read = int(getattr(usage, "cache_read_tokens", 0) or 0)
+            total_in = in_tok + cache_read
+            # Feed the token-based compaction trigger.
+            self._last_input_tokens = total_in
+            window = min(svc.context_window for svc in self._services)
+            turn_chars = sum(t.total_obs_chars() for t in self._turns)
+            ratio = f"{turn_chars / total_in:.2f}" if total_in > 0 else "n/a"
+            self.logger.info(
+                f"[{self.current_iteration}][Context] input={total_in:,} tok "
+                f"(fresh={in_tok:,} cached={cache_read:,}) / window={window:,} "
+                f"= {(total_in / window * 100) if window else 0:.0f}% | "
+                f"turns={len(self._turns)} obs_chars={turn_chars:,} "
+                f"budget={self._obs_budget_chars:,} "
+                f"(eff={self._effective_obs_budget():,}) | "
+                f"measured chars_per_token={ratio}",
+                component="PersistentAgent",
+            )
+        except Exception:
+            # Observability must never break the turn.
+            pass
+
     def _effective_obs_budget(self) -> int:
         """obs budget after subtracting prelude / summary / item-static overhead.
 
@@ -1537,7 +2103,13 @@ class PersistentAgent:
             + len(self._current_item_block or "")
             + len(self._current_ltm_block or "")
         )
-        return max(self._obs_budget_chars - overhead, 100_000)
+        # Reserve a PROPORTION of the budget for fresh observations, not a fixed
+        # 100k. A fixed floor larger than the budget itself silently hands back
+        # more room than the window has — the same class of bug as the absolute
+        # floor removed from `resolve_obs_budget`. A quarter of the budget is
+        # always representable within the window by construction.
+        return max(self._obs_budget_chars - overhead,
+                   int(self._obs_budget_chars * 0.25))
 
     def _budget_enforced_turns(self) -> List[ConversationTurn]:
         """Return turns that fit within the effective observation budget."""
@@ -1559,66 +2131,94 @@ class PersistentAgent:
     # replacing the body with a re-read hint. Write/edit are excluded (their
     # output is a diff/path, small and not re-derivable the same way); desktop/
     # browser snapshots are handled by _supersede_stale instead.
+    #
+    # SHELL/BASH ARE DELIBERATELY EXCLUDED (2026-08-05 review). CC's
+    # microcompact clears "Read-class" tool results — a category defined by
+    # semantics (idempotent, re-runnable reads of stable content), not by tool
+    # name. HandQ's `shell` is a general escape hatch: the agent uses it for
+    # both idempotent reads (`grep`, `cat`, `dir`) AND real-time physical-world
+    # probes (`Get-PnpDevice`, CDP scripts reading current UI state,
+    # `adb devices`). Those probes are TIME-STAMPED SNAPSHOTS — re-running
+    # returns "the state NOW", not "the state THEN". Blanket-eliding all shell
+    # results with a "re-run if needed" hint invites the agent to re-observe a
+    # world that has since changed. Tools with narrow, idempotent semantics
+    # (`read`, `grep`, `glob`, `web_search`) remain in the whitelist because
+    # their re-run genuinely returns the same content (subject to the file
+    # not being edited between the two reads, which is a separate concern
+    # already handled by the edit-tool's staleness check).
     _MICROCOMPACT_TOOLS: frozenset = frozenset({
-        "read", "grep", "glob", "shell", "bash", "web_search",
+        "read", "grep", "glob", "web_search",
     })
-    # Only elide bodies larger than this (chars) — small results are not worth
+    # CC parity: microcompact keeps the most recent N TURNS fully intact.
+    # CC uses "5 tool uses" but that's suited for CC's 1-2-call-per-turn
+    # pattern; HandQ does parallel dispatch (3-5 tool calls per turn), so
+    # "5 tool uses" here would protect only 1-2 turns and lose the paired
+    # reasoning. Turns are the atomic think→act unit — protecting 5 of them
+    # gives the same practical coverage as CC's 5-tool-use budget while
+    # preserving reasoning continuity for an autonomous long-running agent.
+    _MICROCOMPACT_KEEP_RECENT_TURNS: int = 5
+    # Budget gate — TWO gates AND'd:
+    #   (a) obs bytes exceed this fraction of the effective budget
+    #       (existing HandQ semantics — no-pressure-no-compression)
+    #   (b) the elision would actually save >= this many chars
+    #       (CC parity: `keepRecent=5` + "predicted savings >= 20000 tokens").
+    #       Char-denominated because HandQ's budget is char-denominated;
+    #       ~4 chars/token → 20k tokens ≈ 80k chars.
+    # Below either gate, nothing is elided.
+    _MICROCOMPACT_RATIO: float = 0.60
+    _MICROCOMPACT_MIN_SAVINGS_CHARS: int = 80_000
+    # Only elide bodies larger than this (chars) — small results aren't worth
     # the traceability loss.
     _MICROCOMPACT_MIN_CHARS: int = 600
-    # Keep the most recent N turns fully intact — microcompact never touches
-    # them (the agent is still actively reasoning over recent output).
-    _MICROCOMPACT_KEEP_RECENT_TURNS: int = 4
-    # Budget gate: microcompact only elides when total observation bytes exceed
-    # this fraction of the effective obs budget. Below it, EVERYTHING stays full
-    # — CC-aligned "no pressure → no compression". Kept lower than the
-    # LLM-summary triggers (ITEM_BOUNDARY 0.80 / _compact_conversation 0.95) so
-    # this cheap, lossless-in-capability layer relieves pressure first.
-    _MICROCOMPACT_RATIO: float = 0.60
+    _SUPERSEDE_BUDGET_RATIO: float = 0.75
 
     def _microcompact_old_outputs(self, turns: List[ConversationTurn]) -> List[Dict[str, Any]]:
         """Sole observation-elision layer (CC-aligned microcompact).
 
-        Under BUDGET PRESSURE only, replace old, large, re-derivable tool
-        RESULTS (read/grep/glob/shell/web_search) with a one-line re-read hint
-        via ``superseded_note``. tool_use blocks are never touched. The agent
-        can re-run the tool if it needs the content again — lossless in
-        capability, only trading a re-read for tokens. `superseded_note` is
-        one-way (never cleared), so a settled turn's rendered bytes never change
-        again → prompt-cache prefix stays stable.
+        Under BUDGET PRESSURE, replace old, large, re-derivable tool RESULTS
+        (read/grep/glob/web_search) with a one-line re-read hint via
+        ``superseded_note``. tool_use blocks are never touched.
 
-        Budget-gated (``_MICROCOMPACT_RATIO``): when observation bytes are under
-        the fraction of the effective budget, NOTHING is elided — everything
-        stays full. This is the CC "no pressure → no compression" behaviour, and
-        the fix for the case where a weak model lost its own recent edit to an
-        age-based tier drop while the context was nowhere near full.
+        CC parity (claude.exe §3.3 microcompact):
+          * KEEP the most recent 5 TOOL USES intact (not turns — a turn may
+            contain multiple parallel tool calls).
+          * Elide only when PREDICTED SAVINGS >= ``_MICROCOMPACT_MIN_SAVINGS_CHARS``
+            (~20k tokens in CC), AND obs bytes are already over
+            ``_MICROCOMPACT_RATIO`` of the budget.
+          * Elide `read`-class tools only. `shell`/`bash` are excluded because
+            their semantics are a superset — the agent uses shell both for
+            idempotent reads (`grep`, `cat`) and for real-time world probes
+            (`Get-PnpDevice`, CDP UI state, `adb devices`). Blanket "re-run if
+            needed" advice is wrong for the second class: re-running observes
+            the world NOW, not the world THEN. See _MICROCOMPACT_TOOLS.
+          * `superseded_note` is one-way (never cleared), so a settled turn's
+            rendered bytes never change again → prompt-cache prefix stays
+            stable.
 
         Returns a list of elision events (one per newly-elided obs) for the
-        ExecutionRecorder's per-turn trace. Idempotent: an already-elided obs is
-        skipped, so a settled elision is reported once, not every build.
+        ExecutionRecorder's per-turn trace. Idempotent.
         """
         events: List[Dict[str, Any]] = []
-        if len(turns) <= self._MICROCOMPACT_KEEP_RECENT_TURNS:
-            return events
         # Budget gate — below the ratio, keep everything full (CC-aligned).
         total_chars = sum(t.total_obs_chars() for t in turns)
         if total_chars <= self._effective_obs_budget() * self._MICROCOMPACT_RATIO:
             return events
+
+        # Turn-based retention: the most recent 5 turns are fully protected.
+        if len(turns) <= self._MICROCOMPACT_KEEP_RECENT_TURNS:
+            return events
         cutoff = len(turns) - self._MICROCOMPACT_KEEP_RECENT_TURNS
+
+        # First pass: identify eligible candidates and predict total savings.
+        candidates: List[tuple] = []
+        potential_savings = 0
         for turn in turns[:cutoff]:
             for obs in turn.observations:
                 if obs.superseded_note is not None:
                     continue
                 if not obs.success:
-                    continue  # keep errors — they explain failures, small anyway
+                    continue  # keep dead-path evidence intact
                 if (obs.tool_name or "") not in self._MICROCOMPACT_TOOLS:
-                    continue
-                out = obs.output if isinstance(obs.output, dict) else {}
-                if (obs.tool_name or "") in ("shell", "bash") and "task_id" in out:
-                    # Background-task launch/status results carry an
-                    # irreproducible task_id — re-running a launch mints a NEW
-                    # task, so "re-run if needed" is actively wrong advice.
-                    # Live-confirmed 2026-07-14: eliding these caused repeated
-                    # relaunches chasing a lost task_id.
                     continue
                 try:
                     body_len = len(obs.to_obs_json(1))
@@ -1626,33 +2226,36 @@ class PersistentAgent:
                     continue
                 if body_len < self._MICROCOMPACT_MIN_CHARS:
                     continue
-                params = obs.tool_parameters or {}
-                target = (
-                    params.get("path")
-                    or params.get("pattern")
-                    or params.get("command")
-                    or params.get("query")
-                    or ""
-                )
-                target_hint = f" ({str(target)[:80]})" if target else ""
-                obs.superseded_note = (
-                    f"[old {obs.tool_name} output{target_hint} elided to save "
-                    f"context; re-run the tool if you need it again]"
-                )
-                events.append({
-                    "tool": obs.tool_name or "?",
-                    "decision": "elided",
-                    "chars_saved": body_len,
-                })
-                # DEBUG observability (moved here from the deleted tier-2
-                # compressor): every elide decision is grep-able as
-                # `[Microcompact]` on a session log, reconstructing the
-                # compression history without the full trace file.
-                self.logger.debug(
-                    f"[Microcompact] tool={obs.tool_name or '?'} elided "
-                    f"body_len={body_len}",
-                    component="PersistentAgent",
-                )
+                candidates.append((obs, body_len))
+                potential_savings += body_len
+
+        if potential_savings < self._MICROCOMPACT_MIN_SAVINGS_CHARS:
+            return events
+
+        # Second pass: elide.
+        for obs, body_len in candidates:
+            params = obs.tool_parameters or {}
+            target = (
+                params.get("path")
+                or params.get("pattern")
+                or params.get("query")
+                or ""
+            )
+            target_hint = f" ({str(target)[:80]})" if target else ""
+            obs.superseded_note = (
+                f"[old {obs.tool_name} output{target_hint} elided to save "
+                f"context; re-run the tool if you need it again]"
+            )
+            events.append({
+                "tool": obs.tool_name or "?",
+                "decision": "elided",
+                "chars_saved": body_len,
+            })
+            self.logger.debug(
+                f"[Microcompact] tool={obs.tool_name or '?'} elided "
+                f"body_len={body_len}",
+                component="PersistentAgent",
+            )
         return events
 
     def _supersede_stale(self, turns: List[ConversationTurn]) -> None:
@@ -1671,13 +2274,35 @@ class PersistentAgent:
         budget/compaction trims only the oldest, so the newest occurrence of a
         signature is never the one dropped — an obs that is not-newest now can
         never become newest later.
+        Failures are NEVER superseded (mirrors _microcompact_old_outputs's
+        `if not obs.success: continue`). A failed observation is not a stale
+        snapshot — it is the record of a dead path, and eliding it is what lets
+        an agent re-walk the same wall. The 2026-08-01 Alpaca trace hit the
+        identical capture failure 12 times; all but the newest were stamped
+        "superseded by newer desktop_find_and_click", which reads as "there is
+        a fresher value for this" rather than "this failed".
+
+        The signature includes the TARGET, not just the tool name. Keying on
+        tool_name alone asserted a false equivalence: a failed
+        find_and_click("Connect") got marked superseded by a later
+        find_and_click("Boot MD EDL"), two calls that share nothing but a tool.
         """
+        # Budget gate — no pressure, no supersession. Mirrors _microcompact's
+        # CC-aligned "no pressure → no compression" principle. Without this,
+        # hover observations at different (x,y) coords get erased even when
+        # context is nowhere near full, preventing the agent from building a
+        # spatial map of the UI (the 2026-08-04 gear-icon-hunt failure).
+        total_chars = sum(t.total_obs_chars() for t in turns)
+        if total_chars <= self._effective_obs_budget() * self._SUPERSEDE_BUDGET_RATIO:
+            return
         seen_signatures: set = set()
         for turn in reversed(turns):
             for obs in reversed(turn.observations):
-                sig = obs.tool_name
-                if sig not in SUPERSEDABLE_TOOL_ACTIONS:
+                if obs.tool_name not in SUPERSEDABLE_TOOL_ACTIONS:
                     continue
+                if not obs.success:
+                    continue  # keep dead-path evidence intact
+                sig = self._supersede_signature(obs)
                 if obs.superseded_note is not None:
                     seen_signatures.add(sig)
                     continue
@@ -1685,9 +2310,90 @@ class PersistentAgent:
                     seen_signatures.add(sig)  # newest occurrence — keep intact
                     continue
                 obs.superseded_note = (
-                    f"[superseded by newer {obs.tool_name}; "
+                    f"[superseded by a newer {sig}; "
                     f"result elided to save tokens]"
                 )
+
+    @staticmethod
+    def _supersede_signature(obs: ToolResult) -> str:
+        """Identity of the surface an observation describes.
+
+        Tool name plus the target it was pointed at, so only genuinely
+        equivalent re-observations supersede each other. ``description`` covers
+        find_element / find_and_click, ``hwnd`` + ``region`` cover
+        screenshot / snapshot (a window capture and a fullscreen capture are
+        different surfaces), and ``selector`` covers the browser pair.
+        """
+        params = obs.tool_parameters or {}
+        parts = [obs.tool_name or ""]
+        for key in ("description", "selector", "hwnd", "region", "x", "y"):
+            val = params.get(key)
+            if val not in (None, ""):
+                parts.append(f"{key}={val}")
+        return ":".join(parts)
+
+    def _dedup_identical_outputs(self, turns: List[ConversationTurn]) -> None:
+        """Stamp older observations whose output is byte-identical to a newer
+        one FROM THE SAME TOOL.
+
+        Complementary to _supersede_stale (which keys on tool-name+target) and
+        _microcompact (which keys on tool-type+age). This catches the pattern
+        where the SAME tool at the SAME target returns the SAME bytes across
+        many turns — e.g. 62 identical GetWindowRect results — which neither of
+        the other two layers can see.
+
+        Keyed on ``(tool_name, output-hash)``, not on output-hash alone: a
+        `read` and a `shell cat` of the same file, or two different UIA-tree
+        tools that happen to serialize the same dialog, are NOT duplicates —
+        they describe different worlds and their equivalence isn't safe to
+        assert here. This matches the docstring's "same tool at the same
+        target" invariant.
+
+        The stamp names the SURVIVOR (the newer occurrence's tool name), not
+        the older observation being stamped — so the agent is told which
+        already-present result to trust, not which tool it just called
+        (harmless when both are the same tool, but wrong if the survivor's
+        tool ever differed).
+
+        Budget-gated (same ratio as _supersede_stale) and one-way
+        (idempotent, cache-safe). Only deduplicates SUCCESSFUL observations
+        >= 200 chars to avoid false-positives on trivial short outputs.
+        """
+        total_chars = sum(t.total_obs_chars() for t in turns)
+        if total_chars <= self._effective_obs_budget() * self._SUPERSEDE_BUDGET_RATIO:
+            return
+
+        import hashlib as _hl
+        # newest -> oldest: first occurrence (newest) wins; older dupes get
+        # stamped with a reference back to it. Key is (tool_name, hash) so
+        # cross-tool identical outputs are NOT merged.
+        seen: Dict[tuple, str] = {}  # (tool, hash) -> tool name of newest
+        for turn_idx in range(len(turns) - 1, -1, -1):
+            turn = turns[turn_idx]
+            for obs in turn.observations:
+                if obs.superseded_note is not None:
+                    continue
+                if not obs.success:
+                    continue
+                try:
+                    # Hash the OUTPUT only (not params/step) — two calls with
+                    # different commands that return identical results ARE
+                    # dupes when they're from the same tool.
+                    body = str(obs.output) if obs.output is not None else ""
+                except Exception:
+                    continue
+                if len(body) < 200:
+                    continue
+                tool = obs.tool_name or ""
+                h = _hl.blake2b(body.encode("utf-8", "replace"), digest_size=12).hexdigest()
+                key = (tool, h)
+                if key not in seen:
+                    seen[key] = tool
+                else:
+                    obs.superseded_note = (
+                        f"[identical to a newer {seen[key] or 'tool'} result; "
+                        f"elided to save tokens]"
+                    )
 
     # ── Tool execution ───────────────────────────────────────────────────────
 
@@ -2022,6 +2728,11 @@ class PersistentAgent:
                 tool_parameters={"task_id": task.task_id, "command": task.command, "run_in_background": True},
             )
             bg_observations.append(obs)
+            # Mark the task resolved in the completion audit. This observation
+            # never passes through the per-turn advisor loop, so without this
+            # line a task that genuinely FINISHED would still read as
+            # unresolved and the audit guard would block a valid completion.
+            self._completion_audit.record_tool_result(obs)
             self.logger.info(
                 f"[{self.current_iteration}][Background] Task '{task.task_id}' completed "
                 f"(exit_code={task.exit_code}): {(task.command or '')[:80]}",
@@ -2036,9 +2747,19 @@ class PersistentAgent:
             )
 
     def _update_obs_budget_for_service(self, service: LLMService) -> None:
-        """Callback: update observation budget when a different service is selected."""
-        new_budget = resolve_obs_budget(service.context_window)
-        if new_budget != self._obs_budget_chars:
+        """Callback: shrink the observation budget when a smaller model serves.
+
+        DOWNWARD ONLY, clamped to ``_obs_budget_ceiling``. The ceiling is
+        already the chain's smallest window, so a large-window service serving
+        this turn must not raise the budget: `_turns` outlives the hop, and
+        history grown to fit a 1M model cannot fall back to a 200k one. Kept as
+        a real callback rather than deleted because a service may still report a
+        window SMALLER than what config resolved (explicit override, gateway
+        downgrade), and that shrink is worth honouring immediately.
+        """
+        new_budget = min(resolve_obs_budget(service.context_window),
+                         self._obs_budget_ceiling)
+        if new_budget < self._obs_budget_chars:
             self.logger.info(
                 f"[{self.current_iteration}][Budget] Model {service.model} selected, "
                 f"obs budget {self._obs_budget_chars:,} -> {new_budget:,} chars.",
@@ -2073,6 +2794,25 @@ class PersistentAgent:
     # pressure, introducing one hallucination surface per item for no benefit.
     # Compaction is now purely budget-driven, decoupled from item structure.
     ITEM_BOUNDARY_COMPACT_RATIO = 0.80
+    # CC circuit breakers (claude.exe §3.6). After this many consecutive LLM
+    # summarizer failures, stop calling the LLM summarizer for the rest of the
+    # session (rule-based summary only). If a compaction is followed within
+    # _COMPACT_THRASH_WINDOW turns by another budget breach that many times,
+    # summarizing isn't helping — warn the user once.
+    _COMPACT_MAX_CONSECUTIVE_FAILURES = 3
+    _COMPACT_THRASH_WINDOW = 3
+    _COMPACT_THRASH_MAX_EPISODES = 3
+
+    # ── PTL recovery tuning ────────────────────────────────────────────────
+    # Step 0 of the PTL ladder walks the observation budget DOWN and retries
+    # with a free, non-destructive request trim before any history is
+    # destroyed. Bounded so a genuinely un-shrinkable prompt still falls
+    # through to compaction / hard-drop / elision instead of spinning here.
+    _PTL_MAX_BACKOFFS: int = 3
+    _PTL_BACKOFF_FACTOR: float = 0.7
+    # Below this the agent has no room left for fresh observations, so further
+    # backoff is pointless — escalate to the destructive steps instead.
+    _PTL_BUDGET_FLOOR_CHARS: int = 60_000
 
     async def _compact_item_boundary(self) -> None:
         """Compress old turns at an item boundary ONLY under obs-budget pressure.
@@ -2089,10 +2829,17 @@ class PersistentAgent:
         if len(self._turns) <= self.KEEP_RECENT_TURNS:
             return
 
-        budget = self._effective_obs_budget()
-        total_chars = sum(t.total_obs_chars() for t in self._turns)
-        if total_chars <= budget * self.ITEM_BOUNDARY_COMPACT_RATIO:
-            return
+        # Token-based trigger (CC parity): use the real token count from the
+        # most recent API response, not a char estimate. Falls back to
+        # char-based if no measurement yet (first turn of session).
+        if self._last_input_tokens > 0:
+            if self._last_input_tokens < self._item_boundary_threshold_tokens:
+                return
+        else:
+            budget = self._effective_obs_budget()
+            total_chars = sum(t.total_obs_chars() for t in self._turns)
+            if total_chars <= budget * self.ITEM_BOUNDARY_COMPACT_RATIO:
+                return
 
         compress_count = len(self._turns) - self.KEEP_RECENT_TURNS
         if compress_count <= 0:
@@ -2108,7 +2855,8 @@ class PersistentAgent:
         # Extract verified structured facts BEFORE the turns are trimmed, so
         # they can be pinned after the prose summary (skeleton-first).
         verified = self._extract_verified_facts(compress_count)
-        new_summary = await self._llm_compress(trace_text, compress_count)
+        new_summary, _llm_ok = await self._llm_compress(trace_text, compress_count)
+        self._note_compaction_outcome(_llm_ok)
         if verified:
             new_summary = f"{new_summary}\n\n{verified}"
 
@@ -2183,18 +2931,25 @@ class PersistentAgent:
         if len(self._turns) <= self.KEEP_RECENT_TURNS + 2:
             return
 
-        budget = self._effective_obs_budget()
-        total_chars = sum(t.total_obs_chars() for t in self._turns)
-        if total_chars <= budget * budget_ratio:
-            return
+        # Token-based trigger (CC parity). Falls back to char-estimate only
+        # when no real token measurement is available yet.
+        if self._last_input_tokens > 0:
+            if self._last_input_tokens < self._compact_threshold_tokens:
+                return
+        else:
+            budget = self._effective_obs_budget()
+            total_chars = sum(t.total_obs_chars() for t in self._turns)
+            if total_chars <= budget * budget_ratio:
+                return
 
         compress_count = len(self._turns) - self.KEEP_RECENT_TURNS
         if compress_count <= 0:
             return
 
         self.logger.info(
-            f"[{self.current_iteration}][Compact] Budget at "
-            f"{total_chars / budget:.0%}; compressing {compress_count} turns.",
+            f"[{self.current_iteration}][Compact] Token pressure "
+            f"({self._last_input_tokens:,}/{self._compact_threshold_tokens:,} tok); "
+            f"compressing {compress_count} turns.",
             component="PersistentAgent",
         )
 
@@ -2209,7 +2964,8 @@ class PersistentAgent:
 
         # LLM compression with fallback
         verified = self._extract_verified_facts(compress_count)
-        new_summary = await self._llm_compress(trace_text, compress_count)
+        new_summary, _llm_ok = await self._llm_compress(trace_text, compress_count)
+        self._note_compaction_outcome(_llm_ok)
         if verified:
             new_summary = f"{new_summary}\n\n{verified}"
 
@@ -2235,6 +2991,8 @@ class PersistentAgent:
                 reasoning = reasoning[:300]
 
             lines.append(f"[Turn {turn_idx + 1}]")
+            if turn.user_interjection:
+                lines.append(f"User said: \"{chr(10).join(turn.user_interjection)}\"")
             if reasoning.strip():
                 lines.append(f"Reasoning: {reasoning}")
 
@@ -2255,7 +3013,20 @@ class PersistentAgent:
                     first_val = next(iter(params.values()), "") if params else ""
                     param_desc = str(first_val)[:80]
 
-                output = str(obs.output or obs.error or "")
+                # Concatenate BOTH output and error — the old `output or error`
+                # short-circuit dropped every structured failure's diagnostic
+                # (shell exits non-zero with a non-empty stdout dict, so
+                # obs.error never reached the compaction input, and the summary
+                # read as if the call had merely returned that stdout with no
+                # note of failure). Losing the failure signal at compaction
+                # turns dead paths back into "looks feasible next" — the exact
+                # rehash the summary is supposed to prevent.
+                out_str = str(obs.output) if obs.output is not None else ""
+                err_str = str(obs.error) if obs.error else ""
+                if out_str and err_str:
+                    output = f"{out_str}\n[error] {err_str}"
+                else:
+                    output = out_str or err_str
                 if len(output) > 500:
                     output = output[:200] + "\n...[truncated]...\n" + output[-200:]
 
@@ -2265,8 +3036,18 @@ class PersistentAgent:
 
         return "\n".join(lines)
 
-    async def _llm_compress(self, trace_text: str, turn_count: int) -> str:
-        """Call LLM for semantic compression; fall back to rule-based on failure."""
+    async def _llm_compress(self, trace_text: str, turn_count: int) -> tuple[str, bool]:
+        """Semantic compression via LLM; rule-based fallback on failure.
+
+        Returns ``(summary, llm_ok)``. ``llm_ok`` is False when the LLM
+        summarizer was skipped (circuit-breaker disabled) or failed and the
+        rule-based fallback was used — the caller folds that into the
+        consecutive-failure breaker. The compaction call passes NO tools (CC
+        parity: ``canUseTool`` is force-denied during compaction — a summary is
+        a single-shot text generation, never a tool-using turn).
+        """
+        if self._compact_llm_disabled:
+            return self._rule_based_fallback_summary(turn_count), False
         summary_prompt = COMPACT_CONVERSATION_PROMPT.format(trace_text=trace_text)
         try:
             result = await call_with_fallback(
@@ -2274,24 +3055,76 @@ class PersistentAgent:
                 dict(messages=[{"role": "user", "content": summary_prompt}], json_mode=False),
             )
             if result.content and result.content.strip():
-                return self._strip_analysis_scratch(result.content.strip())
+                return self._strip_analysis_scratch(result.content.strip()), True
         except Exception as e:
             self.logger.warning(
                 f"[{self.current_iteration}][Compact] LLM call failed: {e}; using fallback",
                 component="PersistentAgent",
             )
+        return self._rule_based_fallback_summary(turn_count), False
 
-        return self._rule_based_fallback_summary(turn_count)
+    def _note_compaction_outcome(self, llm_ok: bool) -> None:
+        """Fold one compaction's result into the CC failure/thrash breakers.
+
+        Failure breaker: N consecutive rule-based fallbacks disable the LLM
+        summarizer for the session. Thrash breaker: record the iteration; if the
+        gap since the previous compaction is under the thrash window, count an
+        episode and warn the user once when episodes cross the cap.
+        """
+        if llm_ok:
+            self._compact_consecutive_failures = 0
+        else:
+            self._compact_consecutive_failures += 1
+            if (not self._compact_llm_disabled
+                    and self._compact_consecutive_failures >= self._COMPACT_MAX_CONSECUTIVE_FAILURES):
+                self._compact_llm_disabled = True
+                self.logger.warning(
+                    f"[{self.current_iteration}][Compact] LLM summarizer failed "
+                    f"{self._compact_consecutive_failures}x consecutively — disabling "
+                    f"it for the rest of this session (rule-based summary only).",
+                    component="PersistentAgent",
+                )
+
+        prev = self._compact_iteration_history[-1] if self._compact_iteration_history else None
+        self._compact_iteration_history.append(self.current_iteration)
+        if prev is not None and (self.current_iteration - prev) <= self._COMPACT_THRASH_WINDOW:
+            self._compact_thrash_episodes += 1
+            if (not self._compact_thrash_warned
+                    and self._compact_thrash_episodes >= self._COMPACT_THRASH_MAX_EPISODES):
+                self._compact_thrash_warned = True
+                self.logger.warning(
+                    f"[{self.current_iteration}][Compact] Thrashing — compaction "
+                    f"repeatedly followed within {self._COMPACT_THRASH_WINDOW} turns by "
+                    f"another budget breach. A single tool output is likely too large "
+                    f"for summarizing to help.",
+                    component="PersistentAgent",
+                )
+                try:
+                    self._interaction_manager.notify_inline_event(
+                        "compact",
+                        "Context keeps refilling right after compaction — a single "
+                        "large file or tool output is likely the cause. Consider "
+                        "reading it in smaller chunks.",
+                    )
+                except Exception:
+                    pass
 
     @staticmethod
     def _strip_analysis_scratch(summary: str) -> str:
-        """Drop the COMPACT_CONVERSATION_PROMPT's <analysis> scratch block.
+        """Extract the summary body from the compaction model's output.
 
-        The prompt asks the model to think through the trace inside
-        <analysis> tags before writing the actual summary — that block is
-        disposable reasoning, not part of the summary we want to spend the
-        MAX_SUMMARY_CHARS budget on.
+        CC parity: Claude Code pulls the content of ``<summary>...</summary>``
+        with a regex and, when the tag is absent, uses the whole raw output as
+        the summary. We do the same, then drop any ``<analysis>`` scratch block
+        that survived (the prompt asks the model to think in there first, and
+        that reasoning is disposable — it must not eat the MAX_SUMMARY_CHARS
+        budget).
         """
+        m = re.search(r"<summary>(.*?)</summary>", summary, flags=re.DOTALL)
+        if m:
+            body = m.group(1).strip()
+            if body:
+                return body
         stripped = re.sub(r"<analysis>.*?</analysis>", "", summary, flags=re.DOTALL).strip()
         return stripped or summary
 

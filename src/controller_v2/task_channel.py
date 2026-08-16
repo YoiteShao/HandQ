@@ -18,7 +18,7 @@ tool. What lives here is only what the two loops must SHARE:
 import asyncio
 import collections
 import logging
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import AbstractSet, Any, Callable, Deque, Dict, Iterable, List, Optional, Set
 
@@ -170,10 +170,13 @@ class TaskChannel:
         self._active_tools: Set[str] = set()
         self._on_tools_changed_callbacks: List[Callable[[List[str]], Any]] = []
 
-        # Latest user message — verbatim. Written by Orchestrator on every user
-        # turn; read by PersistentAgent to inject a `[User Original Request]`
-        # grounding block. Single-slot, last-write-wins.
-        self._latest_user_message: str = ""
+        # Pending user messages — verbatim, in arrival order. Appended by
+        # Orchestrator on every user turn; drained by PersistentAgent to inject
+        # `[User]` grounding blocks. Queue (not a single slot): two messages
+        # can arrive from the Orchestrator's asyncio task before the agent's
+        # turn loop reaches the drain point in _think_streaming, and a
+        # single-slot last-write-wins design silently lost the earlier one.
+        self._pending_user_messages: List[str] = []
 
         # ── Progress-sense bus (Tier-0 digests + Tier-1 concern) ─────────────
         # Bounded ring of per-turn mechanical digests written by the agent each
@@ -232,15 +235,33 @@ class TaskChannel:
                 pass
         return new
 
-    # ── Latest user message (orchestrator writes, agent reads) ──────────────
+    # ── Pending user messages (orchestrator writes, agent drains) ───────────
 
-    def set_latest_user_message(self, text: str) -> None:
-        """Record the latest verbatim user message. Sync, lock-free."""
-        self._latest_user_message = text or ""
+    def append_user_message(self, text: str) -> None:
+        """Queue a verbatim user message. Sync, lock-free, append-only.
 
-    def get_latest_user_message(self) -> str:
-        """Return the most recently recorded user message verbatim."""
-        return self._latest_user_message
+        Safe under V2's single-threaded asyncio model without a lock: this
+        function has no await points, so it always runs atomically relative
+        to `peek_pending_user_messages` / `clear_pending_user_messages`.
+        """
+        if text:
+            self._pending_user_messages.append(text)
+
+    def peek_pending_user_messages(self) -> List[str]:
+        """Return a snapshot of queued messages, oldest first. Does not clear.
+
+        Split from clearing (mirrors the old get/set pair) so a caller can
+        read pending messages, decide whether this turn actually lands, and
+        only clear on success — a turn that fails to land leaves the queue
+        untouched for the next attempt instead of dropping messages.
+        """
+        return list(self._pending_user_messages)
+
+    def clear_pending_user_messages(self) -> None:
+        """Clear the queue. Call only immediately after a successful peek,
+        with no intervening await — otherwise a message appended in between
+        would be silently dropped."""
+        self._pending_user_messages = []
 
     # ── Agent interface ──────────────────────────────────────────────────────
 
@@ -372,6 +393,87 @@ class TaskChannel:
     def get_completed_results(self) -> List[TaskResult]:
         """Get all completed task results (for coordinator evaluation)."""
         return list(self._results)
+
+    # ── Session-resume snapshot (SessionDigest, controller_v2/session_digest.py) ─
+
+    def snapshot_queue(self) -> Dict[str, Any]:
+        """Serialise the whole queue for a SessionDigest checkpoint.
+
+        Plain dataclass -> dict via asdict; TaskResult/TaskSpec hold no live
+        handles (see docs/session_resume_design.md §4.1), so this is a
+        straight snapshot, not a belief reconstruction.
+        """
+        current = self.get_current_item()
+        return {
+            "completed": [asdict(r) for r in self._results],
+            "current": asdict(current) if current is not None else None,
+            "pending": [asdict(t) for t in self.get_pending_items()],
+        }
+
+    async def restore_queue(self, snapshot: Dict[str, Any]) -> None:
+        """Reload a snapshot produced by snapshot_queue() into a fresh
+        (empty) channel.
+
+        The in-flight ``current`` item (if any) is re-queued at the head of
+        pending rather than resumed mid-item — resuming an item that was cut
+        off mid-execution would silently trust a half-done world-state (see
+        design §6.7: "重新逼近被打断的 item 是幂等安全的... 前提是 agent 重新观察").
+        ``ltm_block``/``goal_iteration`` are cleared on every restored
+        TaskSpec: both are Coordinator-computed advisory fields recomputed
+        per-enqueue (see Orchestrator._build_precise_long_term_block /
+        _requeue_goal, which already clears them the same way for a mechanical
+        re-queue), not source-of-truth state worth carrying across a restart.
+
+        completed results are NOT re-run through mark_current_done (no
+        callbacks fire) — they are historical fact, not new completions.
+        """
+        self._results = [
+            self._task_result_from_dict(d)
+            for d in snapshot.get("completed", []) or []
+        ]
+
+        restored_pending: List[TaskSpec] = []
+        current = snapshot.get("current")
+        if current:
+            restored_pending.append(self._task_spec_from_dict(current))
+        for d in snapshot.get("pending", []) or []:
+            restored_pending.append(self._task_spec_from_dict(d))
+
+        async with self._lock:
+            self._items = restored_pending
+            self._current_index = 0
+            if self._items:
+                self._item_available.set()
+        self._notify_tasks_changed()
+
+    @staticmethod
+    def _task_spec_from_dict(d: Dict[str, Any]) -> TaskSpec:
+        spec = TaskSpec(**d)
+        spec.ltm_block = None
+        spec.goal_iteration = None
+        return spec
+
+    @staticmethod
+    def _task_result_from_dict(d: Dict[str, Any]) -> TaskResult:
+        """Reconstruct a TaskResult from its asdict() form.
+
+        asdict() flattens nested dataclasses/datetimes to plain dict/str,
+        so token_usage and completed_at need explicit re-typing on the way
+        back in — a plain ``TaskResult(**d)`` would leave them as a raw
+        dict / ISO string instead of TokenUsage / datetime instances.
+        """
+        d = dict(d)
+        tu = d.get("token_usage")
+        if isinstance(tu, dict):
+            d["token_usage"] = TokenUsage(**tu)
+        ca = d.get("completed_at")
+        if isinstance(ca, str) and ca:
+            from datetime import datetime as _dt
+            try:
+                d["completed_at"] = _dt.fromisoformat(ca)
+            except ValueError:
+                d["completed_at"] = None
+        return TaskResult(**d)
 
     # ── Progress-sense bus ────────────────────────────────────────────────────
 

@@ -20,6 +20,7 @@ JSON parsing / repair lives in ``Plan.from_data()`` and
 """
 import json
 import socket
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, AsyncGenerator, Callable, Literal, Optional
@@ -189,8 +190,14 @@ class LLMService(ABC):
         self.logger = get_logger()
         # Session-level exhaustion flag: set True when a long-duration rate limit
         # (tokens_per_day / retry_after > 5min) is hit. call_with_fallback skips
-        # exhausted services for the remainder of the session.
+        # exhausted services via :meth:`is_exhausted`.
         self._exhausted: bool = False
+        # Monotonic deadline after which the exhaustion above self-clears. Set
+        # from the gateway's own retry_after when it gave us a real number; 0.0
+        # means "no deadline known" and the flag holds for the whole session.
+        # Without this a daily quota that resets at 08:00 would still be refused
+        # by an overnight session that had been running since 17:00.
+        self._exhausted_until: float = 0.0
         # Optional callback invoked on transient server errors before each retry.
         # Signature: on_server_error(user_message: str, retry_in_seconds: int, attempts_left: int)
         # Set by the bridge to forward retry status to the frontend UI.
@@ -342,11 +349,49 @@ class LLMService(ABC):
     # ------------------------------------------------------------------
 
 
+    def mark_exhausted(self, retry_after_secs: float = 0.0) -> None:
+        """Flag this service as rate-limited out for (at least) *retry_after_secs*.
+
+        Passing 0 (or a negative) means the wait window is unknown, in which
+        case the flag holds for the remainder of the session — the conservative
+        reading, since we cannot tell when the budget resets.
+        """
+        self._exhausted = True
+        self._exhausted_until = (
+            time.monotonic() + retry_after_secs if retry_after_secs > 0 else 0.0
+        )
+
+    def is_exhausted(self) -> bool:
+        """True while this service should be skipped by the fallback pool.
+
+        Self-clears once a known retry window has elapsed, so a long-running
+        session picks the service back up instead of permanently shrinking its
+        pool over a limit that has since reset.
+        """
+        if not self._exhausted:
+            return False
+        if self._exhausted_until and time.monotonic() >= self._exhausted_until:
+            self._exhausted = False
+            self._exhausted_until = 0.0
+            self.logger.info(
+                f"Rate-limit window elapsed for {self.model}; "
+                f"returning it to the fallback pool.",
+            )
+            return False
+        return True
+
     def _is_prompt_too_long_error(self, error: Exception) -> bool:
         """Return ``True`` if *error* indicates the prompt exceeded the model's context limit.
 
         Covers error messages from:
           - QGenie / generic: "prompt is too long", "limit exceeded"
+          - QGenie/Bedrock gateway: ValidationException "Input is too long for
+            requested model." — note the wording is *Input*, not *prompt*. Until
+            this literal was added, detection of the gateway's own phrasing
+            relied entirely on the ``"400" and "too long"`` fallback below,
+            i.e. on "400" happening to appear in the stringified error. When it
+            did not, the error fell through to ``_is_client_error`` and the item
+            died instead of entering PTL recovery.
           - Anthropic SDK:    400 BadRequestError with "prompt is too long"
                               or context-window messages
         """
@@ -357,6 +402,7 @@ class LLMService(ABC):
             return False
         return (
             "prompt is too long" in error_str
+            or "input is too long" in error_str
             or "limit exceeded" in error_str
             or "context_length_exceeded" in error_str
             or "context window" in error_str
@@ -386,6 +432,29 @@ class LLMService(ABC):
             if f"http_status={code}" in error_str or f"status code: {code}" in error_str:
                 return True
         return False
+
+    def _is_permanent_local_error(self, error: Exception) -> bool:
+        """Return ``True`` for a failure that never left this machine.
+
+        A ``TypeError`` out of a provider SDK call is raised while assembling the
+        request, before any socket is opened — a misconfiguration or a programming
+        error, byte-identical on every attempt. Retrying it is pure delay, and
+        with a 10-attempt ``2**n`` ladder that delay is ~17 minutes during which
+        the UI shows nothing but a thinking indicator.
+
+        The case that motivated this: a config whose ``llm.API_KEY`` is blank,
+        with no ``ANTHROPIC_API_KEY`` / ``ANTHROPIC_AUTH_TOKEN`` in the
+        environment, makes the Anthropic SDK raise ``TypeError: Could not resolve
+        authentication method``. That is NOT an ``AuthenticationError`` — the
+        server never saw the request — so :meth:`_is_client_error` does not catch
+        it, and the full ladder ran before the operator learned anything was
+        wrong. On a remote-driven session that silence is all the operator gets.
+
+        Deliberately narrow: ``TypeError`` only. Broadening to ``ValueError``
+        would start swallowing response-parsing failures, which can be transient
+        (a truncated stream) and are worth retrying.
+        """
+        return isinstance(error, TypeError)
 
     def _is_likely_network_error(self, error: Exception) -> bool:
         """Return ``True`` for errors that smell like local connectivity loss.

@@ -79,8 +79,14 @@ if TYPE_CHECKING:
 #                              ctx.agent_todo (rendered as one UI panel); a
 #                              sub-agent writing to it would stomp the
 #                              parent's own plan, not maintain a separate one.
-#   ask_human                — no InteractionManager reachable from a
-#                              sub-task; there is no user to ask.
+#   ask_human                — deliberately excluded from this allowlist:
+#                              even though ask_human is now always-registered
+#                              (on_demand=False), a sub-task has no
+#                              InteractionManager/UI delegate of its own to
+#                              route a question through, and blocking a
+#                              sub-agent's bounded loop on a human reply
+#                              would stall the parent's iter_budget for
+#                              nothing the sub-agent's caller asked for.
 #   schedule_wakeup          — re-queues a brand-new TaskSpec onto the
 #                              session's shared _task_channel (the same
 #                              channel the PARENT polls via

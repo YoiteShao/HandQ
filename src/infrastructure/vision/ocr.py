@@ -25,6 +25,7 @@ Configuration in ``handq_config.yaml`` (optional — defaults work)::
 """
 from __future__ import annotations
 
+import gc
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -32,6 +33,8 @@ from typing import Any, List, Optional, Tuple, Union
 
 import numpy as np
 from rapidocr_onnxruntime import RapidOCR  # type: ignore[import-not-found]
+
+from ..long_term_memory import _constants as _C
 
 # ── Dark-background preprocessing ────────────────────────────────────────────
 # PP-OCR's text detection model was trained primarily on natural scenes and
@@ -62,6 +65,33 @@ def _preprocess_for_ocr(img: np.ndarray) -> np.ndarray:
     if _is_dark_background(img):
         return 255 - img
     return img
+
+
+def _cap_long_edge(img: np.ndarray, max_long_edge: int) -> Tuple[np.ndarray, float]:
+    """Downscale *img* so its long edge <= max_long_edge.
+
+    Returns ``(img, scale)`` where ``scale`` is the factor APPLIED (<=1.0).
+    No-op (scale=1.0, same array) when already within bound. Callers must
+    multiply any pixel coordinate derived from the returned image by
+    ``1/scale`` to map it back into the ORIGINAL image's coordinate space —
+    see ``recognize()``.
+
+    RapidOCR's own ``limit_side_len`` only resizes the tensor fed to the
+    detection model; it does not shrink the intermediate image-processing
+    buffers, which scale with the INPUT image and are the real RSS driver
+    on 4K / multi-monitor captures. This cap runs before RapidOCR ever sees
+    the image, so it shrinks every downstream buffer, not just the model
+    input.
+    """
+    h, w = img.shape[:2]
+    long_edge = max(h, w)
+    if long_edge <= max_long_edge:
+        return img, 1.0
+    scale = max_long_edge / float(long_edge)
+    import cv2
+    new_w, new_h = max(1, round(w * scale)), max(1, round(h * scale))
+    resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    return resized, scale
 
 
 def _load_image_as_ndarray(image: Any) -> Optional[np.ndarray]:
@@ -149,6 +179,11 @@ class LocalOCR:
         self._inter_op_num_threads = inter_op_num_threads
         self._engine: Any = None
         self._logger = get_logger()
+        # Wall-clock of the last recognize() call. Read by
+        # PersonalityMonitor's idle-flush gate (get_local_ocr_last_used_ts)
+        # to decide whether the interactive singleton is safe to tear down —
+        # 0.0 means "never used" (e.g. only prewarmed via _ensure_engine()).
+        self.last_used_ts: float = 0.0
 
     def _ensure_engine(self) -> Optional[str]:
         """Load the RapidOCR engine on first use. Returns None on success."""
@@ -184,16 +219,24 @@ class LocalOCR:
 
         Preprocessing: dark-background images (terminals, CMD) are
         automatically inverted before detection to compensate for PP-OCR's
-        dark-on-light training bias.
+        dark-on-light training bias. Inputs whose long edge exceeds
+        ``_constants.OCR_MAX_LONG_EDGE_PX`` are downscaled before detection
+        (see ``_cap_long_edge``); returned box coordinates are scaled back
+        to the ORIGINAL input's pixel space, so this is transparent to
+        every caller.
         """
+        self.last_used_ts = time.time()
         err = self._ensure_engine()
         if err is not None:
             return OCRResult("", error=err)
         t0 = time.time()
+        scale = 1.0
         try:
             ocr_input = image
             arr = _load_image_as_ndarray(image)
             if arr is not None:
+                if _C.OCR_RESIZE_CAP_ENABLED:
+                    arr, scale = _cap_long_edge(arr, _C.OCR_MAX_LONG_EDGE_PX)
                 ocr_input = _preprocess_for_ocr(arr)
             # RapidOCR returns (results, elapse_seconds) where each
             # result is [polygon_points, text, score]. Older versions
@@ -204,6 +247,10 @@ class LocalOCR:
                              elapsed_ms=int((time.time() - t0) * 1000))
         elapsed_ms = int((time.time() - t0) * 1000)
 
+        # Map coordinates back to the ORIGINAL (pre-downscale) pixel space
+        # so the "bbox is pixel coordinates of the input" contract holds
+        # unchanged for every caller, whether or not the resize cap fired.
+        inv = 1.0 / scale if scale != 1.0 else 1.0
         boxes: List[OCRBox] = []
         full_lines: List[str] = []
         if result:
@@ -214,8 +261,8 @@ class LocalOCR:
                     continue
                 if not text:
                     continue
-                xs = [int(p[0]) for p in polygon]
-                ys = [int(p[1]) for p in polygon]
+                xs = [int(p[0] * inv) for p in polygon]
+                ys = [int(p[1] * inv) for p in polygon]
                 boxes.append(OCRBox(
                     text=str(text),
                     bbox=(min(xs), min(ys), max(xs), max(ys)),
@@ -300,11 +347,28 @@ def get_local_ocr_background(config_manager: Any = None) -> LocalOCR:
     return _local_ocr_background
 
 
-def flush_local_ocr() -> int:
-    """Drop both singletons (if any). Returns the count of instances closed."""
+def flush_local_ocr(*, background: bool = True, interactive: bool = True) -> int:
+    """Drop the selected singleton(s) and reclaim their memory.
+
+    Called by :class:`~..personality.service.PersonalityMonitor`'s idle-flush
+    gate once the shared OCR idle signal has held long enough (see
+    ``_constants.py`` §11.8) — never from an interactive code path, so this
+    is safe to make as thorough as possible.
+
+    RapidOCR sets ``enable_cpu_mem_arena=False`` on its own onnxruntime
+    sessions (arena is OFF), so dropping the last reference to the engine and
+    forcing a GC pass actually returns the freed InferenceSession memory to
+    the OS rather than leaving it held in a growing arena. Returns the count
+    of instances actually closed (0 when nothing was loaded).
+    """
     global _local_ocr, _local_ocr_background
     closed = 0
-    for attr in ("_local_ocr", "_local_ocr_background"):
+    targets = []
+    if interactive:
+        targets.append("_local_ocr")
+    if background:
+        targets.append("_local_ocr_background")
+    for attr in targets:
         inst = globals()[attr]
         globals()[attr] = None
         if inst is None:
@@ -314,4 +378,28 @@ def flush_local_ocr() -> int:
             closed += 1
         except Exception:
             pass
+    if closed:
+        gc.collect()
     return closed
+
+
+def get_local_ocr_last_used_ts() -> float:
+    """Wall-clock time of the interactive singleton's last ``recognize()``
+    call. Returns 0.0 if the singleton was never built or never actually
+    used for recognition (e.g. only prewarmed via ``_ensure_engine()``).
+
+    This is the authoritative "is OCR actually being used" signal for the
+    idle-flush gate — robust to desktop_tool's read-only actions
+    (screenshot / find_element / snapshot), which never take the
+    cross-session desktop ownership lock that a lock-based check would
+    otherwise have to rely on.
+    """
+    return _local_ocr.last_used_ts if _local_ocr is not None else 0.0
+
+
+def is_local_ocr_loaded() -> bool:
+    """True iff the interactive singleton currently holds a LocalOCR
+    instance (regardless of whether its ONNX engine has been lazily built
+    yet)."""
+    return _local_ocr is not None
+

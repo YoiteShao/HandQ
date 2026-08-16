@@ -9,6 +9,7 @@ llm:
   # tabs below.  One entry per model; order determines fallback priority
   # within each role's checked subset.
   available_models:
+  - anthropic::claude-5-opus
   - anthropic::claude-5-sonnet
   - anthropic::claude-4-8-opus
   - anthropic::claude-4-7-opus
@@ -20,6 +21,7 @@ llm:
   # Agent pool — checked subset of available_models used by the coordinator
   # and the agent.  Order = fallback priority.
   agent_models:
+  - anthropic::claude-5-sonnet
   - anthropic::claude-4-6-sonnet:1M
   - anthropic::claude-4-6-sonnet
   - anthropic::claude-4-5-sonnet
@@ -33,7 +35,10 @@ llm:
   - anthropic::claude-4-5-haiku:thinking
 session:
   log_level: INFO
-  workspace_base: .workspace   # session artifacts written here (relative to cwd)
+  workspace_base: .workspace   # session artifacts subdir. On Windows: relative to
+                               # the session storage dir. On Linux: relative to the
+                               # machine-local install root (<root>/workspace/), NOT
+                               # $HOME — see handq_setup.sh on the install root.
 interaction_switches:
   tool_write:
     auto_approve: true
@@ -45,7 +50,7 @@ interaction_switches:
     auto_approve: true
     description: Control bash tool auto-execution
   tool_browser:
-    auto_approve: false
+    auto_approve: true
     description: Browser automation (independent profile, off-screen window).
       Auto-approve controls whether each browser action runs without asking.
       attach_browser is gated separately by the high_risk switch and always
@@ -60,7 +65,7 @@ interaction_switches:
     auto_approve: true
     description: Control high-risk operation auto-execution
 browser:
-  attach_enabled: false
+  attach_enabled: true
   cdp_port: 9222
   cdp_url: ''
   prefer_attach: false

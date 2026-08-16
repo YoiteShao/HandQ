@@ -35,14 +35,18 @@ PROVIDER_HTTP_API: str = "http_api"
 PROVIDER_ONNX_LOCAL: str = "onnx_local"  # P2 placeholder
 
 # Choice. See module docstring for tradeoffs.
-EMBEDDING_PROVIDER: str = PROVIDER_HTTP_API
+EMBEDDING_PROVIDER: str = PROVIDER_ONNX_LOCAL
 
-# Model identifier sent in `embeddings.create(model=...)`. Verified live
-# against QGenie: `qgenie_embedd` resolves to ``Qwen/Qwen3-Embedding-0.6B``
-# and returns 1024-dim vectors.
+# Model identifier sent in `embeddings.create(model=...)`. Only consumed by
+# the PROVIDER_HTTP_API branch of from_config() — PROVIDER_ONNX_LOCAL's
+# OnnxEmbedder hardcodes its own model/dims (see embedding/onnx_local.py).
+# Verified live against QGenie: `qgenie_embedd` resolves to
+# ``Qwen/Qwen3-Embedding-0.6B`` and returns 1024-dim vectors.
 EMBEDDING_MODEL: str = "qgenie_embedd"
 
-# Output vector dimensions. Qwen3-Embedding-0.6B = 1024.
+# Output vector dimensions for PROVIDER_HTTP_API (Qwen3-Embedding-0.6B).
+# PROVIDER_ONNX_LOCAL's OnnxEmbedder reports its own dims (512); not read
+# from here.
 EMBEDDING_DIMS: int = 1024
 
 # Qwen3-Embedding is asymmetric: queries should be wrapped with an Instruct
@@ -249,6 +253,10 @@ SKILL_RECURRENCE_WINDOW_DAYS: int = 45
 # DREAM_L2_CLUSTER_THRESHOLD (0.55) used for memory synthesis on the same
 # embedder, nudged up because a skill's name+description is shorter and more
 # focused than a memory chunk. Tune via the nearest-cosine logging the bump emits.
+#
+# NEEDS RE-VALIDATION against bge-small-zh-v1.5 — see RECALL_MIN_SCORE note
+# in §4. Anchored to DREAM_L2_CLUSTER_THRESHOLD, which itself needs
+# recalibration.
 SKILL_RECURRENCE_TAU: float = 0.60
 MERGE_EXACT_THRESHOLD: float = 0.90          # auto-merge bar
 MERGE_LLM_GATE_THRESHOLD: float = 0.85       # [0.85, 0.90) → helper-LLM arbiter
@@ -320,6 +328,11 @@ DREAM_L3_WINDOW_SECONDS: int = 60 * 60 * 24 * 90        # 90 days
 # 0.55 was chosen empirically from yansu's similarity-threshold heuristics
 # (its merge bar is ~0.95 for exact, 0.85 for propose; pattern clusters
 # are intentionally looser — we want "same theme" not "same content").
+#
+# NEEDS RE-VALIDATION against bge-small-zh-v1.5 — see RECALL_MIN_SCORE note
+# in §4. Both thresholds below (and everything anchored to them, e.g.
+# SKILL_RECURRENCE_TAU) were tuned against Qwen3-Embedding-0.6B's cosine
+# distribution, not the current local embedder's.
 DREAM_L2_CLUSTER_THRESHOLD: float = 0.55
 DREAM_L3_CLUSTER_THRESHOLD: float = 0.35    # patterns are already
                                             # synthesised, looser still
@@ -361,6 +374,13 @@ RECALL_KNOWLEDGE_K: int = 5
 # query has no real match in the corpus. FAST tier callers must pass
 # ``min_score=RECALL_MIN_SCORE_FAST`` explicitly to close that hole. Empty
 # recall is strictly better than misleading recall on the chat hot path.
+#
+# NEEDS RE-VALIDATION: tuned against Qwen3-Embedding-0.6B's cosine
+# distribution (PROVIDER_HTTP_API). Now that EMBEDDING_PROVIDER is
+# PROVIDER_ONNX_LOCAL (bge-small-zh-v1.5), this threshold has not been
+# re-measured against the new embedding space — resume_index.py's own
+# DENSE_COS_GATE needed independent recalibration (0.50→0.68) against real
+# data for the same model, so this is a known follow-up, not a validated bar.
 RECALL_MIN_SCORE: float = 0.35
 RECALL_MIN_SCORE_FAST: float = 0.45
 
@@ -388,11 +408,19 @@ RECALL_MIN_SCORE_FAST: float = 0.45
 # matches in a low-quality corpus are dominated by coincidental keyword
 # overlap; the rare real exact-keyword match also usually produces a decent
 # dense cosine so nothing precise is actually lost).
+#
+# NEEDS RE-VALIDATION against bge-small-zh-v1.5 — see RECALL_MIN_SCORE note.
 RECALL_FAST_POST_FUSION_MIN_SCORE: float = 0.50
 # Stage-3 rerank gate. The LLM reranker scores 0.0–1.0 and its own system
 # prompt declares sub-0.3 candidates to be noise (reranker.py:_LLM_RERANK_SYSTEM);
 # this is the consumer that enforces that contract. Rows scoring below this
 # after rerank are dropped entirely (recall may legitimately return nothing).
+#
+# NEEDS RE-VALIDATION against bge-small-zh-v1.5 — see RECALL_MIN_SCORE note
+# above (this is the LLM rerank score, not raw cosine, but the LLM's own
+# judgment of "relevant" was calibrated while reading Qwen3-Embedding-ranked
+# candidates, so the effective distribution of what reaches this gate shifts
+# too).
 RECALL_RERANK_MIN_SCORE: float = 0.30
 RECALL_FTS_OVERFETCH: int = 3
 
@@ -802,6 +830,70 @@ ACTIVITY_SENSITIVE_WINDOW_PATTERNS: tuple = (
     r"(?i)password|passphrase|2fa|otp",
     r"(?i)private[\s\-_]?(window|browsing|tab)",
 )
+
+
+# ── §11.8 OCR engine idle-teardown (memory reclaim) ────────────────────────
+#
+# RapidOCR's onnxruntime InferenceSessions size their internal buffers to
+# the largest input ever seen and never shrink (arena is OFF —
+# rapidocr_onnxruntime sets enable_cpu_mem_arena=False in its own
+# infer_engine.py — so this is ORT's CPU allocator holding memory, not an
+# arena growth artifact; dropping the reference + gc.collect() actually
+# returns it to the OS). A single OCR call can peak ~565MB working memory
+# (see personality/service.py's _ocr_drain_loop docstring). Two singletons
+# exist (get_local_ocr / get_local_ocr_background, see vision/ocr.py) and
+# neither was ever torn down — this is the dominant contributor to
+# bridge_main.py's occasional multi-GB RSS spikes that persist long after
+# the triggering OCR call finished, even while the user is actively working
+# (activity ≠ memory pressure — the leftover buffers just sit there).
+#
+# Both flush paths piggyback on the SAME idle signal PersonalityMonitor's
+# OCR drain loop already computes every tick (_gate_open(): session locked,
+# or input-idle >= ACTIVITY_OCR_GATE_INPUT_IDLE_SEC AND screen-quiet >=
+# ACTIVITY_OCR_GATE_SCREEN_QUIET_SEC) — no new poller, no new wakeup source.
+# A dwell requirement ON TOP of the gate is required: the drain loop itself
+# starts consuming the ring the instant the gate opens, so flushing right
+# then would just force an immediate rebuild.
+ACTIVITY_OCR_IDLE_FLUSH_ENABLED: bool = True
+
+# Background singleton (get_local_ocr_background): also requires the ring +
+# spillover backlog to be fully drained before flushing (checked by the
+# caller) — this dwell is a thrash-prevention floor on top of that, not the
+# sole gate. 10 min gives ample margin above the ~90s (60+30) gate-open
+# threshold itself.
+ACTIVITY_OCR_BG_FLUSH_IDLE_SEC: float = 600.0
+
+# Interactive singleton (desktop_tool's get_local_ocr()): deliberately more
+# conservative than the background bar — its rebuild cost (~600ms cold
+# start) lands SYNCHRONOUSLY on the user's next find_element/screenshot
+# call, so we bias hard toward "don't tear this down unless we're quite
+# sure the user stepped away." Gated on BOTH (a) this dwell against the
+# shared idle signal AND (b) the same dwell against the engine's own
+# last-used timestamp — (b) is the authoritative signal since it directly
+# measures actual OCR usage and is immune to desktop_tool's read-only
+# actions (screenshot/find_element/snapshot) never taking the cross-session
+# desktop ownership lock that (a)'s sibling check also reads.
+ACTIVITY_OCR_INTERACTIVE_FLUSH_IDLE_SEC: float = 900.0
+
+# ── §11.9 OCR input resize cap ──────────────────────────────────────────────
+#
+# Screenshots feeding OCR (both desktop_tool's interactive path and the
+# activity monitor's background capture) are not downscaled before hitting
+# RapidOCR — its own limit_side_len only shrinks the model's input tensor,
+# not the intermediate image-processing buffers, which scale with the INPUT
+# image and are the actual RSS driver on 4K / multi-monitor setups. Applied
+# inside LocalOCR.recognize() (vision/ocr.py) so both singletons and every
+# caller benefit without touching desktop_tool.py or capturer.py.
+#
+# 3000px keeps 1080p (1920 long edge) and 1440p (2560 long edge) — the
+# common single-monitor cases — completely untouched. Single 4K monitors
+# (3840) and any multi-monitor virtual-desktop capture (always >= one full
+# monitor width, routinely 2-3x that) get capped. Phase 0's bench
+# ("Element-localisation centre distance 7px") ran on ~1024px images, well
+# under this cap, so existing numbers are unaffected; the newly-affected
+# 4K+ range has not been separately re-validated.
+OCR_RESIZE_CAP_ENABLED: bool = True
+OCR_MAX_LONG_EDGE_PX: int = 3000
 
 
 # ── 12. Scheduler (固化脚本 / 定时任务) ────────────────────────────────────────

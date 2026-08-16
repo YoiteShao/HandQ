@@ -59,7 +59,7 @@ import re
 import sys
 import time
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence, Tuple
 
 from .base_tool import BaseTool, ToolResult
 from ..infrastructure.logger import get_logger
@@ -205,6 +205,22 @@ def is_any_session_holding_desktop() -> bool:
     destroy timeout, the very next caller sees the new truth.
     """
     return _GLOBAL_DESKTOP_OWNER is not None
+
+
+def _describe_desktop_holder(holder: Optional["DesktopState"]) -> str:
+    """Human-readable name for whoever holds the desktop ownership lock.
+
+    Used in the "waiting for the desktop" line, so it has to be meaningful to
+    someone who did not know a second session existed. The most important case
+    to name precisely is a session being driven from another machine: "another
+    session" understates it when the answer is "an operator on a different
+    computer". Falls back to a vague-but-true phrase rather than inventing
+    detail, and never raises — this only ever feeds a message.
+    """
+    if holder is None:
+        return "another session"
+    label = str(getattr(holder, "label", "") or "").strip()
+    return label or "another session on this machine"
 
 
 _desktop_store_instance: Optional[Any] = None
@@ -522,8 +538,16 @@ class DesktopState:
     def __init__(
         self,
         im: Optional["InteractionManager"] = None,
+        label: str = "",
     ) -> None:
         self._im: Optional["InteractionManager"] = im
+        #: Short human-readable name for this session, used only when telling
+        #: ANOTHER session why it is waiting for the desktop (see
+        #: ``_describe_desktop_holder``). Set by the bridge, which is the layer
+        #: that knows whether a sid is local or being served to a remote
+        #: controller — the distinction that makes the wait message worth
+        #: reading. Empty is fine; the message degrades to "another session".
+        self.label: str = str(label or "")
         # takeover state
         self.takeover_active: bool = False
         self.task_approved: bool = False
@@ -673,14 +697,55 @@ class DesktopState:
         desktop actions block here until release. Read-only actions
         (screenshot, list_windows, find_element, snapshot) do NOT call this —
         they remain freely concurrent.
+
+        The wait is **announced** and **unbounded**, in that order of
+        importance. Ownership is held for a whole task, not per click, so a
+        session whose first input action lands while another session is mid-task
+        can sit here for minutes. Silently, it used to look exactly like a hang —
+        worst of all on a machine in server mode, where the holder is a remote
+        operator's agent and the local user has no window showing it. So the
+        contended case emits an inline event before parking and another once it
+        gets through.
+
+        There is deliberately no timeout. The work is still wanted, and the lock
+        ordering at the dispatch site (ownership before ``_desktop_lock``) already
+        rules out a cycle, so waiting is correct and a deadline would only fail a
+        task that needed to queue. Visibility was the actual defect.
         """
         global _GLOBAL_DESKTOP_OWNER
         if self._owns_global_lock:
             return
+        holder = _GLOBAL_DESKTOP_OWNER
+        contended = (
+            _GLOBAL_DESKTOP_OWNERSHIP_LOCK.locked() and holder is not self
+        )
+        if contended:
+            self._announce("⇄", (
+                f"Desktop is currently held by {_describe_desktop_holder(holder)};"
+                " waiting for it to finish before driving mouse/keyboard."
+            ))
         await _GLOBAL_DESKTOP_OWNERSHIP_LOCK.acquire()
         self._owns_global_lock = True
         self._owner_loop = asyncio.get_running_loop()
         _GLOBAL_DESKTOP_OWNER = self
+        if contended:
+            self._announce("⇄", "Desktop is now free; continuing.")
+
+    def _announce(self, icon: str, message: str) -> None:
+        """Push one inline event to whichever UI this session has.
+
+        Best effort by design: this is an explanation, never a correctness
+        requirement, and it must not be able to turn a desktop action into a
+        failure. Works for a remotely-driven session too — its delegate is a
+        ``NetworkUIDelegate``, so the line travels to the controlling operator
+        the same way every other event does.
+        """
+        if self._im is None:
+            return
+        try:
+            self._im.show_inline_event(icon, message)
+        except Exception:
+            pass
 
     def _release_global_takeover_if_owned(self) -> None:
         """Release the process-wide desktop ownership lock iff this
@@ -823,7 +888,413 @@ _LIST_WINDOWS_CAP = 50
 _TYPE_TEXT_MAX_CHARS = 4000
 
 
+# ── Native file-open/save dialog (Win32, NOT CDP-reachable) ──────────────────
+#
+# A BROWSE / Open / Save button in an Electron app (xPCAT, QPM, …) fires a
+# native Win32 common file dialog — a top-level window of class ``#32770`` with
+# a filename Edit inside. It is NOT part of the Chromium DOM, so:
+#   * CDP cannot see it: Page.setInterceptFileChooserDialog fires only for HTML
+#     <input type=file>, never for the main process's dialog.showOpenDialog,
+#     and patching ipcRenderer/@electron/remote from the renderer misses it too.
+#   * A screenshot may fail (BitBlt returns nothing on RDP/VNC sessions).
+#
+# The 2026-08-04 flash run stalled here for ~2h: the agent clicked the DOM
+# BROWSE button over CDP twice (stacking two native dialogs the user watched
+# pile up), every CDP instrument reported "no dialog / no effect", and it never
+# reached across the boundary. The one channel that DOES see the dialog is Win32
+# window enumeration (EnumWindows / pywinauto Desktop) — which needs no
+# foreground window and no screenshot, and which ``desktop_list_windows`` proved
+# working in that very session. This helper drives that channel: enumerate the
+# native dialog by class, fill its filename Edit, and confirm.
+
+# Win32 common dialog class. Both the classic GetOpenFileName dialog and the
+# newer IFileDialog present as a top-level "#32770" window.
+_NATIVE_DIALOG_CLASS = "#32770"
+# Titles the OS gives these dialogs, across locales we support (en / zh). Used
+# only to rank candidates when several #32770 windows exist — never to REQUIRE a
+# match, since a match-by-title-only filter would miss a locale we haven't listed.
+_FILE_DIALOG_TITLE_HINTS = (
+    "open", "save", "save as", "select", "choose", "browse",
+    "打开", "另存为", "保存", "选择", "浏览",
+)
+
+
+def _enum_native_dialogs() -> List[Dict[str, Any]]:
+    """Return every visible top-level ``#32770`` window (native common dialogs).
+
+    Best-effort; returns [] when win32 is unavailable or enumeration races.
+    Each entry: {hwnd, title, class_name}. Ranked so title-matching dialogs
+    come first, then by most-recently-created (highest hwnd as a cheap proxy),
+    because when TWO dialogs are stacked the topmost/frontmost is the one the
+    user is looking at and the one a confirm should act on.
+    """
+    if not _WIN32_AVAILABLE:
+        return []
+    found: List[Dict[str, Any]] = []
+    try:
+        def _cb(hwnd: int, _extra: Any) -> bool:
+            try:
+                if not win32gui.IsWindowVisible(hwnd):
+                    return True
+                cls = win32gui.GetClassName(hwnd) or ""
+                if cls != _NATIVE_DIALOG_CLASS:
+                    return True
+                title = win32gui.GetWindowText(hwnd) or ""
+                found.append({"hwnd": int(hwnd), "title": title, "class_name": cls})
+            except Exception:
+                pass
+            return True
+        win32gui.EnumWindows(_cb, None)
+    except Exception:
+        return []
+
+    def _rank(d: Dict[str, Any]) -> tuple:
+        t = (d.get("title") or "").lower()
+        titled = any(h in t for h in _FILE_DIALOG_TITLE_HINTS)
+        # titled first (0 sorts before 1), then newest hwnd first
+        return (0 if titled else 1, -int(d.get("hwnd") or 0))
+
+    found.sort(key=_rank)
+    return found
+
+
+# Win32 class names for a standard text-entry control, used to identify a
+# file dialog's filename field. "Edit"/"RichEdit20W"/"RichEdit" cover the
+# common-dialog case; the RichEdit variants below cover older/ANSI and
+# newer-version registrations some non-standard/custom dialogs still use.
+_EDIT_CLASS_NAMES = (
+    "Edit", "RichEdit20W", "RichEdit20A", "RichEdit50W", "RichEdit", "RICHEDIT_CLASS",
+)
+
+
+def _win32_message_fill_dialog(
+    hwnd: int, path: str, submit: bool,
+) -> Dict[str, Any]:
+    """Fill + submit a #32770 dialog using window MESSAGES only (no foreground).
+
+    This is the path that actually works on an RDP/VNC session with no
+    foreground window: ``WM_SETTEXT`` into the filename Edit, then ``BM_CLICK``
+    on the Open/Save button (or ``WM_COMMAND IDOK`` to the dialog). None of
+    these need the window to be focused, unlike SendInput/type_keys.
+
+    Returns {found_edit, edit_text_after, submitted, button_text} or {}.
+
+    2026-08-04: the pywinauto path set the filename text but ``submitted`` came
+    back False and the dialog stayed open — the modern common-dialog Open button
+    is not a plain ``Button`` child (it lives in a DirectUIHWND), so
+    ``child_window(class_name="Button")`` missed it, and the ``type_keys("{ENTER}")``
+    fallback needs a foreground window this session doesn't have. Because the
+    file was never accepted, xPCAT never ran its parse-and-autofill on
+    contents.xml — the exact "Device Programmer / RAW PROGRAM didn't populate"
+    symptom. Enumerating the real child controls and driving them by message
+    fixes both halves.
+    """
+    import ctypes
+    import ctypes.wintypes as wt
+
+    user32 = ctypes.windll.user32
+    WM_SETTEXT = 0x000C
+    WM_COMMAND = 0x0111
+    BM_CLICK = 0x00F5
+    IDOK = 1
+
+    children: List[tuple] = []
+    WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, wt.HWND, wt.LPARAM)
+
+    def _cb(h: int, _lp: int) -> bool:
+        try:
+            cls = ctypes.create_unicode_buffer(96)
+            user32.GetClassNameW(h, cls, 96)
+            txt = ctypes.create_unicode_buffer(512)
+            user32.GetWindowTextW(h, txt, 512)
+            children.append((int(h), cls.value, txt.value))
+        except Exception:
+            pass
+        return True
+
+    try:
+        user32.EnumChildWindows(hwnd, WNDENUMPROC(_cb), 0)
+    except Exception:
+        return {}
+
+    # Filename edit: an "Edit" whose current text is empty/short (not a path
+    # already). The classic dialog nests it under a ComboBoxEx32; the modern one
+    # exposes a bare Edit. Prefer an empty one, else the first Edit.
+    edit_hwnd = 0
+    for h, cls, txt in children:
+        if cls == "Edit" and len(txt or "") < 5:
+            edit_hwnd = h
+            break
+    if not edit_hwnd:
+        for h, cls, txt in children:
+            if cls in _EDIT_CLASS_NAMES:
+                edit_hwnd = h
+                break
+
+    out: Dict[str, Any] = {"found_edit": bool(edit_hwnd)}
+    if edit_hwnd:
+        try:
+            user32.SetFocus(edit_hwnd)
+        except Exception:
+            pass
+        # WM_SETTEXT with the string as lParam — no per-key injection.
+        user32.SendMessageW(edit_hwnd, WM_SETTEXT, 0, ctypes.c_wchar_p(path))
+        time.sleep(0.15)
+        buf = ctypes.create_unicode_buffer(1200)
+        user32.GetWindowTextW(edit_hwnd, buf, 1200)
+        out["edit_text_after"] = buf.value
+    else:
+        # No edit control found — this dialog is likely a developer stub
+        # (e.g. xPCAT's "TODO: Place dialog controls here." placeholder).
+        # Do NOT click any button or send WM_COMMAND: dismissing a stub
+        # dialog without setting a path is a silent side-effect the caller
+        # cannot recover from (the dialog closes but the app never parses
+        # the file). Return immediately so the caller can report failure
+        # without having altered any state.
+        out["submitted"] = False
+        out["dialog_closed"] = False
+        out["no_edit_found"] = True
+        out["error"] = "No filename Edit control in this dialog (may be a developer stub)."
+        return out
+
+    if not submit:
+        out["submitted"] = False
+        return out
+
+    # Submit by MESSAGE. Try the Open/Save button first, then WM_COMMAND IDOK.
+    submitted = False
+    for h, cls, txt in children:
+        if cls == "Button":
+            low = (txt or "").lower().replace("&", "").strip()
+            # "browse" / "select" are here on evidence, not guesswork: xPCAT's
+            # "Choose meta build, flat build or flashless build" dialog labels
+            # its ACCEPT button "Browse" (confirmed 2026-08-04, BM_CLICK on
+            # hwnd=1969802 class='Button' text='Browse' closed the dialog).
+            # Matching only open/save/ok would fall through to IDOK on that
+            # dialog and, on any picker whose default button differs, miss.
+            if low in ("open", "save", "ok", "browse", "select",
+                       "打开", "保存", "确定", "选择"):
+                try:
+                    user32.SendMessageW(h, BM_CLICK, 0, 0)
+                    submitted = True
+                    out["button_text"] = txt
+                    break
+                except Exception:
+                    continue
+    if not submitted:
+        # DirectUIHWND-hosted button (modern dialog) has no discoverable Button
+        # child — post the default-command (IDOK) straight to the dialog, which
+        # the dialog proc routes to whatever its default button is.
+        try:
+            user32.SendMessageW(hwnd, WM_COMMAND, IDOK, 0)
+            submitted = True
+            out["button_text"] = "(WM_COMMAND IDOK)"
+        except Exception:
+            pass
+
+    # Confirm the dialog actually closed — that, not "we sent a click", is the
+    # real signal the file was accepted and xPCAT can now parse it.
+    time.sleep(0.35)
+    try:
+        still_open = bool(user32.IsWindow(hwnd) and user32.IsWindowVisible(hwnd))
+    except Exception:
+        still_open = False
+    out["submitted"] = submitted
+    out["dialog_closed"] = (not still_open)
+    return out
+
+
+def _fill_native_file_dialog(
+    path: str, dialog_hwnd: int = 0, submit: bool = True,
+) -> Dict[str, Any]:
+    """Type *path* into a native file dialog's filename Edit and (optionally) OK.
+
+    Pure Win32 — needs no foreground window, no screenshot, no CDP. Returns a
+    result dict; NEVER raises (any failure becomes ``{"ok": False, ...}``) so
+    the async wrapper can time-box it.
+
+    Detection IS the primary signal: when no ``#32770`` dialog exists the result
+    is ``{"ok": False, "no_dialog": True, ...}`` — that is exactly the fact the
+    agent could not get from CDP.
+    """
+    if not _WIN32_AVAILABLE:
+        return {"ok": False, "error": "win32/pywinauto unavailable"}
+
+    dialogs = _enum_native_dialogs()
+    if not dialogs:
+        return {
+            "ok": False,
+            "no_dialog": True,
+            "error": (
+                "No native file dialog (#32770 window) is currently open. Either "
+                "the BROWSE/Open button was not actually clicked, or the click "
+                "did not open a dialog. Click the DOM button first, then call "
+                "this immediately."
+            ),
+        }
+
+    # Pick the requested hwnd if it is still a live dialog, else the top-ranked.
+    target = None
+    if dialog_hwnd:
+        target = next((d for d in dialogs if d["hwnd"] == int(dialog_hwnd)), None)
+    if target is None:
+        target = dialogs[0]
+
+    stacked = len(dialogs)
+    hwnd = target["hwnd"]
+
+    # Message-based fill+submit FIRST — it works with no foreground window,
+    # which SendInput/type_keys (the pywinauto default) does not.
+    try:
+        msg = _win32_message_fill_dialog(hwnd, path, submit)
+    except Exception as exc:
+        msg = {"error": f"{type(exc).__name__}: {exc}"}
+
+    edit_text = msg.get("edit_text_after")
+    text_ok = bool(edit_text) and path.rsplit("\\", 1)[-1].lower() in edit_text.lower()
+    submitted = bool(msg.get("submitted"))
+    dialog_closed = msg.get("dialog_closed")
+
+    # If the message path could not even find/set the filename edit, fall back
+    # to pywinauto's set_edit_text (some custom dialogs expose the edit only via
+    # UIA). Submit still prefers messages above; here we only recover the text.
+    if not msg.get("found_edit") and not text_ok:
+        try:
+            dlg = pywinauto.Desktop(backend="win32").window(handle=hwnd)
+            try:
+                dlg.set_focus()
+            except Exception:
+                pass
+            for spec in (
+                {"class_name": "Edit"}, {"class_name": "RichEdit20W"},
+                {"class_name": "RichEdit20A"}, {"class_name": "RichEdit50W"},
+                {"class_name": "RichEdit"}, {"class_name": "ComboBox"},
+                {"best_match": "Edit"},
+            ):
+                try:
+                    cand = dlg.child_window(**spec)
+                    cand.wait("exists", timeout=2)
+                    try:
+                        cand.set_edit_text(path)
+                    except Exception:
+                        cand.set_text(path)
+                    text_ok = True
+                    break
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
+    if not text_ok:
+        return {
+            "ok": False,
+            "dialog_hwnd": hwnd,
+            "dialog_title": target.get("title"),
+            "stacked_dialogs": stacked,
+            "error": (
+                "Found the native dialog but could not set its filename field. "
+                f"{msg.get('error', 'The dialog may be a non-standard picker.')}"
+            ),
+        }
+
+    # ``ok`` reflects the REAL goal: with submit=True, the file is only accepted
+    # (and the app's parse/autofill only fires) once the dialog CLOSES. Report
+    # submit success on the dialog actually closing, not on "we sent a click".
+    if submit:
+        ok = bool(dialog_closed) if dialog_closed is not None else submitted
+    else:
+        ok = True
+
+    result = {
+        "ok": ok,
+        "dialog_hwnd": hwnd,
+        "dialog_title": target.get("title"),
+        "stacked_dialogs": stacked,
+        "path_set": path,
+        "submitted": submitted,
+        "dialog_closed": dialog_closed,
+    }
+    if submit and not ok:
+        result["error"] = (
+            "Set the filename but the dialog did not close, so the file was NOT "
+            "accepted and the app has NOT parsed it yet. The Open/Save button "
+            "may be a DirectUIHWND control that ignored the message — retry, or "
+            "check desktop_list_windows to see if the dialog is still open."
+        )
+    if submit and ok:
+        result["note"] = (
+            "Dialog closed — the file was accepted. The app should now parse it "
+            "and populate any dependent fields (e.g. xPCAT's Device Programmer / "
+            "RAW PROGRAM). Verify those fields actually populated before "
+            "treating this step as done; if they are still empty the parse did "
+            "not fire."
+        )
+    # Mapped-drive warning. A drive letter may resolve to the same share as the
+    # UNC path the task named, but it is NOT the path the user asked for, and it
+    # silently breaks when the mapping differs across sessions/accounts.
+    # 2026-08-04: the agent scraped `Z:\...r1-00192...` off a stray File Explorer
+    # window instead of using the task's `\\grilled\...c1-00194...` — wrong build
+    # AND wrong path form, and the run ended with "No rawprogram files found".
+    if len(path) > 1 and path[1] == ":" and path[0].isalpha():
+        result["path_form_warning"] = (
+            f"'{path[:2]}' is a MAPPED DRIVE. If the task gave you a UNC path "
+            f"(\\\\server\\share\\...), pass that verbatim instead — a drive "
+            f"letter may point somewhere else in another session, and using it "
+            f"means you are no longer provably operating on the path the user "
+            f"specified. Also re-check the build/folder name matches the task."
+        )
+    return result
+
+
 # ── Window inspection ────────────────────────────────────────────────────────
+
+def probe_input_injection() -> Dict[str, Any]:
+    """One-shot session capability probe: can we drive the GUI by input at all?
+
+    On an RDP / VNC / service session there may be NO foreground window for the
+    ENTIRE session, which makes every pointer-injection path (PyAutoGUI,
+    SendInput, SetForegroundWindow) structurally impossible — not flaky, not
+    coordinate-dependent, impossible.
+
+    2026-08-03 flash-meta run: this exact fact was finally reported at turn 119,
+    minute 61, by a ``desktop_find_and_click`` failure. The preceding ~40 turns
+    were spent re-deriving coordinates, maximizing windows and swapping click
+    tools — optimizing a path that could never work. PyAutoGUI's failsafe kept
+    reporting ``cursor_at_exception=Point(x=0, y=0)`` and the agent read that as
+    a targeting problem. One probe at startup turns an hour of thrashing into a
+    line of environment context.
+
+    Returns a dict with ``available`` (bool) and ``detail`` (str). Never raises
+    — a probe that breaks session start would be worse than the blindness it
+    fixes.
+    """
+    if not _IS_WINDOWS:
+        return {"available": True, "detail": "non-Windows platform; not probed"}
+    if not _WIN32_AVAILABLE:
+        return {"available": False, "detail": "win32 bindings unavailable"}
+    try:
+        hwnd = int(win32gui.GetForegroundWindow() or 0)
+    except Exception as exc:
+        return {"available": False,
+                "detail": f"GetForegroundWindow() raised {type(exc).__name__}"}
+    if hwnd:
+        title = ""
+        try:
+            title = win32gui.GetWindowText(hwnd) or ""
+        except Exception:
+            pass
+        return {"available": True,
+                "detail": f"foreground window present (hwnd={hwnd}"
+                          + (f", title={title!r}" if title else "") + ")"}
+    return {
+        "available": False,
+        "detail": (
+            "GetForegroundWindow() returned nothing at session start. This is "
+            "the signature of an RDP / VNC / service session with no "
+            "interactive desktop focus."
+        ),
+    }
+
 
 def _foreground_window_info() -> Dict[str, Any]:
     """Return {hwnd, title, pid, process_name, rect: [x1,y1,x2,y2]} for the
@@ -1222,10 +1693,13 @@ def _covering_window_info(x: int, y: int, target_hwnd: int = 0) -> Optional[Dict
 # the moment of failure — the actual cursor position and target — so a
 # human or a future diagnosis pass has real data instead of a guess.
 
-def _failsafe_diagnostic(target_x: int, target_y: int) -> str:
+def _failsafe_diagnostic(target_x: Optional[int], target_y: Optional[int]) -> str:
     """Best-effort snapshot of cursor/screen state at the moment PyAutoGUI's
     failsafe fired, for the error message. Never raises — any read failure
     degrades to "unavailable" rather than interrupting error handling.
+
+    Coordinates are optional: keyboard actions (hotkey / key_press) have no
+    target point, and printing "target=(0, 0)" for them would invent a claim.
     """
     cursor = "unavailable"
     screen = "unavailable"
@@ -1237,20 +1711,37 @@ def _failsafe_diagnostic(target_x: int, target_y: int) -> str:
         screen = str(pyautogui.size())
     except Exception:
         pass
-    return f"target=({target_x}, {target_y}), cursor_at_exception={cursor}, screen_size={screen}"
+    target = (
+        f"target=({target_x}, {target_y}), "
+        if target_x is not None and target_y is not None else
+        "target=n/a (keyboard action, no pointer target), "
+    )
+    return f"{target}cursor_at_exception={cursor}, screen_size={screen}"
 
 
-def _failsafe_error_text(action: str, target_x: int, target_y: int) -> str:
-    """Shared, honest failsafe error message for click_at / find_and_click.
+def _failsafe_error_text(
+    action: str,
+    target_x: Optional[int] = None,
+    target_y: Optional[int] = None,
+) -> str:
+    """Shared, honest failsafe error message for every input action.
 
     Does NOT assert "mouse hit corner" as a confirmed cause — only that
     PyAutoGUI's own failsafe check fired. See module comment above for why
     that distinction matters.
+
+    Every input action routes here. Until 2026-08-02 only click_at and
+    find_and_click did: hover_at / drag / scroll / hotkey / key_press still
+    carried the old hardcoded "(mouse hit corner). Move the mouse away from
+    screen corners and retry." — the exact string that sent two 2026-08-01
+    sessions chasing a cursor that could not be moved. Worse for hotkey /
+    key_press, which do not touch the pointer at all, so blaming a corner was
+    guaranteed to be wrong.
     """
     diag = _failsafe_diagnostic(target_x, target_y)
     return (
         f"{action}: PyAutoGUI raised its failsafe exception before this "
-        f"click executed. This does NOT necessarily mean the mouse was at "
+        f"action executed. This does NOT necessarily mean the mouse was at "
         f"a screen corner — treat that as unconfirmed. Diagnostic: {diag}. "
         "If this recurs at coordinates nowhere near a real screen corner, "
         "it may be an internal PyAutoGUI timing/state issue rather than a "
@@ -1280,29 +1771,172 @@ def _failsafe_error_text(action: str, target_x: int, target_y: int) -> str:
 # snapshot already ran.
 
 
-def _click_effect(
-    state_after: Dict[str, Any], content_changed: Optional[bool],
-) -> str:
-    """Classify what a click actually DID, for the LLM to branch on.
+def _probe_geometry_changed(
+    probe_rect: Optional[Sequence[int]],
+) -> bool:
+    """True when the foreground window's rect no longer matches *probe_rect*.
 
-    - ``"navigated"``     — any top-level change (foreground/title/new window)
-                            OR the content probe saw the window change.
-    - ``"none_detected"`` — the probe ran and everything was flat: the click
-                            had no observable effect (caller attaches
-                            ``DesktopTool._no_effect_hint``).
-    - ``"unknown"``       — the probe was unavailable AND no top-level change,
-                            so we genuinely cannot tell — never a false claim.
+    Matters because the content probe hashes a FIXED screen rectangle captured
+    before the action. If the window moved or resized in between, the before/
+    after hashes cover different content and their difference says nothing about
+    whether the application did anything — it only says the screen looks
+    different, which a resize guarantees.
     """
-    top_level_changed = bool(
+    if not probe_rect:
+        return False
+    rect_after = _foreground_window_info().get("rect")
+    if not rect_after:
+        return False
+    try:
+        return list(probe_rect) != list(rect_after)
+    except Exception:
+        return False
+
+
+def _click_effect(
+    state_after: Dict[str, Any],
+    content_changed: Optional[bool],
+    geometry_changed: bool = False,
+) -> str:
+    """Report WHAT WAS OBSERVED after an input action — never what it meant.
+
+    Values are deliberately named after the observation, not after an
+    interpretation of it:
+
+    - ``"window_changed"``  — a genuine top-level event: the foreground window,
+                              its title, or the window list changed.
+    - ``"pixels_changed"``  — same window, same geometry, but its content region
+                              hashes differently.
+    - ``"geometry_only"``   — the window moved or resized and nothing else is
+                              known. The pixel probe is INVALID here (see
+                              `_probe_geometry_changed`) so no content claim is
+                              made.
+    - ``"none_detected"``   — the probe ran and everything was flat: the action
+                              had no observable effect (caller attaches
+                              ``DesktopTool._no_effect_hint``).
+    - ``"unknown"``         — the probe was unavailable AND no top-level change,
+                              so we genuinely cannot tell.
+
+    WHY THE OLD ``"navigated"`` VALUE IS GONE. It collapsed "foreground/title/
+    window-list changed" and "some pixels differ" into one word that reads as
+    "the application went somewhere" — a conclusion the tool is in no position
+    to draw. 2026-08-03, turn 30: the agent clicked a window's MAXIMIZE box.
+    The framebuffer necessarily differed, so the probe said
+    ``content_changed: true`` and the tool announced ``effect: "navigated"``.
+    The agent converted that single word into a confident and entirely false
+    root cause for its previous 20 failures —
+
+        "之前点击失败原因是窗口未最大化时 Tera Term 遮挡了按钮区域"
+        "...I've actually made real progress"
+
+    — and used that manufactured "progress" to override a STALL warning it had
+    just been given. Tera Term had never blocked anything; the app was
+    UIA-opaque and the session had no foreground window at all. Reporting the
+    facts separately leaves the inference where it belongs: with the agent, who
+    can also see the snapshot, the OCR and its own goal.
+    """
+    window_changed = bool(
         state_after.get("foreground_changed")
         or state_after.get("title_changed")
         or state_after.get("new_windows")
     )
-    if top_level_changed or content_changed is True:
-        return "navigated"
+    if window_changed:
+        return "window_changed"
+    if geometry_changed:
+        return "geometry_only"
+    if content_changed is True:
+        return "pixels_changed"
     if content_changed is False:
         return "none_detected"
     return "unknown"
+
+
+_GEOMETRY_ONLY_HINT = (
+    "The window moved or resized during this action, so the content probe "
+    "compared two different regions and its result was discarded. This is NOT "
+    "evidence that the application responded to your click — a resize alone "
+    "changes every pixel. Nothing is known about whether the control you aimed "
+    "at was activated. Re-observe (desktop_snapshot, or a fresh screenshot) "
+    "before concluding anything, and do not treat this as progress."
+)
+
+
+# ── Effect-probe helpers for non-click input actions ────────────────────────
+#
+# The 2026-08-01 flash trace exposed that ``type_text`` / ``drag`` / ``scroll``
+# / ``hotkey`` / ``key_press`` all reported ``{ok: true, out: {..., state_after:
+# {…all-false…}}}`` regardless of whether their input actually did anything.
+# ``_capture_state_after`` sees only WINDOW-LEVEL delta (foreground / title /
+# new windows); typing into a field, scrolling a list, pressing Enter on a
+# form — none of those change window state, so success and no-effect looked
+# byte-identical in the returned JSON. The agent then read a swallowed Enter or
+# a lost scroll as "done, move on".
+#
+# click_at / find_and_click already carry the honest three-way probe
+# (navigated / none_detected / unknown). These helpers apply the same probe to
+# the remaining input actions so all seven surface a comparable ``effect``.
+#
+# Best-effort throughout: if the probe rect is unavailable (no foreground, or
+# a race where the window closes mid-action), _content_signature returns None
+# and _click_effect degrades to ``"unknown"`` — never a false ``"navigated"``.
+
+
+def _begin_effect_probe() -> "tuple[Dict[str, Any], Optional[Tuple[int, int, int, int]], Any]":
+    """Capture the pre-action state used to detect an action's effect.
+
+    Returns (state_before, probe_rect, sig_before) — feed all three to
+    ``_finalize_effect`` after the action runs.
+    """
+    state_before = _capture_state_before()
+    probe_rect = _foreground_window_info().get("rect")
+    sig_before = _content_signature(
+        tuple(probe_rect) if probe_rect else None
+    )
+    return state_before, probe_rect, sig_before
+
+
+def _finalize_effect(
+    output: Dict[str, Any],
+    state_before: Dict[str, Any],
+    probe_rect: Optional[Tuple[int, int, int, int]],
+    sig_before: Any,
+) -> "tuple[Dict[str, Any], str]":
+    """Fill state_after / content_changed / effect on *output* in place.
+
+    Emits the observations as SEPARATE, orthogonal fields — ``window_changed``,
+    ``geometry_changed``, ``content_changed`` — alongside the ``effect`` label,
+    so the agent can see which signal fired rather than inferring it back out of
+    a single cooked word. See `_click_effect` for the incident that motivated
+    the split.
+
+    Returns (state_after, effect) so the caller can invalidate caches on state
+    change and attach an ``effect_hint`` when ``effect == "none_detected"``
+    (the caller does that because the hint uses ``self._no_effect_hint``).
+    """
+    state_after = _capture_state_after(state_before)
+    output["state_after"] = state_after
+    geometry_changed = _probe_geometry_changed(probe_rect)
+    content_changed = _content_changed(
+        sig_before,
+        _content_signature(tuple(probe_rect) if probe_rect else None),
+    )
+    # A resize/move invalidates the pixel comparison outright — publishing it
+    # would be publishing a known-meaningless bit.
+    if geometry_changed:
+        content_changed = None
+    output["window_changed"] = bool(
+        state_after.get("foreground_changed")
+        or state_after.get("title_changed")
+        or state_after.get("new_windows")
+    )
+    output["geometry_changed"] = geometry_changed
+    if content_changed is not None:
+        output["content_changed"] = content_changed
+    effect = _click_effect(state_after, content_changed, geometry_changed)
+    output["effect"] = effect
+    if effect == "geometry_only":
+        output["effect_hint"] = _GEOMETRY_ONLY_HINT
+    return state_after, effect
 
 
 # ── Sensitive window filter ──────────────────────────────────────────────────
@@ -1543,16 +2177,30 @@ def _screenshot_region(out_path: str, region: str = "foreground",
     elif region == "foreground":
         info = _foreground_window_info()
         if not info or not info.get("rect"):
+            # Name the two escape hatches. Telling the agent to "make sure a
+            # window is active" is useless advice on the sessions where this
+            # actually fires: RDP / VNC / service desktops where
+            # GetForegroundWindow() returns 0 for the WHOLE session and no
+            # amount of activating will change it. The 2026-08-01 Alpaca trace
+            # burned 36 turns / 14 minutes on that dead end before stumbling
+            # onto region='fullscreen' by re-reading the tool schema — at which
+            # point the very first call succeeded.
             raise RuntimeError(
-                "Cannot determine foreground window. Make sure a window is "
-                "active before calling screenshot region='foreground'."
+                "Cannot determine foreground window — GetForegroundWindow() "
+                "returned nothing. On RDP / VNC / service sessions there may "
+                "be NO foreground window for the entire session, so activating "
+                "a window will not help. Use region='fullscreen' instead (it "
+                "captures the virtual screen and needs no foreground window), "
+                "or, with desktop_screenshot, pass hwnd=<target> to capture "
+                "one window directly via PrintWindow."
             )
         x1, y1, x2, y2 = info["rect"]
         # Clamp non-positive dimensions (minimised windows can return -32000).
         if x2 - x1 <= 0 or y2 - y1 <= 0:
             raise RuntimeError(
                 f"Foreground window has invalid rect {info['rect']}. "
-                "It may be minimised — restore it before screenshotting."
+                "It may be minimised — restore it, or capture it without "
+                "restoring via region='fullscreen' / hwnd=<target>."
             )
         rect_resolved = (x1, y1, x2, y2)
     elif region == "fullscreen":
@@ -1632,6 +2280,102 @@ _UIA_MAX_ELEMENTS: int = 100
 # the UIA call (maybe never) returns. Fine for the occasional hang; repeated
 # hangs on the same window would starve the default executor pool.
 _UIA_ENUMERATE_TIMEOUT_S: float = 12.0
+
+# Ceiling on the fast per-control UIA calls (invoke/SetValue). These have no
+# tree walk to do and normally return in well under a second; on a broken UIA
+# provider they can hang indefinitely — same failure mode as _uia_enumerate
+# but reached from click_at / find_and_click / type_text. 3s is enough
+# headroom for a slow-but-alive control while bounding the damage from a
+# wedged one. On timeout the caller falls back to raw mouse / clipboard
+# paste, and the target hwnd goes on the UIA blacklist below.
+_UIA_INVOKE_TIMEOUT_S: float = 3.0
+
+# ── UIA blacklist ────────────────────────────────────────────────────────────
+#
+# The 2026-08-03 flash trace crashed the whole bridge (STATUS_HEAP_CORRUPTION,
+# exit code 3221226356) 15 minutes after a `_uia_enumerate` timeout on the
+# xPCAT Electron window: snapshot at 12:01:01 fired the "UIA enumerate
+# exceeded 12.0s (hwnd=199582) — likely a Chromium/Electron window opaque to
+# UIA" fallback, but the executor thread stayed wedged deep in the target's
+# cross-process UIA provider. Every input action on that hwnd afterwards ran
+# through UIA again (_action_type_text called _uia_set_focused_value at
+# 12:16:01, and never returned) — and the second UIA call into the same
+# already-broken provider heap-corrupted the process, taking the whole
+# session down mid-flash.
+#
+# The rule is simple: if a hwnd's UIA provider has ONCE wedged us, never
+# talk UIA to it again in this session. Blacklist entries survive until
+# process exit — a wedged provider does not un-wedge, and a Chromium/Electron
+# window that was opaque to UIA a minute ago is still opaque now. Screenshot
+# + OCR + raw mouse / keystroke path still works; it is just slower, which
+# is a much better outcome than heap-corrupting the process.
+_UIA_BLACKLIST: set = set()
+
+
+def _uia_blacklist_add(hwnd: int, reason: str) -> None:
+    """Mark *hwnd* as UIA-hostile for the rest of this session. Best-effort;
+    a zero/negative hwnd is silently ignored (no reliable target to key on).
+    """
+    if not hwnd or hwnd <= 0:
+        return
+    hwnd = int(hwnd)
+    if hwnd in _UIA_BLACKLIST:
+        return
+    _UIA_BLACKLIST.add(hwnd)
+    try:
+        get_logger().warning(
+            f"UIA blacklist: hwnd={hwnd} — {reason}. All further UIA calls "
+            f"targeting this window will fall back to raw mouse / clipboard "
+            f"paste for the rest of this session.",
+            component="DesktopTool",
+        )
+    except Exception:
+        pass
+
+
+def _uia_blacklisted(hwnd: int) -> bool:
+    return bool(hwnd) and int(hwnd) in _UIA_BLACKLIST
+
+
+async def _try_uia(
+    fn,
+    *args,
+    hwnd: int,
+    label: str,
+) -> "tuple[Optional[Any], Optional[str]]":
+    """Run a per-control UIA call under a hard timeout + blacklist gate.
+
+    Returns (result, err). On success err is None. On any failure (blacklist
+    hit, timeout, exception) the caller must take the non-UIA fallback path
+    for THIS call site — the whole point is that a hostile UIA provider
+    cannot be allowed to block or crash the process.
+
+    *hwnd* is the target window we are about to touch UIA on. When it is
+    already on the blacklist we short-circuit before calling into the C
+    extension at all; on timeout it is added. A zero hwnd (target unknown,
+    e.g. _uia_set_focused_value uses whatever is focused) still runs — but
+    if that call times out we cannot blacklist anything, so it's important
+    that callers pass a specific hwnd whenever they can.
+    """
+    if _uia_blacklisted(hwnd):
+        return None, f"{label}: hwnd={hwnd} is UIA-blacklisted this session"
+    loop = asyncio.get_event_loop()
+    try:
+        result = await asyncio.wait_for(
+            loop.run_in_executor(None, fn, *args),
+            timeout=_UIA_INVOKE_TIMEOUT_S,
+        )
+        return result, None
+    except asyncio.TimeoutError:
+        _uia_blacklist_add(
+            hwnd, f"{label} exceeded {_UIA_INVOKE_TIMEOUT_S}s (likely a "
+            f"Chromium/Electron accessibility bridge — a second UIA call "
+            f"into the same wedged provider has been observed to crash the "
+            f"process with STATUS_HEAP_CORRUPTION)",
+        )
+        return None, f"{label}: UIA call timed out after {_UIA_INVOKE_TIMEOUT_S}s"
+    except Exception as exc:
+        return None, f"{label}: UIA call raised {type(exc).__name__}: {exc}"
 
 
 def _suggest_uia_selector(name: str, automation_id: str, control_type: str) -> str:
@@ -2039,6 +2783,7 @@ class DesktopTool(BaseTool):
                     "hotkey",
                     "key_press",
                     "run_uia",
+                    "fill_file_dialog",
                 ],
                 "description": (
                     "Desktop action to perform. Mouse / keyboard actions "
@@ -2091,7 +2836,7 @@ class DesktopTool(BaseTool):
                     "replaces. Default false."
                 ),
             },
-            "path": {
+            "save_path": {
                 "type": "string",
                 "description": (
                     "[screenshot] Output file path. Absolute paths used as-is "
@@ -2241,6 +2986,39 @@ class DesktopTool(BaseTool):
                     "click_at's automatic invoke→toggle→select fallthrough."
                 ),
             },
+            "path": {
+                "type": "string",
+                "description": (
+                    "[fill_file_dialog] Full path to type into the native file "
+                    "dialog's filename field, then confirm. OMIT it to run in "
+                    "DETECTION mode — the call then just reports whether a native "
+                    "#32770 dialog is currently open (the one fact CDP cannot "
+                    "give you for an Electron BROWSE/Open button)."
+                ),
+            },
+            "submit": {
+                "type": "boolean",
+                "description": (
+                    "[fill_file_dialog] After setting the path, confirm the "
+                    "dialog (click Open/Save). Default true — and you almost "
+                    "always want true: the app does NOT parse the file or "
+                    "populate any dependent fields until the dialog CLOSES. "
+                    "Setting the filename without submitting leaves the dialog "
+                    "open and the app unchanged (this is exactly why xPCAT's "
+                    "Device Programmer / RAW PROGRAM stay empty — the "
+                    "contents.xml was typed but never accepted). Only pass "
+                    "false if you deliberately want to inspect the dialog before "
+                    "confirming, and then submit in a following call."
+                ),
+            },
+            "dialog_hwnd": {
+                "type": "integer",
+                "description": (
+                    "[fill_file_dialog] Target a specific dialog by hwnd when "
+                    "detection reported more than one stacked. Omit to use the "
+                    "frontmost."
+                ),
+            },
         },
         "required": ["action"],
         "additionalProperties": False,
@@ -2299,6 +3077,7 @@ class DesktopTool(BaseTool):
             "hotkey":       self._action_hotkey,
             "key_press":    self._action_key_press,
             "run_uia":      self._action_run_uia,
+            "fill_file_dialog": self._action_fill_file_dialog,
         }
         handler = dispatch.get(action)
         if handler is None:
@@ -2361,7 +3140,7 @@ class DesktopTool(BaseTool):
     ) -> ToolResult:
         region = (kwargs.get("region") or "foreground").lower()
         monitor = int(kwargs.get("monitor") or 0)
-        path_arg: Optional[str] = kwargs.get("path")
+        path_arg: Optional[str] = kwargs.get("save_path")
         with_ocr = bool(kwargs.get("with_ocr", False))
         try:
             hwnd_arg = int(kwargs["hwnd"]) if kwargs.get("hwnd") else None
@@ -2421,7 +3200,10 @@ class DesktopTool(BaseTool):
                 None, _screenshot_region, out_path, region, monitor, hwnd_arg,
             )
         except Exception as exc:
-            return self._error(params, start, f"screenshot: {exc}")
+            return self._error(
+                params, start, f"screenshot: {exc}",
+                hwnd=hwnd_arg or 0,
+            )
 
         if wrote_to_store:
             store.enforce_retention("task")
@@ -2591,6 +3373,14 @@ class DesktopTool(BaseTool):
                 timeout=_UIA_ENUMERATE_TIMEOUT_S,
             )
         except asyncio.TimeoutError:
+            # Blacklist the hwnd so subsequent input actions (click_at /
+            # find_and_click / type_text) skip UIA entirely on this window.
+            # A second UIA call into the same wedged provider was live-
+            # confirmed on 2026-08-03 to heap-corrupt the process — see
+            # _UIA_BLACKLIST comment.
+            _uia_blacklist_add(
+                hwnd, f"snapshot enumerate exceeded {_UIA_ENUMERATE_TIMEOUT_S}s",
+            )
             self.logger.warning(
                 f"snapshot: UIA enumerate exceeded {_UIA_ENUMERATE_TIMEOUT_S}s "
                 f"(hwnd={hwnd}) — likely a Chromium/Electron window opaque to "
@@ -2737,7 +3527,8 @@ class DesktopTool(BaseTool):
         except pyautogui.FailSafeException:
             return self._error(
                 params, start,
-                "hover_at: PyAutoGUI failsafe triggered (mouse hit corner).",
+                _failsafe_error_text("hover_at", x, y),
+                hwnd=_root_window_at_point(x, y) or 0,
             )
         except Exception as exc:
             return self._error(params, start, f"hover_at moveTo: {exc}")
@@ -2842,7 +3633,10 @@ class DesktopTool(BaseTool):
                 None, _screenshot_region, out_path, region, 0,
             )
         except Exception as exc:
-            return self._error(params, start, f"find_element capture: {exc}")
+            return self._error(
+                params, start, f"find_element capture: {exc}",
+                hwnd=int(_foreground_window_info().get("hwnd") or 0),
+            )
         store.enforce_retention("ephemeral")
 
         # rect[0:2] is the screen-space origin of the captured area.
@@ -2891,6 +3685,7 @@ class DesktopTool(BaseTool):
                 f"find_element: neither OCR nor vision could locate "
                 f"{description!r}. Inspect the screenshot at {out_path} "
                 f"to verify the target is actually visible.{_vision_note}",
+                hwnd=int(_foreground_window_info().get("hwnd") or 0),
             )
         vx, vy, vconf, vreason = vision_hit
         return ToolResult(
@@ -3079,10 +3874,17 @@ class DesktopTool(BaseTool):
         # UIA path: only for left single-clicks (mirrors click_at logic).
         input_source: str
         if use_uia and button == "left" and not double:
-            uia_err = await asyncio.get_event_loop().run_in_executor(
-                None, _uia_invoke_at_point, x, y,
+            # _uia_invoke_at_point returns None on success, str on
+            # per-control failure. _try_uia adds a timeout + blacklist wrapper
+            # around it: (None, None) = full success; anything else falls
+            # through to raw mouse. hwnd is resolved from the click point so
+            # blacklist entries can be keyed on the actual target window.
+            _target_hwnd = _root_window_at_point(x, y) or 0
+            uia_result, wrap_err = await _try_uia(
+                _uia_invoke_at_point, x, y,
+                hwnd=_target_hwnd, label="find_and_click",
             )
-            if uia_err is None:
+            if wrap_err is None and uia_result is None:
                 input_source = "uia_pattern"
             else:
                 try:
@@ -3095,6 +3897,7 @@ class DesktopTool(BaseTool):
                 except pyautogui.FailSafeException:
                     return self._error(
                         params, start, _failsafe_error_text("find_and_click", x, y),
+                        hwnd=_root_window_at_point(x, y) or 0,
                     )
                 input_source = "mouse"
         else:
@@ -3108,6 +3911,7 @@ class DesktopTool(BaseTool):
             except pyautogui.FailSafeException:
                 return self._error(
                     params, start, _failsafe_error_text("find_and_click", x, y),
+                    hwnd=_root_window_at_point(x, y) or 0,
                 )
             input_source = "mouse"
 
@@ -3119,7 +3923,12 @@ class DesktopTool(BaseTool):
             _sig_before,
             _content_signature(tuple(_probe_rect) if _probe_rect else None),
         )
-        effect = _click_effect(state_after, content_changed)
+        _geometry_changed = _probe_geometry_changed(_probe_rect)
+        if _geometry_changed:
+            # Pixel comparison is meaningless across a resize/move — drop it
+            # rather than report a bit that is known to be uninformative.
+            content_changed = None
+        effect = _click_effect(state_after, content_changed, _geometry_changed)
 
         # Combined result: the find metadata + the click outcome. Lets the
         # LLM verify the OCR/vision match without an extra screenshot.
@@ -3131,6 +3940,12 @@ class DesktopTool(BaseTool):
             "screenshot": out.get("screenshot"),
             "input_source": input_source,
             "state_after": state_after,
+            "window_changed": bool(
+                state_after.get("foreground_changed")
+                or state_after.get("title_changed")
+                or state_after.get("new_windows")
+            ),
+            "geometry_changed": _geometry_changed,
             "effect": effect,
         }
         if content_changed is not None:
@@ -3139,6 +3954,8 @@ class DesktopTool(BaseTool):
             merged["covering_window"] = covering_window
         if effect == "none_detected":
             merged["effect_hint"] = self._no_effect_hint(state_before.get("foreground_hwnd", 0))
+        elif effect == "geometry_only":
+            merged["effect_hint"] = _GEOMETRY_ONLY_HINT
         return ToolResult(
             success=True,
             output=merged,
@@ -3185,13 +4002,19 @@ class DesktopTool(BaseTool):
         # UIA path: only for left single-clicks (right/middle/double have no
         # UIA equivalent and must always use pyautogui).
         if use_uia and button == "left" and not double:
-            uia_err = await asyncio.get_event_loop().run_in_executor(
-                None, _uia_invoke_at_point, x, y,
+            # See find_and_click's UIA block for the wrapper contract. Same
+            # rationale applies here: any wedge routes to raw mouse rather
+            # than blocking the tool forever or risking a second UIA call
+            # into a broken provider.
+            _target_hwnd = _root_window_at_point(x, y) or 0
+            uia_result, wrap_err = await _try_uia(
+                _uia_invoke_at_point, x, y,
+                hwnd=_target_hwnd, label="click_at",
             )
-            if uia_err is None:
+            if wrap_err is None and uia_result is None:
                 output["input_source"] = "uia_pattern"
             else:
-                output["uia_fallback_reason"] = uia_err
+                output["uia_fallback_reason"] = wrap_err or str(uia_result)
                 try:
                     await asyncio.get_event_loop().run_in_executor(
                         None,
@@ -3200,6 +4023,7 @@ class DesktopTool(BaseTool):
                 except pyautogui.FailSafeException:
                     return self._error(
                         params, start, _failsafe_error_text("click_at", x, y),
+                        hwnd=_root_window_at_point(x, y) or 0,
                     )
                 output["input_source"] = "mouse"
         else:
@@ -3211,6 +4035,7 @@ class DesktopTool(BaseTool):
             except pyautogui.FailSafeException:
                 return self._error(
                     params, start, _failsafe_error_text("click_at", x, y),
+                    hwnd=_root_window_at_point(x, y) or 0,
                 )
             output["input_source"] = "mouse"
 
@@ -3229,12 +4054,23 @@ class DesktopTool(BaseTool):
             _sig_before,
             _content_signature(tuple(_probe_rect) if _probe_rect else None),
         )
+        _geometry_changed = _probe_geometry_changed(_probe_rect)
+        if _geometry_changed:
+            content_changed = None
+        output["window_changed"] = bool(
+            state_after.get("foreground_changed")
+            or state_after.get("title_changed")
+            or state_after.get("new_windows")
+        )
+        output["geometry_changed"] = _geometry_changed
         if content_changed is not None:
             output["content_changed"] = content_changed
-        effect = _click_effect(state_after, content_changed)
+        effect = _click_effect(state_after, content_changed, _geometry_changed)
         output["effect"] = effect
         if effect == "none_detected":
             output["effect_hint"] = self._no_effect_hint(state_before.get("foreground_hwnd", 0))
+        elif effect == "geometry_only":
+            output["effect_hint"] = _GEOMETRY_ONLY_HINT
         return ToolResult(
             success=True,
             output=output,
@@ -3267,18 +4103,30 @@ class DesktopTool(BaseTool):
         use_uia = bool(kwargs.get("use_uia_pattern", True))
 
         _ensure_dpi_aware()
-        state_before = _capture_state_before()
+        state_before, _probe_rect, _sig_before = _begin_effect_probe()
         output: Dict[str, Any] = {"chars": len(text)}
 
         if use_uia:
-            uia_err = await asyncio.get_event_loop().run_in_executor(
-                None, _uia_set_focused_value, text,
+            # _uia_set_focused_value operates on whatever control currently
+            # has keyboard focus. The foreground window is the closest thing
+            # we have to a target hwnd for blacklist purposes — good enough
+            # in practice because focus almost always lives in the foreground
+            # window, and getting it wrong just misses one blacklist entry
+            # (the next timeout will add it). The 2026-08-03 heap-corruption
+            # crash was in this exact call: type_text ran UIA against an
+            # xPCAT Electron window whose UIA provider had already wedged
+            # snapshot 15 minutes earlier. That is precisely what the
+            # blacklist and 3s timeout below defend against.
+            _fg_hwnd = int(_foreground_window_info().get("hwnd") or 0)
+            uia_result, wrap_err = await _try_uia(
+                _uia_set_focused_value, text,
+                hwnd=_fg_hwnd, label="type_text",
             )
-            if uia_err is None:
+            if wrap_err is None and uia_result is None:
                 # ValuePattern.SetValue replaces the entire field content.
                 output["input_source"] = "uia_value_pattern"
             else:
-                output["uia_fallback_reason"] = uia_err
+                output["uia_fallback_reason"] = wrap_err or str(uia_result)
                 paste_err = await asyncio.get_event_loop().run_in_executor(
                     None, _clipboard_paste_text, text,
                 )
@@ -3294,9 +4142,14 @@ class DesktopTool(BaseTool):
             output["input_source"] = "clipboard_paste"
 
         await asyncio.sleep(0.1)
-        state_after = _capture_state_after(state_before)
+        state_after, effect = _finalize_effect(
+            output, state_before, _probe_rect, _sig_before,
+        )
         self.state.invalidate_on_state_change(state_after)
-        output["state_after"] = state_after
+        if effect == "none_detected":
+            output["effect_hint"] = self._no_effect_hint(
+                state_before.get("foreground_hwnd", 0)
+            )
         return ToolResult(
             success=True,
             output=output,
@@ -3333,7 +4186,7 @@ class DesktopTool(BaseTool):
         duration = max(duration, 0.1)
 
         _ensure_dpi_aware()
-        state_before = _capture_state_before()
+        state_before, _probe_rect, _sig_before = _begin_effect_probe()
         try:
             await asyncio.get_event_loop().run_in_executor(
                 None,
@@ -3343,17 +4196,24 @@ class DesktopTool(BaseTool):
         except pyautogui.FailSafeException:
             return self._error(
                 params, start,
-                "drag: PyAutoGUI failsafe triggered. Mouse hit a corner.",
+                _failsafe_error_text("drag", fx, fy),
+                hwnd=_root_window_at_point(fx, fy) or 0,
             )
         await asyncio.sleep(0.1)
-        state_after = _capture_state_after(state_before)
+        output: Dict[str, Any] = {
+            "from": [fx, fy], "to": [tx, ty], "duration": duration,
+        }
+        state_after, effect = _finalize_effect(
+            output, state_before, _probe_rect, _sig_before,
+        )
         self.state.invalidate_on_state_change(state_after)
+        if effect == "none_detected":
+            output["effect_hint"] = self._no_effect_hint(
+                _root_window_at_point(fx, fy) or state_before.get("foreground_hwnd", 0)
+            )
         return ToolResult(
             success=True,
-            output={
-                "from": [fx, fy], "to": [tx, ty], "duration": duration,
-                "state_after": state_after,
-            },
+            output=output,
             tool_name=self.name,
             tool_parameters=params,
             execution_time=time.time() - start,
@@ -3378,7 +4238,7 @@ class DesktopTool(BaseTool):
                 "scroll requires integer x / y / dy.",
             )
         _ensure_dpi_aware()
-        state_before = _capture_state_before()
+        state_before, _probe_rect, _sig_before = _begin_effect_probe()
         try:
             await asyncio.get_event_loop().run_in_executor(
                 None,
@@ -3387,17 +4247,24 @@ class DesktopTool(BaseTool):
         except pyautogui.FailSafeException:
             return self._error(
                 params, start,
-                "scroll: PyAutoGUI failsafe triggered (mouse hit corner). "
-                "Move the mouse away from screen corners and retry.",
+                _failsafe_error_text("scroll", x, y),
+                hwnd=_root_window_at_point(x, y) or 0,
             )
         except Exception as exc:
             return self._error(params, start, f"scroll: {type(exc).__name__}: {exc}")
         await asyncio.sleep(0.1)
-        state_after = _capture_state_after(state_before)
+        output: Dict[str, Any] = {"x": x, "y": y, "dy": dy}
+        state_after, effect = _finalize_effect(
+            output, state_before, _probe_rect, _sig_before,
+        )
         self.state.invalidate_on_state_change(state_after)
+        if effect == "none_detected":
+            output["effect_hint"] = self._no_effect_hint(
+                _root_window_at_point(x, y) or state_before.get("foreground_hwnd", 0)
+            )
         return ToolResult(
             success=True,
-            output={"x": x, "y": y, "dy": dy, "state_after": state_after},
+            output=output,
             tool_name=self.name,
             tool_parameters=params,
             execution_time=time.time() - start,
@@ -3422,7 +4289,7 @@ class DesktopTool(BaseTool):
             )
         keys = [str(k).strip().lower() for k in keys if str(k).strip()]
         _ensure_dpi_aware()
-        state_before = _capture_state_before()
+        state_before, _probe_rect, _sig_before = _begin_effect_probe()
         try:
             await asyncio.get_event_loop().run_in_executor(
                 None,
@@ -3431,17 +4298,24 @@ class DesktopTool(BaseTool):
         except pyautogui.FailSafeException:
             return self._error(
                 params, start,
-                "hotkey: PyAutoGUI failsafe triggered (mouse hit corner). "
-                "Move the mouse away from screen corners and retry.",
+                _failsafe_error_text("hotkey"),
+                hwnd=int(_foreground_window_info().get("hwnd") or 0),
             )
         except Exception as exc:
             return self._error(params, start, f"hotkey: {type(exc).__name__}: {exc}")
         await asyncio.sleep(0.1)
-        state_after = _capture_state_after(state_before)
+        output: Dict[str, Any] = {"keys": keys}
+        state_after, effect = _finalize_effect(
+            output, state_before, _probe_rect, _sig_before,
+        )
         self.state.invalidate_on_state_change(state_after)
+        if effect == "none_detected":
+            output["effect_hint"] = self._no_effect_hint(
+                state_before.get("foreground_hwnd", 0)
+            )
         return ToolResult(
             success=True,
-            output={"keys": keys, "state_after": state_after},
+            output=output,
             tool_name=self.name,
             tool_parameters=params,
             execution_time=time.time() - start,
@@ -3462,7 +4336,7 @@ class DesktopTool(BaseTool):
         if not key:
             return self._error(params, start, "key_press requires 'key'.")
         _ensure_dpi_aware()
-        state_before = _capture_state_before()
+        state_before, _probe_rect, _sig_before = _begin_effect_probe()
         try:
             await asyncio.get_event_loop().run_in_executor(
                 None,
@@ -3471,17 +4345,24 @@ class DesktopTool(BaseTool):
         except pyautogui.FailSafeException:
             return self._error(
                 params, start,
-                "key_press: PyAutoGUI failsafe triggered (mouse hit corner). "
-                "Move the mouse away from screen corners and retry.",
+                _failsafe_error_text("key_press"),
+                hwnd=int(_foreground_window_info().get("hwnd") or 0),
             )
         except Exception as exc:
             return self._error(params, start, f"key_press: {type(exc).__name__}: {exc}")
         await asyncio.sleep(0.1)
-        state_after = _capture_state_after(state_before)
+        output: Dict[str, Any] = {"key": key}
+        state_after, effect = _finalize_effect(
+            output, state_before, _probe_rect, _sig_before,
+        )
         self.state.invalidate_on_state_change(state_after)
+        if effect == "none_detected":
+            output["effect_hint"] = self._no_effect_hint(
+                state_before.get("foreground_hwnd", 0)
+            )
         return ToolResult(
             success=True,
-            output={"key": key, "state_after": state_after},
+            output=output,
             tool_name=self.name,
             tool_parameters=params,
             execution_time=time.time() - start,
@@ -3528,9 +4409,13 @@ class DesktopTool(BaseTool):
             text = kwargs.get("text")
             if text is None:
                 return self._error(params, start, "run_uia pattern='value' requires 'text'.")
-            err = await asyncio.get_event_loop().run_in_executor(
-                None, _uia_set_focused_value, str(text),
+            # See type_text's UIA block for the wrapper contract.
+            _fg_hwnd = int(_foreground_window_info().get("hwnd") or 0)
+            uia_result, wrap_err = await _try_uia(
+                _uia_set_focused_value, str(text),
+                hwnd=_fg_hwnd, label="run_uia:value",
             )
+            err = wrap_err if wrap_err is not None else uia_result
             out_extra: Dict[str, Any] = {"text_chars": len(str(text))}
         else:
             try:
@@ -3542,9 +4427,12 @@ class DesktopTool(BaseTool):
                     "unless pattern='value'.",
                 )
             covering_window = _covering_window_info(x, y, state_before.get("foreground_hwnd", 0))
-            err = await asyncio.get_event_loop().run_in_executor(
-                None, _uia_invoke_single_pattern, x, y, pattern,
+            _target_hwnd = _root_window_at_point(x, y) or 0
+            uia_result, wrap_err = await _try_uia(
+                _uia_invoke_single_pattern, x, y, pattern,
+                hwnd=_target_hwnd, label=f"run_uia:{pattern}",
             )
+            err = wrap_err if wrap_err is not None else uia_result
             out_extra = {"x": x, "y": y}
             if covering_window is not None:
                 out_extra["covering_window"] = covering_window
@@ -3558,6 +4446,148 @@ class DesktopTool(BaseTool):
         return ToolResult(
             success=True,
             output={"pattern": pattern, "state_after": state_after, **out_extra},
+            tool_name=self.name,
+            tool_parameters=params,
+            execution_time=time.time() - start,
+        )
+
+    # ── fill_file_dialog ────────────────────────────────────────────────────
+    async def _action_fill_file_dialog(
+        self, params: Dict[str, Any], start: float, **kwargs: Any,
+    ) -> ToolResult:
+        """Detect and drive a NATIVE Win32 file-open/save dialog via win32.
+
+        This is the boundary CDP cannot cross. A BROWSE/Open/Save button in an
+        Electron app (xPCAT, QPM) opens a native ``#32770`` dialog that is not
+        in the Chromium DOM — CDP's file-chooser interception never fires for
+        it, and patching ipcRenderer/@electron/remote misses it. Win32 window
+        enumeration DOES see it, needs no foreground window, and needs no
+        screenshot.
+
+        Two roles in one tool, deliberately: DETECTION is the signal the agent
+        could not otherwise get. Call with no ``path`` (or path="") to just ask
+        "is a native dialog open right now?" — the answer is the perception the
+        CDP path never provided. Call WITH ``path`` to fill the filename field
+        and confirm.
+        """
+        if not _WIN32_AVAILABLE:
+            return self._error(
+                params, start,
+                "win32/pywinauto unavailable — cannot drive native dialogs.",
+            )
+
+        path = kwargs.get("path")
+        submit = bool(kwargs.get("submit", True))
+        dialog_hwnd = int(kwargs.get("dialog_hwnd") or 0)
+
+        # Detection-only mode: no path → report what native dialogs exist.
+        if not path:
+            def _detect_dialogs():
+                """Enumerate native dialogs AND probe each for a fillable Edit."""
+                import ctypes
+                import ctypes.wintypes as wt
+                dlgs = _enum_native_dialogs()
+                if not dlgs:
+                    return dlgs
+                _user32 = ctypes.windll.user32
+                _WNDENUMPROC = ctypes.WINFUNCTYPE(
+                    ctypes.c_bool, wt.HWND, wt.LPARAM,
+                )
+                for d in dlgs:
+                    ref = [False]
+                    def _cb(h, _lp, _ref=ref):
+                        try:
+                            cls = ctypes.create_unicode_buffer(96)
+                            _user32.GetClassNameW(h, cls, 96)
+                            if cls.value in _EDIT_CLASS_NAMES:
+                                _ref[0] = True
+                                return False  # stop enumeration
+                        except Exception:
+                            pass
+                        return True
+                    try:
+                        _user32.EnumChildWindows(
+                            d["hwnd"], _WNDENUMPROC(_cb), 0,
+                        )
+                    except Exception:
+                        pass
+                    d["has_filename_edit"] = ref[0]
+                return dlgs
+
+            dialogs = await asyncio.get_event_loop().run_in_executor(
+                None, _detect_dialogs,
+            )
+
+            # Build the hint — warn if any open dialog lacks an Edit control.
+            unfillable = any(
+                not d.get("has_filename_edit") for d in dialogs
+            ) if dialogs else False
+
+            if dialogs:
+                hint = (
+                    "Dialog(s) detected. Call fill_file_dialog(path=..., submit=true) to fill and confirm."
+                )
+                if unfillable:
+                    hint += (
+                        " WARNING: dialog(s) with has_filename_edit=false cannot be filled — "
+                        "use notify_user."
+                    )
+            else:
+                hint = "No native file dialog open. Re-click the BROWSE button, then call this immediately."
+
+            return ToolResult(
+                success=True,
+                output={
+                    "native_dialogs_open": len(dialogs),
+                    "dialogs": dialogs,
+                    "hint": hint,
+                },
+                tool_name=self.name,
+                tool_parameters=params,
+                execution_time=time.time() - start,
+            )
+
+        path = str(path)
+        # Filling a dialog IS an input action — take the sensitive-window guard
+        # + takeover the same way the other input actions do.
+        guard = await self._input_action_guard()
+        if guard:
+            return self._error(params, start, guard)
+
+        _ensure_dpi_aware()
+        # Time-box the whole win32 automation so a wedged dialog can't hang the
+        # turn (mirrors the UIA timeout defence).
+        try:
+            result = await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(
+                    None, _fill_native_file_dialog, path, dialog_hwnd, submit,
+                ),
+                timeout=15.0,
+            )
+        except asyncio.TimeoutError:
+            return self._error(
+                params, start,
+                "fill_file_dialog: native dialog automation exceeded 15s — the "
+                "dialog may be wedged. Check desktop_list_windows.",
+            )
+
+        if not result.get("ok"):
+            # A "no dialog" result is a real, actionable finding, not a crash —
+            # surface it as a failed result carrying the reason so the anti-
+            # repeat / reported_failures machinery sees it.
+            return self._error(
+                params, start,
+                f"fill_file_dialog: {result.get('error', 'failed')}",
+            )
+
+        # Filling a dialog changes the app; invalidate any cached snapshot.
+        try:
+            self.state.invalidate_on_state_change(_capture_state_after({}))
+        except Exception:
+            pass
+        return ToolResult(
+            success=True,
+            output=result,
             tool_name=self.name,
             tool_parameters=params,
             execution_time=time.time() - start,
@@ -3709,7 +4739,32 @@ class DesktopTool(BaseTool):
 
     def _error(
         self, params: Dict[str, Any], start: float, msg: str,
+        *, hwnd: int = 0,
     ) -> ToolResult:
+        """Build a failed ToolResult, optionally carrying process hints.
+
+        When *hwnd* is supplied, ``_process_hint_suffix`` appends any
+        skill-provided ``process_hints`` for that window's process — the same
+        re-surfacing ``_no_effect_hint`` does, but for HARD failures.
+
+        Why this matters: the hint used to reach the model ONLY through the
+        ``none_detected`` branch of click_at / find_and_click. Every hard
+        failure — failsafe, capture error, refused guard — returned a bare
+        string. The 2026-08-01 Alpaca trace hard-failed 7 clicks on TAC.exe
+        while the alpaca-workflow skill (read at turn 2) already said
+        verbatim: "do not retry the click or drop to raw Win32
+        SendInput/PostMessage/SendMessage — use
+        desktop_find_and_click(use_uia_pattern=False), which already works."
+        The agent tried all three forbidden Win32 paths anyway, across ~50
+        minutes, because by then the skill text had scrolled far outside
+        effective attention and nothing re-stated it at the moment of failure.
+
+        Defaults to ``hwnd=0`` so call sites that have no meaningful window
+        (bad params, unknown action, non-Windows platform) behave exactly as
+        before — an unresolvable hwnd yields "" rather than noise.
+        """
+        if hwnd:
+            msg += self._process_hint_suffix(hwnd)
         return ToolResult(
             success=False, output=None, error=msg,
             tool_name=self.name, tool_parameters=params,
@@ -3837,3 +4892,9 @@ class DesktopRunUiaTool(_DesktopAtomic):
     _action = "run_uia"
     def __init__(self, ctx=None) -> None:
         super().__init__(ctx=ctx, name="desktop_run_uia")
+
+
+class DesktopFillFileDialogTool(_DesktopAtomic):
+    _action = "fill_file_dialog"
+    def __init__(self, ctx=None) -> None:
+        super().__init__(ctx=ctx, name="desktop_fill_file_dialog")

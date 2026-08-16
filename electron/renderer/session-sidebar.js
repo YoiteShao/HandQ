@@ -146,6 +146,12 @@
   // keep the pinned width. There is no "unpin" gesture yet; reloading the
   // app goes back to auto.
   const SIDEBAR_TO_CARD_RATIO = 2.5 / 4;      // 0.625
+  // Must match .session-sidebar's `transition: width` duration in
+  // styles.css (currently 320ms) + slack for trailing paint/transitionend.
+  // Single source of truth for both widthTransitionEndTs and the
+  // card-width-instant/sidebar-blur-suppression window below, so the two
+  // never drift apart if the CSS duration changes again.
+  const SIDEBAR_WIDTH_ANIM_WINDOW_MS = 370;
   let userDraggedWidth = false;
   let userSidebarWidth = null;                // px; only read when userDraggedWidth
   let mainResizeObserver = null;
@@ -157,6 +163,15 @@
   // the transition every frame, producing jitter instead of a clean glide.
   // Value is `performance.now() + transition_duration + slack`.
   let widthTransitionEndTs = 0;
+  // Handle for the body.card-width-instant removal timeout (see
+  // _setCollapsed) — cleared/reset on every toggle so a rapid open→close→
+  // open sequence doesn't have an earlier timer prematurely removing the
+  // class mid-way through a later toggle's own animation window.
+  let _cardWidthInstantTimer = 0;
+  // Coalesces bursts of ingestFileTouch calls (e.g. an agent touching many
+  // files in a tight loop) into one _renderFilesList() per frame instead
+  // of a full tree rebuild per event.
+  let _filesListRafId = 0;
 
   function _emptySessionState(name) {
     return {
@@ -283,8 +298,18 @@
       if (!sid || !evt || !evt.path || !evt.touch) return;
       _ingest(sid, evt);
       if (sid === activeSid) {
-        _renderFilesList();
-        _maybeAutoExpand();
+        // rAF-coalesced: a burst of touches in one frame (e.g. an agent
+        // rapidly touching many files) used to trigger a full O(N) tree
+        // rebuild per event. _ingest above is a cheap Map write, so it's
+        // fine to run on every event; only the expensive render is batched
+        // to at most once per frame.
+        if (!_filesListRafId) {
+          _filesListRafId = requestAnimationFrame(() => {
+            _filesListRafId = 0;
+            _renderFilesList();
+            _maybeAutoExpand();
+          });
+        }
       } else {
         // Event for another session — no visual update here, but next time
         // the user switches to that session we should nudge it open.
@@ -486,6 +511,118 @@
     },
     onUndoRequest: function (cb) { if (typeof cb === 'function') undoListeners.push(cb); },
 
+    // ── Resume candidate display ─────────────────────────────────────────
+    // When the active session has a pending resume offer the sidebar shows
+    // candidates at the top. Calling hideResume clears it. The sidebar
+    // auto-expands on show and returns to normal on hide. The whole list
+    // is re-rendered every call (innerHTML=''; then append) so the bridge
+    // pushing a refreshed candidate set — every user message keeps
+    // searching until INTENT settles or "Not resuming" is clicked, so this
+    // may fire several times per conversation — overwrites the previous
+    // card wholesale, giving the user a "these are the current best
+    // matches for what I've said so far" feel rather than an increment.
+    // ``holdSeconds`` is a legacy parameter — the bridge always sends
+    // ``null`` on the wire now (messages are never held awaiting a resume
+    // decision); the parameter is kept only so existing call sites don't
+    // have to reshuffle their positional arguments.
+
+    showResumeCandidates: function (sid, candidates, holdSeconds, callbacks, triggerText) {
+      if (!dom.resumeSection) return;
+      // Only render for the active session (the sidebar is per-session).
+      if (sid !== activeSid) return;
+
+      dom.resumeSection.innerHTML = '';
+      dom.resumeSection.classList.remove('hidden');
+      // Mark the whole sidebar "resume-active" so CSS hides the plan bar /
+      // activity / files sections — while a resume offer is up, the panel
+      // shows ONLY the resume choice (nothing else to distract from the
+      // identity decision).
+      if (dom.host) dom.host.setAttribute('data-resume-active', 'true');
+
+      const title = document.createElement('div');
+      title.className = 'ss-resume-title';
+      // Quote the user's own words so it's clear WHICH message these
+      // candidates answer (the message bubble is over in the chat pane;
+      // this ties the two together).
+      const tq = String(triggerText || '').trim();
+      if (tq) {
+        const short = tq.length > 48 ? tq.slice(0, 45) + '…' : tq;
+        title.textContent = '↻ You said “' + short + '” — resume one of these?';
+      } else {
+        title.textContent = '↻ Resume a previous session?';
+      }
+      dom.resumeSection.appendChild(title);
+
+      const list = document.createElement('div');
+      list.className = 'ss-resume-list';
+      for (const c of candidates) {
+        const row = document.createElement('div');
+        row.className = 'ss-resume-row';
+        const t = document.createElement('div');
+        t.className = 'ss-resume-row-title';
+        t.textContent = String(c.title || '(untitled)');
+        row.appendChild(t);
+        const meta = [];
+        if (c.updated_at) meta.push(String(c.updated_at));
+        meta.push(c.is_fully_done ? PLAN_GLYPH.done + ' Completed' : PLAN_GLYPH.interrupted + ' Interrupted');
+        if (Array.isArray(c.workspace_files) && c.workspace_files.length) {
+          meta.push('Output: ' + c.workspace_files.slice(0, 2).join(', ') +
+            (c.workspace_files.length > 2 ? ' (+more)' : ''));
+        } else {
+          meta.push('No output');
+        }
+        const metaEl = document.createElement('div');
+        metaEl.className = 'ss-resume-row-meta';
+        metaEl.textContent = meta.join(' · ');
+        row.appendChild(metaEl);
+        if (c.final_answer) {
+          const ans = document.createElement('div');
+          ans.className = 'ss-resume-row-answer';
+          const firstLine = String(c.final_answer).split('\n')[0];
+          ans.textContent = firstLine.length > 140 ? firstLine.slice(0, 137) + '…' : firstLine;
+          row.appendChild(ans);
+        }
+        row.addEventListener('click', () => {
+          if (callbacks && callbacks.onConfirm) callbacks.onConfirm(c.session_dir);
+        });
+        list.appendChild(row);
+      }
+      dom.resumeSection.appendChild(list);
+
+      // Single "Not resuming" button (merged New Task + No Resume: session
+      // identity settled, runs held message + permanently disables search).
+      const actions = document.createElement('div');
+      actions.className = 'ss-resume-actions';
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'ss-resume-dismiss';
+      btn.textContent = 'Not resuming';
+      btn.title = 'Run your message as a new task and stop suggesting resume';
+      btn.addEventListener('click', () => {
+        if (callbacks && callbacks.onNotResuming) callbacks.onNotResuming();
+      });
+      actions.appendChild(btn);
+      dom.resumeSection.appendChild(actions);
+
+      // Auto-expand the sidebar so the user sees the candidates.
+      _setCollapsed(false);
+    },
+
+    hideResume: function (sid) {
+      if (!dom.resumeSection) return;
+      dom.resumeSection.innerHTML = '';
+      dom.resumeSection.classList.add('hidden');
+      if (dom.host) dom.host.removeAttribute('data-resume-active');
+      // If the session has no other content, collapse the sidebar.
+      const s = activeSid ? bySid.get(activeSid) : null;
+      const hasActivity = !!(s && (s.filesByPath.size > 0
+                                   || s.taskItems.length > 0
+                                   || s.activityItems.length > 0));
+      if (!hasActivity) {
+        _setCollapsed(true);
+      }
+    },
+
     // ── Debug helpers, exposed on window.SessionSidebar so you can
     //    diagnose UI plumbing from DevTools without needing the backend
     //    to actually fire an event. Meant for troubleshooting only.
@@ -605,6 +742,7 @@
     const $ = id => document.getElementById(id);
     dom.host           = $('session-sidebar');
     if (!dom.host) return;   // sidebar isn't in the DOM (older layout)
+    dom.resumeSection  = $('ss-resume-section');
     dom.name           = $('ss-session-name');
     dom.planBar        = $('ss-planbar');
     dom.activityList   = $('ss-activity-list');
@@ -638,6 +776,17 @@
     // (raised from the old 480 so ratio-based auto values on wide windows
     // aren't hard-capped). Only the auto ratio path benefits from the 800
     // ceiling; the user drag inherits it as a common upper bound.
+    //
+    // .session-sidebar's base rule carries a 200ms width transition (for
+    // the open/close toggle). Without suppressing it here, every pointer-
+    // move during a live drag would retarget that still-in-flight CSS
+    // transition instead of snapping straight to the pointer, producing a
+    // rubber-banding lag. ss-width-dragging turns the transition off only
+    // for the duration of this drag.
+    dom.widthHandle.addEventListener('pointerdown', () => dom.host.classList.add('ss-width-dragging'));
+    const _endWidthDrag = () => dom.host.classList.remove('ss-width-dragging');
+    dom.widthHandle.addEventListener('pointerup', _endWidthDrag);
+    dom.widthHandle.addEventListener('pointercancel', _endWidthDrag);
     _wireDrag(dom.widthHandle, 'ew', (dx, startVal) => {
       const w = Math.max(_sidebarMinWidth(), Math.min(_sidebarMaxWidth(), startVal - dx));
       dom.host.style.width = w + 'px';
@@ -781,12 +930,112 @@
     // IS the one setting the transition's initial target, and it runs
     // BEFORE _setCollapsed stamps widthTransitionEndTs, so timing-wise
     // it's the very first write, not a mid-flight retargeting.
-    if (!assumingOpen && performance.now() < widthTransitionEndTs) return;
+    // Hard gate on the drive itself, in addition to the timestamp above.
+    // widthTransitionEndTs is a fixed 370ms window, but a drive can
+    // legitimately run longer (up to REVEAL_MAX_MS when the window resize is
+    // slow to arrive or never comes). An RO write in that gap wouldn't move
+    // the panel — .ss-driving's width wins — but it WOULD overwrite the
+    // inline width that renderer.js's _sendAutoResizeIpc reads as the
+    // authoritative target, so the next IPC would ask main.js for the wrong
+    // window size. assumingOpen bypasses this for the same reason it
+    // bypasses the timestamp: that call comes from _setCollapsed and is
+    // setting the target a new drive is about to head for, so it must land
+    // even while a previous drive is still winding down.
+    if (!assumingOpen && (performance.now() < widthTransitionEndTs || _revealActive())) return;
     const raw = (userDraggedWidth && userSidebarWidth != null)
       ? userSidebarWidth
       : _autoSidebarWidth();
     const w = Math.round(Math.max(_sidebarMinWidth(), Math.min(_sidebarMaxWidth(), raw)));
+    // Skip no-op writes. The ResizeObserver on .main fires every frame while
+    // the user drags a window edge, and this function runs inside a rAF — so
+    // each write dirties layout that the NEXT frame's getBoundingClientRect
+    // reads have to flush, costing a forced full-document layout per frame
+    // even when the computed width didn't actually move. Sub-pixel flex
+    // distribution during a drag means `raw` jitters constantly while the
+    // rounded result stays put, so this catches most frames.
+    const prevW = parseFloat(dom.host.style.width);
+    if (Number.isFinite(prevW) && Math.abs(prevW - w) < 1) return;
     dom.host.style.width = w + 'px';
+  }
+
+  // --- JS-driven reveal --------------------------------------------------
+  //
+  // The sidebar's width is not animated by CSS during a toggle; it is derived
+  // every frame from the window's actual width so the centre chat card keeps a
+  // constant width throughout. layout-drive.js owns that loop and carries the
+  // full rationale — this panel is the case that motivated it, having bulged
+  // the card ~113px mid-open and pinched it ~123px mid-close. Everything here
+  // is just the geometry this particular panel contributes.
+  function _railExtras() {
+    const railEl = document.getElementById('stage-rail');
+    if (!railEl || railEl.getAttribute('data-empty') === 'true') return 0;
+    // Rail contributes its rendered width + its 10px margin against .main.
+    return railEl.getBoundingClientRect().width + 10;
+  }
+
+  // Solve for "how wide can the sidebar be right now while the chat region
+  // keeps the width `cardW`". Any constant this misses (a .main padding, a
+  // sub-pixel gap) is absorbed by the drive's own calibration, measured once
+  // at start so frame 0 reproduces the sidebar's true starting width exactly
+  // — which is why this doesn't need to enumerate every box in the row.
+  function _rawDriven(cardW, mainW) {
+    return mainW - _railExtras() - cardW - 10;
+  }
+
+  function _mainWidth() {
+    const mainEl = document.querySelector('.main');
+    return mainEl ? mainEl.getBoundingClientRect().width : 0;
+  }
+
+  function _chatRegionWidth() {
+    const el = document.getElementById('chat-region');
+    return el ? el.getBoundingClientRect().width : 0;
+  }
+
+  // Hand the toggle to layout-drive.js, which owns the per-frame loop and the
+  // self-calibration. startW / finalW are the sidebar's widths before and
+  // after this toggle (finalW is 0 when closing); cardW is the chat region's
+  // pre-toggle width, i.e. the value being held constant.
+  function _startReveal(startW, finalW, cardW) {
+    if (!dom.host || !window.HandQLayoutDrive) return;
+    const host = dom.host;
+    window.HandQLayoutDrive.start({
+      el: host,
+      prop: '--ss-driven-w',
+      cls: 'ss-driving',
+      startW: startW,
+      finalW: finalW,
+      solve: () => _rawDriven(cardW, _mainWidth()),
+      onSettle: () => {
+        // Opening pins the inline width so the ordinary rules keep it once
+        // the driving class is gone. Closing needs no inline value at all —
+        // [data-collapsed="true"]'s `width: 0 !important` takes back over and
+        // the driven width is already 0, so nothing moves at the handover.
+        //
+        // The INTENDED final width is pinned even if the window never made
+        // room for it (setBounds is a no-op when the window already sits
+        // against the work-area edge). The card does then give up the space,
+        // exactly as it did before this drive existed — what's being
+        // protected is "no mid-flight wobble", not "the card never shrinks".
+        if (finalW > 0) host.style.width = Math.round(finalW) + 'px';
+        document.body.classList.remove('ss-driving-active');
+      },
+    });
+    // A driven CLOSE flips data-collapsed up front (so every state reader sees
+    // the settled truth immediately) while the panel is still visibly on
+    // screen for another ~200ms. _updateActivityBadge reveals the floating
+    // reopen button off that same attribute, which would otherwise pop in on
+    // top of the panel it is meant to replace. Hold it back for the drive.
+    // Skipped when the drive declined to start (reduced motion), since then
+    // there is no interval to cover.
+    if (window.HandQLayoutDrive.isActive(host)) {
+      document.body.classList.add('ss-driving-active');
+    }
+  }
+
+  function _revealActive() {
+    return !!(dom.host && window.HandQLayoutDrive &&
+              window.HandQLayoutDrive.isActive(dom.host));
   }
 
   function _setCollapsed(collapsed) {
@@ -810,15 +1059,42 @@
     // we're about to flip it) and its transition-window suppression
     // (this call IS the one that sets the transition's initial target).
     if (!collapsed) _refreshSidebarWidth(true);
+    // Measure the pre-toggle geometry BEFORE the attribute flip changes
+    // layout. startW is the sidebar's current rendered width (0 while
+    // collapsed, since [data-collapsed="true"] forces width:0 regardless of
+    // the inline value _refreshSidebarWidth just wrote); finalW is where
+    // this toggle is heading; cardW0 is the chat region width the drive will
+    // hold constant.
+    const startW = dom.host.getBoundingClientRect().width;
+    const finalW = collapsed ? 0 : (parseFloat(dom.host.style.width) || 0);
+    const cardW0 = _chatRegionWidth();
     dom.host.setAttribute('data-collapsed', next);
-    // Reserve the next ~250ms as CSS's exclusive animation window (see
-    // widthTransitionEndTs comment). Covers the 200ms `transition: width`
-    // in styles.css plus 50ms of trailing paint / transitionend slack.
-    // Only fires on a real toggle — a redundant setCollapsed(true) when
-    // already collapsed shouldn't reserve the window since no transition
-    // will run.
+    // Reserve CSS's exclusive animation window (see widthTransitionEndTs
+    // comment + SIDEBAR_WIDTH_ANIM_WINDOW_MS above). Only fires on a real
+    // toggle — a redundant setCollapsed(true) when already collapsed
+    // shouldn't reserve the window since no transition will run.
     if (prev !== next) {
-      widthTransitionEndTs = performance.now() + 250;
+      widthTransitionEndTs = performance.now() + SIDEBAR_WIDTH_ANIM_WINDOW_MS;
+      _startReveal(startW, finalW, cardW0);
+      // .session-card's own `transition: width` (styles.css) is meant for
+      // a DISCRETE target change (e.g. the window's native resize landing
+      // on a new size) — it plays one clean curve toward one endpoint.
+      // But here the card's grid-computed width is a continuously MOVING
+      // target for the whole window, recomputed every frame as the
+      // sidebar itself animates. Leaving the card's transition armed
+      // during that window means it's constantly chasing a goalpost that
+      // just moved again on the next frame — the card visibly lags behind
+      // the sidebar's clean curve instead of moving in lockstep with it
+      // (reads as "sidebar moves, then the card's animation gets patched
+      // on after"). Suppressing it here lets the card snap to each
+      // frame's grid-computed width exactly in sync with the sidebar;
+      // body.card-width-instant is removed after the same window the
+      // sidebar's own transition owns.
+      document.body.classList.add('card-width-instant');
+      clearTimeout(_cardWidthInstantTimer);
+      _cardWidthInstantTimer = setTimeout(() => {
+        document.body.classList.remove('card-width-instant');
+      }, SIDEBAR_WIDTH_ANIM_WINDOW_MS);
     }
     _updateActivityBadge();
     // Notify the outer renderer's _updateLayout so the window can grow /
@@ -874,12 +1150,18 @@
     }
   }
 
+  // Registry of in-flight setPointerCapture grabs, so a global safety net
+  // (below) can force-release them even when the owning element never gets
+  // its own pointerup/pointercancel. See _wireDrag for why this exists.
+  const _activeCaptures = new Set();
+
   function _wireDrag(el, axis, onMove, getStartValue) {
     let active = null;
     el.addEventListener('pointerdown', (e) => {
       active = { startX: e.clientX, startY: e.clientY, startVal: getStartValue() };
       el.classList.add('dragging');
       el.setPointerCapture(e.pointerId);
+      _activeCaptures.add(stop);
     });
     el.addEventListener('pointermove', (e) => {
       if (!active) return;
@@ -890,11 +1172,57 @@
       if (!active) return;
       active = null;
       el.classList.remove('dragging');
-      try { el.releasePointerCapture(e.pointerId); } catch (_) {}
+      // e is undefined when the global safety net below force-calls this
+      // without a real pointer event to hand it — releasePointerCapture
+      // needs a pointerId, but by then the browser has usually already
+      // dropped the capture on its own (that's what triggered the safety
+      // net's pointerup listener to fire in the first place), so this is
+      // best-effort cleanup of OUR bookkeeping, not the capture itself.
+      if (e) { try { el.releasePointerCapture(e.pointerId); } catch (_) {} }
+      _activeCaptures.delete(stop);
     };
     el.addEventListener('pointerup', stop);
     el.addEventListener('pointercancel', stop);
   }
+
+  // Global safety net for setPointerCapture drags (the width handle here,
+  // and the app-wide floating-composer/terminal-panel resize handles use
+  // the same idiom — see renderer.js's initPanelDrag/initPanelResize).
+  //
+  // setPointerCapture makes the browser route ALL subsequent pointer
+  // events for that pointerId to the captured element, regardless of what
+  // is actually under the cursor, until the element calls
+  // releasePointerCapture OR the browser auto-releases it (pointer up,
+  // pointercancel, or the element leaving the DOM). If the element's own
+  // pointerup/pointercancel handler is ever skipped — e.g. the release
+  // happens while the cursor is over a `-webkit-app-region: drag` region,
+  // where Electron's native window-drag can swallow the event before it
+  // reaches the page — our `active` bookkeeping never clears, and every
+  // click ANYWHERE in the app keeps silently targeting the drag handle
+  // instead of whatever the user is actually pointing at. That reproduces
+  // exactly as "hover shows nothing, clicks do nothing" on completely
+  // unrelated UI (Settings' switches and Save button included) — the
+  // browser has already released ITS side of the capture, so this is
+  // purely our handler never having run.
+  //
+  // Listening on `window` with capture:true catches a pointerup no matter
+  // which element the browser decided to dispatch it to, so even a "the
+  // event went somewhere weird" case still reaches this. Same for
+  // pointercancel and losing window focus entirely (alt-tab away mid-drag).
+  ['pointerup', 'pointercancel'].forEach((type) => {
+    window.addEventListener(type, () => {
+      if (_activeCaptures.size === 0) return;
+      const stops = Array.from(_activeCaptures);
+      _activeCaptures.clear();
+      stops.forEach((stop) => stop());
+    }, { capture: true });
+  });
+  window.addEventListener('blur', () => {
+    if (_activeCaptures.size === 0) return;
+    const stops = Array.from(_activeCaptures);
+    _activeCaptures.clear();
+    stops.forEach((stop) => stop());
+  });
 
   // ── HUD renderers ─────────────────────────────────────────────────────
   function _renderName() {
@@ -983,6 +1311,20 @@
     return s.length > n ? s.slice(0, n - 1) + '…' : s;
   }
 
+  // Activity content/result are free-form LLM text (tool params, decision
+  // reasoning, result summaries) that can carry **bold** or literal
+  // newlines — same shape as chat system bubbles. Defer to renderer.js's
+  // shared inline formatter (bold/italic/code + explicit <br>) so both
+  // surfaces render markdown the same way instead of dumping raw text via
+  // .textContent. Falls back to escaped plain text if renderer.js hasn't
+  // installed the helper yet (load order: this file is <script>'d first).
+  function _renderInline(s) {
+    if (window.HandQFormat && typeof window.HandQFormat.renderInline === 'function') {
+      return window.HandQFormat.renderInline(s);
+    }
+    return _esc(s).replace(/\n/g, '<br>');
+  }
+
   function _isJsonString(s) {
     if (!s || typeof s !== 'string') return false;
     const trimmed = s.trim();
@@ -1064,7 +1406,7 @@
       const content = document.createElement('span');
       content.className = 'aa-content' + (contentIsJson ? ' ai-json' : '');
       if (contentIsJson) content.appendChild(_renderJsonContent(entry.content));
-      else content.textContent = _truncate(entry.content, ACTIVITY_TRUNC);
+      else content.innerHTML = _renderInline(_truncate(entry.content, ACTIVITY_TRUNC));
       item.appendChild(content);
       if (!contentIsJson) item.title = entry.content;
     }
@@ -1076,7 +1418,7 @@
         result.appendChild(document.createTextNode('↳ '));
         result.appendChild(_renderJsonContent(entry.resultContent));
       } else {
-        result.textContent = '↳ ' + _truncate(entry.resultContent, ACTIVITY_TRUNC);
+        result.innerHTML = '↳ ' + _renderInline(_truncate(entry.resultContent, ACTIVITY_TRUNC));
       }
       item.appendChild(result);
     }
@@ -1086,9 +1428,9 @@
     // the user's "I opened this" state survives a tool-result update.
     if (item.classList.contains('expanded')) {
       const c = item.querySelector('.aa-content');
-      if (c && !c.classList.contains('ai-json')) c.textContent = entry.content;
+      if (c && !c.classList.contains('ai-json')) c.innerHTML = _renderInline(entry.content);
       const r = item.querySelector('.aa-result');
-      if (r && !r.classList.contains('ai-json')) r.textContent = '↳ ' + (entry.resultContent || '');
+      if (r && !r.classList.contains('ai-json')) r.innerHTML = '↳ ' + _renderInline(entry.resultContent || '');
     }
   }
 
@@ -1105,13 +1447,13 @@
       item.classList.toggle('expanded');
       const c = item.querySelector('.aa-content');
       if (c && !c.classList.contains('ai-json')) {
-        c.textContent = item.classList.contains('expanded')
+        c.innerHTML = _renderInline(item.classList.contains('expanded')
           ? entry.content
-          : _truncate(entry.content, ACTIVITY_TRUNC);
+          : _truncate(entry.content, ACTIVITY_TRUNC));
       }
       const r = item.querySelector('.aa-result');
       if (r && !r.classList.contains('ai-json')) {
-        r.textContent = '↳ ' + (item.classList.contains('expanded')
+        r.innerHTML = '↳ ' + _renderInline(item.classList.contains('expanded')
           ? entry.resultContent
           : _truncate(entry.resultContent, ACTIVITY_TRUNC));
       }

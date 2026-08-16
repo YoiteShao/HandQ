@@ -43,13 +43,25 @@ function safeStringify(v) {
 // Strip API_KEY (and the legacy api_key / api_key_env) from any nested
 // object before we log it. Used to redact the config payload passed to
 // setConfig() (porting_design.md §(2.8)).
+//
+// Also strips the remote-control bearer token and the `handq://host:port/token`
+// pairing string. Those travel through remote_pair / remote_probe / the
+// remote_control_status response, all of which are logged like any other
+// envelope — so without these keys a machine's control token would land in
+// handq-frontend.log in cleartext. Anyone with the token can open agent
+// sessions on that machine.
+const _REDACT_KEYS = new Set([
+    'API_KEY', 'api_key', 'api_key_env',
+    'token', 'pairing', 'capability', 'remote_control_token',
+]);
+
 function redactApiKey(value) {
     if (!value || typeof value !== 'object') return value;
     if (Array.isArray(value)) return value.map(redactApiKey);
     const out = {};
     for (const k of Object.keys(value)) {
         const v = value[k];
-        if (k === 'API_KEY' || k === 'api_key' || k === 'api_key_env') {
+        if (_REDACT_KEYS.has(k)) {
             out[k] = (v === undefined || v === null || v === '') ? v : '<redacted>';
         } else if (v && typeof v === 'object') {
             out[k] = redactApiKey(v);
@@ -313,6 +325,14 @@ contextBridge.exposeInMainWorld('windowControls', {
             try { cb(state); } catch (_) { /* swallow */ }
         });
     },
+    // Subscribe to window focus/blur so the custom titlebar can dim like a
+    // real OS window when it loses activation.
+    onActiveState: (cb) => {
+        if (typeof cb !== 'function') return;
+        ipcRenderer.on('window:activeState', (_evt, state) => {
+            try { cb(state); } catch (_) { /* swallow */ }
+        });
+    },
 });
 
 // Global hotkey settings — renderer reads/writes the toggle shortcut.
@@ -387,4 +407,14 @@ contextBridge.exposeInMainWorld('glassCapture', {
             try { cb(bounds); } catch (_) { /* swallow */ }
         });
     },
+    // Ask main to toggle WDA_EXCLUDEFROMCAPTURE. webgl mode needs it ON (the
+    // shader samples the real desktop and would otherwise capture itself);
+    // veil mode is pure CSS and turns it OFF so the window appears in ordinary
+    // OS screenshots. Fire-and-forget from the renderer's point of view.
+    setContentProtection: (on) => ipcRenderer.invoke('glass:setContentProtection', on),
+    // Live-set Win11's system frosted-glass material. Session-only, no
+    // persistence — main.js re-creates the window with default (transparent-
+    // only) options on next launch. Values: 'none' / 'auto' / 'mica' /
+    // 'acrylic' / 'tabbed'. macOS + Linux ignore this.
+    setBackgroundMaterial: (material) => ipcRenderer.invoke('window:setBackgroundMaterial', material),
 });

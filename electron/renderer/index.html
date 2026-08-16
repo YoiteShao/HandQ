@@ -183,6 +183,21 @@
                                 <span class="im-label">Skills</span>
                             </button>
                         </li>
+                        <li role="none">
+                            <button class="island-menu-item" id="sc-remote" role="menuitem"
+                                    type="button">
+                                <svg class="im-icon" viewBox="0 0 16 16" aria-hidden="true">
+                                    <rect x="1.6" y="3" width="7" height="5" rx="1"
+                                          stroke="currentColor" stroke-width="1.3" fill="none"/>
+                                    <rect x="7.4" y="8" width="7" height="5" rx="1"
+                                          stroke="currentColor" stroke-width="1.3" fill="none"/>
+                                    <path d="M10.9 5.5h3.5M12.9 4l1.5 1.5-1.5 1.5"
+                                          stroke="currentColor" stroke-width="1.3"
+                                          fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+                                </svg>
+                                <span class="im-label">Connect</span>
+                            </button>
+                        </li>
                     </ul>
                 </div>
                 <button class="titlebar-new-btn" id="sc-new-session" type="button"
@@ -195,6 +210,23 @@
                               stroke="currentColor" stroke-width="1.4"
                               stroke-linecap="round"/>
                     </svg>
+                </button>
+                <!-- 被控状态常驻指示器：只在本机允许被远程控制时显示，被驱动时高亮
+                     并显示远程会话数。点击打开 Remote machines 面板。这是"不存在
+                     用户不知道自己在被控制"这条要求的落点。 -->
+                <button class="titlebar-serve-indicator hidden" id="serve-indicator"
+                        type="button" aria-label="Remote control status"
+                        title="本机远程控制状态">
+                    <svg viewBox="0 0 16 16" aria-hidden="true">
+                        <rect x="1.6" y="3" width="7" height="5" rx="1"
+                              stroke="currentColor" stroke-width="1.3" fill="none"/>
+                        <rect x="7.4" y="8" width="7" height="5" rx="1"
+                              stroke="currentColor" stroke-width="1.3" fill="none"/>
+                        <path d="M10.9 5.5h3.5M12.9 4l1.5 1.5-1.5 1.5"
+                              stroke="currentColor" stroke-width="1.3"
+                              fill="none" stroke-linecap="round" stroke-linejoin="round"/>
+                    </svg>
+                    <span class="serve-indicator-count" id="serve-indicator-count"></span>
                 </button>
             </div>
             <div class="titlebar-controls" aria-label="Window controls">
@@ -283,6 +315,12 @@
                 </header>
 
                 <div class="ss-inner" id="ss-inner">
+                    <!-- Resume candidate section (§ hold-until-decision) — shown
+                         at the TOP when the active session has a pending resume
+                         offer. Hidden otherwise; rendered by session-sidebar.js's
+                         showResumeCandidates(). -->
+                    <div class="ss-resume-section hidden" id="ss-resume-section"></div>
+
                     <!-- Plan bar (top) — full task-plan queue, always expanded -->
                     <div class="ss-planbar" id="ss-planbar"></div>
 
@@ -471,106 +509,94 @@
                         <legend class="settings-section-header">Interaction Switches<span class="settings-chevron">▾</span></legend>
 
                         <p class="help-text fieldset-intro">
-                            <strong>Enable</strong> controls whether the tool exists at
-                            all — when off, the tool is hidden from the agent.
-                            <strong>Auto-approve</strong> controls whether calls run
-                            silently — checked = run without asking; unchecked = confirm
-                            first. Tools without an Enable switch are always available.
-                            Paths inside the working directory are always auto-approved
-                            for write/edit regardless of these switches.
+                            <strong>Auto-approve</strong>: checked = run silently,
+                            unchecked = ask first. Files inside the working
+                            directory are always auto-approved for write/edit.
                         </p>
 
-                        <div class="tool-group">
-                            <div class="tool-group-name">Write tool</div>
-                            <label class="checkbox-row tool-sub">
-                                <input type="checkbox" id="cfg-sw-tool-write" />
-                                <span>Auto-approve</span>
-                                <small class="help-text">
-                                    When unchecked, ask before the write tool
-                                    creates or overwrites a file outside the
-                                    working directory.
-                                </small>
-                            </label>
-                        </div>
+                        <div class="tool-group-grid">
+                            <div class="tool-group">
+                                <div class="tool-group-name">Write tool</div>
+                                <label class="checkbox-row tool-sub">
+                                    <input type="checkbox" id="cfg-sw-tool-write" />
+                                    <span>Auto-approve</span>
+                                    <small class="help-text">
+                                        Ask before creating or overwriting files
+                                        outside the working directory.
+                                    </small>
+                                </label>
+                            </div>
 
-                        <div class="tool-group">
-                            <div class="tool-group-name">Edit tool</div>
-                            <label class="checkbox-row tool-sub">
-                                <input type="checkbox" id="cfg-sw-tool-edit" />
-                                <span>Auto-approve</span>
-                                <small class="help-text">
-                                    When unchecked, ask before the edit tool
-                                    modifies an existing file outside the working
-                                    directory.
-                                </small>
-                            </label>
-                        </div>
+                            <div class="tool-group">
+                                <div class="tool-group-name">Edit tool</div>
+                                <label class="checkbox-row tool-sub">
+                                    <input type="checkbox" id="cfg-sw-tool-edit" />
+                                    <span>Auto-approve</span>
+                                    <small class="help-text">
+                                        Ask before modifying files outside the
+                                        working directory.
+                                    </small>
+                                </label>
+                            </div>
 
-                        <div class="tool-group">
-                            <div class="tool-group-name">Bash tool</div>
-                            <label class="checkbox-row tool-sub">
-                                <input type="checkbox" id="cfg-sw-tool-bash" />
-                                <span>Auto-approve</span>
-                                <small class="help-text">
-                                    When unchecked, ask before any bash command
-                                    runs. The high-risk switch below is checked
-                                    first and takes priority.
-                                </small>
-                            </label>
-                        </div>
+                            <div class="tool-group">
+                                <div class="tool-group-name">Bash tool</div>
+                                <label class="checkbox-row tool-sub">
+                                    <input type="checkbox" id="cfg-sw-tool-bash" />
+                                    <span>Auto-approve</span>
+                                    <small class="help-text">
+                                        Ask before running bash commands.
+                                        High-risk commands are always gated
+                                        separately below.
+                                    </small>
+                                </label>
+                            </div>
 
-                        <div class="tool-group" data-tool="browser">
-                            <div class="tool-group-name">Browser tool</div>
-                            <label class="checkbox-row tool-sub" data-row="auto">
-                                <input type="checkbox" id="cfg-sw-tool-browser-auto" />
-                                <span>Auto-approve</span>
-                                <small class="help-text">
-                                    When unchecked, ask before each browser action
-                                    (navigate, click, type, extract, screenshot, …).
-                                    The browser launches off-screen with a separate
-                                    profile so it does not disturb your main Chrome.
-                                    attach_browser (taking over your running Chrome)
-                                    is gated separately by the high-risk switch and
-                                    always asks regardless of this setting.
-                                </small>
-                            </label>
-                        </div>
+                            <div class="tool-group" data-tool="browser">
+                                <div class="tool-group-name">Browser tool</div>
+                                <label class="checkbox-row tool-sub" data-row="auto">
+                                    <input type="checkbox" id="cfg-sw-tool-browser-auto" />
+                                    <span>Auto-approve</span>
+                                    <small class="help-text">
+                                        Ask before each browser action. Runs in
+                                        an off-screen browser, separate from your
+                                        main Chrome. Taking over your running
+                                        Chrome always asks, regardless of this
+                                        setting.
+                                    </small>
+                                </label>
+                            </div>
 
-                        <div class="tool-group" data-tool="desktop">
-                            <div class="tool-group-name">Desktop tool</div>
-                            <label class="checkbox-row tool-sub" data-row="auto">
-                                <input type="checkbox" id="cfg-sw-tool-desktop-auto" />
-                                <span>Auto-approve</span>
-                                <small class="help-text">
-                                    When unchecked, the agent asks once per task
-                                    before driving your real mouse / keyboard
-                                    (click_at, type_text, drag, scroll, hotkey,
-                                    key_press); a single approval covers every
-                                    desktop action until the task ends. Press
-                                    <code>Ctrl+Shift+C</code> anytime to revoke.
-                                    Read-only actions (screenshot, list_windows,
-                                    find_element) are not gated. Sensitive
-                                    windows (password managers, banking) are
-                                    always refused regardless of this switch.
-                                    Off by default — desktop input affects
-                                    whatever app is focused, not just HandQ's
-                                    own browser.
-                                </small>
-                            </label>
-                        </div>
+                            <div class="tool-group" data-tool="desktop">
+                                <div class="tool-group-name">Desktop tool</div>
+                                <label class="checkbox-row tool-sub" data-row="auto">
+                                    <input type="checkbox" id="cfg-sw-tool-desktop-auto" />
+                                    <span>Auto-approve</span>
+                                    <small class="help-text">
+                                        Ask once per task before controlling your
+                                        real mouse/keyboard; one approval covers
+                                        the whole task. Press
+                                        <code>Ctrl+Shift+C</code> to revoke.
+                                        Screenshots and other read-only actions
+                                        are never gated; sensitive windows
+                                        (password managers, banking) are always
+                                        refused. Off by default.
+                                    </small>
+                                </label>
+                            </div>
 
-                        <div class="tool-group">
-                            <div class="tool-group-name">High-risk commands</div>
-                            <label class="checkbox-row tool-sub">
-                                <input type="checkbox" id="cfg-sw-high-risk" />
-                                <span>Auto-approve</span>
-                                <small class="help-text">
-                                    When unchecked, ask before any high-risk
-                                    bash command (rm, kill, shutdown, DROP
-                                    TABLE, git push --force, …). Strongly
-                                    recommended: leave unchecked.
-                                </small>
-                            </label>
+                            <div class="tool-group">
+                                <div class="tool-group-name">High-risk commands</div>
+                                <label class="checkbox-row tool-sub">
+                                    <input type="checkbox" id="cfg-sw-high-risk" />
+                                    <span>Auto-approve</span>
+                                    <small class="help-text">
+                                        Ask before high-risk commands (rm, kill,
+                                        shutdown, DROP TABLE, git push --force, …).
+                                        Strongly recommended: leave unchecked.
+                                    </small>
+                                </label>
+                            </div>
                         </div>
                     </fieldset>
 
@@ -643,6 +669,30 @@
                         </label>
                     </fieldset>
 
+                    <!-- ============================== Remote control ==============================
+                         Deliberately NOT a settings section. Everything about
+                         Connect — becoming a server, pairing with one, opening
+                         and destroying remote sessions — lives in the Connect
+                         panel (the ⇄ island-menu entry), because those are
+                         actions with immediate consequences on another machine,
+                         not preferences. This block used to hold a "允许本机被
+                         远程控制" checkbox that persisted `remote_control.serve`
+                         and made HandQ start listening at boot, which
+                         contradicted the panel's own rule (every "As Server"
+                         mints a fresh token, nothing auto-listens) and opened
+                         the machine up with a token the user had never seen.
+                         It also held a "在本机也显示远程会话" toggle that had
+                         been dead since the mirror tab was removed — nothing
+                         read it.
+
+                         The remaining knobs (bind / port / max_sessions /
+                         allow_remote_secret_prompt) are advanced and yaml-only;
+                         see remote_control/serving.py. allow_remote_secret_prompt
+                         in particular SHOULD require editing a file on the被控
+                         machine — it is what lets a remote operator be prompted
+                         for a local password over a channel with no TLS.
+                    -->
+
                     <div class="settings-actions">
                         <button type="button" id="settings-load">Reload</button>
                         <button type="submit" id="settings-save">Save</button>
@@ -650,6 +700,7 @@
                     </div>
                 </form>
                 <div class="settings-version settings-version-centered muted">Version <span id="settings-version-number">—</span></div>
+                <div class="overlay-resize-handle" aria-hidden="true"></div>
             </div>
         </div>
 
@@ -659,6 +710,172 @@
         <!-- triage stats, scheduled tasks, activity monitor state, and    -->
         <!-- the git post-commit hook. NOT user-facing; the only way to    -->
         <!-- reach this panel is the special /memory command.              -->
+        <!-- ============================================================ -->
+        <!--  v6 Connect panel — role selection + As Server / As Client   -->
+        <!--  dashboards. See docs/connect_v6_reference.md. This is the    -->
+        <!--  full-screen surface replacing #overlay-remote; the old       -->
+        <!--  overlay still exists below because remote-control.js's       -->
+        <!--  pairing dialogs and its remoteSessions bookkeeping live      -->
+        <!--  alongside it and this panel delegates to them.               -->
+        <!-- ============================================================ -->
+        <div class="overlay hidden" id="overlay-connect" aria-hidden="true">
+            <div class="overlay-card connect-card" role="dialog" aria-modal="true">
+                <header class="overlay-header">
+                    <h2 id="connect-title">Connect</h2>
+                    <div class="connect-header-actions">
+                        <button type="button" class="overlay-close" id="connect-close"
+                                aria-label="Close">×</button>
+                    </div>
+                </header>
+
+                <div class="connect-body">
+                    <!-- Page 1: role selection -->
+                    <section class="connect-page" data-connect-page="role">
+                        <div class="connect-role-grid">
+                            <button type="button" class="connect-role-tile"
+                                    id="connect-role-server">
+                                <span class="connect-role-title">As Server</span>
+                                <span class="connect-role-desc">
+                                    Let another HandQ control this machine
+                                </span>
+                            </button>
+                            <button type="button" class="connect-role-tile"
+                                    id="connect-role-client">
+                                <span class="connect-role-title">As Client</span>
+                                <span class="connect-role-desc">Control a remote machine</span>
+                            </button>
+                        </div>
+                        <p class="connect-note">
+                            Linux HandQ is always Server (managed directly via CLI) — no need to choose here.
+                        </p>
+                    </section>
+
+                    <!-- Page 2: As Server dashboard -->
+                    <section class="connect-page hidden" data-connect-page="server">
+                        <div class="connect-panel-actions">
+                            <button type="button" class="destructive"
+                                    id="connect-server-exit">Exit Server</button>
+                            <button type="button" id="connect-server-disconnect">
+                                Disconnect Client
+                            </button>
+                        </div>
+
+                        <div class="connect-section">
+                            <h3>Connection Info</h3>
+                            <div class="connect-kv">
+                                <label>Pairing string</label>
+                                <code id="connect-server-pairing">—</code>
+                                <button type="button" class="connect-copy"
+                                        data-copy-source="connect-server-pairing">Copy</button>
+                            </div>
+                            <div class="connect-kv">
+                                <label>Status</label>
+                                <span id="connect-server-status">Waiting for connection…</span>
+                            </div>
+                        </div>
+
+                        <div class="connect-section">
+                            <h3>Active Sessions</h3>
+                            <div class="connect-session-list"
+                                 id="connect-server-sessions"
+                                 data-empty="true"></div>
+                        </div>
+
+                        <div class="connect-section connect-log-section">
+                            <h3>Log <button type="button" class="connect-log-clear"
+                                    id="connect-server-log-clear">Clear</button></h3>
+                            <div class="connect-log"
+                                 id="connect-server-log"></div>
+                        </div>
+                    </section>
+
+                    <!-- Page 3: As Client dashboard -->
+                    <section class="connect-page hidden" data-connect-page="client">
+                        <div class="connect-section">
+                            <h3>Connect New Server
+                                <button type="button" class="destructive"
+                                        id="connect-client-exit">Exit Client Mode</button>
+                            </h3>
+                            <div class="connect-add-actions">
+                                <button type="button" id="connect-add-linux">
+                                    + Linux (SSH auto)
+                                </button>
+                                <button type="button" id="connect-add-windows">
+                                    + Windows (manual paste)
+                                </button>
+                            </div>
+                        </div>
+
+                        <div class="connect-section">
+                            <h3>Connected Servers</h3>
+                            <div class="connect-server-list"
+                                 id="connect-server-list"
+                                 data-empty="true"></div>
+                        </div>
+
+                        <div class="connect-section connect-log-section">
+                            <h3>Log <button type="button" class="connect-log-clear"
+                                    id="connect-client-log-clear">Clear</button></h3>
+                            <div class="connect-log"
+                                 id="connect-client-log"></div>
+                        </div>
+                    </section>
+                </div>
+                <div class="overlay-resize-handle" aria-hidden="true"></div>
+            </div>
+        </div>
+
+        <!-- ============================================================ -->
+        <!-- Remote machines — direct control channel                     -->
+        <!-- (docs/fleet_scheduling_design.md). Two halves: what THIS      -->
+        <!-- machine offers to controllers, and the machines this one      -->
+        <!-- controls.                                                     -->
+        <!-- ============================================================ -->
+        <div class="overlay hidden" id="overlay-remote" aria-hidden="true">
+            <div class="overlay-card remote-card" role="dialog" aria-modal="true">
+                <header class="overlay-header">
+                    <h2>Remote machines</h2>
+                    <button type="button" class="overlay-close" id="remote-close"
+                            aria-label="Close">×</button>
+                </header>
+
+                <div class="remote-body">
+                    <!-- ── 控制端：paired targets ───────────────────── -->
+                    <section class="remote-section">
+                        <div class="remote-section-head">
+                            <h3>我控制的机器</h3>
+                            <div class="remote-head-actions">
+                                <button type="button" class="primary" id="remote-add-btn">
+                                    + 配对新机器
+                                </button>
+                                <button type="button" id="remote-add-linux-btn">
+                                    + Linux (SSH 自动)
+                                </button>
+                            </div>
+                        </div>
+                        <p class="help-text">
+                            在目标机器上打开 <strong>Remote machines → 本机控制地址</strong>，
+                            复制那一行 <code>handq://…</code> 粘贴到这里即可。
+                            远端会话就是一个普通的对话标签页；关闭标签页只是断开，
+                            远端任务会继续跑，之后可以重新接管。
+                        </p>
+                        <div class="remote-target-list" id="remote-target-list"
+                             data-empty="true"></div>
+                    </section>
+
+                    <!-- ── 被控端：my own address ───────────────────── -->
+                    <section class="remote-section">
+                        <div class="remote-section-head">
+                            <h3>本机控制地址</h3>
+                            <span class="remote-serve-state" id="remote-serve-state"></span>
+                        </div>
+                        <div id="remote-serve-body"></div>
+                    </section>
+                </div>
+                <div class="overlay-resize-handle" aria-hidden="true"></div>
+            </div>
+        </div>
+
         <!-- ============================================================ -->
         <div class="overlay hidden" id="overlay-admin" aria-hidden="true">
             <div class="overlay-card admin-card" role="dialog" aria-modal="true">
@@ -763,6 +980,7 @@
                         </div>
                     </section>
                 </div>
+                <div class="overlay-resize-handle" aria-hidden="true"></div>
             </div>
         </div>
 
@@ -818,6 +1036,7 @@
                         </div>
                     </section>
                 </div>
+                <div class="overlay-resize-handle" aria-hidden="true"></div>
             </div>
         </div>
 
@@ -853,6 +1072,7 @@
                         <button type="submit" id="sched-create">Create</button>
                     </div>
                 </form>
+                <div class="overlay-resize-handle" aria-hidden="true"></div>
             </div>
         </div>
 
@@ -884,6 +1104,42 @@
                 </div>
                 <div class="skills-grid" id="skills-grid"></div>
             </div>
+            <div class="overlay-resize-handle" aria-hidden="true"></div>
+        </div>
+    </div>
+
+    <!-- ============================================================ -->
+    <!-- Upload Skill picker — opened from the Connect panel's client  -->
+    <!-- dashboard. Lists this machine's own user-authored skills so   -->
+    <!-- one or more can be picked and pushed to a connected server,   -->
+    <!-- fully overwriting the same-named folder over there.           -->
+    <!-- ============================================================ -->
+    <div class="overlay hidden" id="overlay-skill-upload" aria-hidden="true">
+        <div class="overlay-card settings-card skills-card" role="dialog" aria-modal="true">
+            <header class="overlay-header">
+                <h2>Upload Skill</h2>
+                <button type="button" class="overlay-close" id="skill-upload-close"
+                        aria-label="Close">×</button>
+            </header>
+            <p class="connect-note" id="skill-upload-target"></p>
+            <p class="connect-note">
+                Each selected skill's folder on the target machine is fully
+                overwritten to match your copy — files over there that aren't
+                in your copy are deleted.
+            </p>
+            <div class="settings-toast hidden" id="skill-upload-toast" role="status"></div>
+            <div class="skills-body">
+                <div class="skills-list-header">
+                    <button type="button" id="skill-upload-refresh-btn">Refresh</button>
+                    <span class="admin-count" id="skill-upload-count"></span>
+                </div>
+                <div class="skills-grid" id="skill-upload-grid"></div>
+            </div>
+            <div class="settings-actions">
+                <button type="button" id="skill-upload-cancel">Cancel</button>
+                <button type="button" id="skill-upload-submit" class="primary">Upload selected</button>
+            </div>
+            <div class="overlay-resize-handle" aria-hidden="true"></div>
         </div>
     </div>
 
@@ -945,12 +1201,27 @@
                     <button type="submit" id="skill-form-save">Save</button>
                 </div>
             </form>
+            <div class="overlay-resize-handle" aria-hidden="true"></div>
         </div>
     </div>
     </div>
 
+    <div id="hq-tooltip" class="hq-tooltip hidden" role="tooltip"></div>
+
     <script src="vendor/xterm.bundle.js"></script>
+    <!-- layout-drive.js must load before its consumers (session-sidebar.js
+         drives the right sidebar, renderer.js the left stage rail). -->
+    <script src="layout-drive.js"></script>
     <script src="session-sidebar.js"></script>
+    <!-- remote-control.js must load BEFORE renderer.js: it only defines
+         window.HandQRemote, and renderer.js calls HandQRemote.init() at the end
+         of its own setup (so the DOM and the session machinery both exist by
+         then, and the module's status listener is registered alongside
+         renderer.js's own). -->
+    <script src="remote-control.js"></script>
+    <!-- v6 Connect panel — loads after remote-control.js so it can delegate
+         the pairing dialogs to HandQRemote instead of re-implementing them. -->
+    <script src="connect-panel.js"></script>
     <script src="renderer.js"></script>
     <script src="admin-panel.js"></script>
     <script src="glass-effect.js"></script>

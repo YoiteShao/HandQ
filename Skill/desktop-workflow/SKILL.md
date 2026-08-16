@@ -4,7 +4,7 @@ description: Windows native app automation. Claim desktop_snapshot and desktop_f
 enabled: true
 standing: false
 origin: bundled
-allowed-tools: [desktop_screenshot, desktop_snapshot, desktop_click_at, desktop_find_and_click, desktop_find_element, desktop_type_text, desktop_hotkey, desktop_key_press, desktop_drag, desktop_scroll, desktop_list_windows, desktop_hover_at]
+allowed-tools: [desktop_screenshot, desktop_snapshot, desktop_click_at, desktop_find_and_click, desktop_find_element, desktop_type_text, desktop_hotkey, desktop_key_press, desktop_drag, desktop_scroll, desktop_list_windows, desktop_hover_at, desktop_fill_file_dialog]
 ---
 # Desktop Automation Workflow
 
@@ -31,6 +31,43 @@ check whether the app can be started with (or is already running with) a
 deterministically instead of guessing from pixels, and it is not limited to
 actual browser windows. Only move to screenshot+OCR as primary when no
 debug port is available.
+
+## NATIVE FILE DIALOGS ARE NOT IN THE DOM — use desktop_fill_file_dialog
+
+A BROWSE / Open / Save / "Select file" button in a desktop app — INCLUDING an
+Electron/Chromium app you are otherwise driving over CDP — opens a **native
+Windows file dialog** (a top-level `#32770` window with a filename box). This
+dialog is a hard boundary:
+
+- **CDP cannot see it or fill it.** `Page.setInterceptFileChooserDialog` fires
+  ONLY for an HTML `<input type=file>`, NEVER for the app's native
+  `dialog.showOpenDialog`. Patching `ipcRenderer` / `@electron/remote` /
+  `contextBridge` from the renderer misses it too — the dialog lives in the main
+  process / the OS, not the page.
+- A screenshot may also fail (BitBlt returns nothing on RDP/VNC sessions).
+
+**TRIGGER:** you clicked a BROWSE/Open/Save button (via CDP, click_at, or
+anything) and: the field you expected to fill is still empty, OR a CDP script
+reported `No fileChooserOpened` / `openDialog` / `Device Programmer: None` /
+`remote.dialog not found`, OR you simply cannot tell whether a dialog opened.
+
+**ACTION:**
+1. Call `desktop_fill_file_dialog` with **no path** — it enumerates native
+   `#32770` dialogs via Win32 (needs no foreground window, no screenshot) and
+   tells you whether one is open. THIS is the perception CDP could not give you.
+2. If one is open, call `desktop_fill_file_dialog(path="<full path>")` to type
+   the path into the filename box and confirm.
+
+**DO NOT**, when a native dialog is (or might be) open:
+- re-click the DOM BROWSE button — each click stacks ANOTHER hidden native
+  dialog (the classic "two file dialogs piled up" symptom);
+- try to intercept/inject the path via CDP, `ipcRenderer`, `@electron/remote`,
+  or by setting an Angular/React property — none of these reach the native
+  dialog, and they routinely write the path into the wrong field.
+
+If two dialogs are already stacked (from earlier duplicate clicks), fill the
+frontmost, then call detection again — a second may remain to be cancelled
+(`desktop_key_press` Esc) or filled.
 
 ## MECHANICAL RULE — before you decide "I need to find X icon", re-read the
 ## OCR/snapshot text you already have
@@ -102,10 +139,18 @@ hwnd, and target that one from here on.
 
 Clicking a list/table ROW (its text label, its highlighted background)
 frequently only SELECTS it — a highlight-color change that shows up as
-`content_changed: true` / `effect: navigated` even though nothing you
+`content_changed: true` / `effect: pixels_changed` even though nothing you
 actually wanted happened (no detail panel, no expand). This is a common,
 easy-to-miss trap: the effect signal is being honest about a REAL pixel
 change, but that change is the selection highlight, not your goal.
+
+Read the fields separately, because they mean different things:
+`window_changed: true` is a real top-level event (new window, new title).
+`geometry_changed: true` means the window moved or resized and the pixel probe
+was discarded as meaningless — it is NEVER evidence your click landed.
+`pixels_changed` means only that: some pixels differ inside the same window at
+the same geometry. None of the three tells you your GOAL was reached; only
+re-observing the app does.
 
 **The actual action is frequently a separate, unlabeled icon-only control**
 next to or inside the row: a chevron/arrow (expand/collapse), a plus/gear/
@@ -117,7 +162,7 @@ icon) — here there IS no text label, because the control genuinely is just
 a glyph.
 
 **TRIGGER:** you clicked a row (or its visible text) and got `effect:
-navigated`/`content_changed: true`, but re-checking the OCR/snapshot after
+pixels_changed`/`content_changed: true`, but re-checking the OCR/snapshot after
 shows the same layout, no new panel, no expanded content — i.e. the "change"
 was cosmetic (selection/hover), not the navigation you wanted. You've now
 tried this 2+ times, possibly at slightly different x/y within the same row.

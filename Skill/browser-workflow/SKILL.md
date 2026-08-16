@@ -32,17 +32,34 @@ no undo):
   2. **A local desktop app that is Chromium-based under the hood.** Signal:
      `desktop_snapshot`/UIA comes back nearly empty for it (see
      desktop-workflow's Electron caveat), AND it can be started with — or is
-     already running with — a `--remote-debugging-port=<port>` flag. In this
-     case: launch/relaunch the app yourself with that flag (via `shell`),
-     make sure `browser.cdp_port` matches (or pass a `browser_credentials_file`
-     pointing at it), then `browser_attach` instead of the app's normal
-     launch path. Do NOT hand-write a websocket/CDP client script for this —
+     already running with — a `--remote-debugging-port=<port>` flag.
+
+     **Before you pick `<port>`, read it — don't invent it.** `browser_attach`
+     with no `browser_credentials_file` resolves the port from
+     `handq_config.yaml`'s `browser.cdp_port` (default `9222`), NOT from
+     whatever you happened to launch the app with. Check that config value
+     FIRST (`grep`/`read` it), then launch/relaunch the app (via `shell`)
+     with `--remote-debugging-port=<that same value>`. Only pick a different
+     port if that one is already taken by something else — and if you do,
+     you MUST pass `browser_credentials_file` pointing at a file containing
+     that exact port; a bare `browser_attach()` call after launching on a
+     non-default port will silently query the wrong port.
+
+     A mismatched port and a genuinely-disabled `attach_enabled` produce the
+     **same error text** (`"attach_browser is disabled. Set
+     browser.attach_enabled: true..."`), because the tool can't tell "nothing
+     is listening on the port I checked" apart from "something's listening
+     but I won't identify it as safe." Don't take that message at face value.
+     Before touching `handq_config.yaml` or telling the user to change it,
+     re-verify: is the app actually listening on the exact port `browser_attach`
+     is querying (`browser.cdp_port` or your `browser_credentials_file`)? If
+     not, that's the real bug — fix the port match, not the config switch.
+
+     Do NOT hand-write a websocket/CDP client script for this —
      `browser_navigate`/`browser_snapshot`/`browser_click`/`browser_type`
      already speak CDP through Playwright and handle selector waiting,
      retries, and dropdown/tree interaction that raw `Runtime.evaluate` calls
-     don't. If `attach_browser` errors because `browser.attach_enabled` is
-     off, tell the user it needs to be set to `true` in `handq_config.yaml`
-     rather than falling back to a hand-rolled CDP script.
+     don't.
 
   Requires user approval (high-risk); in attach mode `browser_new_tab` opens
   tabs in the background.

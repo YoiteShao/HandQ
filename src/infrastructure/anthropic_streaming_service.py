@@ -52,6 +52,7 @@ Usage
 """
 import asyncio
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any, AsyncGenerator, Literal, Optional, Union
 
@@ -215,6 +216,91 @@ def _resolve_context_window(model: str, override: Optional[int]) -> int:
 
 
 _DEFAULT_THINKING_BUDGET_TOKENS = 4096
+
+
+# Rate-limit detail extraction.
+#
+# The QGenie/Bedrock gateway does NOT send an HTTP ``Retry-After`` header on a
+# 429. It puts the wait inside the JSON body, as a STRING WITH A UNIT SUFFIX:
+#
+#   {'error': {'code': 'RATE_LIMIT_EXCEEDED',
+#              'message': 'Rate limit exceeded for model: anthropic::claude-4-6-sonnet',
+#              'details': {'retry_after': '53881s', 'limit_type': 'tokens_per_day'}}}
+#
+# Reading headers only meant ``retry_after_secs`` stayed 0.0 forever, the
+# ``> 300s`` test never fired, and ``_exhausted`` was never set. Observed
+# 2026-08-03: 34/34 throttle log lines printed "retry_after=0s" while the body
+# they quoted on the SAME LINE said '53881s' — a ~15h tokens_per_day limit. The
+# pool then re-walked the two dead hops on all 16 following turns.
+#
+# Note ``float('53881s')`` also raises, so even a header carrying the gateway's
+# format would have been dropped. Strip to digits before converting.
+_RETRY_AFTER_RE = re.compile(r"['\"]retry_after['\"]\s*:\s*['\"]?([0-9]+(?:\.[0-9]+)?)")
+_LIMIT_TYPE_RE = re.compile(r"['\"]limit_type['\"]\s*:\s*['\"]([a-zA-Z_]+)['\"]")
+
+# Limit types that are per-DAY (or longer) budgets rather than burst throttles.
+# These justify marking a service exhausted for the rest of the session
+# regardless of the parsed seconds — the number is advisory, the class is not.
+_LONG_WINDOW_LIMIT_TYPES: frozenset = frozenset({
+    "tokens_per_day", "requests_per_day", "tokens_per_month",
+})
+
+
+def _coerce_seconds(raw: Any) -> float:
+    """Parse a retry-after value that may carry a unit suffix ('53881s')."""
+    if raw is None:
+        return 0.0
+    digits = re.sub(r"[^0-9.]", "", str(raw))
+    try:
+        return float(digits) if digits else 0.0
+    except ValueError:
+        return 0.0
+
+
+def _parse_rate_limit_details(error: Exception) -> tuple[float, str]:
+    """Return ``(retry_after_seconds, limit_type)`` for a 429.
+
+    Tries, in order: the HTTP ``Retry-After`` header (spec-compliant servers),
+    the structured JSON body (``error.details``), then a regex over ``str(e)``
+    as the last resort. Any layer may be missing; ``(0.0, "")`` means nothing
+    was parseable.
+    """
+    # (1) Header — standards-compliant path.
+    try:
+        hdrs = getattr(getattr(error, "response", None), "headers", None)
+        if hdrs is not None:
+            ra = hdrs.get("Retry-After") or hdrs.get("retry-after")
+            if ra is not None:
+                secs = _coerce_seconds(ra)
+                if secs > 0:
+                    return secs, ""
+    except (TypeError, ValueError, AttributeError):
+        pass
+
+    # (2) Structured body — what the QGenie gateway actually sends.
+    secs = 0.0
+    limit_type = ""
+    try:
+        body = getattr(error, "body", None)
+        if isinstance(body, dict):
+            details = ((body.get("error") or {}).get("details")) or {}
+            if isinstance(details, dict):
+                secs = _coerce_seconds(details.get("retry_after"))
+                limit_type = str(details.get("limit_type") or "")
+    except (TypeError, AttributeError):
+        pass
+    if secs > 0 or limit_type:
+        return secs, limit_type
+
+    # (3) Regex over the stringified error — survives arbitrary wrapping.
+    text = str(error)
+    m = _RETRY_AFTER_RE.search(text)
+    if m:
+        secs = _coerce_seconds(m.group(1))
+    m = _LIMIT_TYPE_RE.search(text)
+    if m:
+        limit_type = m.group(1)
+    return secs, limit_type
 
 
 def _model_supports_extended_thinking(model: str) -> bool:
@@ -1002,6 +1088,23 @@ class AnthropicStreamingService(LLMService):
             except Exception as e:
                 last_error = e
 
+                # Cheapest and most certain check, so it goes first: a failure
+                # that never left this machine cannot be fixed by waiting (see
+                # LLMService._is_permanent_local_error). With max_retries=10 and a
+                # 2**n ladder, retrying one of these spends ~17 minutes before
+                # anyone hears about it — and on a remote-driven session, silence
+                # is the only thing the operator sees while it happens.
+                if self._is_permanent_local_error(e):
+                    self.logger.error(
+                        f"AnthropicStreaming request failed (permanent local "
+                        f"error, not retrying): {type(e).__name__}: {e}. Most "
+                        f"likely llm.API_KEY is empty in this machine's "
+                        f"handq_config.yaml and neither ANTHROPIC_API_KEY nor "
+                        f"ANTHROPIC_AUTH_TOKEN is set in its environment.",
+                        component="AnthropicStreamingService",
+                    )
+                    raise
+
                 if self._is_prompt_too_long_error(e):
                     self.logger.error(
                         f"AnthropicStreaming request failed (prompt too long): {type(e).__name__}: {e}",
@@ -1032,30 +1135,28 @@ class AnthropicStreamingService(LLMService):
                     or "rate limit exceeded" in str(e).lower()
                 )
                 if is_429:
-                    retry_after_secs = 0.0
-                    try:
-                        resp = getattr(e, "response", None)
-                        if resp is not None:
-                            hdrs = getattr(resp, "headers", None)
-                            if hdrs is not None:
-                                ra = hdrs.get("Retry-After") or hdrs.get("retry-after")
-                                if ra is not None:
-                                    retry_after_secs = float(ra)
-                    except (TypeError, ValueError, AttributeError):
-                        pass
-
-                    if retry_after_secs > 300.0:
-                        self._exhausted = True
+                    retry_after_secs, limit_type = _parse_rate_limit_details(e)
+                    # A per-day/-month budget is a session-ending condition for
+                    # this service no matter what the seconds field says: the
+                    # class of the limit is authoritative, the number is
+                    # advisory (and may be absent entirely). Long explicit
+                    # waits still qualify on the seconds path alone, so a
+                    # gateway that reports only Retry-After keeps working.
+                    long_window = limit_type in _LONG_WINDOW_LIMIT_TYPES
+                    if long_window or retry_after_secs > 300.0:
+                        self.mark_exhausted(retry_after_secs)
                         self.logger.warning(
                             f"AnthropicStreaming service marked exhausted "
-                            f"(retry_after={retry_after_secs:.0f}s): "
-                            f"{type(e).__name__}: {e}",
+                            f"(model={self.model}, limit_type={limit_type or 'unknown'}, "
+                            f"retry_after={retry_after_secs:.0f}s) — skipping it for "
+                            f"the rest of this session: {type(e).__name__}: {e}",
                             component="AnthropicStreamingService",
                         )
                     else:
                         self.logger.warning(
                             f"AnthropicStreaming throttled "
-                            f"(retry_after={retry_after_secs:.0f}s); "
+                            f"(model={self.model}, limit_type={limit_type or 'unknown'}, "
+                            f"retry_after={retry_after_secs:.0f}s); "
                             f"falling back without marking exhausted: "
                             f"{type(e).__name__}: {e}",
                             component="AnthropicStreamingService",
@@ -1096,6 +1197,14 @@ class AnthropicStreamingService(LLMService):
 
     def _user_friendly_error(self, e: Exception) -> str:
         """Return a short, user-friendly description of a server-side error."""
+        if isinstance(e, TypeError) and "authentication" in str(e).lower():
+            # Not a server error at all — the request never left this machine.
+            # Named explicitly because the SDK's own wording ("Could not resolve
+            # authentication method") gives no hint about which file to edit.
+            return (
+                "LLM 认证凭据未配置：这台机器的 handq_config.yaml 里 llm.API_KEY 为空，"
+                "且环境变量 ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN 也没有设置"
+            )
         if isinstance(e, anthropic.APIStatusError):
             status = getattr(e, 'status_code', None)
             if status and 500 <= status < 600:

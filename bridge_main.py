@@ -806,7 +806,7 @@ async def _run_boot_subsystems() -> None:
     _emit_boot_progress("skills_init_start")
     _t_skills = time.monotonic()
     try:
-        # Bundled recipe skills (monitor-long-running, remote-handq-workflow, …)
+        # Bundled recipe skills (monitor-long-running, ssh-workflow, …)
         # are scanned in place from the install-dir Skill/ root and merged with
         # the user's own Skill root — no copy step, so a read-only or partially
         # written user dir can't make a shipped skill vanish (see

@@ -47,6 +47,7 @@ class UIDelegate(Protocol):
     # ── State / inline events ─────────────────────────────────────────────
     def show_state_changed(self, state: str) -> None: ...
     def show_inline_event(self, icon: str, desc: str) -> None: ...
+    def show_user_notice(self, message: str, urgent: bool = False) -> None: ...
 
     # ── Agent telemetry ───────────────────────────────────────────────────
     def notify_decision_made(
@@ -72,7 +73,9 @@ class UIDelegate(Protocol):
         self, tool_name: str, params: Dict[str, Any], hint: str
     ) -> UserConfirmation: ...
     async def request_secret_input(self, prompt: str) -> str: ...
-    async def request_user_text(self, prompt: str) -> str: ...
+    async def request_user_form(
+        self, question: str, fields: list
+    ) -> Dict[str, Any]: ...
 
     # ── Coordinator reply streaming ─────────────────────────────────────────
     def show_coordinator_thinking(self) -> None: ...
@@ -99,7 +102,7 @@ class InteractionManager:
                         ``notify_tool_execution_started``
       Async input     : ``request_risk_confirmation``,
                         ``request_tool_confirmation``,
-                        ``request_secret_input``, ``request_user_text``
+                        ``request_secret_input``, ``request_user_form``
       Reply streaming : ``notify_coordinator_thinking``,
                         ``clear_coordinator_thinking``,
                         ``stream_coordinator_reply_chunk``,
@@ -108,6 +111,9 @@ class InteractionManager:
 
     def __init__(self, delegate: Optional[UIDelegate] = None) -> None:
         self._ui: Optional[UIDelegate] = delegate
+        # Latest tool-call-turn reasoning that hasn't reached the chat yet —
+        # see notify_decision_made / _await_delegate.
+        self._pending_reasoning: str = ""
 
     # ── Wiring ────────────────────────────────────────────────────────────
 
@@ -145,6 +151,28 @@ class InteractionManager:
         """Single-line status banner (icon + text)."""
         self._ui_call("show_inline_event", str(icon or "·"), str(desc or ""))
 
+    def notify_user_notice(self, message: str, urgent: bool = False) -> None:
+        """Push a PROMINENT, unmissable message from the agent to the user.
+
+        Distinct from :meth:`notify_inline_event` (a one-line status chip that
+        scrolls by with the tool trace) — this renders as a standalone system
+        bubble, the same weight as a network-outage banner.
+
+        Exists because the agent had NO way to reach the user mid-item. In the
+        2026-08-03 flash-meta run the agent correctly diagnosed at turn 242 that
+        the USER's own repeated "Boot SS EDL" clicks were intercepting the
+        firehose reboot and dragging the device back into 9008 — the single fact
+        that would have unblocked the task — and wrote
+
+            "⚠️  CRITICAL: Please do NOT click 'Boot SS EDL' for the next 120 seconds"
+
+        into a script's stdout that no human ever read. Turn 247 named the gap
+        outright ("This is a communication gap where I need to clarify") and
+        then called ``wait_interval(60)``. Fire-and-forget: never blocks the
+        agent, never waits for acknowledgement.
+        """
+        self._ui_call("show_user_notice", str(message or ""), bool(urgent))
+
     def notify_recall_started(self) -> None:
         """LTM recall is in flight. Drives a transient ``recalling…`` label on
         the activity strip; the next state / decision / tool event supersedes
@@ -154,7 +182,17 @@ class InteractionManager:
     def notify_decision_made(
         self, iteration: int, reasoning: str, token_count: int = 0
     ) -> None:
-        """The agent emitted reasoning for its latest turn."""
+        """The agent emitted reasoning for its latest turn.
+
+        Stashes ``reasoning`` as pending: a tool-call turn's reasoning only
+        ever reaches the activity sidebar, never the chat, so if the very
+        next thing the agent does is block on the user (risk/tool
+        confirmation, secret input, ask_human) via ``_await_delegate``, the
+        user would be asked to act on context they never saw. Cleared by
+        ``stream_coordinator_reply_chunk`` once a real reply bubble carries
+        it into the chat instead.
+        """
+        self._pending_reasoning = str(reasoning or "")
         self._ui_call("notify_decision_made", int(iteration), str(reasoning), int(token_count))
 
     def notify_tool_execution_started(
@@ -251,7 +289,16 @@ class InteractionManager:
     async def _await_delegate(
         self, method: str, default: Any, *args: Any, **kwargs: Any,
     ) -> Any:
-        """Invoke an async delegate method; return ``default`` if absent."""
+        """Invoke an async delegate method; return ``default`` if absent.
+
+        Every caller of this method blocks the agent on the user (risk/tool
+        confirmation, secret input, ask_human). Flush any pending reasoning
+        as a chat bubble first — see ``notify_decision_made`` — so the user
+        isn't asked to act on a turn's reasoning they never saw.
+        """
+        if self._pending_reasoning:
+            self.notify_user_notice(self._pending_reasoning)
+            self._pending_reasoning = ""
         if self._ui is None:
             return default
         fn = getattr(self._ui, method, None)
@@ -321,17 +368,20 @@ class InteractionManager:
             str(prompt),
         )
 
-    async def request_user_text(self, prompt: str) -> str:
-        """Ask the user a free-form (non-secret) clarifying question.
+    async def request_user_form(self, question: str, fields: list) -> Dict[str, Any]:
+        """Ask the user a free-form (non-secret) question, optionally with
+        structured fields (text/textarea/radio/checkbox).
 
-        Unlike :meth:`request_secret_input`, the answer is NOT masked — the
-        delegate renders a normal text field. Used by the ``ask_human`` tool.
-        Default when no delegate is wired: ``""``.
+        Unlike :meth:`request_secret_input`, the answer is NOT masked, and
+        unlike a single text field, the delegate may render several distinct
+        controls in one modal. Used by the ``ask_human`` tool.
+        Default when no delegate is wired: ``{}``.
         """
         return await self._await_delegate(
-            "request_user_text",
-            "",
-            str(prompt),
+            "request_user_form",
+            {},
+            str(question),
+            fields or [],
         )
 
     # ── Coordinator reply streaming (fire-and-forget) ──────────────────────
@@ -350,7 +400,13 @@ class InteractionManager:
 
     def stream_coordinator_reply_chunk(self, text: str) -> None:
         """Push one streamed fragment of the coordinator's reply to
-        the UI (renderer appends it to the live assistant bubble)."""
+        the UI (renderer appends it to the live assistant bubble).
+
+        A real reply bubble is starting, so drop any pending reasoning —
+        see ``notify_decision_made`` — it no longer needs a standalone
+        notice, the chat is about to carry fresh content anyway.
+        """
+        self._pending_reasoning = ""
         self._ui_call("stream_coordinator_reply_chunk", str(text))
 
     def seal_coordinator_reply(self) -> None:

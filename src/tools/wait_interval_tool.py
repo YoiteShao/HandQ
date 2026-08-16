@@ -42,11 +42,19 @@ class WaitIntervalTool(BaseTool):
     def __init__(self, ctx: Optional["SessionContext"] = None):
         super().__init__("wait_interval", ctx=ctx)
 
-    async def execute(self, seconds: int = 300, **kwargs: Any) -> ToolResult:
+    async def execute(
+        self,
+        seconds: int = 300,
+        user_message: Optional[str] = None,
+        **kwargs: Any,
+    ) -> ToolResult:
         """Sleep for the specified duration, interruptible by user messages.
 
         Args:
             seconds: Duration to wait (1-7200). Default 300 (5 minutes).
+            user_message: Delivered to the user as a prominent bubble BEFORE
+                the wait begins. Set it whenever the thing being waited on is
+                a HUMAN action — see the note below.
 
         Returns:
             ToolResult with output indicating whether the wait completed
@@ -54,8 +62,42 @@ class WaitIntervalTool(BaseTool):
         """
         start = time.time()
         params = {"seconds": seconds}
+        if user_message:
+            params["user_message"] = user_message
 
         seconds = max(_MIN_SECONDS, min(int(seconds), _MAX_SECONDS))
+
+        # Deliver the human-facing message BEFORE sleeping — announcing it
+        # afterwards would defeat the point. Waiting on a person who was never
+        # told what to do cannot terminate: the 2026-08-03 flash-meta run spent
+        # its last ~20 turns in a poll → wait_interval(60) → poll loop, while
+        # the agent's own reasoning already knew the user needed to stop
+        # pressing a button. It never told them.
+        notice_delivered: Optional[bool] = None
+        if user_message and user_message.strip():
+            notice_delivered = False
+            im = getattr(self.ctx, "interaction_manager", None) if self.ctx else None
+            if im is not None:
+                try:
+                    im.notify_user_notice(user_message.strip(), urgent=True)
+                    notice_delivered = True
+                except Exception:
+                    notice_delivered = False
+
+        def _out(body: str) -> Any:
+            if notice_delivered is None:
+                return body
+            return {
+                "wait": body,
+                "user_message_delivered": notice_delivered,
+                "note": (
+                    "The user was shown your message before this wait started."
+                    if notice_delivered else
+                    "YOUR MESSAGE WAS NOT DELIVERED (no UI attached). The user "
+                    "does not know what you are waiting for — do not assume the "
+                    "action you asked for will happen."
+                ),
+            }
 
         interrupt_event = None
         if self.ctx:
@@ -70,7 +112,7 @@ class WaitIntervalTool(BaseTool):
                 elapsed = time.time() - start
                 return ToolResult(
                     success=True,
-                    output=f"interrupted (after {elapsed:.0f}s)",
+                    output=_out(f"interrupted (after {elapsed:.0f}s)"),
                     tool_name=self.name,
                     tool_parameters=params,
                     execution_time=elapsed,
@@ -79,7 +121,7 @@ class WaitIntervalTool(BaseTool):
                 elapsed = time.time() - start
                 return ToolResult(
                     success=True,
-                    output=f"elapsed:{seconds}s",
+                    output=_out(f"elapsed:{seconds}s"),
                     tool_name=self.name,
                     tool_parameters=params,
                     execution_time=elapsed,
@@ -89,7 +131,7 @@ class WaitIntervalTool(BaseTool):
             elapsed = time.time() - start
             return ToolResult(
                 success=True,
-                output=f"elapsed:{seconds}s",
+                output=_out(f"elapsed:{seconds}s"),
                 tool_name=self.name,
                 tool_parameters=params,
                 execution_time=elapsed,
@@ -104,6 +146,15 @@ class WaitIntervalTool(BaseTool):
                     "Duration to wait in seconds (1-7200). Use between observation "
                     "cycles in a monitoring loop. The wait is interruptible — if the "
                     "user sends a message, this returns immediately with 'interrupted'."
+                ),
+            },
+            "user_message": {
+                "type": "string",
+                "description": (
+                    "REQUIRED when you are waiting on a HUMAN action rather than a "
+                    "machine one. Shown to the user prominently before the wait "
+                    "starts. Waiting silently for a person who was never told what "
+                    "you need cannot succeed. Omit for ordinary machine polling."
                 ),
             },
         }

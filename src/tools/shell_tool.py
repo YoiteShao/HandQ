@@ -416,6 +416,123 @@ _COMMAND_SEMANTICS: Dict[str, Any] = {
 }
 
 
+# ── Self-reported outcome scan (goal-level signal) ──────────────────────────
+#
+# `exit_code` answers "did the interpreter run?" — never "did the script achieve
+# its goal?". That gap is the single biggest observability hole in HandQ, and it
+# opens the moment an agent moves real work into `python script.py`.
+#
+# 2026-08-03 flash-meta run: the agent moved 100% of its GUI automation into
+# `python cdp_*.py` (33 one-shot scripts). The whole desktop_* effect layer —
+# content_changed / effect / effect_hint — became unreachable, and the only
+# remaining success signal was each script's own unconditional print(). Turn
+# 106 shipped this as ok=true / exit_code=0:
+#
+#     [A] Clicking XMLS button...   CLICKED_XMLS[0]: secondary p-button
+#     [B] Inspecting XMLS dialog... NO_DIALOG_NO_PANEL. Open dialogs: 0
+#     [C] Selecting XML files...    NO_DIALOG
+#     [D] Clicking OK...            NO_DIALOG
+#     [E] Check RAW PROGRAM state... RAW PROGRAM SECTION NOT FOUND
+#
+# Turn 190 was worse: `Connect: CONNECT_NOT_FOUND` sat one line above a
+# "connection confirmed" reading of a 90-minute-stale CSS class, both under
+# ok=true; the agent read only the second.
+#
+# 2026-08-04 flash run added the CDP-null-effect family below. Driving an
+# Electron BROWSE button over CDP, every instrument reported the click had no
+# effect — `No CDP fileChooserOpened event received`, `Device Programmer: None`,
+# `invoke calls: []`, `remote.dialog intercepted: false` — because the file
+# dialog is a native Win32 window CDP cannot see. All of that shipped as
+# exit_code=0/ok=true, so the agent re-clicked and stacked a second dialog.
+# Surfacing these "ran-but-null-effect" markers turns that silent loop into a
+# visible reported_failures list, and the effect_hint below now points at
+# desktop_fill_file_dialog for the specific fileChooser case.
+#
+# Deliberately CASE-SENSITIVE and uppercase-only for the UPPER_SNAKE tokens.
+# Scripts print those as deliberate status tokens, so requiring caps keeps
+# ordinary prose ("no errors found", "0 failed") from tripping the scan. The
+# CDP-null-effect phrases are matched case-insensitively but are specific enough
+# not to false-positive. This does NOT flip `success` — process semantics stay
+# honest and a script legitimately reporting one NOT_FOUND among ten checks is
+# not a failed command. It makes the negative lines impossible to skim past,
+# which is the actual failure mode.
+_SELF_REPORTED_FAILURE_RE = re.compile(
+    r"(?m)^.*?(?:"
+    r"\b(?:NOT_FOUND|NOT FOUND|NO_DIALOG(?:_NO_PANEL)?|NO_PANEL|NO_MATCH|"
+    r"CONNECT_NOT_FOUND|FAILURE|FATAL|UNREACHABLE|REFUSED|TIMEOUT)\b"
+    r"|Traceback \(most recent call last\)"
+    r"|(?i:no\b.{0,20}fileChooserOpened)"
+    r"|(?i:remote\.dialog (?:not found|intercepted: false))"
+    r"|(?i:Device Programmer: None)"
+    r").*$"
+)
+_MAX_REPORTED_LINES = 8
+_MAX_REPORTED_LINE_CHARS = 240
+
+# The fileChooser marker specifically means "a native OS dialog probably opened
+# where CDP can't see it" — route the agent to the tool that CAN.
+_FILECHOOSER_MARKER_RE = re.compile(r"(?i)fileChooserOpened|open dialog|openDialog")
+
+
+def _scan_self_reported_failures(stdout: str) -> List[str]:
+    """Return stdout lines that look like the script reporting its OWN failure."""
+    if not stdout:
+        return []
+    hits: List[str] = []
+    for m in _SELF_REPORTED_FAILURE_RE.finditer(stdout):
+        line = m.group(0).strip()
+        if not line:
+            continue
+        if len(line) > _MAX_REPORTED_LINE_CHARS:
+            line = line[:_MAX_REPORTED_LINE_CHARS] + "…"
+        hits.append(line)
+        if len(hits) >= _MAX_REPORTED_LINES:
+            break
+    return hits
+
+
+def _apply_outcome_patterns(
+    stdout: str,
+    stderr: str,
+    success_pattern: Optional[str],
+    failure_pattern: Optional[str],
+) -> tuple[Optional[bool], Optional[str]]:
+    """Evaluate agent-declared success/failure oracles against the output.
+
+    Returns ``(verdict, note)`` where ``verdict`` is None when the agent
+    declared no oracle (nothing to say), True/False when one matched. Unlike
+    the advisory scan above, an explicit oracle IS authoritative and drives the
+    tool's ``success`` flag — the agent asked for exactly this contract.
+
+    ``failure_pattern`` is checked first: "did the thing I feared happen?" is a
+    stronger statement than "did a string I hoped for appear?".
+    """
+    blob = f"{stdout}\n{stderr}"
+    if failure_pattern:
+        try:
+            if re.search(failure_pattern, blob):
+                return False, (
+                    f"failure_pattern {failure_pattern!r} matched the output — "
+                    f"the declared failure condition occurred."
+                )
+        except re.error as exc:
+            return None, f"failure_pattern is not a valid regex ({exc}); ignored."
+    if success_pattern:
+        try:
+            if re.search(success_pattern, blob):
+                return True, (
+                    f"success_pattern {success_pattern!r} matched the output."
+                )
+            return False, (
+                f"success_pattern {success_pattern!r} did NOT match the output — "
+                f"the command ran but did not report the outcome you declared as "
+                f"success. Do not treat this as done."
+            )
+        except re.error as exc:
+            return None, f"success_pattern is not a valid regex ({exc}); ignored."
+    return None, None
+
+
 def _base_command_token(command: str) -> str:
     """First token of the LAST pipeline/chain segment, normalized.
 
@@ -745,6 +862,8 @@ class ShellTool(BaseTool):
         cwd: Optional[str] = None,
         shell: Optional[str] = None,
         description: Optional[str] = None,
+        success_pattern: Optional[str] = None,
+        failure_pattern: Optional[str] = None,
         **kwargs,
     ) -> ToolResult:
         """
@@ -757,7 +876,12 @@ class ShellTool(BaseTool):
         """
         # Route: task management
         if task_id is not None:
-            kill_requested = (command and command.strip().lower() == "kill")
+            # bool() around the `and` — command may be None or empty, and
+            # `and` short-circuits to those falsy values, not to False. Passing
+            # "" or None where _task_action expects a bool typechecks wrong and
+            # in principle could route through a truthy branch on an
+            # unexpected value.
+            kill_requested = bool(command and command.strip().lower() == "kill")
             return await self._task_action(task_id, kill=kill_requested)
 
         # Route: requires a command
@@ -785,6 +909,8 @@ class ShellTool(BaseTool):
                 timeout=timeout,
                 shell=shell,
                 cwd=cwd,
+                success_pattern=success_pattern,
+                failure_pattern=failure_pattern,
                 **kwargs,
             )
 
@@ -966,6 +1092,8 @@ class ShellTool(BaseTool):
         timeout: Optional[int] = None,
         shell: Optional[str] = None,
         cwd: Optional[str] = None,
+        success_pattern: Optional[str] = None,
+        failure_pattern: Optional[str] = None,
         **kwargs,
     ) -> ToolResult:
         """Execute a command in foreground with timeout."""
@@ -1179,6 +1307,57 @@ class ShellTool(BaseTool):
                     "venv": self.venv_path,
                 }
 
+                # ── Goal-level outcome signal ───────────────────────────────
+                # Layer 1 (opt-in, AUTHORITATIVE): the agent declared its own
+                # oracle, so honour it and let it drive `success`.
+                _verdict, _verdict_note = _apply_outcome_patterns(
+                    stdout_text, stderr_text, success_pattern, failure_pattern,
+                )
+                if _verdict is not None:
+                    is_error = not _verdict
+                    observation["outcome_check"] = _verdict_note
+                elif _verdict_note:
+                    # Malformed regex — say so instead of silently ignoring it.
+                    observation["outcome_check"] = _verdict_note
+
+                # Layer 2 (always on, ADVISORY but loud): lines where the
+                # script reports its own failure. Never flips `success` — see
+                # _SELF_REPORTED_FAILURE_RE for why — but is placed where it
+                # cannot be skimmed past.
+                _reported = _scan_self_reported_failures(stdout_text)
+                if _reported:
+                    observation["reported_failures"] = _reported
+                    _hint = (
+                        f"exit_code={process.returncode} only means the "
+                        f"interpreter ran; it does NOT mean the script achieved "
+                        f"its goal. This command's OWN output reports "
+                        f"{len(_reported)} failed/not-found step(s), listed in "
+                        f"`reported_failures`. Treat those lines as the outcome, "
+                        f"not the exit code and not any success string the "
+                        f"script printed alongside them. If you needed a "
+                        f"machine-checkable verdict, re-run with "
+                        f"`success_pattern` / `failure_pattern` so the tool "
+                        f"decides instead of you."
+                    )
+                    # A fileChooser/openDialog null-effect almost always means a
+                    # NATIVE OS file dialog opened where CDP cannot see it. Point
+                    # at the tool that can, instead of letting the agent re-click
+                    # the DOM button and stack another invisible dialog.
+                    if _FILECHOOSER_MARKER_RE.search("\n".join(_reported)):
+                        _hint += (
+                            " NOTE: a 'fileChooser/openDialog' null result means "
+                            "a BROWSE/Open button most likely opened a NATIVE "
+                            "Windows file dialog, which is NOT in the DOM and "
+                            "which CDP cannot see or fill. Do NOT re-click the "
+                            "DOM button (that just stacks another hidden dialog) "
+                            "and do NOT try to intercept it via CDP / "
+                            "ipcRenderer / @electron/remote. Call "
+                            "desktop_fill_file_dialog (no path) to confirm the "
+                            "dialog is open, then again with path=<full path> to "
+                            "select the file."
+                        )
+                    observation["effect_hint"] = _hint
+
                 # Workspace-mtime scan: emit file_touch(edit) for every file
                 # under effective_cwd whose mtime landed after this command
                 # started. Only meaningful on a non-error result (a failed rm
@@ -1199,10 +1378,22 @@ class ShellTool(BaseTool):
                     except Exception:
                         pass
 
+                # When an agent-declared oracle is what failed, stderr is
+                # typically EMPTY (the script ran fine, it just didn't achieve
+                # the goal). Falling back to `stderr_text` alone would produce
+                # success=False with error=None — the mirror image of the
+                # partial-success erasure bug, and just as unreadable. Name the
+                # real reason.
+                _error_text: Optional[str] = None
+                if is_error:
+                    _error_text = stderr_text or observation.get("outcome_check") or (
+                        f"command exited {process.returncode} with no stderr"
+                    )
+
                 return ToolResult(
                     success=not is_error,
                     output=observation,
-                    error=stderr_text if is_error else None,
+                    error=_error_text,
                     execution_time=time.time() - start_time,
                     exit_code=process.returncode,
                     tool_name=self.name,

@@ -152,6 +152,22 @@ class SessionContext:
     # active goal, the ordinary one-item-and-done completion path applies.
     active_goal: Optional["GoalState"] = field(default=None, repr=False)
 
+    # ── Session-resume search gate (bridge-owned, see stdio_bridge.py) ──────
+    # Session-resume search runs on EVERY user message (not just the first)
+    # until the session's identity is settled one of three ways:
+    #   (a) the user accepted a resume offer (_do_resume_confirm succeeded —
+    #       identity as "continuing session X" is now fixed);
+    #   (b) the user clicked "Not resuming" on a candidate card
+    #       (resume_disable_for_session IPC — explicit "this is a fresh
+    #       conversation, stop asking"); or
+    #   (c) INTENT classified a turn's FINAL lane as "queue" — a real task
+    #       (_on_coordinator_intent — the user's intent is now unambiguous
+    #       without needing an explicit click; "chat" and "interrupt" are
+    #       both inert here, see that method's docstring for why).
+    # False (default) means still-undecided: every subsequent message keeps
+    # searching and may surface a new offer.
+    resume_search_disabled: bool = field(default=False, repr=False)
+
     # ── Scheduler singleton (process-level, injected by FlowControllerV2) ──
     # The live bridge-global ``Scheduler`` (stdio_bridge.scheduler), passed in
     # so the agent-facing schedule_create/list/delete tools can reach it via

@@ -1,0 +1,7 @@
+# Vendored fastembed model files (see src/controller_v2/resume_index.py).
+# Force binary handling for everything under here — these are consumed
+# byte-for-byte by onnxruntime/tokenizers; Git's default line-ending
+# normalization on Windows (core.autocrlf) must never touch them, even
+# the .json sidecar files (tokenizer.json is a large structured file the
+# tokenizers library parses exactly as downloaded).
+* -text

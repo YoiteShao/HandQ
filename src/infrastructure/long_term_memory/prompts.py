@@ -801,6 +801,7 @@ Answer with a SINGLE JSON object, no prose, no markdown fences:
  "description": "<one line: what the skill does>",
  "when_to_use": "<one line: the trigger/situation>",
  "steps_md": "<markdown: the generalized, parameterized steps>",
+ "reference_md": "<markdown: optional — see 'Keep steps_md lean' below>",
  "allowed_tools": ["<on-demand tool name the recipe needs>", ...],
  "reason": "<short, max 100 chars>"}
 
@@ -816,6 +817,22 @@ Set "worth_skill": false (the conservative default) for: one-off or trivial
 tasks, pure question-answering, anything whose only content is specific values
 that cannot be generalized, or anything that cannot be described without
 embedding a secret/credential.
+
+Keep steps_md LEAN — it is loaded on every future invocation, so it should
+read like a map (trigger conditions, ordered steps, the ONE non-obvious fact
+per step that would otherwise cost re-discovery), NOT a manual. If the
+trajectory involved substantial verbatim material — a full helper script, a
+long sequence of exact shell/SQL commands, a large JSON/config template, or
+several multi-line code snippets — put that material in "reference_md"
+instead of inlining it in steps_md, and have steps_md point to it with
+`${SKILL_DIR}/reference.md` (e.g. "see `${SKILL_DIR}/reference.md` § Deploy
+script for the exact command"). `${SKILL_DIR}` is resolved to this skill's own
+directory at read-time, so it always works regardless of machine/install path
+— never invent or hard-code an absolute path yourself.
+Leave "reference_md" as "" (empty) when the procedure is short enough that
+splitting it would just add an indirection with nothing to show for it — most
+skills don't need one. Only split when there is genuinely bulky, reusable,
+copy-pasteable material to move out.
 
 CRITICAL — the "name" must be CANONICAL and PHRASING-STABLE: a short, generic
 action label describing the KIND of task, NOT the user's literal wording. The
@@ -842,7 +859,7 @@ Use the base (dictionary) form of the verb and a singular object.
 The "allowed_tools" list carries any ON-DEMAND tool names the recipe needs.
 On-demand tools are the ones NOT in the always-on core (read/write/edit/shell/
 glob/grep/notebook_edit/read_skill/wait_interval/spawn_agent/todo_write). The
-usual candidates are: ssh, remote_handq, session, browser, desktop, web_search,
+usual candidates are: ssh, session, browser, desktop, web_search,
 email, teams, ask_human. Include ONLY tools the trajectory actually shows being
 used successfully. Skip anything you're unsure about. Return [] for skills that
 only use always-on tools. This lets read_skill activate the same tools the
@@ -889,6 +906,13 @@ def parse_skill_extraction(json_str: str) -> dict:
         "description": str(parsed.get("description") or "").strip()[:300],
         "when_to_use": str(parsed.get("when_to_use") or "").strip()[:300],
         "steps_md": str(parsed.get("steps_md") or "").strip()[:4000],
+        # Optional companion reference file — bulky verbatim material (scripts,
+        # long command sequences, templates) the LLM chose to split out of
+        # steps_md rather than inline. Empty string ⇒ no reference.md is
+        # written (most skills don't need one — see SKILL_EXTRACTION_SYSTEM's
+        # "Keep steps_md LEAN" guidance). Capped generously higher than
+        # steps_md since this is meant to hold the bulky material.
+        "reference_md": str(parsed.get("reference_md") or "").strip()[:12000],
         "allowed_tools": allowed_tools,
         "reason": str(parsed.get("reason") or "").strip()[:200],
     }

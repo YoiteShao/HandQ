@@ -51,7 +51,8 @@ $Items = @(
     'handq_config.example.yaml',
     'packaging',
     'src',
-    'electron/package.json'
+    'electron/package.json',
+    'Skill'
 )
 
 # Exclusions for directory copies.

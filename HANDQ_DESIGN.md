@@ -53,6 +53,10 @@ INSTALL_DIR =
                                           恒为 `persistent_session`，故后缀恒为 `persiste`。每行一条 JSON，
                                           `kind` 区分 session_start/user_request/item_start/turn/item_end/
                                           session_end；见 §2.5.5「执行轨迹格式」）
+      digest.json                      ← SessionDigest（会话续接用的轨迹快照，见 §2.16）。destroy 时
+                                         写权威版本，item 完成时增量 checkpoint 兜底崩溃。**不是**
+                                         `session_state.json`——那是一个已废弃机制留下的同名旧格式
+                                         （`{"steps":[...]}` schema），二者刻意用不同文件名区分，避免混淆
       .workspace\                      ← agent 的"全世界"——prompt 中唯一出现的可写路径
                                          （子目录名读自 `session.workspace_base`，默认 `.workspace`；
                                           所有 agent 产物都落这里，UI 的 Files 面板读取并支持拖出/另存为）
@@ -114,6 +118,7 @@ INSTALL_DIR =
 | Session 历史 | `%USERPROFILE%\HandQ\History\<id>\` | 否 | 是 | 跨升级，可手动清理 |
 | Per-session engine log | `%USERPROFILE%\HandQ\History\<id>\handq-engine.log` | 否 | 是 | 跟随 session |
 | Per-session 执行轨迹 | `%USERPROFILE%\HandQ\History\<id>\session_<TS>_persiste.jsonl` | 否 | 是 | 跟随 session（ExecutionRecorder 写，每-turn 增量 JSONL） |
+| Per-session 续接快照 | `%USERPROFILE%\HandQ\History\<id>\digest.json` | 否 | 是 | 跟随 session（SessionDigest 写，destroy 时权威版本 + item 完成时崩溃兜底；见 §2.16） |
 | Per-session 浏览器 profile | `%USERPROFILE%\HandQ\browser_profile\sessions\<sid>\` | 否 | 是 | 每个 flow 独立的 Chromium user-data-dir；详见 §1.4 多 session 模型 |
 | LTM SQLite | `%USERPROFILE%\HandQ\personality\memory.db` | 否 | 是 | 跨升级 |
 | 长 /remember 镜像 | `%USERPROFILE%\HandQ\personality\memory_notes\<id>.md` | 否 | 是 | 跨升级；用户可编辑器打开 |
@@ -235,6 +240,12 @@ HandQ/                              ← 仓库根，也是直接运行时的 INS
 ├── handq_config.yaml               ← 本地工作配置（在 .gitignore 中，由 example 拷贝得到）
 ├── handq_config.example.yaml       ← 跟进 git 的模板（API_KEY 留空，作为 ship-default）
 ├── requirements.txt                ← Python 依赖（与 packaging\build.ps1 的 --include-package 对齐）
+├── assets/
+│   └── models/
+│       └── bge-small-zh-v1.5/      ← 随包 vendored 的 onnx 模型（会话续接检索用，见 §2.16）。
+│                                      提交进 git（无 Git LFS，~92MB），随 electron-builder 的
+│                                      extraFiles 打进安装根 `<install_root>\assets\models\`，
+│                                      离线/内网环境不触碰 HuggingFace Hub
 ├── scripts/
 │   ├── handq_post_commit.py        ← Git hook 源（bridge 安装到 .git/hooks/post-commit）
 │   └── start_chrome_with_debug.bat ← Edge/Chrome attach 模式启动器
@@ -477,28 +488,42 @@ handq_linux --version             # 打印当前安装的版本
 
 （`handq`、`hi` 是同一个命令的别名，由 `handq_setup.sh` 装好）
 
-每条非 daemon 命令执行前都会先打印一行 session 横幅（当前 `session_id` + 工作目录），并明确区分三种情形——首次、`continuing <session>`、`NEW session (previous ... is gone)`。控制台内还支持两个不退出的子命令：`new`（当场开新 session）、`status`（查看当前状态）。工作目录是 `~/<workspace_base>/<session_id>/`。
+每条非 daemon 命令执行前都会先打印一行 session 横幅（当前 `session_id` + 工作目录），并明确区分三种情形——首次、`continuing <session>`、`NEW session (previous ... is gone)`。控制台内还支持两个不退出的子命令：`new`（当场开新 session）、`status`（查看当前状态）。工作目录是 `<root>/workspace/<session_id>/`（`<root>` 见下面「安装根」一节）。
 
-daemon 是 `setsid` 脱离终端常驻的：控制台退出后 daemon 继续活着，Windows 随时可以通过 SSH 接管同一个 daemon（两边共享同一份 `~/.handq/<user>@<host>/` 文件 IPC）。人和 Windows 是两个平等的客户端，但同一时刻只有一个任务在跑。
+daemon 是 `setsid` 脱离终端常驻的：控制台退出后 daemon 继续活着，Windows 随时可以通过 SSH 接管同一个 daemon（两边共享 `<root>/` 下的文件 IPC）。人和 Windows 是两个平等的客户端，但同一时刻只有一个任务在跑。
+
+**安装根（`<root>`）与"同一用户多机并行"**：Linux 用户的 `$HOME` 在多台物理机之间被云盘同步（同一用户名）。若安装/状态落在 `$HOME` 下，两台机器就会共享同一份安装和同一份状态目录——同一个用户没法在两台机器上同时跑 daemon。所以安装、config、文件 IPC、推送的技能、agent 工作目录**全部**放在一个**机器本地**的根 `<root>` 下，按下面的候选链解析（`handq_setup.sh` 解析，`handq_linux.py` 与 `remote_handq_tool._PROBE` 读取）：
+
+| 序 | 候选 | 性质 |
+|---|---|---|
+| 1 | `/local/mnt/workspace/<user>@handq` | 机器本地，通常免配额 |
+| 2 | `/var/tmp/<user>@handq` | 机器本地，跨重启保留（不用 `/tmp`——常是 tmpfs） |
+| 3 | `$HOME/handq/<user>@<host>` | 最后手段；`$HOME` 被同步，故必须带主机段 |
+
+不变式：**任何候选下都不会有两个活着的 daemon 共享同一个根**。`<root>` 是 `chmod 700` 的（config 里有 API key，而候选 1/2 多用户可见）。解析结果由 `handq_setup.sh` 写进 `~/.config/handq/hosts/<shorthost>` 的 `export HANDQ_ROOT=...`——这是"本机根在哪"的唯一权威，`handq_linux`（读 `$HANDQ_ROOT`）和 Windows 的 `_PROBE`（grep 这个文件）都读它、都不重新推导，三方因此不会漂移。`<root>` 下的布局：`handq_linux.dist/`（二进制 + 依赖 + 随包 `Skill/`）、`handq_config.yaml`、`state.json` / `handq.pid`、`messages/`·`commands/`·`reply/`、`confirmation_*.json`、`daemon.log` / `daemon_error.txt`、`skills/`（推送的技能，是 dist 的**兄弟**——升级只 mv/rm `handq_linux.dist`，不碰状态与推送内容）、`workspace/<session_id>/`。
+
+`~/.local/bin/{handq_linux,handq,hi}` 是仍留在 `$HOME`（被同步）里的东西：一个**主机无关**的静态 dispatcher，运行时通过 `~/.config/handq/hosts/<shorthost>` 路由到本机的 `<root>`。它对每台机器都成立，所以共享无害。
 
 安装方式两种：
-1. **手动**：把打包好的 dist（`handq_linux.dist/` + `handq_setup.sh`）拷到 Linux 机器上，跑 `bash handq_setup.sh --config <config>`。
-2. **免手动**：Windows 配置了 `update.linux_share_path` 后，第一次从 Windows 委托任务时自动帮你装好（配置照抄 Windows 本机当前的）。
+1. **手动**：把打包好的 dist（`handq_linux.dist/` + `handq_setup.sh`）拷到 Linux 机器上（放哪都行，常在 `$HOME` 下），跑 `bash handq_setup.sh --config <config>`——它会把 payload 复制进解析出的 `<root>` 再安装。
+2. **免手动**：Windows 配置了 `update.linux_share_path` 后，第一次从 Windows 委托任务时自动帮你装到 `<root>`（配置照抄 Windows 本机当前的）。
+
+**从旧布局迁移**：旧版把安装放在 `~/handq`、工作目录放在 `~/.workspace`、IPC 放在 `~/.handq/<user>@<host>`（前两者共享）。迁移由 `_discover` / `_ensure_installed` 自动处理，原则是"能修则修，绝不删不该删的"：`_discover` 的启动路径**只**认 `<root>`，任何 `<root>` 之外的东西（PATH 上的旧 wrapper、旧 `~/handq` dist）都归为 legacy、报告但**从不采纳**；`_get_installed_version` 只读 `<root>` 下的 config（否则旧 config 的版本号会让升级判定成"已最新"而永远不部署新根——一个静默死锁）；旧 `~/handq` 安装**绝不自动删除**（它可能正是另一台尚未迁移的机器的活安装，且删除不可恢复），只在日志里说明可在全舰队迁移完成后手工回收；唯一被主动停掉的 legacy 物是旧 `~/.handq/<u>@<h>` 里**还活着**的 daemon——否则同一台机器会跑两个 daemon、各监听各自端口。
 
 **自动部署流程**（配置 `update.linux_share_path` 后，`submit_goal`/`new_session` 触发 `_ensure_installed`）：
 
-1. `discover` 探测远端已装版本；未装或 daemon 正在跑则跳过（daemon 存活时永不重新部署）
+1. `discover` 解析 `<root>` + 探测其下已装版本；`<root>` 下的 daemon 正在跑则跳过（daemon 存活时永不重新部署，且因为根是机器本地的，这个判断对多机场景现在是可靠的）
 2. 扫描共享目录取最高 semver 的 tarball；版本 ≥ 已装版本则跳过（Linux 端允许落后于共享目录最新版）
-3. SFTP 推送 tarball，解压到暂存目录并验证可执行——**验证通过前，线上目录完全不受影响**；验证失败直接中止，旧版本原封不动
-4. 把 Windows 本机当前配置（含 API_KEY / 模型池）写成远端配置，`version` 字段强制覆盖为实际部署版本号
-5. best-effort 跑一次 `handq_setup.sh` 装好人类操作者需要的别名/PATH（失败不影响部署结果）
+3. SFTP 推送 tarball（落在 `<root>` 下，机器本地），解压到 `<root>` 内暂存目录并验证可执行——**验证通过前，线上目录完全不受影响**；验证失败直接中止，旧版本原封不动
+4. 把 Windows 本机当前配置（含 API_KEY / 模型池）写成 `<root>/handq_config.yaml`，`version` 字段强制覆盖为实际部署版本号
+5. best-effort 跑一次 `handq_setup.sh --root <root>`：记录 `HANDQ_ROOT`、装好人类操作者需要的别名/PATH（失败不影响部署结果）
 6. 重新 `discover(force=True)` 刷新缓存
 
 **`remote_handq` 工具的 11 个动作**：
 
 | action | 等价于人在 Linux 上做什么 | 备注 |
 |---|---|---|
-| `discover` | 探测 `~/.handq/<user>@<host>/` 在哪、`handq_linux` 装没装、daemon 活没活 | 只读 |
+| `discover` | 解析本机 `<root>` 在哪、`handq_linux` 装没装、daemon 活没活；并报告 legacy 遗留（旧 `~/handq` 安装、旧 IPC 目录、旧 daemon 是否还活着） | 只读 |
 | `ensure_installed` | 版本比对 + 按需自动部署/升级 | 只读→写，仅版本落后时有副作用 |
 | `submit_goal` | 唤醒 daemon（若未活）+ 相当于人执行 `handq_linux "<goal>"` | 内部先跑一次 `ensure_installed` |
 | `send_message` | 相当于人在控制台里，任务跑到一半时敲一行新指令插进去 | 要求 daemon 已经在跑一个任务 |
@@ -861,7 +886,7 @@ ToolRegistry (src/tools/tool_registry.py)
 | `web_search` | 网页搜索 |
 | `ask_human` | 向用户提问(受严格节制规则约束) |
 
-**Workflow Skills(按需 read_skill)**：`browser-workflow` / `desktop-workflow` / `email-workflow` / `teams-workflow` / `ssh-workflow` / `remote-handq-workflow` / `web-search-workflow` / `coding-discipline` 等——这些工具/规范的详细用法是 Agent 主动拉取的 Skill,不是预注入 hint。
+**Workflow Skills(按需 read_skill)**：`browser-workflow` / `desktop-workflow` / `email-workflow` / `teams-workflow` / `ssh-workflow` / `web-search-workflow` / `coding-discipline` 等——这些工具/规范的详细用法是 Agent 主动拉取的 Skill,不是预注入 hint。
 
 **2.6.4 并发能力**
 
@@ -887,7 +912,7 @@ description: 部署到预发布环境的完整流程
 enabled: true
 standing: false
 origin: user
-allowed-tools: [ssh, remote_handq]
+allowed-tools: [ssh]
 ---
 # Deploy to Staging
 1. SSH 到目标机器...
@@ -1114,7 +1139,109 @@ Electron renderer.js:
 
 Skill 面板走独立的 `skill_list`/`skill_set_enabled`/`skill_set_standing`/`skill_create`/`skill_update`/`skill_delete`/`skill_import` IPC 消息(`stdio_bridge.py` → `SkillRegistry`)。`skill_list` 返回的清单已经过滤掉 `origin: bundled` 的条目(见 2.7),前端 `admin-panel.js` 直接渲染返回的数组,不做任何额外的 origin 过滤或硬编码假设。
 
-### 2.15 总结：一次典型任务的完整生命周期
+### 2.16 会话续接（Session Resume）
+
+一个 session 被销毁（用户点 X / 关 App）后，其对话与任务进度默认永久丢失——`_ensure_flow` 每个新 `session_id` 都分配全新目录（§1.2）。会话续接机制在 destroy 时把"轨迹"（不是"信念"）落盘，让用户后续开一个新 session 说"继续上次那个 X"时，能被语义匹配到、一键接回原有的对话历史与任务队列。
+
+**核心取舍——恢复轨迹，不恢复信念**：`PersistentAgent._turns`（逐轮工作记忆，含对活 OS 句柄——浏览器 tab、SSH 连接、后台进程——的引用）**从不序列化**。这些句柄在进程重启后必然失效，逐字恢复只会让 agent 误信"已死资源还活着"。真正需要救的只有三样结构化数据：verbatim 对话、`TaskResult`/`TaskSpec` 队列、standing goal——agent 醒来后用工具重新观察世界，而不是相信一份可能已经过期的记忆快照。
+
+**存（`SessionDigest`，`src/controller_v2/session_digest.py`）**：
+
+```python
+@dataclass
+class SessionDigest:
+    schema_version, session_id, title, created_at, updated_at
+    workspace_dir, workspace_files          # 一次 listdir，补 artifacts 的差集
+    status: "destroyed" | "crashed"
+    conversation: [{"role", "content"}, ...]   # 逐字，来自 Orchestrator.conversation_history
+    completed, current, pending               # TaskChannel.snapshot_queue() 的原样 asdict
+    active_tools, active_goal                 # TaskChannel.active_tools / SessionContext.active_goal
+    agent_summary                              # 唯一携带的一片"信念"——agent 关闭时已在用的摘要，非重新叙述
+```
+
+落盘文件名为 `digest.json`（**不是** `session_state.json`——那是一个已废弃机制留下的同名旧格式，字段完全不同，为避免混淆刻意改了名；`from_json()` 对每个字段防御性 `.get()`，读到旧格式文件不会崩，只会得到一份空壳 digest）。原子写：临时文件 + `os.replace`。
+
+两个写入时机（`flow_controller.py`）：
+- **`FlowControllerV2.destroy()`**——权威版本，覆盖两条 destroy 路径（`close_session` 与 `shutdown`）；`ctx.close()` 之前调用，此时 `_orchestrator`/`_task_channel`/`_agent`/`_ctx` 仍全部存活。
+- **`TaskChannel.on_item_done` 回调**——每个 item 完成时增量 checkpoint，App 崩溃（destroy 从未运行）时的兜底，保证 digest 至少停在上一个 item 边界。
+
+**取（`ResumeIndex`，`src/controller_v2/resume_index.py`）**：进程内内存态检索，扫描 `History/` 下所有 `digest.json`，BM25（SQLite FTS5，jieba 分词）与本地 dense（`bge-small-zh-v1.5`，`fastembed`/onnxruntime）双路检索，RRF 融合排序，dense-cos ≥ 0.68 作绝对闸门（2026-08-01 用真实 93-session 语料重新校准，见下方"已知限制"——早期 0.50 是约20组样本校准，在真实语料上严重过松）。闸门是**逐候选**判定的：先看 top1 是否过线（不过 → 整体静默，不弹卡），过线后**每个** dense-cos 单独过线的候选都进结果，**没有固定数量上限**（早期设计有 `MAX_CANDIDATES=3` 的护栏，已按"符合阈值的都应该拉出来"移除——真命中 7 个旧 session 就展示 7 个，前端卡片可滚动，绝不为了短而静默丢弃真实匹配）。
+
+- **不是持久化 DB**：索引是纯内存派生物，`digest.json` 文件是唯一 source of truth；`build()` 每次全量重扫重建，消灭 upsert/悬空/损坏这一整类维护问题。
+- **两次 `build()` + embedding 缓存**：bridge 启动时 warm-build 一次（预热 embedding 模型 + 首次嵌入全部现存 digest 填缓存，~5-7s，在后台不占用户热路径），此后**每次搜索前都重新 `build()`**。关键：embedding **按 corpus 文本哈希缓存**（`_embed_cache`，见 `resume_index.py`）——digest 落盘后不可变，所以重建只嵌入**新增/变化**的 digest，命中缓存的直接复用向量。热路径代价 = disk 扫描 + FTS5 插入 + query 嵌入 ≈ 百毫秒（84 session 实测重建 140ms），而非全量重嵌（同规模 ~4.8s——2026-08-01 加缓存前实测，就是"发消息后数秒死区"那个 bug 的根因）。若只在启动时建一次，同一 bridge 进程生命周期内新产生的 digest 永远搜不到（2026-07-31 真实复现过这个 bug 并修复）。
+- **离线可用**：`bge-small-zh-v1.5` 模型文件 vendored 在仓库 `assets/models/`（见 §1.5），运行时经 `fastembed` 的 `specific_model_path` 参数直接加载，不经过 HuggingFace Hub 缓存校验、零网络访问（已用故意配置不可达代理的方式实测验证）。找不到 vendored 副本时（开发环境未拉取 `assets/`）回退到 `fastembed` 默认的 HuggingFace 下载路径。
+- **jieba 分词是必须的**：SQLite FTS5 默认的 `unicode61` tokenizer 把连续汉字整块当一个 token，中文查询基本全 miss；jieba 分词后中文查询命中率从 6/9 提升到 8/9（实测，`scratch_resume/04`）。大小写：BM25 侧天然大小写不敏感，但 dense 侧 bge 模型把 "QPM" 和 "qpm" 编码成不同向量——查询与语料在 embed 前都强制 `.lower()`。
+
+**持续检索（`stdio_bridge.py`）**：resume 是软提示，不是硬阻断——且检索不再只看首条消息。同一 session 内，只要 `SessionContext.resume_search_disabled` 还没被翻起，**每一条**新消息都用**到目前为止的完整对话**（`_resume_query_text_for_followup` 拼接 role+content，不只当前这句）重新检索：命中就整块刷新右侧候选卡（覆盖旧卡，不是增量 patch，让用户直观感觉列表在随对话累积变化），未命中就发空数组清卡。这样"你还记得翻译任务吗"→"QPM"→"翻译"三句叠加的语义信号远比单句强。永久停止检索的开关有三条路径落回同一个 `resume_search_disabled=True`：① 用户点候选、确认续接成功（`_do_resume_confirm`）；② 用户点候选卡的 "Not resuming" 按钮（`resume_disable_for_session` IPC，显式"这就是新对话，别再问了"）；③ **INTENT 把这一轮的最终车道判成 "queue"**（`_on_coordinator_intent`——用户真的要开始干活了，身份也就此定下来，"chat" 和 "interrupt" 都是**故意不关**：chat 只是聊，interrupt 是控制命令、不是"开始一件事"）。
+
+**coordinator 与 resume 各管各的（2026-08-01 rewrite）**：这一段推翻了短暂存在过的"挂起待表态+30s 倒计时"模型（那一版本命中时把触发消息扣下、不执行、等用户表态或超时；用户实测后指出：这让"coordinator 是否回复"与"resume 是否命中"耦合，不符合直觉——问一句普通问题、恰好命中一个旧标题，回复就要挂在一个不相干的选择上）。新的两条独立轨道：
+
+```
+用户发消息（首条 request 或后续 user_input，处理一致）：
+  ├─ (首条时) _ensure_flow + flow.start() —— tab 先渲染、agent idle 等空队列
+  ├─ 若 SessionContext.resume_search_disabled=False：
+  │   跑 resume 搜索（本地无网络；索引若还在冷启动 warm-build，等≤15s 再搜）
+  │   ├─ 命中 → 发候选卡（`hold_seconds=None`，纯 FYI）
+  │   └─ 未命中 → 发空数组清掉可能残留的旧卡
+  └─ 无条件调 flow.on_user_message(text)  ← 消息永远立即执行，从不被扣
+
+同一协程里搜索先跑、on_user_message 后跑：这一段顺序天然保证候选卡信封
+（若有）先于 on_user_message 自己发的 thinking-bubble/reply 信封落到 wire 上，
+用户能看到"候选卡"和"coordinator 回答"两个明确分开的事件，不会混起来。
+thinking 气泡完全交给 FlowControllerV2.on_user_message 原生
+(notify_coordinator_thinking / clear_coordinator_thinking 括号住整个 INTENT+
+reply 生命周期)：只要 LLM 请求在飞、气泡就在，跟 resume 命中与否无关；
+bridge 不再手动开关这个气泡（老版本手动关是在"消息被扣、其实没在跑"时不
+让气泡撒谎，新模型下消息永远在跑，就没这个问题了）。
+
+INTENT 把这一轮的 final 车道判成 "queue"（在 commitment-leak guard 之后，
+所以观察到的是真正据以分支的最终值，不是 LLM 原始返回）：
+  ├─ Orchestrator 通过新增的 on_intent_classified 回调把 "queue" 抛给 bridge
+  ├─ bridge 的 _on_coordinator_intent 立即：
+  │    ├─ ctx.resume_search_disabled = True（永久，同 idempotent，重复入队不
+  │    │    重复清卡）
+  │    └─ _clear_resume_offer(sid) —— 撤回当前显示的候选卡（发空数组）
+  └─ 之后这个 session 完全走正常 task 流程，resume 检索再不介入
+```
+
+`on_intent_classified` 是 Orchestrator 新增的第 7 个可选回调（`orchestrator.py.__init__`），触发点在 `_handle_user_message` 里 commitment-leak guard 跑完、`is_task = intent in ("queue","interrupt")` 决策之前——这是 `intent` 最终不再变动的那一瞬间。`FlowControllerV2.__init__` 参照 `on_reply_to_user` 的 Pattern A 直接下传（不做 IM/UI 广播），因为 bridge 要的是**编程接口**（拿到值就翻 `resume_search_disabled` 并清卡），不是给渲染器看的信号。回调抛异常被 orchestrator 侧 try/except 兜住，不影响这一轮回复本身。
+
+**Review-先行（确认续接后先复盘，不直接干活）**：`resume_confirm` 拆掉临时 session（此时上面几乎一定有正在跑或已经跑完的 `on_user_message`——新模型下消息永远立即执行，所以 `_cancel_inflight` 是这个流程的核心步骤，抢占并短暂等待那个真在飞的请求让出来，然后才 destroy）、灌完轨迹后**不重放触发消息**（触发消息的执行副作用会随着临时 session 的 destroy 一起被丢弃——用户既然点了续接就等同于说"我要的是老 session，不是刚才那一问"），而是：① 先发一条固定 assistant 气泡"↻ Resuming — reviewing the previous session…"，② 入队一条固定的 review 指令（`_RESUME_REVIEW_INSTRUCTION`：回顾恢复的对话/队列/workspace，写一段总结，明确"不要执行任何操作或工具调用来验证/继续"），走正常 task 执行链路产出总结气泡，③ 之后 session 转入普通 idle，等用户下一句指令。两条用户可见气泡都走 `on_reply_to_user` 路径，不塞进 IPC final 的 reply。
+
+`_ensure_flow` 的 `resume_session_dir` 参数：给定时复用既有目录（不跑 `_allocate_session_dir`），让 workspace 与 `digest.json` 都留在原地。`FlowControllerV2.start()` 的 `resume_digest` 参数：在 agent loop 启动**之前**把 digest 的三样轨迹字段灌回 `Orchestrator.conversation_history` / `TaskChannel`（`restore_queue`，in-flight 的 `current` 项回退到 pending 队首重新排队，而不是假装"接着跑一半")/ `SessionContext.active_goal`，并给 agent 挂一条一次性续接横幅（下一轮 `_build_messages` 消费后自动清空）。
+
+**候选卡（右侧 session-sidebar，非左侧卡片头部）**：命中后渲染在 `session-sidebar.js` 的 `#ss-resume-section`（`showResumeCandidates`/`hideResume`），显示时把 Plan/Activity/Files 整块隐藏、只显示续接选择（身份级切换，不该跟别的内容抢注意力）。标题引用触发消息原文（"You said "…" — resume one of these?"）。每个候选展示标题、最后活跃时间、完成/中断状态、产出文件、结论首行；**点候选行**即确认续接（发 `resume_confirm`）。**当前只有这一个显式按钮："Not resuming"**（发 `resume_disable_for_session`——永久关闭本 session 的检索、清掉这次的卡；因为消息本来就在跑或已跑完，这个按钮不再承担"放出扣下的消息"的语义了，只做"停止再问"）。整块卡片每次搜索都是 `innerHTML=''` + 重新 append 全部候选行（不做增量 patch），所以 bridge 每次刷新推来的候选集完整覆盖上一次的显示，用户视觉上就是列表在随对话累积重排。收到 `candidates:[]` 空数组即隐藏卡片。UI 文案全英文。信封仍保留 `hold_seconds` 字段（永远 `None`）纯粹是 wire 层向下兼容，前端 `if (holdSeconds && holdSeconds > 0)` 分支永远不进入，倒计时渲染代码已删。
+> **历史遗留**：bridge 侧仍保留 `resume_dismiss` IPC 处理分支（语义：仅丢弃当前 offer，不设永久关闭标志，区别于 `resume_disable_for_session` 的永久语义）——这是早期"三按钮"设计（Continue/New Task/No Resume）的残留，但当前前端只渲染"Not resuming"一个按钮，没有触发 `resume_dismiss` 的 UI 入口。如果后续要恢复"仅这次不续接、但下条消息还会再问"的能力，需要在 `session-sidebar.js` 补一个对应按钮；如果确认不需要，`resume_dismiss` 分支可以整个删除。
+
+**已知限制**：
+- 存量迁移未做——本机制之前遗留的旧格式 `session_state.json`（`{"steps":[...]}` schema）不会被读入检索，历史 session 要重新走一次真实的 destroy 才会有 `digest.json`。
+- 检索语料只取 workspace **顶层** listdir，不递归子目录；`conversation` 只取到 workspace 顶层文件名，深层产物不进语料。
+- dense-cos 0.68 闸门是用 93-session 真实语料 + 3 个真实 query 变体校准的（2026-08-01），仍不是理论最优值——上线后应按真实误弹/漏召反馈继续微调；弱信号 query（如单句无历史）在这个阈值下有可能一个候选都不返回，这是"宁可漏召不可误召"的取舍，不是 bug。
+- 首消息若落在 bridge 冷启动的 warm-build 窗口内（真实语料下测得 ~10.8s@92-session），会被 `_resume_index_ready` 挂起等待、最长 15s（见 `_RESUME_INDEX_WAIT_TIMEOUT`）——超时才 fail open。用户体验上是"App 刚启动那几秒发消息，回复会稍微慢一点"，不是卡死。
+- INTENT 分类失误直接影响 resume 门开关：LLM 把真正的 chat 判成 "queue" 会**过早**关掉检索、把真正的 task 判成 "chat" 会**继续**每条消息都搜（浪费 ~150-200ms/次，但不会误关）。commitment-leak guard（发现 `deferred_actions` 非空但 intent 不是 queue/interrupt 就强制改判 queue）覆盖大部分误判，但如果连 `deferred_actions` 都是空的 chat 却被 LLM 判成 queue，就没有二次防线；实测中该组合极少发生（LLM 通常一致地"chat + 空 deferred"或"queue + 非空 deferred"）。
+
+**代码索引**：
+
+| 关注点 | 文件 | 符号 |
+|---|---|---|
+| 轨迹落盘 schema + 原子读写 | `src/controller_v2/session_digest.py` | `SessionDigest`、`DIGEST_FILENAME`、`save`/`load` |
+| destroy/崩溃两个写入时机 | `src/controller_v2/flow_controller.py` | `destroy`、`_on_item_done_checkpoint`、`_checkpoint_digest` |
+| 灌轨迹回新组件 | `src/controller_v2/flow_controller.py` | `start(resume_digest=...)`、`_restore_from_digest` |
+| 队列快照/恢复 | `src/controller_v2/task_channel.py` | `snapshot_queue`、`restore_queue` |
+| 对话历史恢复 | `src/controller_v2/orchestrator.py` | `restore_conversation` |
+| 一次性续接横幅 | `src/controller_v2/persistent_agent.py` | `set_resume_banner`、`export_summary`/`restore_summary` |
+| BM25+dense 混合检索（逐候选闸门，无上限） | `src/controller_v2/resume_index.py` | `ResumeIndex`、`build`、`search`、`_ensure_model`、`DENSE_COS_GATE` |
+| embedding 缓存（重建只嵌新增，消除秒级死区） | `src/controller_v2/resume_index.py` | `_embed_cache`、`_build_indices_sync` |
+| 首消息等索引就绪（避免冷启动窗口漏检索） | `src/bridge/stdio_bridge.py` | `_resume_index_ready`、`_RESUME_INDEX_WAIT_TIMEOUT`、`_build_resume_index_background` |
+| 离线模型路径解析 | `src/controller_v2/resume_index.py` | `_vendored_model_dir`、`_install_dir`、`_model_cache_dir` |
+| 持续检索 + 完整历史 query | `src/bridge/stdio_bridge.py` | `_refresh_resume_offer`、`_resume_query_text_for_followup`、`_search_resume_candidates` |
+| INTENT-driven resume 关闸 | `src/controller_v2/orchestrator.py`、`src/controller_v2/flow_controller.py`、`src/bridge/stdio_bridge.py` | `Orchestrator.on_intent_classified` 回调（第 7 个，触发点在 commitment-leak guard 之后）、`FlowControllerV2.__init__(on_intent_classified=...)` Pattern-A 下传、bridge 侧 `_on_coordinator_intent`（"queue" 车道→翻 `resume_search_disabled` + `_clear_resume_offer`，"chat"/"interrupt" 都 no-op） |
+| review-先行续接 IPC | `src/bridge/stdio_bridge.py` | `_do_resume_confirm`、`_RESUME_REVIEW_INSTRUCTION`、`_cancel_inflight`（抢占临时 session 上正在跑的请求，非老版本的 hold-cancel）、`_emit_resume_offer`、`_PendingResumeOffer` |
+| 永久关检索开关 | `src/controller_v2/session_context.py`、`src/bridge/stdio_bridge.py` | `SessionContext.resume_search_disabled`、`resume_disable_for_session` IPC |
+| 候选卡 UI（点候选=续接 / "Not resuming"=永久关；整块重渲染） | `electron/renderer/renderer.js`、`electron/renderer/session-sidebar.js` | `_showResumeCandidates`、`_sendResumeConfirm`、`_disableResumeForSession`、`showResumeCandidates`/`hideResume`（信封 `hold_seconds` 永远 `None`，倒计时渲染分支已删） |
+| 随包 vendored 模型 | `assets/models/bge-small-zh-v1.5/`、`electron/package.json` | `build.extraFiles` |
+
+### 2.17 总结：一次典型任务的完整生命周期
 
 ```
 1. 用户在 Electron 输入 "帮我把 config.yaml 的端口改成 8080"
@@ -1149,56 +1276,6 @@ Skill 面板走独立的 `skill_list`/`skill_set_enabled`/`skill_set_standing`/`
 14. skeleton + LLM 润色 → "已将 config.yaml 的端口从 3000 修改为 8080。"
 15. Bridge → Electron → 用户看到回复
 ```
-
----
-
-## 三、变更历史附录
-
-> 本章压缩自原 `ALIGNMENT_REPORT.md`（2026-07-12）与后续的调度器 CC-parity 改造。记录"曾经做过什么改动、为什么"，不重复第一、二章已经描述的当前设计——当前状态请查前两章，本章只保留历史动机和踩过的坑。
-
-### 3.1 对齐 Claude Code 改造（2026-07-12）
-
-**背景**：用户提出四项要求——对齐 Claude Code 的 prompt 构造方式、提升并发能力、清理死代码、补齐测试覆盖。调研阶段并行产出四份技术简报，逐项确认后分五阶段落地，每阶段完成后跑全量回归。改造后离线测试从 261 个增至 324 个（新增 63 个），全部通过；`pytest.ini` 的默认路径也从指向已损坏的 `tests/` 修复为 `tests_v3/`。
-
-**Prompt 构造对齐**：System prompt 从"单一字符串"拆成两条独立 system 消息（核心行为规则 / Environment），只在最稳定的分区（核心规则）末尾打 cache 断点，Environment 不打（会话级但相对易变，收益低于维护成本）。Coordinator(INTENT) 调用维持单条 system 消息，不加缓存（内容每次都变、调用本身很短，加缓存收益有限）。同期补齐了 Extended Thinking 的完整回填协议——此前思考文本被解析后存进 `reasoning_content` 但从未被下游读取，不写日志、不显示、也不会在下一轮对话里带回给模型，这与 Claude Code"thinking block 必须原样回传"的协议要求有差距。这两项改动的**当前状态**见 2.5.4。
-
-**并发能力提升**（当前状态见 2.6.4，此处只记历史动机）：
-- **Desktop 只读动作误锁**：审计发现所有桌面动作（包括纯查询的 screenshot/snapshot/list_windows/find_element）此前共用同一把锁，导致多 session 截图互相排队。审计过程中一度把 `hover_at` 误判为"可能只读"，复核代码发现它会调用 `pyautogui.moveTo` 真实移动物理鼠标，两个 session 同时 hover 会互相抢夺鼠标位置——修正分类后保留在输入动作集合中，并加了回归锚点防止未来重犯。
-- **Shell 并发安全性判定**：此前完全依赖模型自己声明 `concurrent_safe`，模型忘记声明时一律按"不安全"处理，导致 `git status`、`ls` 这类明显只读命令被不必要串行化。新增服务端启发式兜底，关键安全设计：模型显式声明始终优先于启发式；含链式/重定向操作符(`&&`/`;`/`>`/`` $() ``)一律判定不安全；管道每一段都要独立通过只读判定。
-- **fan_out_agents 并发上限**：原硬编码 `[1,10]` 默认 6，不随机器规格变化；改为按 CPU 核数自适应但仍封顶 10（子任务是完整子 agent 会话，比轻量 step 重得多，不能照搬 Claude Code Workflow 引擎的激进上限）。
-- **跨层写路径去重**：`fan_out_agents`/`spawn_agent` 的子任务之间此前完全没有写路径去重保护，存在真实的数据竞争/静默覆盖风险。修复方式测试踩过一个坑——`ScriptedLLMService` 的队列是跨并发调用共享的纯 FIFO，两个子任务的轮次会交替到达导致队列被错误交叉消费；改用能感知调用内容的路由函数（检查"这是哪个任务在问"的文本标记）而不是死板按到达顺序发放。
-- **LTM 召回超时保护**：审计发现召回调用此前没有任何超时保护，若底层 SQLite 因后台 DreamWorker 写入卡住会无限期阻塞任务启动或聊天热路径，附带修复。
-
-**死代码清理**：确认删除 `generate_system_prompt_tools_section()`(`tool_registry.py`，已被 `generate_tools_for_api()` 取代)、`JsonNextStepsArrayStreamer` 类、`write_iteration()` 的 4 个孤儿 token 参数、`parse_verdict()` 的孤儿 `llm_services` 参数。同期修复 `pytest.ini` 的 `testpaths`（从指向已损坏的 `tests/` 改为 `tests_v3/`）——此前裸跑 `pytest` 会默默命中一堆跑不起来的旧测试。
-
-**一次需要坦白的事故**：批量删除 `tests/v2/`（76 文件）时，最初依据"1020 tests collected, 11 errors"的聚合统计，错误地推断"大部分已损坏"从而整体删除。复核后发现实际只有 11 个文件真正因引用已删除符号而报错，另外约 65 个本应可以正常运行的有效测试被一并误删。这批文件不受 git 跟踪，`Remove-Item -Force` 未走回收站，已确认无法恢复。教训已写入长期记忆：**批量删除前必须逐文件核实，不再按聚合错误数做粗粒度判断**。
-
-**测试补充**：新增 9 个测试文件、63 个测试用例，覆盖复杂/模糊任务全链路（同轮 claim_tool+调用、多步链式工具调用、Skill 渐进式披露不重复注入、模糊场景工具选择可观测性）、Extended Thinking 端到端回填、跨层写冲突的真实并发时序验证、LTM 召回超时降级、DEBUG 日志正确性，以及并发/启发式相关的穷尽正负样本覆盖。
-
-### 3.2 Scheduler 追平 Claude Code 的 loop/调度能力
-
-**背景**：以对 Claude Code（`claude.exe` 二进制逆向还原的地面真相）的 `CronCreate`/`CronList`/`CronDelete`（固定节奏、可 durable）与 `ScheduleWakeup`（动态节奏、会话级、模型自定 delay）两套循环范式为基准，发现 HandQ 的 `Scheduler` 服务内核本身已经相当完整（友好语法解析、JSON 持久化、no-skip 追赶、失败自动禁用），但**agent 完全够不到它**——只有 Electron UI 能通过 `cron_*` IPC 驱动。
-
-**落地内容**（当前状态见 2.6.3、2.10.4）：
-1. cron 语法解析新增标准 5 字段 cron 分支，友好语法优先尝试、标准 cron 兜底，两者都能存，不破坏已存任务。
-2. Store/service 精化：7 天硬过期、确定性抖动（按 `task.id` hash，非随机，保持可测）、`durable` 字段区分会话级内存态与落盘持久态。
-3. 新增 `schedule_create`/`schedule_list`/`schedule_delete` 三个 agent 可调用工具，薄封装现有 `Scheduler` 服务（经 `ctx.scheduler` 注入）。
-4. 新增 `schedule_wakeup` 工具——刻意**不**走 Scheduler 服务（会落盘+铸造新会话，丢失上下文，与 CC 的"会话级、保留上下文、无 durable"语义冲突），改为在当前会话的 event loop 上挂一个被追踪的 `asyncio` 定时器，睡眠后把 prompt 重新入队到同一个 `TaskChannel`——与持久目标的 `_requeue_goal` 是同一套机械重入队模式。
-5. 全工具测试覆盖 sweep：离线测试基线从 381 增至 558（+177），覆盖此前缺口——`notebook_edit`、`web_search`、`email`、`teams`、`browser_*`、部分 `desktop_*` 动作、以及全部新调度工具。email/teams/browser 均做行为级 mock（Outlook COM / Graph API / Playwright），不止 schema/dispatch 层面。
-
-**上线后修的三个真实 bug**（用户实际使用中报告，非本次改造范围内的历史遗留）：
-- **时区显示 bug**：Electron 前端 `fmtTime()` 误用 UTC 而非本地时间格式化 —— UI 展示层问题，与后端调度逻辑无关。
-- **一次性任务"1分钟后提醒"未触发**：根因有两层——LLM 推断 schedule 失败静默降级为 `daily 09:00`（`InferResult.ok` 标志此前没有暴露给 UI，用户看不出推断失败了），加上一个卡死在 RUNNING 状态的僵尸任务。修复：`InferResult.ok=False` 时 UI 明确提示推断失败；`service.py::_scan_and_fire` 加入 zombie-RUNNING backstop（超过 `SCHEDULER_TASK_TIMEOUT_SEC` 自动判定 fire 丢失并重置）。
-- **任务完成后仍显示"running"（真实根因）**：`_fire()` 曾在 `await dispatch(t)` **返回之后**才调用 `mark_running`。但真实 bridge 的 `dispatch`（`accept_scheduled_task`）是同步阻塞的完整会话往返，内部会在返回前调用 `notify_task_finished`（→`mark_finished`，写下最终 ok/failed）。于是"返回后才 mark_running"的时序，实际上是在真实结果已经写入之后，把状态覆盖回一个永久卡住的"running"。修复：把 `mark_running` 移到 `dispatch` **之前**，对 refusal（bridge 忙/关闭中）路径新增 `restore_next_run_at` 参数以恢复 `mark_running` 提前做的 `next_run_at` 推进/清零。加了一条回归测试（`test_scheduler_service.py::test_dispatch_that_finishes_synchronously_is_not_clobbered`），已用 `git stash` 验证在旧代码上失败、新代码上通过。
-
-同期还修了一个 Electron 侧的连带 bug：`renderer.js` 的 `gateGen()` 在首次 session_id 事件到达时会把它丢弃（懒挂载机制的边界条件），导致"没有 session 卡片出现"。
-
-### 3.3 已知限制 / 后续建议
-
-1. 只读桌面动作的并发上限（4）是保守估计——UIA/pywinauto 在真实并发下的行为未经压力测试验证。
-2. Shell 只读启发式白名单目前只覆盖工具提示词里列出的命令，可按实际观察到的常见模式继续扩充。
-3. Coordinator(INTENT) 调用仍未启用 prompt cache——如果未来 INTENT prompt 变长，可重新评估。
-4. `browser_profile\sessions\<sid>\` 孤儿目录（用户关 session 后留下）尚无自动清理，不影响运行。
 
 
 

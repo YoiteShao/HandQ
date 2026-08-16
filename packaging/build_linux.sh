@@ -183,6 +183,12 @@ INCLUDE_COMMON=(
     "--include-package=PIL"             # pdfplumber dep (Pillow)
     "--include-package=pypdfium2"       # pdfplumber dep (required >= 0.10.0); remove if not installed
     "--include-package=chardet"         # pdfminer.six encoding dep
+    # Bundle the Skill/ recipe tree as data so SkillRegistry.init() on Linux
+    # (handq_linux._init_skill_registry) finds it under _install_dir()/Skill —
+    # the POSIX root skills._default_skills_root() resolves to. Without this the
+    # daemon inits an empty registry: read_skill fails for every name and the
+    # [Available Skills] menu is blank, even though the code path is now wired.
+    "--include-data-dir=Skill=Skill"
     # Note: ./handq_config.yaml is NOT embedded — it lives at the dist root
     # so users can edit it directly before running handq_setup.sh.
 )
@@ -335,7 +341,11 @@ build_linux() {
     #                          it from here; handq_setup.sh also passes it as
     #                          --config to the installed handq_linux command)
     #   handq_setup.sh       ← users run this to install the handq_linux command
-    #   handq_linux.dist/    ← binary + all C extensions/deps (don't edit)
+    #   handq_linux.dist/    ← binary + all C extensions/deps (don't edit).
+    #                          Includes Skill/ (via --include-data-dir above), so
+    #                          the daemon's SkillRegistry finds it at
+    #                          _install_dir()/Skill and the auto-deploy tarball
+    #                          below carries it without a separate entry.
     print_info "Assembling distributable package in ${DIST_DIR}/..."
     cp "${PROJECT_ROOT}/handq_setup.sh" "${DIST_DIR}/handq_setup.sh"
     chmod +x "${DIST_DIR}/handq_setup.sh"

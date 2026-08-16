@@ -27,6 +27,8 @@ from .ocr import (
     OCRResult,
     get_local_ocr,
     get_local_ocr_background,
+    get_local_ocr_last_used_ts,
+    is_local_ocr_loaded,
     flush_local_ocr,
 )
 
@@ -41,5 +43,7 @@ __all__ = [
     "OCRResult",
     "get_local_ocr",
     "get_local_ocr_background",
+    "get_local_ocr_last_used_ts",
+    "is_local_ocr_loaded",
     "flush_local_ocr",
 ]

@@ -32,6 +32,7 @@ from collections import deque
 from pathlib import Path
 from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
 
+import psutil
 import yaml
 
 from ..long_term_memory import _constants as C
@@ -40,7 +41,13 @@ from ..long_term_memory.models import (
     ActivitySample, MonitorTier,
 )
 from ..long_term_memory.uia_worker import get_uia_worker
-from ..vision.ocr import LocalOCR, get_local_ocr_background
+from ..vision.ocr import (
+    LocalOCR,
+    flush_local_ocr,
+    get_local_ocr_background,
+    get_local_ocr_last_used_ts,
+    is_local_ocr_loaded,
+)
 from ..vision.storage import ScreenshotStore
 from .capturer import MonitorCapturer, get_foreground_window_rect
 from .frame_diff import (
@@ -221,6 +228,17 @@ class PersonalityMonitor:
         # Diagnostic counters for personality_status IPC.
         self._gate_open_now: bool = False
         self._ocr_drained_total: int = 0
+
+        # ── OCR engine idle-flush (memory reclaim, _constants §11.8) ──
+        # Continuous-dwell tracker for the OCR idle gate — None while the
+        # gate is closed; set to the wall-clock time the gate most recently
+        # opened continuously. _maybe_flush_idle_ocr uses this to require a
+        # dwell ON TOP OF the gate itself before tearing down either engine
+        # singleton, so a flush never races the drain loop's own immediate
+        # reuse of the engine the instant the gate opens.
+        self._ocr_gate_open_since: Optional[float] = None
+        self._ocr_flushes_total: int = 0
+        self._ocr_flush_last_freed_mb: float = 0.0
 
         # ── Spillover (disk-backed bounded fallback) ─────────────────
         # See _constants §11.7.1. Triggers on ring overflow and on
@@ -469,6 +487,8 @@ class PersonalityMonitor:
             "ring_size_total": sum(len(r) for r in self._rings.values()),
             "ocr_gate_open": bool(self._gate_open_now),
             "ocr_drained_total": int(self._ocr_drained_total),
+            "ocr_flushes_total": int(self._ocr_flushes_total),
+            "ocr_flush_last_freed_mb": round(self._ocr_flush_last_freed_mb, 1),
             "spilled_total": int(self._spilled_total),
             "spill_recovered_total": int(self._spill_recovered_total),
             "spill_files_now": self._spill_count(),
@@ -1040,10 +1060,12 @@ class PersonalityMonitor:
             while True:
                 if self._paused:
                     self._gate_open_now = False
+                    self._ocr_gate_open_since = None
                     await asyncio.sleep(C.ACTIVITY_OCR_DRAIN_POLL_SEC)
                     continue
                 gate = self._gate_open()
                 self._gate_open_now = gate
+                await self._maybe_flush_idle_ocr(gate)
                 if not gate:
                     await asyncio.sleep(C.ACTIVITY_OCR_DRAIN_POLL_SEC)
                     continue
@@ -1108,6 +1130,91 @@ class PersonalityMonitor:
             if ts and (now - ts) < C.ACTIVITY_OCR_GATE_SCREEN_QUIET_SEC:
                 return False
         return True
+
+    # ── OCR engine idle-flush (memory reclaim) ─────────────────────────────
+
+    async def _maybe_flush_idle_ocr(self, gate_open: bool) -> None:
+        """Tear down either OCR engine singleton once the idle gate has
+        held continuously long enough (see _constants.py §11.8).
+
+        Ticked from ``_ocr_drain_loop`` on every iteration — piggybacks on
+        the gate that loop already computes, so this adds no new wakeup
+        source. Requires a DWELL on top of the gate itself (tracked via
+        ``self._ocr_gate_open_since``): the drain loop starts consuming the
+        ring the instant the gate opens, so flushing right then would just
+        force an immediate rebuild.
+        """
+        if not gate_open:
+            self._ocr_gate_open_since = None
+            return
+        now = time.time()
+        if self._ocr_gate_open_since is None:
+            self._ocr_gate_open_since = now
+            return  # never flush the instant the gate opens
+        dwell = now - self._ocr_gate_open_since
+        if not C.ACTIVITY_OCR_IDLE_FLUSH_ENABLED:
+            return
+
+        # Background singleton: also require the ring + spillover backlog
+        # to be fully drained — no point tearing down an engine the drain
+        # loop is about to reuse on its very next iteration.
+        if dwell >= C.ACTIVITY_OCR_BG_FLUSH_IDLE_SEC and self._ocr is not None:
+            backlog_empty = (
+                not any(self._rings.values()) and self._spill_count() == 0
+            )
+            if backlog_empty:
+                await self._do_flush(
+                    background=True, interactive=False, reason="background-idle",
+                )
+                self._ocr = None
+
+        # Interactive singleton (desktop_tool's get_local_ocr()): gated on
+        # BOTH the shared idle dwell AND the engine's own last-used
+        # timestamp. The latter is the authoritative "is OCR actually being
+        # used" signal — desktop_tool's read-only actions (screenshot /
+        # find_element / snapshot) never take the cross-session desktop
+        # ownership lock, so _desktop_query() alone could read "idle" while
+        # a session is still mid-burst of OCR-backed calls.
+        if (
+            dwell >= C.ACTIVITY_OCR_INTERACTIVE_FLUSH_IDLE_SEC
+            and is_local_ocr_loaded()
+            and (now - get_local_ocr_last_used_ts())
+            >= C.ACTIVITY_OCR_INTERACTIVE_FLUSH_IDLE_SEC
+            and not self._desktop_query()
+        ):
+            await self._do_flush(
+                background=False, interactive=True, reason="interactive-idle",
+            )
+
+    async def _do_flush(
+        self, *, background: bool, interactive: bool, reason: str,
+    ) -> None:
+        """Run ``flush_local_ocr`` off the event loop and log the RSS delta.
+
+        Blocking work (psutil snapshot + the engine drop + gc.collect())
+        is offloaded via run_in_executor so this never stalls the event
+        loop that also services chat/IPC — the flush only fires while the
+        idle gate is already open, so nothing interactive should be
+        happening anyway, but this keeps it structurally true.
+        """
+        loop = asyncio.get_running_loop()
+
+        def _work():
+            proc = psutil.Process()
+            rss_before = proc.memory_info().rss
+            closed = flush_local_ocr(background=background, interactive=interactive)
+            rss_after = proc.memory_info().rss
+            return closed, rss_before, rss_after
+
+        closed, rss_before, rss_after = await loop.run_in_executor(None, _work)
+        if closed:
+            freed_mb = (rss_before - rss_after) / (1024 * 1024)
+            self._ocr_flushes_total += 1
+            self._ocr_flush_last_freed_mb = freed_mb
+            _logger.info(
+                "OCR idle-flush (%s): rss %.1fMB -> %.1fMB (freed %.1fMB), closed=%d",
+                reason, rss_before / 1e6, rss_after / 1e6, freed_mb, closed,
+            )
 
     def _pop_round_robin(self) -> Optional[Dict[str, Any]]:
         """Pop the OLDEST entry across every non-empty ring.

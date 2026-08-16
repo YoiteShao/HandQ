@@ -915,6 +915,7 @@ class DreamWorker:
     async def _write_live_skill(
         self, *, title: str, description: str, content: str,
         allowed_tools: Optional[List[str]] = None,
+        reference_md: Optional[str] = None,
     ) -> bool:
         """Write (or update) a live, DISABLED skill under the unified Skill root.
 
@@ -942,6 +943,18 @@ class DreamWorker:
         ``read_skill`` activates the tool the same way a hand-authored recipe
         would. Empty list ⇒ frontmatter has no ``allowed-tools`` key.
 
+        ``reference_md`` (optional) — bulky verbatim material (a full helper
+        script, a long command sequence, a template) the extraction LLM chose
+        to split out of ``content``/``steps_md`` rather than inline, per the
+        "keep steps_md lean" discipline in ``SKILL_EXTRACTION_SYSTEM`` (mirrors
+        Claude Code's SKILL.md + companion-file split, and the same rework
+        done by hand on ``xpcat-flashing-workflow`` — see its ``dom-reference.md``).
+        Written as ``reference.md`` next to ``SKILL.md`` in the skill's own
+        directory; ``content`` is expected to point at it via
+        ``${SKILL_DIR}/reference.md``, which ``read_skill`` resolves at
+        read-time (see ``_substitute_skill_dir`` in ``skill_tool.py``). Blank/
+        None ⇒ no companion file is written — most skills don't need one.
+
         Runs in the shared backend process, so ``SkillRegistry.get()`` is the
         same singleton the agent reads; the write is visible immediately.
         """
@@ -952,6 +965,7 @@ class DreamWorker:
         )
 
         slug = slugify_skill_name(title, fallback="skill")
+        ref_text = (reference_md or "").strip()
 
         def _apply() -> dict:
             reg = SkillRegistry.get()
@@ -960,15 +974,33 @@ class DreamWorker:
                 # Origin protection — never clobber user-owned content.
                 if existing.origin != SKILL_ORIGIN_AUTO:
                     return {"ok": False, "reason": "user_owned", "name": slug}
-                return reg.update_skill(
+                result = reg.update_skill(
                     slug, description=description, body=content,
                     origin=SKILL_ORIGIN_AUTO,
                     allowed_tools=allowed_tools,
                 )
-            return reg.create_skill(
-                slug, description, content, enabled=False,
-                origin=SKILL_ORIGIN_AUTO, allowed_tools=allowed_tools,
-            )
+            else:
+                result = reg.create_skill(
+                    slug, description, content, enabled=False,
+                    origin=SKILL_ORIGIN_AUTO, allowed_tools=allowed_tools,
+                )
+            # Companion file write is best-effort and never blocks the skill
+            # itself from landing — a failed reference.md write just leaves
+            # steps_md's ${SKILL_DIR}/reference.md pointer dangling, which the
+            # user notices (and can fix by hand) the same way they'd notice
+            # any other auto-minted skill needing a touch-up before enabling.
+            if result.get("ok") and ref_text:
+                final_name = str(result.get("name", slug))
+                entry = reg.get_any(final_name)
+                if entry is not None:
+                    try:
+                        ref_path = Path(entry.source_path).parent / "reference.md"
+                        ref_path.write_text(ref_text.rstrip() + "\n", encoding="utf-8")
+                    except OSError:
+                        _logger.exception(
+                            "session skill reference.md write failed slug=%s", final_name,
+                        )
+            return result
 
         res = await asyncio.to_thread(_apply)
         if not res.get("ok"):
@@ -1075,12 +1107,16 @@ class DreamWorker:
         if steps:
             content_lines.append(steps)
         content = "\n\n".join(filter(None, content_lines))
+        reference_md = (verdict.get("reference_md") or "").strip() or None
 
-        # PII post-filter. The LLM-generated steps can surface a secret that
-        # the raw trajectory's pre-filter didn't (e.g. a token paraphrased
-        # into a step). Mirror the memory/knowledge post-filter: a secret-
-        # bearing skill is dropped and never written.
-        if self._pii.has_secret(content):
+        # PII post-filter. The LLM-generated steps (and the optional reference
+        # file — it can carry a full script/command sequence, exactly the
+        # shape a paraphrased token would hide in) can surface a secret that
+        # the raw trajectory's pre-filter didn't. Mirror the memory/knowledge
+        # post-filter: a secret-bearing skill is dropped and never written.
+        if self._pii.has_secret(content) or (
+            reference_md and self._pii.has_secret(reference_md)
+        ):
             _logger.info(
                 "session skill dropped: PII detected in extracted steps cid=%s",
                 c.id[:8],
@@ -1112,9 +1148,12 @@ class DreamWorker:
         # allowed_tools comes from parse_skill_extraction (may be []). Threaded
         # through so an auto-minted recipe carries its tool grant end-to-end.
         allowed_tools = verdict.get("allowed_tools") or []
+        # reference_md was already extracted + PII-checked above alongside
+        # content; passed straight through to _write_live_skill's companion
+        # ${SKILL_DIR}/reference.md contract (see its docstring).
         return await self._write_live_skill(
             title=title, description=description, content=content,
-            allowed_tools=allowed_tools,
+            allowed_tools=allowed_tools, reference_md=reference_md,
         )
 
 

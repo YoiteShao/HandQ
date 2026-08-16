@@ -330,6 +330,22 @@ async def _handle_network_failure(
 # ── Fallback wrappers ───────────────────────────────────────────────────────
 
 
+def _next_live_service(
+    services: List[LLMService], after: int,
+) -> Optional[Tuple[int, LLMService]]:
+    """Index+service of the first non-exhausted service after *after*.
+
+    ``on_fallback`` / ``_fallback_notifier`` previously always announced
+    ``services[i + 1]`` as the destination, which became wrong the moment
+    exhausted services were actually being skipped — the UI would name a model
+    that never got a request. Returns None when nothing usable remains.
+    """
+    for j in range(after + 1, len(services)):
+        if not services[j].is_exhausted():
+            return j, services[j]
+    return None
+
+
 async def _try_all_services(
     services: List[LLMService],
     chat_kwargs: dict,
@@ -345,7 +361,7 @@ async def _try_all_services(
 
     last_exc: Optional[Exception] = None
     for i, service in enumerate(services):
-        if service._exhausted:
+        if service.is_exhausted():
             _logger.debug(
                 f"call_with_fallback: skipping session-exhausted service "
                 f"index {i} ({service.model})"
@@ -367,15 +383,17 @@ async def _try_all_services(
                     f"service index {i}, not trying remaining services: {exc}",
                 )
                 raise
-            if i < len(services) - 1:
+            nxt = _next_live_service(services, i)
+            if nxt is not None:
+                next_i, next_svc = nxt
                 if on_fallback is not None:
                     try:
-                        on_fallback(i + 1, exc)
+                        on_fallback(next_i, exc)
                     except Exception:
                         pass
                 if _fallback_notifier is not None:
                     try:
-                        _fallback_notifier(services[i].model, services[i + 1].model, exc)
+                        _fallback_notifier(service.model, next_svc.model, exc)
                     except Exception:
                         pass
             else:
@@ -469,7 +487,7 @@ async def call_with_fallback_stream(
         gen = None
 
         for i, service in enumerate(services):
-            if service._exhausted:
+            if service.is_exhausted():
                 _logger.debug(
                     f"call_with_fallback_stream: skipping session-exhausted "
                     f"service index {i} ({service.model})"
@@ -495,10 +513,22 @@ async def call_with_fallback_stream(
                         f"from service index {i}, not trying remaining services: {exc}",
                     )
                     raise
-                if i < len(services) - 1:
+                nxt = _next_live_service(services, i)
+                if nxt is not None:
+                    next_i, next_svc = nxt
                     if on_fallback is not None:
                         try:
-                            on_fallback(i + 1, exc)
+                            on_fallback(next_i, exc)
+                        except Exception:
+                            pass
+                    # The streaming path never fired the bridge's fallback
+                    # notifier, so the renderer's "↪ X failed; trying Y" bubble
+                    # only ever appeared for non-streaming calls — i.e. never
+                    # for the agent's own think/act loop, which is exactly where
+                    # the user needs to see a model switch.
+                    if _fallback_notifier is not None:
+                        try:
+                            _fallback_notifier(service.model, next_svc.model, exc)
                         except Exception:
                             pass
                     continue

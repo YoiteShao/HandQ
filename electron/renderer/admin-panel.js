@@ -372,10 +372,44 @@
         );
     }
 
-    function openSchedules() {
+    // Loading veil for the gap between the panel becoming visible and the
+    // first cron_list reply landing — same pattern as Settings' loading
+    // overlay in renderer.js. Only wraps the initial open-time fetch, not
+    // the 5s background poll (that would flash the veil every cycle).
+    let schedLoadingEl = null;
+
+    function ensureSchedLoadingOverlay() {
+        if (schedLoadingEl) return schedLoadingEl;
+        const card = schedOverlay.querySelector('.sched-card');
+        if (!card) return null;
+        schedLoadingEl = document.createElement('div');
+        schedLoadingEl.className = 'settings-loading-overlay hidden';
+        const text = document.createElement('span');
+        text.className = 'loading-text';
+        text.textContent = 'Loading schedules…';
+        schedLoadingEl.appendChild(text);
+        card.appendChild(schedLoadingEl);
+        return schedLoadingEl;
+    }
+
+    function showSchedLoading() {
+        const ov = ensureSchedLoadingOverlay();
+        if (ov) ov.classList.remove('hidden');
+    }
+
+    function hideSchedLoading() {
+        if (schedLoadingEl) schedLoadingEl.classList.add('hidden');
+    }
+
+    async function openSchedules() {
         schedOverlay.classList.remove('hidden');
         schedOverlay.setAttribute('aria-hidden', 'false');
-        refreshSchedules();
+        showSchedLoading();
+        try {
+            await refreshSchedules();
+        } finally {
+            hideSchedLoading();
+        }
         // Background poll while the panel is open so users see status
         // changes (PENDING / RUNNING / OK) without manual refresh.
         if (schedPollTimer) clearInterval(schedPollTimer);
@@ -757,8 +791,9 @@
     // The single hub for the skill lifecycle. Lists installed skills as
     // cards — enable/disable, edit, delete — including auto-generated ones
     // (direct-written disabled by triage). "Import" pulls in an external
-    // SKILL.md via a native file dialog. There is no approval queue. RPC
-    // layer is shared via the closure above.
+    // skill folder (SKILL.md + its scripts/reference siblings) via a native
+    // directory dialog. There is no approval queue. RPC layer is shared via
+    // the closure above.
     const skOverlay = document.getElementById('overlay-skills');
     const skCloseBtn = document.getElementById('skills-close');
     const skToast = document.getElementById('skills-toast');
@@ -791,10 +826,43 @@
         showSkillToast._tmr = setTimeout(() => skToast.classList.add('hidden'), 3500);
     }
 
-    function openSkills() {
+    // Loading veil for the gap between the panel becoming visible and the
+    // first skill_list reply landing — same pattern as Settings' loading
+    // overlay in renderer.js.
+    let skillLoadingEl = null;
+
+    function ensureSkillLoadingOverlay() {
+        if (skillLoadingEl) return skillLoadingEl;
+        const card = skOverlay.querySelector('.skills-card');
+        if (!card) return null;
+        skillLoadingEl = document.createElement('div');
+        skillLoadingEl.className = 'settings-loading-overlay hidden';
+        const text = document.createElement('span');
+        text.className = 'loading-text';
+        text.textContent = 'Loading skills…';
+        skillLoadingEl.appendChild(text);
+        card.appendChild(skillLoadingEl);
+        return skillLoadingEl;
+    }
+
+    function showSkillLoading() {
+        const ov = ensureSkillLoadingOverlay();
+        if (ov) ov.classList.remove('hidden');
+    }
+
+    function hideSkillLoading() {
+        if (skillLoadingEl) skillLoadingEl.classList.add('hidden');
+    }
+
+    async function openSkills() {
         skOverlay.classList.remove('hidden');
         skOverlay.setAttribute('aria-hidden', 'false');
-        refreshSkillPanel();
+        showSkillLoading();
+        try {
+            await refreshSkillPanel();
+        } finally {
+            hideSkillLoading();
+        }
     }
     function closeSkills() {
         skOverlay.classList.add('hidden');
@@ -913,12 +981,32 @@
             editBtn.type = 'button';
             editBtn.textContent = 'Edit';
             editBtn.addEventListener('click', () => openSkillForm(s.name));
+            actions.appendChild(editBtn);
+            // Reveal: pop the real SKILL.md in the OS file explorer, for
+            // reviewing it outside the panel's own (lossy) edit form —
+            // e.g. diffing frontmatter fields the form doesn't expose.
+            // Same window.handq.revealFile bridge the session sidebar's
+            // file tree uses; silently no-ops if source_path is missing
+            // or the bridge is unavailable rather than throwing.
+            if (s.source_path) {
+                const revealBtn = document.createElement('button');
+                revealBtn.type = 'button';
+                revealBtn.textContent = 'Reveal';
+                revealBtn.title = s.source_path;
+                revealBtn.addEventListener('click', () => {
+                    try {
+                        if (window.handq && typeof window.handq.revealFile === 'function') {
+                            window.handq.revealFile(s.source_path);
+                        }
+                    } catch (_) { /* swallow */ }
+                });
+                actions.appendChild(revealBtn);
+            }
             const delBtn = document.createElement('button');
             delBtn.type = 'button';
             delBtn.className = 'danger';
             delBtn.textContent = 'Delete';
             delBtn.addEventListener('click', () => deleteSkillEntry(s.name));
-            actions.appendChild(editBtn);
             actions.appendChild(delBtn);
             card.appendChild(actions);
 
@@ -1062,7 +1150,8 @@
         try {
             const r = await rpc('skill_import', { path: picked.path });
             if (!r || !r.ok) throw new Error((r && (r.reason || r.error)) || 'unknown');
-            showSkillToast(`${r.name} imported`);
+            const fileNote = r.files ? ` (${r.files} file${r.files === 1 ? '' : 's'})` : '';
+            showSkillToast(`${r.name} imported${fileNote}`);
             refreshSkillPanel();
         } catch (err) {
             showSkillToast('import failed: ' + err.message, 'error');

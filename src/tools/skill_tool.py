@@ -13,10 +13,33 @@ in the menu — their bodies are already in context as plain instructions.
 Resolution goes through :meth:`SkillRegistry.get_skill`, which is enabled-only —
 a disabled or unknown name returns ``success=False`` with a hint pointing back
 at the menu, never a body.
+
+``${SKILL_DIR}`` substitution: mirrors Claude Code's ``${CLAUDE_SKILL_DIR}``.
+A skill's own directory is resolved at read-time (not baked into the file, so
+it works across machines/install layouts) and any literal ``${SKILL_DIR}`` in
+the body is replaced with that absolute path — letting a skill ship a companion
+script (e.g. ``cdp_lib.py`` next to its ``SKILL.md``) and reference it with
+``python ${SKILL_DIR}/cdp_lib.py`` instead of embedding the whole script inline
+or hardcoding a path that only exists on one machine.
 """
 import time
+from pathlib import Path
 
 from .base_tool import BaseTool, ToolResult
+
+
+def _substitute_skill_dir(body: str, source_path: str) -> str:
+    """Replace literal ``${SKILL_DIR}`` in *body* with the skill's own
+    directory (parent of its ``SKILL.md``, i.e. *source_path*), resolved
+    fresh at read-time so it's correct on whatever machine/install layout
+    this is. Skills without the placeholder are returned unchanged — this
+    is a no-op string replace, not a template engine, so a skill with no
+    companion files pays no cost.
+    """
+    if "${SKILL_DIR}" not in body:
+        return body
+    skill_dir = str(Path(source_path).resolve().parent)
+    return body.replace("${SKILL_DIR}", skill_dir)
 
 
 class ReadSkillTool(BaseTool):
@@ -97,7 +120,7 @@ class ReadSkillTool(BaseTool):
         output = {
             "name": entry.name,
             "description": entry.description,
-            "body": entry.body.rstrip(),
+            "body": _substitute_skill_dir(entry.body.rstrip(), entry.source_path),
         }
         if entry.allowed_tools:
             # Report what the skill grants so the agent knows these tools are

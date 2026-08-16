@@ -68,6 +68,7 @@ uses ``list_all`` / ``get_any`` to see everything including disabled ones.
 """
 from __future__ import annotations
 
+import base64
 import logging
 import os
 import re
@@ -304,6 +305,17 @@ class SkillRegistry:
             self._bundled_root,
             self._user_root,
         )
+
+    @property
+    def user_root(self) -> Path:
+        """The user-authored Skill root this instance scans/writes.
+
+        Exposed read-only for callers (remote skill push) that need to walk a
+        skill's files on disk directly rather than going through the
+        per-field write API — bundled skills are never a legitimate source
+        here, so there is no equivalent accessor for ``_bundled_root``.
+        """
+        return self._user_root
 
     # ── Read API ────────────────────────────────────────────────────────────
     #
@@ -543,7 +555,17 @@ class SkillRegistry:
         except OSError as exc:
             _logger.exception("SkillRegistry.create_skill write failed name=%s", name)
             return {"ok": False, "reason": "write_failed", "error": str(exc)}
-        self._refresh_entry(skill_md, name)
+        if not self._refresh_entry(skill_md, name):
+            # The directory did not exist before this call (checked above), so
+            # removing it is safe and leaves no unloadable debris for the next
+            # scan to trip over.
+            shutil.rmtree(skill_md.parent, ignore_errors=True)
+            return {
+                "ok": False,
+                "reason": "unloadable_after_write",
+                "name": name,
+                "error": "rendered SKILL.md did not parse; nothing was created",
+            }
         return {"ok": True, "name": name}
 
     def update_skill(
@@ -603,7 +625,20 @@ class SkillRegistry:
             return {"ok": False, "reason": "write_failed", "error": str(exc)}
         if final_name != name:
             self._entries.pop(name, None)
-        self._refresh_entry(new_md, final_name)
+        if not self._refresh_entry(new_md, final_name):
+            # No rollback is possible here: on a rename the old directory was
+            # already removed above. Say exactly where the file is and that the
+            # body survived, so the user can repair it rather than assume the
+            # edit was rejected.
+            return {
+                "ok": False,
+                "reason": "unloadable_after_write",
+                "name": final_name,
+                "error": (
+                    f"rendered SKILL.md did not parse; the file at {new_md} has an "
+                    "intact body but will not load until its frontmatter is fixed"
+                ),
+            }
         return {"ok": True, "name": final_name}
 
     def delete_skill(self, name: str) -> Dict[str, object]:
@@ -620,25 +655,152 @@ class SkillRegistry:
         self._entries.pop(name, None)
         return {"ok": True, "name": name}
 
-    def import_skill(self, src_path: str) -> Dict[str, object]:
-        """Import a user-supplied SKILL.md from an arbitrary path.
+    def export_skill_files(self, name: str) -> List[Dict[str, str]]:
+        """Read every file under a user-authored skill's own directory for
+        transfer to another machine (remote skill push's source side).
 
-        Parses the file's frontmatter, derives a directory-safe name (frontmatter
-        ``name`` preferred, then the source's parent directory, slugified either
-        way), and writes it under the Skill root via ``create_skill`` /
-        ``update_skill``. A user-picked file is an explicit install, so it lands
-        ``enabled=True`` and ``origin=user`` regardless of any flags in the
-        source — an imported skill is user-owned and off limits to the
-        auto-miner. Re-importing an existing name overwrites description + body
-        in place (and claims ownership).
+        Returns ``[{path, content_b64}]`` where ``path`` is POSIX-style and
+        relative to the skill's directory (``SKILL.md``, ``scripts/foo.py``,
+        …). Raises ``ValueError`` for a name this registry doesn't recognise
+        as user-owned — bundled skills are shipped identically to every
+        machine already and are never a legitimate push source, so callers
+        must reject them before this is reached (see ``push_skills_to`` in
+        ``remote_control/hub.py``); this is the second gate, not the first.
+        """
+        entry = self._entries.get(name)
+        if entry is None:
+            raise ValueError(f"unknown skill {name!r}")
+        if entry.origin == SKILL_ORIGIN_BUNDLED:
+            raise ValueError(f"skill {name!r} is bundled, not user-owned")
+        skill_dir = Path(entry.source_path).parent
+        files: List[Dict[str, str]] = []
+        for path in sorted(skill_dir.rglob("*")):
+            if not path.is_file():
+                continue
+            rel = path.relative_to(skill_dir).as_posix()
+            content = path.read_bytes()
+            files.append({
+                "path": rel,
+                "content_b64": base64.b64encode(content).decode("ascii"),
+            })
+        return files
+
+    def _mirror_files_into(
+        self, name: str, entries: List[Tuple[str, bytes]]
+    ) -> Dict[str, object]:
+        """Traversal-safe full mirror of ``(relative_path, content)`` pairs into
+        ``self._user_root / name``.
+
+        Full replace, not a diff: the target directory is removed and recreated
+        from exactly *entries*, so a file present in the old copy but absent from
+        *entries* is deleted. Every relative path is validated against traversal
+        (``..`` segments, absolute paths) BEFORE anything is written — a
+        malformed or hostile payload must never write outside the skill's own
+        directory. The single home of that security check, shared by
+        :meth:`receive_skill_push` (bytes from a remote push) and
+        :meth:`import_skill` (bytes read off a local skill folder). Callers own
+        the follow-up (``reload`` / ``_refresh_entry``); this only touches disk.
+        """
+        if not _NAME_PATTERN.match(name or ""):
+            return {"ok": False, "name": name, "error": "invalid_name"}
+        target_dir = (self._user_root / name).resolve()
+        try:
+            target_dir.relative_to(self._user_root.resolve())
+        except ValueError:
+            return {"ok": False, "name": name, "error": "invalid_name"}
+        # Validate every path before writing anything — reject the whole mirror
+        # if any single path would escape, rather than write a partial tree.
+        for rel, _content in entries:
+            rel = str(rel or "")
+            if not rel or rel.startswith("/") or rel.startswith("\\"):
+                return {"ok": False, "name": name, "error": f"invalid_path:{rel}"}
+            candidate = (target_dir / rel).resolve()
+            try:
+                candidate.relative_to(target_dir)
+            except ValueError:
+                return {"ok": False, "name": name, "error": f"invalid_path:{rel}"}
+        try:
+            shutil.rmtree(target_dir, ignore_errors=True)
+            target_dir.mkdir(parents=True, exist_ok=True)
+            for rel, content in entries:
+                dest = target_dir / str(rel)
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(content)
+        except (OSError, ValueError) as exc:
+            _logger.exception(
+                "SkillRegistry._mirror_files_into write failed name=%s", name
+            )
+            return {"ok": False, "name": name, "error": str(exc)}
+        return {"ok": True, "name": name}
+
+    def receive_skill_push(
+        self, name: str, files: List[Dict[str, str]]
+    ) -> Dict[str, object]:
+        """Mirror a pushed skill's files into this machine's user Skill root,
+        replacing whatever currently exists under ``name`` (the receiving
+        side of remote skill upload).
+
+        Full mirror, not a diff: the target directory is removed and
+        recreated from exactly the given ``files``, so a file present on the
+        old copy but absent from ``files`` is deleted. Every ``path`` is
+        checked against traversal (``..`` segments, absolute paths) before
+        anything is written — a malformed or hostile payload must not be able
+        to write outside the skill's own directory (see :meth:`_mirror_files_into`).
+        """
+        try:
+            entries: List[Tuple[str, bytes]] = [
+                (
+                    str(f.get("path") or ""),
+                    base64.b64decode(str(f.get("content_b64") or "")),
+                )
+                for f in files
+            ]
+        except (ValueError, TypeError) as exc:
+            return {"ok": False, "name": name, "error": str(exc)}
+        result = self._mirror_files_into(name, entries)
+        if result.get("ok"):
+            self.reload()
+        return result
+
+    def import_skill(self, src_path: str) -> Dict[str, object]:
+        """Import a user-authored skill FOLDER from an arbitrary path.
+
+        A skill is a directory (``SKILL.md`` plus siblings like ``scripts/`` and
+        ``reference/``), so import copies the WHOLE folder — not just the
+        markdown. The old file-only import silently dropped every sibling, so an
+        imported multi-file recipe landed broken (its ``${SKILL_DIR}/scripts/...``
+        references pointed at files that were never copied) while the panel still
+        reported success.
+
+        Accepts either the skill directory itself, or (leniently) a path to its
+        ``SKILL.md`` — in which case its parent directory is imported. The
+        directory's ``SKILL.md`` must parse and carry a ``description``.
+
+        Semantics preserved from the file-only version: the name is derived from
+        frontmatter ``name`` (else the source dir name), slugified; a
+        user-picked skill is an explicit install so it lands ``enabled=True`` and
+        ``origin=user`` regardless of source flags (off limits to the
+        auto-miner); re-importing an existing name replaces it in place (full
+        mirror — a sibling removed at the source is pruned here too); and a name
+        colliding with an ``origin: bundled`` skill is refused.
         """
         path = Path(src_path)
-        if not path.is_file():
-            return {"ok": False, "reason": "not_found", "path": src_path}
+        # Resolve to the skill directory: a folder is used directly; a SKILL.md
+        # file resolves to its parent (lenient back-compat with the old picker).
+        if path.is_dir():
+            src_dir = path
+        elif path.is_file() and path.name == _SKILL_FILE:
+            src_dir = path.parent
+        else:
+            return {"ok": False, "reason": "not_a_skill_dir", "path": src_path}
+
+        skill_md = src_dir / _SKILL_FILE
+        if not skill_md.is_file():
+            return {"ok": False, "reason": "no_skill_md", "path": str(src_dir)}
         try:
-            text = path.read_text(encoding="utf-8")
+            text = skill_md.read_text(encoding="utf-8")
         except OSError as exc:
-            _logger.exception("SkillRegistry.import_skill read failed path=%s", src_path)
+            _logger.exception("SkillRegistry.import_skill read failed path=%s", skill_md)
             return {"ok": False, "reason": "read_failed", "error": str(exc)}
         match = _FRONTMATTER_RE.match(text)
         if not match:
@@ -662,35 +824,121 @@ class SkillRegistry:
         process_hints = _coerce_process_hints(
             fm.get("process-hints", fm.get("process_hints"))
         )
-        raw_name = str(fm.get("name", "") or "").strip() or path.parent.name
+        raw_name = str(fm.get("name", "") or "").strip() or src_dir.name
         name = slugify_skill_name(raw_name)
-        if name in self._entries:
-            return self.update_skill(name, description=description, body=body,
-                                     standing=standing, origin=SKILL_ORIGIN_USER,
-                                     allowed_tools=allowed_tools,
-                                     process_hints=process_hints)
-        return self.create_skill(name, description, body, enabled=True,
-                                 standing=standing, origin=SKILL_ORIGIN_USER,
-                                 allowed_tools=allowed_tools,
-                                 process_hints=process_hints)
 
-    def _refresh_entry(self, skill_md: Path, dir_name: str) -> None:
+        # Bundled-name guard: a user skill of the same name would shadow a
+        # shipped one, so refuse — mirrors create/update/delete's protection.
+        existing = self._entries.get(name)
+        if existing is not None and existing.origin == SKILL_ORIGIN_BUNDLED:
+            return self._bundled_immutable_result(name)
+
+        # Collect the whole source tree as (posix-relative-path, bytes). SKILL.md
+        # is collected too but its content is overwritten below with the
+        # normalized render, so we skip reading it here and inject the render.
+        try:
+            collected: List[Tuple[str, bytes]] = []
+            for p in sorted(src_dir.rglob("*")):
+                if not p.is_file():
+                    continue
+                rel = p.relative_to(src_dir).as_posix()
+                if rel == _SKILL_FILE:
+                    continue  # replaced by the normalized render below
+                collected.append((rel, p.read_bytes()))
+        except OSError as exc:
+            _logger.exception("SkillRegistry.import_skill collect failed dir=%s", src_dir)
+            return {"ok": False, "reason": "read_failed", "error": str(exc)}
+
+        # Normalize the SKILL.md to import's ownership rules (enabled + user
+        # origin) while preserving parsed standing / allowed-tools / hints /
+        # description / body. Rendered here, not read raw, so an imported skill
+        # can never carry an origin: auto/bundled marker into the user root.
+        normalized_md = _render_skill_md(
+            name, description, body, enabled=True, standing=standing,
+            origin=SKILL_ORIGIN_USER, allowed_tools=allowed_tools,
+            process_hints=process_hints,
+        )
+        collected.append((_SKILL_FILE, normalized_md.encode("utf-8")))
+
+        result = self._mirror_files_into(name, collected)
+        if not result.get("ok"):
+            # _mirror_files_into failures use the {ok, name, error} shape; map
+            # to import's {ok, reason, ...} vocabulary for the panel.
+            return {
+                "ok": False,
+                "reason": "write_failed",
+                "name": name,
+                "error": str(result.get("error", "")),
+            }
+
+        target_md = (self._user_root / name / _SKILL_FILE)
+        if not self._refresh_entry(target_md, name):
+            return {
+                "ok": False,
+                "reason": "unloadable_after_write",
+                "name": name,
+                "error": (
+                    f"mirrored SKILL.md at {target_md} did not parse; the files "
+                    "were copied but the skill will not load until its "
+                    "frontmatter is fixed"
+                ),
+            }
+        return {"ok": True, "name": name, "files": len(collected)}
+
+    def _refresh_entry(self, skill_md: Path, dir_name: str) -> bool:
         """Re-parse one SKILL.md and replace its in-memory entry.
 
         Keeps the registry consistent with what a fresh boot scan would load
         (parsed ``enabled`` / description, recorded problems) without paying
         for a full rescan.
+
+        Returns True when the file parsed and the entry is now registered.
+        Callers MUST check it: a False means what was just written to disk is
+        not loadable, so the skill does not exist for any agent-facing surface
+        and will not exist after a restart either. Reporting success in that
+        case is how a render defect turns into silent data loss (see
+        ``_render_skill_md``'s docstring for the instance that motivated this).
         """
         try:
             entry = _load_skill_file(skill_md, dir_name=dir_name)
         except Exception:
             _logger.exception("SkillRegistry._refresh_entry: reload %s failed", skill_md)
-            return
+            return False
         if entry is not None:
             self._entries[entry.name] = entry
+            return True
+        return False
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
+
+
+def _yaml_frontmatter_lines(mapping: Dict[str, object]) -> List[str]:
+    """Serialize *mapping* into frontmatter lines using PyYAML's own emitter.
+
+    Every caller-supplied string in the frontmatter MUST go through here rather
+    than through f-string interpolation, so the emitter decides on quoting. A
+    value containing a colon-then-space, a ``#``, a leading ``[``/``{``/``*``,
+    or a trailing colon is valid text and invalid bare YAML; interpolating it
+    produces a file that ``_load_skill_file`` discards whole.
+
+    Always dump a MAPPING, never a bare scalar: ``yaml.safe_dump('a b c')``
+    returns ``'a b c\\n...\\n'`` — with a document-end marker that would corrupt
+    the frontmatter block on the very next parse.
+
+    ``width`` is raised past PyYAML's 80-column default so a long value stays on
+    one line. Folding would round-trip correctly (callers collapse whitespace to
+    single spaces first) but these files are meant to be hand-editable, and a
+    wrapped description reads badly.
+    """
+    text = yaml.safe_dump(
+        mapping,
+        default_flow_style=False,
+        allow_unicode=True,
+        sort_keys=False,
+        width=4096,
+    )
+    return text.rstrip("\n").splitlines()
 
 
 def _render_skill_md(name: str, description: str, body: str, *,
@@ -708,12 +956,26 @@ def _render_skill_md(name: str, description: str, body: str, *,
     user-owned, the protective default). ``allowed-tools`` is written only
     when non-empty (missing == none), same for ``process-hints`` (rendered as
     a YAML mapping block — hint text is a full sentence, too long for the
-    inline-list style ``allowed-tools`` uses). ``description`` is flattened to
-    a single line so it can't break the YAML block; each process-hint value is
-    flattened the same way for the same reason.
+    inline-list style ``allowed-tools`` uses). ``description`` is flattened to a
+    single line and then serialized by :func:`_yaml_frontmatter_lines`; each
+    process-hint value is flattened and serialized the same way.
+
+    Flattening ALONE is not enough, which is what this function previously got
+    wrong: it emitted ``f"description: {desc_line}"`` directly, so a description
+    containing a colon-then-space — ``"Flash device: full meta"``, the most
+    natural way to write one — became a second key/value separator and made the
+    frontmatter unparseable. ``_load_skill_file`` then discarded the entire
+    skill while ``create_skill`` still returned ``ok: True``, so the panel and
+    the memory system both reported success on a skill that no longer existed.
+    Never interpolate a caller-supplied string into YAML; let the emitter quote.
     """
     desc_line = " ".join(str(description).split())
-    lines = ["---", f"name: {name}", f"description: {desc_line}"]
+    lines = ["---"]
+    # name goes through the emitter too. ``_NAME_PATTERN`` already rules out the
+    # characters that would break bare YAML, so this is belt-and-braces — but it
+    # keeps the "nothing is interpolated into frontmatter" invariant literally
+    # true, instead of true-by-coincidence-of-another-validator.
+    lines.extend(_yaml_frontmatter_lines({"name": name, "description": desc_line}))
     if not enabled:
         lines.append("enabled: false")
     if standing:
@@ -725,20 +987,11 @@ def _render_skill_md(name: str, description: str, body: str, *,
     if allowed_tools:
         lines.append("allowed-tools: [" + ", ".join(allowed_tools) + "]")
     if process_hints:
-        # Dump the WHOLE mapping in one yaml.safe_dump call, not per-value —
-        # per-value dumping of a plain multi-word string appends a stray
-        # "\n..." document-end marker (confirmed: yaml.safe_dump('a b c')
-        # returns 'a b c\n...\n', not 'a b c\n'), which would corrupt the
-        # frontmatter block on the very next parse.
         flat_hints = {
             proc: " ".join(str(hint).split())
             for proc, hint in process_hints.items()
         }
-        block = yaml.safe_dump(
-            {"process-hints": flat_hints},
-            default_flow_style=False, allow_unicode=True, sort_keys=False,
-        )
-        lines.extend(block.rstrip("\n").splitlines())
+        lines.extend(_yaml_frontmatter_lines({"process-hints": flat_hints}))
     lines.append("---")
     lines.append("")
     lines.append(str(body).strip())

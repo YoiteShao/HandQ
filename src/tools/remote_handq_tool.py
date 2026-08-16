@@ -48,14 +48,18 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 import posixpath
 import re
+import sys
+import tarfile
 import threading
 import time
 import uuid
 from datetime import datetime
-from typing import Any, Dict, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 from .base_tool import BaseTool, ToolResult
 from .cancellation import interruptible_sleep, run_with_abort
@@ -67,10 +71,12 @@ from .ssh_tool import (
     _load_credentials,
 )
 
+logger = logging.getLogger("handq.tools.remote_handq")
+
 
 # ── per-host discovery cache ─────────────────────────────────────────────────
-# Keyed by "hostname:port" → resolved launch metadata from _discover().
-_discovery_cache: Dict[str, Dict[str, str]] = {}
+# Keyed by "hostname:port" → resolved root + launch metadata from _discover().
+_discovery_cache: Dict[str, Dict[str, Any]] = {}
 
 POLL_INTERVAL = 1.0  # seconds between reply/state polls when waiting
 
@@ -124,9 +130,11 @@ def _remote_bash(
 
 
 def _probe_home(creds: Dict[str, Any]) -> str:
-    """Return the remote user's $HOME. Used when _discover() has nothing to
-    offer yet (handq_linux not found at all) but a deploy target dir is
-    still needed."""
+    """Return the remote user's $HOME.
+
+    Only used for diagnostics now — the install root comes from ``_discover``
+    (``info["root"]``), which resolves it on the remote side.
+    """
     stdout, _, _ = _remote_bash(creds, "echo $HOME", timeout=10.0)
     return stdout.strip() or "."
 
@@ -135,56 +143,171 @@ def _probe_home(creds: Dict[str, Any]) -> str:
 #  Discovery — where is handq_linux and how do we invoke it
 # ─────────────────────────────────────────────────────────────────────────────
 _PROBE = r"""
-U=$(whoami); H=$(hostname -s 2>/dev/null || hostname); HM="$HOME"
+U=$(whoami); H=$(hostname -s 2>/dev/null || hostname | cut -d. -f1); HM="$HOME"
 echo "USER=$U"; echo "HOST=$H"; echo "HOME=$HM"
 LSH=$(getent passwd "$U" 2>/dev/null | cut -d: -f7)
 [ -z "$LSH" ] && LSH="$SHELL"
 echo "LOGIN_SHELL=$LSH"
-D="$HM/.handq/${U}@${H}"
-echo "HANDQDIR=$D"
-[ -d "$D" ] && echo "DIREXISTS=1" || echo "DIREXISTS=0"
-PF="$D/handq.pid"
-if [ -f "$PF" ]; then
+
+# ── The install root ────────────────────────────────────────────────────────
+# The recorded root is the AUTHORITY. handq_setup.sh resolves the candidate chain
+# once and writes the answer here; re-deriving it on every probe is how the three
+# implementations (setup script, daemon, this probe) would drift apart.
+HOSTCONF="$HM/.config/handq/hosts/$H"
+ROOT=""
+if [ -f "$HOSTCONF" ]; then
+  ROOT=$(sed -n 's/^export HANDQ_ROOT="\(.*\)"$/\1/p' "$HOSTCONF" | head -1)
+fi
+if [ -n "$ROOT" ]; then
+  echo "ROOT_SOURCE=recorded"
+else
+  # Nothing recorded yet: a first-ever install. Run the chain ourselves so the
+  # caller has a deploy target. Deliberately does NOT mkdir — `discover` is a
+  # read-only action, so an absent candidate is judged by its parent's
+  # writability. handq_setup.sh does the real create-and-write probe when it
+  # actually installs, and its answer then becomes the recorded authority.
+  for c in "/local/mnt/workspace/${U}@handq" "/var/tmp/${U}@handq" "$HM/handq/${U}@${H}"; do
+    if [ -L "$c" ]; then
+      echo "ROOT_REJECT=$c: is a symlink"; continue
+    fi
+    if [ -e "$c" ]; then
+      [ -d "$c" ] || { echo "ROOT_REJECT=$c: not a directory"; continue; }
+      [ -O "$c" ] || { echo "ROOT_REJECT=$c: owned by another user"; continue; }
+      [ -w "$c" ] || { echo "ROOT_REJECT=$c: not writable"; continue; }
+    else
+      P=$(dirname "$c")
+      [ -d "$P" ] || { echo "ROOT_REJECT=$c: parent $P missing"; continue; }
+      [ -w "$P" ] || { echo "ROOT_REJECT=$c: parent $P not writable"; continue; }
+    fi
+    ROOT="$c"; break
+  done
+  echo "ROOT_SOURCE=chain"
+fi
+echo "ROOT=$ROOT"
+
+# ── Is the per-host dispatcher conf stale? ──────────────────────────────────
+# This conf is what `handq` / `hi` source at the shell, and what records the root
+# for every reader above. A conf written before the root relocation is a single
+# bare command line with no `export HANDQ_ROOT=`, so the sed above yields "" and
+# ROOT_SOURCE silently degrades to `chain`, while the alias still tries to exec a
+# binary that may no longer exist ("<conf>: line 1: <path>: No such file or
+# directory"). Report both facts so the caller can repair by re-running
+# handq_setup.sh, whose rewrite of this file is unconditional. Read-only.
+#
+# Note there is deliberately NO "recorded root != resolved root" check: when
+# ROOT_SOURCE=recorded the root came OUT of this file, so the two cannot disagree.
+HCSTALE=0; HCBIN=""
+if [ ! -f "$HOSTCONF" ]; then
+  HCSTALE=1
+else
+  grep -q '^export HANDQ_ROOT=' "$HOSTCONF" 2>/dev/null || HCSTALE=1
+  # First double-quoted absolute path on a non-export line: whatever the alias
+  # actually exec's. Matches the current `exec "<bin>" --config …` form and the
+  # older bare `"<bin>" …` one, and for a source checkout it lands on the
+  # interpreter — which is still the right thing to test for existence.
+  #
+  # `^[^"]*"` — anchored, and consuming only NON-quote characters before the
+  # first quote — is load-bearing. A leading `.*` is greedy, so it walked to the
+  # LAST quoted path on the line and captured --config's argument instead: the
+  # config file is not executable, so every healthy conf reported itself stale.
+  HCBIN=$(grep -v '^export ' "$HOSTCONF" 2>/dev/null | sed -n 's/^[^"]*"\(\/[^"]*\)".*/\1/p' | head -1)
+  if [ -z "$HCBIN" ]; then
+    HCSTALE=1
+  elif [ ! -x "$HCBIN" ]; then
+    HCSTALE=1
+  fi
+fi
+echo "HOSTCONF=$HOSTCONF"
+echo "HOSTCONF_STALE=$HCSTALE"
+echo "HOSTCONF_BIN=$HCBIN"
+
+# ── Daemon state lives directly in the root ─────────────────────────────────
+echo "HANDQDIR=$ROOT"
+if [ -n "$ROOT" ] && [ -d "$ROOT" ]; then echo "DIREXISTS=1"; else echo "DIREXISTS=0"; fi
+PF="$ROOT/handq.pid"
+if [ -n "$ROOT" ] && [ -f "$PF" ]; then
   P=$(cat "$PF" 2>/dev/null)
   if [ -n "$P" ] && kill -0 "$P" 2>/dev/null; then echo "ALIVE=1"; else echo "ALIVE=0"; fi
 else
   echo "ALIVE=0"
 fi
-# 1. Installed dispatcher (handq_setup.sh): canonical entry, on PATH or in
-#    ~/.local/bin (the latter is usually NOT on a non-interactive SSH PATH).
-#    It forwards "$@" and injects the per-host --config itself.
-BIN=$(command -v handq_linux 2>/dev/null || true)
-[ -z "$BIN" ] && [ -x "$HM/.local/bin/handq_linux" ] && BIN="$HM/.local/bin/handq_linux"
-# 2/3. Un-installed copies in a common dir: a standalone Nuitka binary
-#      (handq_linux.dist/handq_linux.bin auto-loads its dist-root config) or a
-#      source checkout (handq_linux.py next to src/).
-SBIN=""; SCRIPT=""
-for r in "$HM/handq" "$HM/HandQ" "$HM" "$HM/.local/share/handq"; do
-  [ -z "$SBIN" ] && [ -x "$r/handq_linux.dist/handq_linux.bin" ] && SBIN="$r/handq_linux.dist/handq_linux.bin"
-  [ -z "$SBIN" ] && [ -x "$r/handq_linux.bin" ] && SBIN="$r/handq_linux.bin"
-  [ -z "$SCRIPT" ] && [ -f "$r/handq_linux.py" ] && SCRIPT="$r/handq_linux.py"
-done
-PY=""
-if [ -n "$SCRIPT" ]; then
-  ROOT=$(dirname "$SCRIPT")
-  for c in "$ROOT/.venv/bin/python3" "$ROOT/.venv/bin/python" "$ROOT/venv/bin/python3" "$ROOT/venv/bin/python"; do
-    [ -x "$c" ] && { PY="$c"; break; }
-  done
-  [ -z "$PY" ] && PY=$(command -v python3 2>/dev/null || command -v python 2>/dev/null || echo python3)
+
+# ── The launch, resolved from the ROOT and nowhere else ─────────────────────
+# Anything outside the root is legacy and reported separately below; it is never
+# adopted as the launch. That inversion is what stops a stale wrapper on PATH
+# (whose baked-in path still happens to run) from silently keeping this host on
+# the old shared install forever.
+RBIN=""; RSCRIPT=""; RPY=""
+if [ -n "$ROOT" ]; then
+  [ -x "$ROOT/handq_linux.dist/handq_linux.bin" ] && RBIN="$ROOT/handq_linux.dist/handq_linux.bin"
+  [ -z "$RBIN" ] && [ -x "$ROOT/handq_linux.bin" ] && RBIN="$ROOT/handq_linux.bin"
+  [ -f "$ROOT/handq_linux.py" ] && RSCRIPT="$ROOT/handq_linux.py"
+  if [ -n "$RSCRIPT" ]; then
+    for c in "$ROOT/.venv/bin/python3" "$ROOT/.venv/bin/python" "$ROOT/venv/bin/python3" "$ROOT/venv/bin/python"; do
+      [ -x "$c" ] && { RPY="$c"; break; }
+    done
+    [ -z "$RPY" ] && RPY=$(command -v python3 2>/dev/null || command -v python 2>/dev/null || echo python3)
+  fi
 fi
-echo "BIN=$BIN"; echo "SBIN=$SBIN"; echo "SCRIPT=$SCRIPT"; echo "PY=$PY"
+echo "ROOTBIN=$RBIN"; echo "ROOTSCRIPT=$RSCRIPT"; echo "PY=$RPY"
+[ -f "$ROOT/handq_config.yaml" ] && echo "ROOTCONFIG=$ROOT/handq_config.yaml" || echo "ROOTCONFIG="
+
+# ── Legacy findings (reported, never adopted) ───────────────────────────────
+# PATHBIN and LOCALBIN are reported SEPARATELY. They used to be collapsed into one
+# field with `[ -z "$BIN" ] &&` fallback semantics, so a stale /usr/local/bin
+# wrapper meant ~/.local/bin was never even considered.
+echo "PATHBIN=$(command -v handq_linux 2>/dev/null || true)"
+LOCALBIN=""
+[ -x "$HM/.local/bin/handq_linux" ] && LOCALBIN="$HM/.local/bin/handq_linux"
+echo "LOCALBIN=$LOCALBIN"
+LEGACY_DIST=""
+for r in "$HM/handq" "$HM/HandQ" "$HM" "$HM/.local/share/handq"; do
+  [ -z "$LEGACY_DIST" ] && [ -x "$r/handq_linux.dist/handq_linux.bin" ] && LEGACY_DIST="$r/handq_linux.dist/handq_linux.bin"
+done
+echo "LEGACY_DIST=$LEGACY_DIST"
+# A daemon still running out of the pre-migration IPC dir. This is the ONE legacy
+# artefact that must be actively stopped: the new root has its own pid file, so
+# without this the caller would wake a SECOND daemon on the same host, each
+# serving its own port.
+LEGACY_IPC="$HM/.handq/${U}@${H}"
+[ -d "$LEGACY_IPC" ] && echo "LEGACY_IPC=$LEGACY_IPC" || echo "LEGACY_IPC="
+LP="$LEGACY_IPC/handq.pid"
+if [ -f "$LP" ]; then
+  P=$(cat "$LP" 2>/dev/null)
+  if [ -n "$P" ] && kill -0 "$P" 2>/dev/null; then echo "LEGACY_ALIVE=1"; else echo "LEGACY_ALIVE=0"; fi
+else
+  echo "LEGACY_ALIVE=0"
+fi
 """
 
 
-def _discover(creds: Dict[str, Any], *, force: bool = False) -> Dict[str, str]:
-    """Probe the remote once for handq_dir + launch invocation. Cached per host.
+def _discover(creds: Dict[str, Any], *, force: bool = False) -> Dict[str, Any]:
+    """Probe the remote once for the install root + launch invocation. Cached per host.
 
-    Returns {handq_dir, launch, remote_user, remote_host}. ``launch`` is the
-    command prefix to invoke handq_linux, resolved in priority order:
-      1. installed ``handq_linux`` dispatcher (injects the per-host --config),
-      2. a standalone Nuitka binary (auto-loads its dist-root config),
-      3. ``<python> <handq_linux.py>`` from a source checkout.
-    Raises RuntimeError if handq_linux can't be found on the remote.
+    Returns ``{root, root_source, handq_dir, launch, launch_ok, remote_user,
+    remote_host, remote_home, login_shell, alive, dir_exists, legacy}``.
+
+    **The root is authoritative.** ``launch`` is built from the root and nothing
+    else — ``HANDQ_ROOT=<root> <root>/handq_linux.dist/handq_linux.bin --config
+    <root>/handq_config.yaml`` (or the ``<python> handq_linux.py`` form for a
+    source checkout in the root). The env assignment is explicit rather than
+    relying on the dispatcher to export it, so waking the daemon does not depend
+    on ``~/.local/bin`` being intact or on PATH resolution at all.
+
+    This inverts what this function used to do. It previously built candidates
+    from ``command -v handq_linux`` / an un-installed dist / a source checkout and
+    took the first whose ``--version`` succeeded. With a cloud-synced ``$HOME``
+    that let legacy win permanently: a pre-4.1 wrapper in ``/usr/local/bin`` whose
+    baked path pointed at the old shared ``~/handq`` install still ran, so it was
+    adopted, and the host stayed on the old install no matter what was deployed.
+    Anything found outside the root is now reported under ``legacy`` for repair or
+    warning, and never adopted.
+
+    ``launch`` is ``""`` with ``launch_ok=False`` when the root holds no runnable
+    entry point — the normal state before the first deploy. This function does
+    **not** raise for that any more: "nothing installed yet" is an expected
+    condition during migration, and raising discarded the ``legacy`` findings the
+    caller needs (in particular a still-running pre-migration daemon).
     """
     hk = _host_key(creds)
     if not force and hk in _discovery_cache:
@@ -202,44 +325,74 @@ def _discover(creds: Dict[str, Any], *, force: bool = False) -> Dict[str, str]:
     # with nothing left for any shell to misparse.
     b64 = base64.b64encode(_PROBE.encode("utf-8")).decode("ascii")
     probe_inner = f"printf %s {_shq(b64)} | base64 -d | bash"
-    stdout, _, _ = _remote_bash(creds, probe_inner, timeout=15.0)
+    stdout, _, _ = _remote_bash(creds, probe_inner, timeout=20.0)
     fields: Dict[str, str] = {}
+    rejects: List[str] = []
     for line in stdout.splitlines():
         line = line.strip()
-        if "=" in line:
-            k, _, v = line.partition("=")
+        if "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        # ROOT_REJECT can repeat, one line per refused candidate.
+        if k == "ROOT_REJECT":
+            rejects.append(v)
+        else:
             fields[k] = v
 
-    handq_dir = fields.get("HANDQDIR", "")
-    binary = fields.get("BIN", "")
-    standalone = fields.get("SBIN", "")
-    script = fields.get("SCRIPT", "")
+    root = fields.get("ROOT", "")
+    root_bin = fields.get("ROOTBIN", "")
+    root_script = fields.get("ROOTSCRIPT", "")
     py = fields.get("PY", "python3") or "python3"
+    root_config = fields.get("ROOTCONFIG", "")
 
-    if binary:
-        launch = _shq(binary)
-    elif standalone:
-        launch = _shq(standalone)
-    elif script:
-        launch = f"{_shq(py)} {_shq(script)}"
-    else:
-        raise RuntimeError(
-            f"handq_linux not found on {creds['hostname']}. Copy the built dist "
-            f"package (handq_linux.dist/ + handq_config.yaml + handq_setup.sh) to "
-            f"the remote and run 'bash handq_setup.sh' to install the handq_linux "
-            f"command, or place a source checkout (handq_linux.py next to src/) in "
-            f"~/handq/, then retry."
-        )
+    # Build the launch from the root. The config argument is only added when the
+    # file is actually there: passing --config at a non-existent path would make
+    # handq_linux fall back to its own resolution and mask the real problem.
+    launch = ""
+    if root and (root_bin or root_script):
+        env_prefix = f"HANDQ_ROOT={_shq(root)} "
+        if root_bin:
+            launch = env_prefix + _shq(root_bin)
+        else:
+            launch = env_prefix + f"{_shq(py)} {_shq(root_script)}"
+        if root_config:
+            launch += f" --config {_shq(root_config)}"
 
-    info = {
-        "handq_dir": handq_dir,
+    launch_ok = bool(launch) and _launch_runs(creds, launch)
+
+    legacy = {
+        "path_bin": fields.get("PATHBIN", ""),
+        "local_bin": fields.get("LOCALBIN", ""),
+        "dist": fields.get("LEGACY_DIST", ""),
+        "ipc_dir": fields.get("LEGACY_IPC", ""),
+        "daemon_alive": fields.get("LEGACY_ALIVE", "0") == "1",
+    }
+
+    info: Dict[str, Any] = {
+        "root": root,
+        "root_source": fields.get("ROOT_SOURCE", ""),
+        "root_rejects": rejects,
+        # Daemon state lives directly in the root now; kept under the old key so
+        # every state.json / pid / messages path builder keeps working unchanged.
+        "handq_dir": root,
         "launch": launch,
+        # Whether `launch` actually ran (`--version` rc 0). False also covers
+        # "the root has no entry point yet", which is normal pre-deploy.
+        "launch_ok": launch_ok,
         "remote_user": fields.get("USER", ""),
         "remote_host": fields.get("HOST", ""),
         "remote_home": fields.get("HOME", ""),
         "login_shell": fields.get("LOGIN_SHELL", ""),
         "alive": fields.get("ALIVE", "0"),
         "dir_exists": fields.get("DIREXISTS", "0"),
+        # The per-host dispatcher conf: where it is, whether it still points at
+        # something runnable, and what it points at. Stale means `handq`/`hi` are
+        # broken for a human at the shell AND that root_source fell back to the
+        # candidate chain — see _repair_host_setup, which heals both.
+        "hostconf": fields.get("HOSTCONF", ""),
+        "hostconf_stale": fields.get("HOSTCONF_STALE", "0") == "1",
+        "hostconf_bin": fields.get("HOSTCONF_BIN", ""),
+        "legacy": legacy,
     }
     _discovery_cache[hk] = info
     return info
@@ -248,6 +401,31 @@ def _discover(creds: Dict[str, Any], *, force: bool = False) -> Dict[str, str]:
 def _shq(s: str) -> str:
     """Single-quote a string for safe embedding in a remote bash command."""
     return "'" + s.replace("'", "'\\''") + "'"
+
+
+def _launch_runs(creds: Dict[str, Any], launch: str) -> bool:
+    """Does ``<launch> --version`` actually run (rc 0)?
+
+    A dispatcher can resolve on PATH (``command -v`` / ``-x`` succeed) yet
+    ``exec`` a binary that no longer exists on THIS host — the exact failure
+    mode when ``~`` is cloud-synced across machines: ``~/.local/bin/handq_linux``
+    and its per-host config ``~/.config/handq/hosts/<host>`` travel over intact,
+    but the ``handq_linux.dist/handq_linux.bin`` they point at was built on a
+    different box and isn't here. That resolves fine at discovery and only blows
+    up at ``exec`` time (bash: "No such file or directory", rc 127) deep inside
+    ``_wake_daemon``, as a cryptic wake failure.
+
+    Probing ``--version`` — a clean, config-free ``exit(0)`` in handq_linux.py,
+    already the fallback path in ``_get_installed_version`` — is the
+    shell-agnostic way to tell a runnable launch from a ghost one BEFORE we
+    depend on it. Any non-zero rc (127 for a broken exec, anything else for a
+    crash) means "do not trust this launch".
+    """
+    try:
+        _, _, rc = _remote_bash(creds, launch + " --version", timeout=15.0)
+    except Exception:
+        return False
+    return rc == 0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -335,7 +513,80 @@ def _daemon_alive(creds: Dict[str, Any], handq_dir: str) -> bool:
     return stdout.strip() == "ALIVE"
 
 
-def _wake_daemon(creds: Dict[str, Any], info: Dict[str, str], config_path: str = "") -> bool:
+#: Appended to daemon.log immediately before each wake so the failure path can
+#: show only THIS attempt's output. daemon.log is append-only and shared by every
+#: wake ever made against the host, so an un-scoped ``tail`` presents the oldest
+#: surviving error as though it were the current one — which is exactly how a
+#: fixed-and-redeployed failure keeps "reproducing" for the operator reading it.
+_WAKE_MARKER = "--- handq wake ---"
+
+
+def _legacy_ipc_candidate(info: Dict[str, Any]) -> str:
+    """The pre-relocation IPC dir for this host: ``~/.handq/<user>@<shorthost>``.
+
+    Derived from the probe's user/host/home rather than read from its
+    ``LEGACY_IPC`` field, which only reports a dir that already existed when the
+    probe ran. On a first wake against a pre-relocation build the daemon creates
+    that dir moments AFTER the probe, so the recorded value is empty precisely
+    when we need it. Falls back to the recorded value when the probe did not
+    report enough to derive one.
+    """
+    home = info.get("remote_home") or ""
+    user = info.get("remote_user") or ""
+    host = info.get("remote_host") or ""
+    if not (home and user and host):
+        return (info.get("legacy") or {}).get("ipc_dir") or ""
+    return posixpath.join(home, ".handq", f"{user}@{host}")
+
+
+def _misplaced_daemon(creds: Dict[str, Any], info: Dict[str, Any]) -> Dict[str, Any]:
+    """Is a daemon alive in the LEGACY ipc dir instead of the install root?
+
+    That is the signature of a build predating the root relocation: it ignores
+    ``$HANDQ_ROOT`` and writes ``state.json``/``handq.pid`` under ``$HOME``, so
+    every root-based liveness check reports DEAD even though the daemon started
+    and is serving. Detecting it is what separates "the daemon is broken" from
+    "the daemon is fine, the installed build puts its state somewhere else".
+
+    Returns ``{ipc_dir, port}`` when found, ``{}`` otherwise. Never raises —
+    this only ever runs on a path that is already failing.
+    """
+    ipc_dir = _legacy_ipc_candidate(info)
+    if not ipc_dir or ipc_dir == (info.get("handq_dir") or ""):
+        return {}
+    try:
+        if not _daemon_alive(creds, ipc_dir):
+            return {}
+        state = _read_state(creds, ipc_dir)
+        return {
+            "ipc_dir": ipc_dir,
+            "port": int(state.get("remote_control_port") or 0),
+        }
+    except Exception:
+        logger.debug("remote_handq: misplaced-daemon probe failed", exc_info=True)
+        return {}
+
+
+def _misplaced_diagnosis(stray: Dict[str, Any], info: Dict[str, Any]) -> str:
+    port = stray.get("port") or 0
+    return (
+        f"\n\nThe daemon is actually up, but it wrote its state to {stray['ipc_dir']} "
+        f"instead of the install root {info.get('handq_dir') or '?'}"
+        + (f" (listening on port {port})" if port else "")
+        + ". The handq_linux version installed on this machine"
+        f" ({info.get('installed_version') or 'unknown'}) predates the root-relocation "
+        "change and doesn't recognize $HANDQ_ROOT, so the Windows side can never find "
+        "its pid/state by looking under the install root."
+        "\nFix: rebuild the Linux package from current code (packaging/build_linux.sh) "
+        "and drop it in update.linux_share_path; since the version number would be "
+        "unchanged this won't trigger a redeploy, so bump the version first, or manually "
+        "clear out the remote install root."
+        "\nWorkaround: paste the CONNECT ME line from daemon.log below into the connect "
+        "panel to pair manually."
+    )
+
+
+def _wake_daemon(creds: Dict[str, Any], info: Dict[str, Any], config_path: str = "") -> bool:
     """Launch the daemon detached and wait for its pid file. Returns aliveness.
 
     Raises InterruptedError if the wait is aborted by the engine's stop
@@ -349,9 +600,59 @@ def _wake_daemon(creds: Dict[str, Any], info: Dict[str, str], config_path: str =
     handq_dir = info["handq_dir"]
     launch = info["launch"]
     cfg = f" --config {_shq(config_path)}" if config_path else ""
+    # Never spawn on top of a daemon that is already up in the legacy ipc dir.
+    # A pre-relocation build ignores $HANDQ_ROOT, so root-based liveness reads
+    # DEAD forever and every retry used to fork ANOTHER daemon — the observed
+    # case left two live daemons (12:22 and 12:25) on one host, on different
+    # ports, both writing the same $HOME state dir and clobbering each other's
+    # state.json. Bail out with the diagnosis instead of adding to the pile.
+    stray = _misplaced_daemon(creds, info)
+    if stray:
+        info["wake_diagnosis"] = _misplaced_diagnosis(stray, info)
+        return False
     # nohup + setsid: detached from the SSH session's process group so it
     # survives the connection closing (and Windows power/network loss).
-    wake = f"nohup setsid {launch} --_daemon{cfg} >/dev/null 2>&1 </dev/null & echo WOKE"
+    #
+    # Redirected to daemon.log (handq_linux.py's own DAEMON_LOG path — same
+    # HANDQ_DIR this wake call already resolved via _discover), not
+    # /dev/null. This daemon.log is the ONE the operator is told to check on
+    # every failure path below (state.json timeout, LinuxBootstrapError) and
+    # in the connect_v6_reference troubleshooting section — pointing them at
+    # a file this exact wake discarded into /dev/null made every one of those
+    # pointers a dead end for a Windows-initiated wake specifically (a
+    # locally-started daemon's log was never affected, since cmd_daemon opens
+    # DAEMON_LOG itself before this redirect would apply).
+    log_path = posixpath.join(handq_dir, "daemon.log") if handq_dir else "/dev/null"
+    # mkdir -p first: on a fresh install this directory doesn't exist yet (only
+    # the daemon's own _ensure_dirs() creates it, and that runs AFTER this
+    # redirect would already need it to exist) — without this, >> to a missing
+    # directory fails and the backgrounded command dies before ever exec'ing
+    # the binary, silently, with no diagnostic anywhere.
+    mkdir_cmd = f"mkdir -p {_shq(handq_dir)}; " if handq_dir else ""
+    # `env` is load-bearing, not decoration. `launch` opens with a shell
+    # assignment prefix (HANDQ_ROOT=<root>, see _discover), and a prefix is only
+    # an assignment when it precedes the command word of a simple command. Here
+    # the command word is `nohup`, so without `env` the assignment degrades into
+    # a plain argument: nohup hands it to setsid, which execvp()s it literally
+    # and dies with "setsid: failed to execute HANDQ_ROOT=...: No such file or
+    # directory" — before the binary is ever reached. `env` parses VAR=val args
+    # itself, restoring the assignment semantics inside the detached process.
+    #
+    # This path is the only non-command-initial consumer of `launch`;
+    # _launch_runs and _probe_version both put it at the start of the command,
+    # where the bare prefix works. That asymmetry is why launch_ok can be True
+    # while the wake fails, so do not "simplify" this back to `setsid {launch}`.
+    wake = (
+        f"{mkdir_cmd}printf '%s\\n' {_shq(_WAKE_MARKER)} >>{_shq(log_path)} 2>/dev/null; "
+        f"nohup setsid env {launch} --_daemon{cfg} "
+        f">>{_shq(log_path)} 2>&1 </dev/null & echo WOKE"
+    )
+    # Record what was ACTUALLY run so the failure path can report it verbatim.
+    # It used to report `info['launch'] --_daemon`, which is a different string
+    # from the one executed — and one that works when pasted into a shell by
+    # hand, since there it IS command-initial. An operator debugging the setsid
+    # failure above was therefore handed a command that could not reproduce it.
+    info["last_wake_cmd"] = wake
     _remote_bash(creds, wake, timeout=20.0)
     deadline = time.time() + 15.0
     while time.time() < deadline:
@@ -359,27 +660,86 @@ def _wake_daemon(creds: Dict[str, Any], info: Dict[str, str], config_path: str =
             return True
         if interruptible_sleep(POLL_INTERVAL):
             raise InterruptedError("remote_handq: wake-daemon wait aborted")
+    # The root never got a pid file. Before reporting a dead daemon, check whether
+    # the one we just spawned came up in the legacy ipc dir — on a first wake the
+    # pre-relocation dir does not exist yet at probe time, so this is the only
+    # point where that can be observed.
+    stray = _misplaced_daemon(creds, info)
+    if stray:
+        info["wake_diagnosis"] = _misplaced_diagnosis(stray, info)
     return False
 
 
-def _ensure_daemon(creds: Dict[str, Any], info: Dict[str, str], config_path: str = "") -> None:
+def _scope_to_last_wake(log_tail: str, keep: int = 40) -> Tuple[str, bool]:
+    """Trim a daemon.log tail to the output of the most recent wake.
+
+    Returns ``(text, is_current)``. ``is_current`` is False when no wake marker
+    is present, which means every line shown predates this attempt — the caller
+    labels it as history rather than presenting it as the current failure.
+
+    This exists because daemon.log is append-only and shared by every wake ever
+    made against the host. An un-scoped tail showed a months-old error above a
+    successful start-up and read as the live diagnosis; a real fix looked like it
+    had changed nothing.
+    """
+    if _WAKE_MARKER in log_tail:
+        after = log_tail.rsplit(_WAKE_MARKER, 1)[1]
+        lines = [ln for ln in after.splitlines() if ln.strip()]
+        return "\n".join(lines[-keep:]).strip(), True
+    lines = [ln for ln in log_tail.splitlines() if ln.strip()]
+    return "\n".join(lines[-keep:]).strip(), False
+
+
+def _ensure_daemon(creds: Dict[str, Any], info: Dict[str, Any], config_path: str = "") -> None:
     if _daemon_alive(creds, info["handq_dir"]):
         return
+    if not info.get("launch"):
+        legacy = info.get("legacy") or {}
+        raise RuntimeError(
+            f"handq_linux is not installed in the install root "
+            f"({info.get('root') or 'unresolved'}) on {creds['hostname']}, so there "
+            f"is nothing to wake. Configure update.linux_share_path so HandQ can "
+            f"deploy it, or run 'bash handq_setup.sh' on that host."
+            + (
+                f"\n\nA pre-migration install exists at {legacy['dist']}. It is "
+                f"outside the install root and is deliberately NOT used: the root is "
+                f"machine-local, whereas that path is under a $HOME that is synced "
+                f"between hosts. Deploying will migrate this host to the root and "
+                f"leave the old copy alone."
+                if legacy.get("dist") else ""
+            )
+        )
     if not _wake_daemon(creds, info, config_path):
         handq_dir = info["handq_dir"]
         diag = ""
+        # Most specific first: "the daemon is up, just not where we look" is a
+        # completely different problem from "the daemon will not start", and
+        # leading with the raw log tail buried that distinction.
+        diag += info.get("wake_diagnosis") or ""
+        # The entry point in the root resolved but would not run. Say so up front,
+        # with the fixes, before dumping the raw daemon.log tail — otherwise the
+        # operator just sees "No such file or directory" with no hint why.
+        if info.get("launch_ok") is False:
+            diag += (
+                "\n\nThe handq_linux entry point under the install root won't run "
+                "(corrupt binary, missing dependency, or incompatible with this "
+                "machine's glibc). Fix: configure update.linux_share_path so HandQ "
+                "can auto-redeploy, or re-run handq_setup.sh on that host."
+            )
         try:
             err_tail = _tail_remote_file(creds, posixpath.join(handq_dir, "daemon_error.txt"))
-            log_tail = _tail_remote_file(creds, posixpath.join(handq_dir, "daemon.log"))
+            log_tail = _tail_remote_file(creds, posixpath.join(handq_dir, "daemon.log"), n=200)
             if err_tail:
                 diag += f"\n\n--- daemon_error.txt (tail) ---\n{err_tail.strip()}"
             if log_tail:
-                diag += f"\n\n--- daemon.log (tail) ---\n{log_tail.strip()}"
+                scoped, is_current = _scope_to_last_wake(log_tail)
+                label = "this wake" if is_current else "history, this wake produced no output"
+                diag += f"\n\n--- daemon.log ({label}) ---\n{scoped}"
         except Exception:
             pass  # diagnostics are best-effort; never mask the original failure
         raise RuntimeError(
             f"Failed to wake remote HandQ daemon on {creds['hostname']}. "
-            f"Launch tried: {info['launch']} --_daemon.{diag}"
+            f"Command run: {info.get('last_wake_cmd') or (info['launch'] + ' --_daemon')}{diag}"
         )
 
 
@@ -415,15 +775,51 @@ def _resolve_linux_share_version(share_path: str) -> Optional[Tuple[str, str]]:
     blank, unreachable, or has no matching file. Mirrors electron/updater.js's
     ``scanLatestVersion`` — same file-naming convention, same "just read the
     filesystem" approach (a UNC path is a plain local path from Windows).
+
+    Thin wrapper over :func:`_scan_linux_share` that discards the diagnostic —
+    kept because several callers only want the answer. Prefer the scan function
+    directly when you need to tell "nothing configured" from "path unreachable"
+    from "package is misnamed", which is exactly what the operator needs to see
+    when an expected upgrade doesn't happen.
+    """
+    result = _scan_linux_share(share_path)
+    if result.version and result.tarball_path:
+        return result.version, result.tarball_path
+    return None
+
+
+class _ShareScan(NamedTuple):
+    """Outcome of scanning the Linux update share, with a reason when empty."""
+    version: str            # highest semver found, "" if none usable
+    tarball_path: str       # absolute path to that tarball, "" if none
+    reason: str             # machine slug: ok | no_share | unreachable | no_match
+    detail: str             # human line for the connect log
+
+
+def _scan_linux_share(share_path: str) -> _ShareScan:
+    """Scan the share and say WHY when it yields nothing.
+
+    Every empty outcome here used to be an indistinguishable ``None`` that the
+    caller turned into a silent "already current" — so an operator who dropped a
+    new package and saw no upgrade had no way to tell a mistyped share path from
+    a mis-named tarball from "actually up to date". The reason codes make the one
+    connect-log line that explains it possible.
     """
     if not share_path:
-        return None
+        return _ShareScan("", "", "no_share",
+                          "update.linux_share_path is not configured — skipping auto-upgrade check")
     try:
         entries = os.listdir(share_path)
-    except OSError:
-        return None
+    except OSError as exc:
+        return _ShareScan(
+            "", "", "unreachable",
+            f"Share directory unreachable ({share_path}): {exc} — cannot check for a newer version",
+        )
     best: Optional[Tuple[Tuple[int, ...], str, str]] = None
+    saw_any_tarball = False
     for name in entries:
+        if name.endswith(".tar.gz") and "handq-linux" in name:
+            saw_any_tarball = True
         m = _VERSION_TARBALL_RE.match(name)
         if not m:
             continue
@@ -432,14 +828,70 @@ def _resolve_linux_share_version(share_path: str) -> Optional[Tuple[str, str]]:
         if best is None or parsed > best[0]:
             best = (parsed, version, name)
     if best is None:
-        return None
+        if saw_any_tarball:
+            detail = (
+                f"Share directory has handq-linux packages, but none of the filenames "
+                f"match the convention handq-linux-<X.Y.Z>.tar.gz "
+                f"(e.g. v1.6.0 / 1.6 / -rc1 / .tgz are all ignored)"
+            )
+        else:
+            detail = f"Share directory {share_path} has no handq-linux-<X.Y.Z>.tar.gz package"
+        return _ShareScan("", "", "no_match", detail)
     _, version, name = best
-    return version, os.path.join(share_path, name)
+    return _ShareScan(
+        version, os.path.join(share_path, name), "ok",
+        f"Latest version available on share directory: {version}",
+    )
 
 
-def _get_installed_version(creds: Dict[str, Any], info: Dict[str, str]) -> str:
-    """Return the remote's installed handq_linux version, or "" on any failure."""
-    stdout, _, rc = _remote_bash(creds, info['launch'] + ' --version', timeout=15.0)
+def _get_installed_version(creds: Dict[str, Any], info: Dict[str, Any]) -> str:
+    """Return the version installed **in the root**, or "" when nothing is there.
+
+    Reads ``<root>/handq_config.yaml``'s top-level ``version:``. The deployed
+    config is the truth about what is installed under the root, so read it at the
+    source rather than running ``<launch> --version`` (whose ``--config`` argument
+    is pinned to whatever existed when setup last ran, and so reported the OLD
+    config's version even right after a deploy wrote a new one — making every
+    comparison see the install as perpetually stale).
+
+    Two rules keep this from lying during the migration off the old shared
+    ``~/handq`` layout, and both matter:
+
+    * Only the ROOT's config counts. Reading ``~/handq/handq_config.yaml`` (the old
+      path) would report the legacy install's version, the comparison would decide
+      "already current", and the new root would **never be deployed to** — a
+      deadlock that is completely silent, because nothing errors: it just quietly
+      does nothing forever.
+    * The ``<launch> --version`` fallback — kept for source-checkout layouts — is
+      used only when the launch actually lives inside the root. Otherwise it would
+      report a legacy binary's version and reintroduce the same deadlock by
+      another route.
+
+    Returns "" (meaning "not installed") when the root has no config, which is what
+    makes the first deploy fire.
+    """
+    root = info.get("root") or info.get("handq_dir") or ""
+    if not root:
+        return ""
+    config_path = posixpath.join(root, "handq_config.yaml")
+    # grep the top-level `version:` line; tolerate quotes and surrounding space.
+    stdout, _, rc = _remote_bash(
+        creds,
+        f"grep -E '^version:' {_shq(config_path)} 2>/dev/null | head -1",
+        timeout=10.0,
+    )
+    if rc == 0 and stdout.strip():
+        _, _, value = stdout.strip().partition(":")
+        value = value.strip().strip("'\"")
+        if _parse_version(value):
+            return value
+    # Fallback for source checkouts / unusual layouts — but only when the launch is
+    # inside the root. See the docstring: a legacy launch here means a silent
+    # never-upgrade deadlock.
+    launch = info.get("launch") or ""
+    if not launch or root not in launch:
+        return ""
+    stdout, _, rc = _remote_bash(creds, launch + ' --version', timeout=15.0)
     if rc != 0:
         return ""
     m = _INSTALLED_VERSION_RE.search(stdout)
@@ -493,7 +945,13 @@ mv "$STAGING/handq_linux.dist" "$ROOT/handq_linux.dist"
 # handq_setup.sh travels alongside the binary dir in the tarball but isn't
 # part of the runtime install — copy it over too so _install_human_aliases
 # (and any human who wants to re-run it by hand) finds it at $ROOT.
-[ -f "$STAGING/handq_setup.sh" ] && cp "$STAGING/handq_setup.sh" "$ROOT/handq_setup.sh"
+# `if` rather than `[ -f … ] && cp …`: under `set -e` a bare AND-list whose test
+# is FALSE makes the script exit 1 — after the swap has already succeeded — and
+# the caller then reports a bogus "deploy script exited 1" for a deploy that
+# actually worked.
+if [ -f "$STAGING/handq_setup.sh" ]; then
+  cp "$STAGING/handq_setup.sh" "$ROOT/handq_setup.sh"
+fi
 rm -rf "$STAGING" "$BACKUP"
 echo "STAGE=swap_ok"
 """
@@ -505,39 +963,91 @@ _DEPLOY_STAGE_MESSAGES = {
 }
 
 
+def _validated_local_config() -> Dict[str, Any]:
+    """This controller's own config — the authoritative source for every remote's
+    credentials and model pool — refusing to hand out one with a blank API key.
+
+    A blank ``llm.API_KEY`` is never a deliberate thing to push. It is also
+    invisible on the controller: with an empty key the Anthropic SDK falls back to
+    ``ANTHROPIC_API_KEY`` / ``ANTHROPIC_AUTH_TOKEN`` from the environment, so a
+    Windows box whose config key went missing keeps working and nothing local
+    complains. A Linux daemon has no such environment, so the same blank lands
+    there as ``TypeError: Could not resolve authentication method`` on the first
+    LLM call — retried for ~17 minutes before anyone hears about it.
+
+    That is not hypothetical: an upgrade blanked this machine's key, the next
+    deploy copied the blank over a remote key that had been working, and the
+    remote went silent. Failing here keeps a controller that cannot authenticate
+    from taking a remote down with it.
+    """
+    from ..infrastructure.config_manager import ConfigManager
+
+    cfg = dict(ConfigManager().get_config())
+    if not str((cfg.get("llm") or {}).get("API_KEY") or "").strip():
+        raise RuntimeError(
+            "This machine's handq_config.yaml has a blank llm.API_KEY — refusing to sync "
+            "it to the remote (that would leave the remote HandQ completely unable to call "
+            "the LLM). Fill in the API key under Settings -> LLM Configuration first, or "
+            "edit ~/HandQ/handq_config.yaml directly. "
+            "Note: this machine may keep working even with a blank key — the Anthropic SDK "
+            "falls back to the ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN environment "
+            "variables, but the remote machine has no such environment."
+        )
+    return cfg
+
+
 def _deploy_linux_package(
     creds: Dict[str, Any], info: Dict[str, str], tarball_local_path: str, version: str,
-) -> None:
+) -> str:
     """Push a packaged Linux build to the remote and swap it into place.
 
-    Target root is ``~/handq`` — the same un-installed-copy location the
-    discovery probe already searches (see _PROBE), and the layout
-    ``handq_linux.py``'s own frozen-config resolution expects (dist root one
-    level above ``handq_linux.dist/``). The swap itself does NOT depend on
-    ``handq_setup.sh`` — ``_discover()`` finds an un-installed dist directly
-    via its SBIN probe, so the daemon is launchable immediately after the
-    swap, before handq_setup.sh ever runs (see _install_human_aliases below).
+    Target root is the machine-local install root resolved by ``_discover``
+    (``info["root"]``) — NOT ``~/handq`` any more. Under a cloud-synced ``$HOME``
+    that old target meant every host deployed into the same directory, so one
+    host's upgrade swapped the dist out from under another host's running daemon
+    (and the "don't deploy while alive" guard could not see it, because it checks
+    only the local pid file). The root satisfies the layout
+    ``handq_linux.py``'s frozen-config resolution expects (dist root one level
+    above ``handq_linux.dist/``), so the daemon is launchable immediately after
+    the swap, before handq_setup.sh ever runs.
 
     Extraction is staged and verified before touching the live install (see
     _DEPLOY_SCRIPT) — a bad transfer or broken build never deletes a working
-    old version. Config comes from Windows' own live config (ConfigManager)
-    with ``version`` explicitly forced to *version* (the tarball just
+    old version. Config comes from Windows' own live config
+    (:func:`_validated_local_config`, which refuses a blank API key) with
+    ``version`` explicitly forced to *version* (the tarball just
     deployed) rather than passed through — otherwise the remote's
     ``--version`` would echo back Windows' version instead of its own,
     silently breaking the next round of version comparison.
 
-    After the swap, ``handq_setup.sh`` is invoked once more, best-effort, for
-    its side effect only: installing the ``handq``/``hi`` aliases and PATH
-    entry so a human who later logs in by hand gets the same command Windows
-    already uses internally (_discover resolves an absolute path and never
-    depends on PATH/aliases, so this step is purely a courtesy — its exit
-    code and self-test results are deliberately ignored).
+    After the swap, ``handq_setup.sh`` is invoked once more for its side effects:
+    recording ``HANDQ_ROOT`` in the per-host dispatcher config, and installing the
+    ``handq``/``hi`` aliases + PATH entry so a human who later logs in by hand gets
+    the same command Windows uses internally.
     """
-    remote_home = info.get("remote_home") or "~"
-    remote_root = posixpath.join(remote_home, "handq")
-    remote_tmp = posixpath.join(remote_home, f".handq_deploy_{version}.tar.gz")
+    remote_root = info.get("root") or ""
+    if not remote_root:
+        raise RuntimeError(
+            f"Cannot deploy to {creds.get('hostname')}: no install root could be "
+            f"resolved. None of /local/mnt/workspace/<user>@handq, "
+            f"/var/tmp/<user>@handq or ~/handq/<user>@<host> was usable"
+            + (
+                " — " + "; ".join(info.get("root_rejects") or [])
+                if info.get("root_rejects") else ""
+            )
+        )
+    # Staging, backup and the uploaded tarball all live INSIDE the root, so they
+    # are machine-local like everything else: two hosts can deploy concurrently
+    # without touching each other's extraction, and a ~50MB tarball is no longer
+    # written into a cloud-synced $HOME on every upgrade.
+    remote_tmp = posixpath.join(remote_root, f".handq_deploy_{version}.tar.gz")
     staging_dir = posixpath.join(remote_root, f".handq_staging_{version}")
     backup_dir = posixpath.join(remote_root, ".handq_backup_dist")
+
+    # Resolved BEFORE anything is uploaded or swapped: this raises when our own
+    # API key is blank, and a remote left with a new binary plus an unusable
+    # config is worse than one we never touched.
+    local_config = dict(_validated_local_config())
 
     _sftp_put_file(creds, tarball_local_path, remote_tmp)
 
@@ -556,72 +1066,468 @@ def _deploy_linux_package(
             f"{reason}\n{stdout.strip()}\n{stderr.strip()}"
         )
 
-    from ..infrastructure.config_manager import ConfigManager
     import yaml as _yaml
-    local_config = dict(ConfigManager().get_config())
     local_config["version"] = version
     remote_config_path = posixpath.join(remote_root, "handq_config.yaml")
     _write_remote_file(creds, remote_config_path, _yaml.safe_dump(local_config, sort_keys=False))
 
-    _install_human_aliases(creds, remote_root, remote_config_path)
+    return _install_human_aliases(creds, remote_root, remote_config_path)
 
 
-def _install_human_aliases(creds: Dict[str, Any], remote_root: str, remote_config_path: str) -> None:
+def _install_human_aliases(
+    creds: Dict[str, Any], remote_root: str, remote_config_path: str
+) -> str:
     """Best-effort: run handq_setup.sh so a human who logs in by hand later
     gets the handq/hi aliases + PATH entry. Never raises — this is pure
     convenience, not load-bearing for Windows' own control path (_discover
-    finds the binary by absolute path regardless of whether this succeeds)."""
+    finds the binary by absolute path regardless of whether this succeeds).
+
+    Returns a short diagnostic string ("" on clean success) rather than
+    swallowing everything into ``>/dev/null``. handq_setup.sh ``die``s before it
+    writes the dispatcher whenever ``validate_config`` rejects the config, and
+    that failure used to be completely invisible — the caller redirected both
+    streams to /dev/null and ``except: pass``'d. When it fails the dispatcher
+    keeps pointing at the previous binary, so a deploy that "succeeded" still
+    launches the old version; the operator needs to see that, even though it
+    must not abort the deploy.
+    """
     setup_script = posixpath.join(remote_root, "handq_setup.sh")
+    # --root is passed explicitly so setup does not re-run its own candidate chain
+    # and cannot pick a different directory than the one we just deployed into.
+    # It is also what records HANDQ_ROOT in the per-host dispatcher config, which
+    # every later _discover reads as the authority.
     inner = (
         f"chmod +x {_shq(setup_script)} 2>/dev/null; "
-        f"bash {_shq(setup_script)} --config {_shq(remote_config_path)} >/dev/null 2>&1 || true"
+        f"bash {_shq(setup_script)} --root {_shq(remote_root)} "
+        f"--config {_shq(remote_config_path)} 2>&1"
     )
     try:
-        _remote_bash(creds, inner, timeout=60.0)
-    except Exception:
-        pass
+        stdout, stderr, rc = _remote_bash(creds, inner, timeout=60.0)
+    except Exception as exc:
+        return f"handq_setup.sh failed to run (aliases/PATH not updated, doesn't affect Windows control): {exc}"
+    if rc != 0:
+        tail = (stdout or stderr or "").strip().splitlines()[-3:]
+        return (
+            "handq_setup.sh failed (aliases/PATH not updated; if the dispatcher still "
+            "points at the old binary, the handq command used for manual logins may be "
+            "the old version): " + " / ".join(tail)
+        )
+    return ""
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  Repair — heal a per-host setup left behind by an older handq_setup.sh
+# ─────────────────────────────────────────────────────────────────────────────
+def _install_dir() -> Path:
+    """Directory next to the entry point; the repo root in dev mode.
 
-def _ensure_installed(creds: Dict[str, Any]) -> Dict[str, str]:
-    """Discover the remote; auto-deploy/upgrade if a newer package is on the
-    configured share. No-op (existing behavior) when linux_share_path is
-    blank or the discovered version is already current.
-
-    Never redeploys while the daemon is alive: _deploy_linux_package rm -rf's
-    handq_linux.dist/, which would yank files out from under a resident
-    process. The stale build keeps serving until the daemon is next
-    restarted (new_session / exit_handq), at which point the version check
-    catches up.
+    Same algorithm as ``bridge_main._INSTALL_DIR`` and
+    ``src/infrastructure/skills.py``'s ``_install_dir``, reimplemented for this
+    module's own depth (``src/tools/`` is two levels under the repo root — the
+    same depth as ``src/infrastructure/``).
     """
-    try:
-        info = _discover(creds)
-        discover_exc: Optional[RuntimeError] = None
-    except RuntimeError as exc:
-        info = None
-        discover_exc = exc
+    if getattr(sys, "frozen", False) or "__compiled__" in globals():
+        return Path(os.path.dirname(os.path.abspath(sys.executable)))
+    return Path(__file__).parent.parent.parent.resolve()
 
-    if info is not None and _daemon_alive(creds, info["handq_dir"]):
-        return info
+
+def _local_setup_script() -> Tuple[str, str]:
+    """The best ``handq_setup.sh`` we can lay hands on, plus where it came from.
+
+    Returns ``(text, source)``, or ``("", why_not)`` when there is no source at
+    all — never a silent empty string the caller could mistake for success.
+
+    Two sources, in order:
+
+    1. ``<install dir>/handq_setup.sh`` — present in a source checkout, and by
+       definition the freshest copy.
+    2. the ``handq_setup.sh`` member of the newest package on
+       ``update.linux_share_path``. This fallback is what makes repair work in a
+       packaged Windows build, which does **not** bundle the script:
+       ``packaging/build.ps1`` ships only ``handq_config.yaml`` and
+       ``uia_query.ps1`` as data files.
+
+    Never raises.
+    """
+    local = _install_dir() / "handq_setup.sh"
+    try:
+        if local.is_file():
+            return local.read_text(encoding="utf-8"), str(local)
+    except Exception:
+        logger.debug("remote_handq: reading %s failed", local, exc_info=True)
+
+    try:
+        from ..infrastructure.config_manager import ConfigManager
+        share_path = ConfigManager().get_section("update").get("linux_share_path", "") or ""
+        scan = _scan_linux_share(share_path)
+        if scan.tarball_path:
+            with tarfile.open(scan.tarball_path, "r:gz") as tf:
+                # build_linux.sh tars from inside the dist dir, so the member is
+                # bare — but tolerate the "./" prefix other tar builders emit.
+                for name in ("handq_setup.sh", "./handq_setup.sh"):
+                    try:
+                        fh = tf.extractfile(name)
+                    except KeyError:
+                        continue
+                    if fh is not None:
+                        return (
+                            fh.read().decode("utf-8"),
+                            f"handq_setup.sh inside {scan.tarball_path}",
+                        )
+    except Exception:
+        logger.debug("remote_handq: share extract of handq_setup.sh failed", exc_info=True)
+
+    return "", (
+        f"No usable handq_setup.sh found: local {local} doesn't exist, "
+        f"and the share package didn't have it either — skipping repair"
+    )
+
+
+def _repair_host_setup(
+    creds: Dict[str, Any], info: Dict[str, Any], log: Any
+) -> str:
+    """Rewrite the per-host dispatcher conf, the dispatcher and the handq/hi
+    symlinks by re-running handq_setup.sh on the remote.
+
+    Why push and run the real script instead of writing the two-line conf from
+    here: that format is handq_setup.sh's to own. Its own comment at the write
+    site calls the recorded root "the single authority ... what keeps three
+    implementations from drifting apart" — a fourth implementation living in
+    Python is precisely the drift being warned about. Running the script is also
+    copy-free once it sits in the root: ``stage_into_root`` returns immediately
+    when ``PKG_DIR == HANDQ_ROOT``, so this rewrites configuration without
+    touching the installed binary.
+
+    The pushed script matters: the copy already on the remote can predate
+    ``--root`` and reject it with a usage dump (rc 2), which is how this host got
+    a stale conf in the first place.
+
+    Never raises. Returns "" on clean success, else a short diagnostic.
+    """
+    root = info.get("root") or ""
+    if not root:
+        return "Cannot repair per-host config: no install root has been resolved yet"
+
+    text, source = _local_setup_script()
+    if not text:
+        return source
+
+    setup_script = posixpath.join(root, "handq_setup.sh")
+    try:
+        _write_remote_file(creds, setup_script, text)
+    except Exception as exc:
+        return f"Failed to push handq_setup.sh: {exc}"
+
+    note = _install_human_aliases(creds, root, posixpath.join(root, "handq_config.yaml"))
+    if note:
+        return note
+    log(
+        f"Re-ran handq_setup.sh using {source} — rewrote "
+        f"{info.get('hostconf') or 'the per-host config'} + dispatcher + handq/hi aliases"
+    )
+    return ""
+
+
+def _drop_legacy_ipc_dir(creds: Dict[str, Any], info: Dict[str, Any], log: Any) -> None:
+    """Remove ``~/.handq/<user>@<host>`` once nothing is running out of it.
+
+    This is safe to delete where the pre-migration INSTALL is not: the path
+    carries ``@<host>``, so it belongs to this machine alone, whereas the install
+    lives in a ``$HOME`` that is cloud-synced between hosts and may still be
+    another, not-yet-migrated host's live copy. handq_setup.sh refuses to delete
+    that one for the same reason and only prints an info line; this function
+    keeps that refusal and does not touch it either.
+
+    Liveness is re-checked immediately before the ``rm``, not taken from the
+    probe: a human can start a daemon between the two, and deleting the dir from
+    under a live daemon strands it — its pid/state files vanish while it keeps
+    serving a port nobody can then discover.
+    """
+    ipc_dir = _legacy_ipc_candidate(info)
+    if not ipc_dir or ipc_dir == (info.get("handq_dir") or ""):
+        return
+    try:
+        present, _, _ = _remote_bash(
+            creds, f"[ -d {_shq(ipc_dir)} ] && echo YES || echo NO", timeout=10.0,
+        )
+        if present.strip() != "YES":
+            return
+        if _daemon_alive(creds, ipc_dir):
+            log(
+                f"The legacy layout's IPC dir {ipc_dir} still has a daemon running — "
+                f"skipping deletion this time; it will be cleaned up on the next "
+                f"connect after it stops"
+            )
+            return
+        _remote_bash(creds, f"rm -rf {_shq(ipc_dir)}", timeout=20.0)
+        log(
+            f"Cleaned up the legacy layout's leftover IPC dir {ipc_dir}"
+            f" (the old install directory is left alone: $HOME syncs across machines, "
+            f"another host may still be using it)"
+        )
+    except Exception:
+        logger.debug("remote_handq: legacy ipc cleanup failed", exc_info=True)
+
+
+def _ensure_installed(
+    creds: Dict[str, Any],
+    *,
+    on_log: Optional[Any] = None,
+    allow_deploy_when_alive: bool = False,
+) -> Dict[str, Any]:
+    """Discover the remote and decide what the installed-vs-available versions
+    mean, ALWAYS — then deploy only when it is safe to.
+
+    The returned ``info`` always carries the decision so a caller can act on it
+    without re-deriving it:
+      * ``installed_version`` / ``share_version`` — what is on disk, what is on
+        the share (either may be "" when unknown).
+      * ``upgrade_available`` — a newer package exists on the share.
+      * ``deployed`` — this call actually swapped a new build in.
+
+    The previous version returned early the instant the daemon was alive,
+    without ever comparing versions — so a running daemon could never learn a
+    newer package existed, and "I dropped a new build but nothing upgraded" had
+    no diagnosable cause. The comparison now always happens; what stays gated on
+    daemon liveness is the *deploy*, because ``_deploy_linux_package`` rm -rf's
+    ``handq_linux.dist/`` and must not pull files from under a live process.
+    ``allow_deploy_when_alive`` is for the caller that has already stopped the
+    daemon (see linux_bootstrap): the "don't deploy while alive" guard would
+    otherwise still refuse, having re-probed a daemon the caller just bounced.
+
+    Legacy handling (migration off the old shared ``~/handq`` layout): a daemon
+    still running out of the pre-migration IPC dir is stopped first — see
+    :func:`_stop_legacy_daemon`. The old install itself is deliberately NOT
+    deleted; it may be the live install of another host that has not migrated yet,
+    and the delete would be unrecoverable.
+
+    ``on_log(message)`` — optional sink for one-line operator-facing notes
+    (share scan result, installed version, decision). Every branch that used to
+    ``return`` silently now says why through here.
+    """
+    def _log(msg: str) -> None:
+        if on_log is not None:
+            try:
+                on_log(msg)
+            except Exception:
+                pass
+
+    # _discover no longer raises for "nothing installed yet" — that is the normal
+    # state before the first deploy, and raising discarded the legacy findings
+    # needed below.
+    info: Dict[str, Any] = dict(_discover(creds))
+    legacy = info.get("legacy") or {}
+
+    if not info.get("root"):
+        raise RuntimeError(
+            f"No usable HandQ install root on {creds.get('hostname')}. Tried "
+            f"/local/mnt/workspace/<user>@handq, /var/tmp/<user>@handq and "
+            f"~/handq/<user>@<host>"
+            + (
+                ": " + "; ".join(info.get("root_rejects") or [])
+                if info.get("root_rejects") else ""
+            )
+        )
+
+    # A daemon from the OLD layout is still running. It must be stopped before we
+    # start one at the new root, or the host ends up with two daemons serving two
+    # different ports off two different installs.
+    if legacy.get("daemon_alive"):
+        _stop_legacy_daemon(creds, info, _log)
+        legacy["daemon_alive"] = False
+
+    # Heal a per-host setup left behind by an older handq_setup.sh. Gated on the
+    # probe's staleness flag, so once healed this costs one dict lookup. It sits
+    # BEFORE the share scan deliberately: a stale conf breaks `handq`/`hi` for a
+    # human at the shell and demotes root_source to the candidate chain, neither
+    # of which has anything to do with whether a newer package exists — tying the
+    # repair to an available upgrade is what would keep a same-version host broken
+    # forever.
+    if info.get("hostconf_stale"):
+        _log(
+            f"Per-host config is stale ({info.get('hostconf') or '?'} points at "
+            f"{info.get('hostconf_bin') or 'nothing'}, so handq/hi will fail with "
+            f"No such file or directory) — repairing with the current handq_setup.sh"
+        )
+        note = _repair_host_setup(creds, info, _log)
+        if note:
+            _log(note)
+        else:
+            # Re-probe so hostconf_stale / root_source reflect the repair rather
+            # than the state that triggered it.
+            info = dict(_discover(creds, force=True))
+            legacy = info.get("legacy") or {}
+
+    # Historical leftover from the old shared layout. Gated on the probe having
+    # actually seen the directory, so healthy hosts pay nothing.
+    if legacy.get("ipc_dir"):
+        _drop_legacy_ipc_dir(creds, info, _log)
 
     from ..infrastructure.config_manager import ConfigManager
     share_path = ConfigManager().get_section("update").get("linux_share_path", "") or ""
-    latest = _resolve_linux_share_version(share_path)
-    if latest is None:
-        if info is None:
-            # No share configured (or nothing on it) and nothing installed —
-            # surface _discover's own error verbatim so behavior is unchanged
-            # from before auto-deploy existed when the feature isn't in use.
-            raise discover_exc
+    scan = _scan_linux_share(share_path)
+    _log(scan.detail)
+
+    installed_version = _get_installed_version(creds, info)
+    info["installed_version"] = installed_version
+    info["share_version"] = scan.version
+    info["upgrade_available"] = bool(
+        scan.version
+        and _parse_version(installed_version) < _parse_version(scan.version)
+    )
+    info["deployed"] = False
+
+    # Nothing installed at the root yet. Say so explicitly: with the old layout
+    # still present on disk this is the migration case, and it is worth naming
+    # rather than letting it look like a fresh machine.
+    if not installed_version and (legacy.get("dist") or legacy.get("ipc_dir")):
+        _log(
+            f"This machine is still on the old layout ({legacy.get('dist') or legacy.get('ipc_dir')}) — "
+            f"installing into the new machine-local root {info['root']}. The old directory "
+            f"will not be deleted: another not-yet-migrated machine may still be using it"
+        )
+
+    if not scan.version:
+        # Nothing to deploy FROM. With no install at the root either, this is a
+        # hard failure — and now it can say precisely what is missing.
+        if not info.get("launch"):
+            raise RuntimeError(
+                f"handq_linux is not installed at {info['root']} on "
+                f"{creds.get('hostname')}, and update.linux_share_path has no "
+                f"package to deploy from. Copy the built dist package "
+                f"(handq_linux.dist/ + handq_config.yaml + handq_setup.sh) to the "
+                f"remote and run 'bash handq_setup.sh', or configure "
+                f"update.linux_share_path so it can be deployed automatically."
+                + (
+                    f" (A pre-migration install exists at {legacy['dist']}, but it "
+                    f"is outside the install root and is deliberately not adopted.)"
+                    if legacy.get("dist") else ""
+                )
+            )
         return info
 
-    latest_version, tarball_path = latest
-    installed_version = _get_installed_version(creds, info) if info is not None else ""
-    if info is None or _parse_version(installed_version) < _parse_version(latest_version):
-        deploy_info = info if info is not None else {"remote_home": _probe_home(creds)}
-        _deploy_linux_package(creds, deploy_info, tarball_path, latest_version)
-        info = _discover(creds, force=True)
+    alive = _daemon_alive(creds, info["handq_dir"])
+    # launch_ok False now means "the root has no runnable entry point" — either
+    # nothing is installed there yet (migration / fresh host) or what is there is
+    # broken. Both want a deploy. It is checked as part of needs_deploy so it runs
+    # BEFORE the "remote is already up to date" version-match short-circuit below.
+    launch_broken = not info.get("launch_ok", False)
+    needs_deploy = bool(info.get("upgrade_available")) or launch_broken
+
+    if launch_broken and scan.version:
+        if info.get("launch"):
+            _log(
+                f"The handq_linux entry point under the install root won't run — "
+                f"redeploying {scan.version} to fix it"
+            )
+        else:
+            _log(f"Nothing installed yet under root {info['root']} — deploying {scan.version}")
+
+    if not needs_deploy:
+        _log(f"Remote is already up to date ({installed_version or 'unknown'})")
+        return info
+
+    if alive and not allow_deploy_when_alive:
+        # A redeploy is warranted (newer package, or a broken launch) but the
+        # daemon is running. Do NOT deploy here — _deploy_linux_package rm -rf's
+        # handq_linux.dist/ and must not pull files from under a live process.
+        # The caller decides whether it is safe to bounce it (see
+        # linux_bootstrap._require_idle_or_forced). Report the decision instead
+        # of silently returning the stale info.
+        #
+        # Note this check is now sound for the multi-machine case in a way it
+        # never used to be: the root is machine-local, so the pid file being read
+        # belongs to the only daemon that can possibly be running out of this
+        # install. Under the old shared ~/handq the guard was structurally blind
+        # to a sibling host's live daemon and would happily delete the dist out
+        # from under it.
+        if launch_broken:
+            _log(
+                f"The launch path won't run and needs to redeploy {scan.version}, but the "
+                f"daemon is running — leaving the decision to restart-to-fix to the caller"
+            )
+        else:
+            _log(
+                f"Found newer version {scan.version} (current {installed_version or 'unknown'}), "
+                f"but the daemon is running — leaving the decision to restart-to-upgrade to the caller"
+            )
+        return info
+
+    _log(
+        f"Deploying handq_linux {scan.version} to {info['root']}"
+        + (f" (overwriting {installed_version})" if installed_version else " (fresh install)")
+    )
+    setup_note = _deploy_linux_package(creds, info, scan.tarball_path, scan.version)
+    if setup_note:
+        _log(setup_note)
+    info = dict(_discover(creds, force=True))
+    info["installed_version"] = _get_installed_version(creds, info)
+    info["share_version"] = scan.version
+    info["upgrade_available"] = False
+    info["deployed"] = True
     return info
+
+
+def _stop_legacy_daemon(
+    creds: Dict[str, Any], info: Dict[str, Any], log: Any
+) -> None:
+    """Stop a daemon still running out of the pre-migration ``~/.handq`` IPC dir.
+
+    This is the one legacy artefact that has to be actively dealt with rather than
+    just ignored. The new root has its own pid file, so a probe of the root reports
+    "no daemon" while the old one is still alive and serving — wake the new one and
+    the host is running two daemons off two installs, each on its own port, with
+    the Windows side talking to one and the operator's console possibly to the
+    other.
+
+    Uses the legacy dispatcher if one is still on PATH (it injects the old
+    ``--config`` and knows the old root); falls back to SIGTERM on the pid from the
+    legacy pid file. Never raises: failing to stop the old daemon must not block
+    the migration, but it is logged loudly because the two-daemon state it leaves
+    behind is confusing to debug.
+    """
+    legacy = info.get("legacy") or {}
+    ipc_dir = legacy.get("ipc_dir") or ""
+    launch = legacy.get("path_bin") or legacy.get("local_bin") or ""
+    log(
+        "Detected a daemon still running under the legacy layout — stopping it first, "
+        "otherwise this host would run two daemons at once (each on its own port)"
+    )
+    if launch:
+        try:
+            _remote_bash(creds, _shq(launch) + " --exit 2>&1 || true", timeout=25.0)
+        except Exception:
+            logger.debug("remote_handq: legacy --exit failed", exc_info=True)
+    if ipc_dir:
+        pf = posixpath.join(ipc_dir, "handq.pid")
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline:
+            if not _daemon_alive(creds, ipc_dir):
+                log("Old daemon has stopped")
+                return
+            time.sleep(0.5)
+        # --exit did not take. SIGTERM the pid directly rather than leaving two
+        # daemons up.
+        try:
+            _remote_bash(
+                creds,
+                f'P=$(cat {_shq(pf)} 2>/dev/null); '
+                '[ -n "$P" ] && kill -TERM "$P" 2>/dev/null || true',
+                timeout=15.0,
+            )
+        except Exception:
+            logger.debug("remote_handq: legacy SIGTERM failed", exc_info=True)
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline:
+            if not _daemon_alive(creds, ipc_dir):
+                log("Old daemon has stopped (SIGTERM)")
+                return
+            time.sleep(0.5)
+        log(
+            f"Warning: the old daemon ({pf}) failed to stop. The new daemon will still "
+            f"start, but this host will have two daemons running at once — please handle "
+            f"this manually"
+        )
 
 
 class RemoteHandQTool(BaseTool):
@@ -699,8 +1605,13 @@ class RemoteHandQTool(BaseTool):
                 "description": "[answer_confirmation] For a tool/risk confirmation: 'yes' to approve, 'no' to refuse, 'message' to refuse with guidance (requires 'message').",
             },
             "value": {
-                "type": "string",
-                "description": "[answer_confirmation] For a secret/text (ask_human) confirmation: the secret or text value to supply.",
+                "description": (
+                    "[answer_confirmation] For a 'secret' confirmation: the "
+                    "secret string to supply. For a 'form' (ask_human) "
+                    "confirmation: a JSON object mapping each field's id to "
+                    "its answer (array of strings for checkbox fields, "
+                    "plain string otherwise)."
+                ),
             },
             "reason": {
                 "type": "string",
@@ -844,7 +1755,7 @@ class RemoteHandQTool(BaseTool):
         )
 
     # ── discovery / dir resolution ───────────────────────────────────────────
-    def _info(self, creds: Dict[str, Any], params: Dict[str, Any], *, force: bool = False) -> Dict[str, str]:
+    def _info(self, creds: Dict[str, Any], params: Dict[str, Any], *, force: bool = False) -> Dict[str, Any]:
         info = _discover(creds, force=force)
         override = params.get("handq_dir", "")
         if override:
@@ -852,7 +1763,7 @@ class RemoteHandQTool(BaseTool):
             info["handq_dir"] = override
         return info
 
-    def _info_ensured(self, creds: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, str]:
+    def _info_ensured(self, creds: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, Any]:
         """Like _info, but auto-deploys/upgrades first when a newer package
         is available on update.linux_share_path. Used only by the two
         actions that actually need a runnable daemon (submit_goal,
@@ -870,9 +1781,16 @@ class RemoteHandQTool(BaseTool):
         handq_dir = info["handq_dir"]
         alive = _daemon_alive(creds, handq_dir)
         state = _read_state(creds, handq_dir) if alive else {}
+        legacy = info.get("legacy") or {}
         return {
+            # The machine-local install root. handq_dir is the same path (daemon
+            # state lives directly in the root) — both kept for callers that key
+            # on either name.
+            "root": info.get("root", ""),
+            "root_source": info.get("root_source", ""),
             "handq_dir": handq_dir,
             "launch": info["launch"],
+            "launch_ok": info.get("launch_ok", False),
             "remote_user": info.get("remote_user", ""),
             "remote_hostname": info.get("remote_host", ""),
             # The remote user's login shell (from getent passwd / $SHELL). Only
@@ -885,20 +1803,30 @@ class RemoteHandQTool(BaseTool):
             "daemon_alive": alive,
             "session_id": state.get("session_id", ""),
             "task_status": state.get("task_status", ""),
+            # Migration visibility: a pre-migration install/daemon still on disk.
+            # Reported so an operator can see WHY a host is being migrated and
+            # whether an old daemon is (still) running that will be stopped.
+            "legacy_install": legacy.get("dist", ""),
+            "legacy_ipc_dir": legacy.get("ipc_dir", ""),
+            "legacy_daemon_alive": bool(legacy.get("daemon_alive")),
+            # The per-host dispatcher conf backing `handq` / `hi`. Stale means a
+            # human at the shell gets "<conf>: line 1: <path>: No such file or
+            # directory", and that root_source fell back to the candidate chain.
+            "hostconf": info.get("hostconf", ""),
+            "hostconf_stale": bool(info.get("hostconf_stale")),
+            "hostconf_bin": info.get("hostconf_bin", ""),
         }
 
     def _action_ensure_installed(self, creds: Dict[str, Any], params: Dict[str, Any]) -> Dict[str, Any]:
-        try:
-            pre_info = _discover(creds)
-        except RuntimeError:
-            pre_info = None
-        pre_version = _get_installed_version(creds, pre_info) if pre_info else ""
+        pre_info = _discover(creds)
+        pre_version = _get_installed_version(creds, pre_info)
         info = self._info_ensured(creds, params)
         post_version = _get_installed_version(creds, info)
         return {
+            "root": info.get("root", ""),
             "handq_dir": info["handq_dir"],
             "launch": info["launch"],
-            "deployed": (pre_info is None) or (pre_version != post_version),
+            "deployed": bool(info.get("deployed")) or (pre_version != post_version),
             "old_version": pre_version,
             "new_version": post_version,
         }
@@ -921,7 +1849,7 @@ class RemoteHandQTool(BaseTool):
         return self._post_and_maybe_wait(creds, info, message, params, label="Message")
 
     def _post_and_maybe_wait(
-        self, creds: Dict[str, Any], info: Dict[str, str], text: str,
+        self, creds: Dict[str, Any], info: Dict[str, Any], text: str,
         params: Dict[str, Any], *, label: str,
     ) -> Dict[str, Any]:
         handq_dir = info["handq_dir"]
@@ -1060,11 +1988,19 @@ class RemoteHandQTool(BaseTool):
             }
         kind = req.get("kind", "")
         resp: Dict[str, Any] = {"id": cid}
-        if kind in ("secret", "text"):
+        if kind == "secret":
             value = params.get("value")
             if value is None:
                 raise ValueError(f"'value' is required to answer a '{kind}' confirmation.")
             resp["value"] = str(value)
+        elif kind == "form":
+            value = params.get("value")
+            if not isinstance(value, dict):
+                raise ValueError(
+                    "'value' must be a JSON object mapping field id to answer "
+                    "for a 'form' confirmation."
+                )
+            resp["value"] = value
         else:  # tool / risk
             decision = str(params.get("decision", "")).strip().lower()
             if decision not in ("yes", "no", "message"):
@@ -1162,7 +2098,15 @@ class RemoteHandQTool(BaseTool):
             shaped["hint"] = req.get("hint", "")
             shaped["params"] = req.get("params")
             shaped["how_to_answer"] = "answer_confirmation with decision=yes|no|message (message needs 'message')."
-        else:  # secret / text (ask_human)
+        elif kind == "form":
+            shaped["question"] = req.get("question", "")
+            shaped["fields"] = req.get("fields", [])
+            shaped["how_to_answer"] = (
+                "answer_confirmation with 'value' set to a JSON object mapping "
+                "each field's id to its answer (an array of strings for "
+                "checkbox fields, a plain string otherwise)."
+            )
+        else:  # secret
             shaped["prompt"] = req.get("prompt", "")
             shaped["how_to_answer"] = "answer_confirmation with 'value' set to the requested input."
         return shaped

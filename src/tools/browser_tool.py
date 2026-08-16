@@ -1004,6 +1004,33 @@ def _is_chrome_running() -> bool:
     return False
 
 
+def _query_non_debug_chrome_pids() -> Optional[List[str]]:
+    """Return PIDs of chrome.exe/msedge.exe NOT carrying ``--remote-debugging-port``.
+
+    Returns ``None`` if the CIM query itself failed to run (as opposed to
+    running fine and finding zero matches) — callers use that distinction to
+    fall back to a cruder check/action rather than treating "can't tell" the
+    same as "confirmed gone".
+    """
+    if sys.platform != "win32":
+        return []
+    try:
+        result = subprocess.run(
+            [
+                "powershell", "-NoProfile", "-NonInteractive", "-Command",
+                "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe' OR "
+                "Name='msedge.exe'\" | Where-Object { $_.CommandLine -notlike "
+                "'*--remote-debugging-port*' } | Select-Object -ExpandProperty "
+                "ProcessId",
+            ],
+            capture_output=True, text=True, timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        return [line.strip() for line in result.stdout.splitlines() if line.strip().isdigit()]
+    except Exception:
+        return None
+
+
 def _kill_chrome_processes() -> None:
     """Best-effort terminate chrome.exe / msedge.exe — used after user approves
     the "restart Chrome with debug port" path. Skips any process whose command
@@ -1022,20 +1049,8 @@ def _kill_chrome_processes() -> None:
     """
     if sys.platform != "win32":
         return
-    try:
-        import subprocess as _sp
-        result = _sp.run(
-            [
-                "powershell", "-NoProfile", "-NonInteractive", "-Command",
-                "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe' OR "
-                "Name='msedge.exe'\" | Where-Object { $_.CommandLine -notlike "
-                "'*--remote-debugging-port*' } | Select-Object -ExpandProperty "
-                "ProcessId",
-            ],
-            capture_output=True, text=True, timeout=10,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-        pids = [line.strip() for line in result.stdout.splitlines() if line.strip().isdigit()]
+    pids = _query_non_debug_chrome_pids()
+    if pids is not None:
         for pid in pids:
             try:
                 subprocess.run(
@@ -1046,8 +1061,6 @@ def _kill_chrome_processes() -> None:
             except Exception:
                 pass
         return
-    except Exception:
-        pass
     # Fallback: PowerShell/WMI unavailable for some reason — old unconditional
     # behavior is still better than not killing anything (the caller only
     # reaches here after explicit user approval to restart Chrome).
@@ -1060,6 +1073,35 @@ def _kill_chrome_processes() -> None:
             )
         except Exception:
             pass
+
+
+async def _wait_for_chrome_exit(timeout: float = 8.0, poll_interval: float = 0.4) -> None:
+    """Poll until no non-debug-port chrome.exe/msedge.exe processes remain.
+
+    Replaces a blind ``sleep(1.0)`` that didn't scale with session size: a
+    user with dozens of tabs open has far more renderer/GPU/utility
+    processes to tear down than a single-tab session, and a fixed 1s often
+    wasn't enough for all of them to exit before the debug-port relaunch
+    raced them — Chrome's single-instance-per-profile semantics then
+    silently merge the new debug-port launch into the still-exiting old
+    instance, so the new instance never actually listens on the port
+    (surfaced upstream as "Chrome did not start listening on
+    localhost:9222 within 10 seconds").
+
+    Best-effort: if the CIM query itself is unavailable, falls back to a
+    single fixed sleep matching the old behavior rather than spinning for
+    the full timeout on every call.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        pids = await asyncio.to_thread(_query_non_debug_chrome_pids)
+        if pids is None:
+            # Can't observe process state — fall back to the old fixed wait.
+            await asyncio.sleep(1.0)
+            return
+        if not pids:
+            return
+        await asyncio.sleep(poll_interval)
 
 
 def _find_bat_script() -> Optional[str]:
@@ -2033,21 +2075,29 @@ class BrowserTool(BaseTool):
                 "attach setup: Chrome/Edge already running, asking user to restart",
                 component="BrowserTool",
             )
+            # Title carries the actual consequence (tabs close) up front —
+            # a generic "High-risk operation" title let this warning read
+            # as an approve-access dialog and get clicked through in a few
+            # seconds without the body being read (observed live
+            # 2026-08-03: confirmed in ~5s twice in a row).
+            title = "⚠ This will CLOSE your browser — all open tabs will be lost"
             description = (
-                "Agent wants to ATTACH to your Chrome / Edge so it can use your\n"
-                "real cookies and login state.\n"
+                "HandQ wants to attach to your Chrome / Edge to use your\n"
+                "real cookies and login state — but it's not running with the\n"
+                "debug port this requires.\n"
                 "\n"
-                "Chrome IS running, but it was not started with the debug port\n"
-                "needed for this. To enable attach mode, HandQ needs to:\n"
-                "  • Close all Chrome / Edge windows\n"
-                "  • Restart Chrome with --remote-debugging-port=" + str(port) + "\n"
+                "Approving will:\n"
+                "  1. Close EVERY Chrome / Edge window right now (all tabs,\n"
+                "     all windows — not just one), losing any unsaved form\n"
+                "     input on those pages.\n"
+                "  2. Relaunch it with --remote-debugging-port=" + str(port) + ".\n"
                 "\n"
-                "⚠ Currently open tabs and unsaved form data WILL BE LOST.\n"
-                "  (Your bookmarks, history, and saved logins are unaffected.)\n"
+                "(Bookmarks, history, and saved logins are unaffected — this\n"
+                "only closes the running windows, not your saved data.)\n"
                 "\n"
-                "Approve = HandQ closes Chrome and restarts it.\n"
-                "Reject  = Cancel attach. Agent will fall back to launch_browser\n"
-                "             (independent profile; no access to your current Chrome state)."
+                "Reject = keep your browser open as-is. Agent falls back to\n"
+                "         browser_launch (a separate, independent profile —\n"
+                "         it will NOT see your current tabs or session)."
             )
             im = self.ctx.interaction_manager if self.ctx is not None else None
             if im is None:
@@ -2056,7 +2106,7 @@ class BrowserTool(BaseTool):
                     "(no UI bound). Close Chrome manually and retry, or call "
                     "browser_launch for an independent profile."
                 )
-            confirmation = await im.request_risk_confirmation(description)
+            confirmation = await im.request_risk_confirmation(description, title=title)
             if confirmation.is_rejected() or confirmation.has_new_message():
                 msg = (
                     confirmation.message
@@ -2073,7 +2123,7 @@ class BrowserTool(BaseTool):
                 component="BrowserTool",
             )
             _kill_chrome_processes()
-            await asyncio.sleep(1.0)  # let OS finalise process exits
+            await _wait_for_chrome_exit()
 
         # Either Chrome wasn't running, or we just killed it. Spawn bat.
         try:

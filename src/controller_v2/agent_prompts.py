@@ -57,7 +57,11 @@ def _generate_system_prompt(available_tool_names: Optional[Set[str]] = None) -> 
 
     if sys.platform == "win32":
         _verify_path = "`Test-Path`"
-        _cred_tools = "`ssh` / `remote_handq`"
+        # `remote_handq` used to be listed here too. It was retired in the v6
+        # Connect redesign (remote machines are now driven by the human operator
+        # through the Connect panel, not by the agent through an SSH-polling
+        # tool), so naming it would advertise a tool the agent cannot claim.
+        _cred_tools = "`ssh`"
     else:
         _verify_path = "`ls` or `test -f`"
         _cred_tools = "`ssh`"
@@ -82,8 +86,16 @@ take exact names only — no wildcards or family shorthand.
 A `*` family name above (e.g. `schedule_*`) is shorthand for a GROUP of
 individually-claimable tools — it is NOT itself a valid argument to claim_tool.
 Pass the exact tool name(s) you need; each tool's own description tells you how
-to use it and what it supersedes. After claiming a family that has a
-`<family>-workflow` skill, read_skill("<family>-workflow") for the recipe.
+to use it and what it supersedes. `read_skill("<family>-workflow")` both hands
+you the recipe AND activates the tools that recipe needs, so it is usually a
+better way to acquire a capability than claiming names one at a time.
+
+Reading ONE skill does not mean you are equipped. A task-specific skill
+activates only the few tools ITS OWN recipe uses; the capability-family skill
+(`desktop-workflow`, `browser-workflow`, ...) activates the full set. So before
+you conclude a step is impossible and substitute a different method for it,
+check whether the capability you are missing is one read_skill away — silently
+lacking `desktop_snapshot` looks exactly like "this GUI cannot be automated".
 
 A completion turn (see below) may ALSO include `claim_tool`/`release_tool`
 fields directly in its JSON — equivalent to calling the tools, for the case
@@ -240,7 +252,9 @@ when it matters.
     ).replace(
         "{_tool_menu}", _tool_menu
     ).replace(
-        "{_cred_tools}", "`ssh` / `remote_handq`" if sys.platform == "win32" else "`ssh`"
+        # Reuse the value computed above rather than re-deriving it — the two
+        # used to drift (this copy still named the retired `remote_handq`).
+        "{_cred_tools}", _cred_tools
     )
     # A completion JSON with claim fields omitted leaves a trailing comma on
     # the preceding line ("key_findings": [...],\n}); strip it so the example
@@ -257,48 +271,48 @@ AGENT_SYSTEM_PROMPT: str = _generate_system_prompt()
 
 
 COMPACT_CONVERSATION_PROMPT: str = """\
-You are compressing an AI agent's conversation history to free context-window space. \
-This summary is consumed ONLY by the agent itself to resume work — never shown to a \
+Your task is to create a detailed summary of the conversation so far, paying close \
+attention to the user's explicit requests and your previous actions.
+This summary should be thorough in capturing technical details, code patterns, and \
+architectural decisions that would be essential for continuing the work without losing \
+context. It is consumed ONLY by the agent itself to resume work — never shown to a \
 human — so favor completeness over brevity: a fact you drop cannot be recovered later, \
 while a few extra tokens cost nothing compared to re-discovering it.
 
-Below is a sequence of turns showing the agent's reasoning and tool call results.
+Before providing your final summary, wrap your analysis in <analysis> tags to organize \
+your thoughts: identify every discovery, every state-changing action, every failed \
+approach and why it failed, and what the current instruction still requires. Do this \
+BEFORE writing the summary — do not skip straight to the output.
 
-First, work through the trace inside <analysis> tags: identify every discovery, every \
-state-changing action, every failed approach and why it failed, and what the current \
-instruction still requires. Do this BEFORE writing the summary — do not skip straight \
-to the output.
+Then wrap the summary itself in <summary> tags, covering these nine sections:
 
-Then PRODUCE a concise narrative summary that preserves:
-1. Key discoveries — file paths, config values, function names, env vars — copied \
-VERBATIM, not paraphrased. A path or identifier that is reworded even slightly becomes \
-useless for a later exact-match lookup.
-2. Actions taken and their outcomes (especially writes/edits that changed state). For \
-any file that was created or modified, include its FULL path and the key code/config \
-lines VERBATIM — enough that the agent could recognize the change without re-reading \
-the file.
-3. Failed approaches and WHY they failed (critical — the agent must not retry them). \
-Keep the actual error text verbatim when it explains the failure.
-4. Current state of the work (what is done, what remains).
-5. Next Step — end with a line starting "Next Step:" that quotes VERBATIM the most \
-recent instruction or expected outcome this work is trying to satisfy. This is the \
-single most important line for the agent to pick up correctly after compaction.
+1. Primary Request and Intent — what the user asked for, and why.
+2. Key Technical Concepts — the technologies, protocols, and domain facts in play.
+3. Files and Code Sections — every file read or modified, with its FULL path, the key \
+code/config lines VERBATIM, and why that read/edit mattered. A path or identifier that \
+is reworded even slightly becomes useless for a later exact-match lookup.
+4. Errors and fixes — what failed, the actual error text VERBATIM, and what fixed it. \
+Give special weight to any feedback where the user explicitly asked you to do something \
+differently — record that correction and honor it going forward.
+5. Problem Solving — the reasoning that resolved (or is still resolving) the problem.
+6. All user messages — list EVERY message the user sent (excluding tool results) \
+VERBATIM. Any path, identifier, version string, or safety-relevant constraint the user \
+supplied MUST be reproduced character-for-character, never paraphrased. This section is \
+the record of what was actually asked; treat it as the highest-value content here.
+7. Pending Tasks — what remains, explicitly.
+8. Current Work — what was happening immediately before this summary, with file names \
+and code snippets.
+9. Optional Next Step — quote VERBATIM from the most recent exchange the instruction or \
+expected outcome this work is trying to satisfy, so there is no task-understanding drift.
 
 COMPRESSION RULES:
 - MERGE repeated reads/polls of the same target → one mention with final state
 - DROP verbose intermediate output that produced no lasting artefact
 - KEEP all discovered file paths, function signatures, and config values VERBATIM
 - KEEP error messages that explain WHY an approach failed VERBATIM
+- KEEP every user message VERBATIM (section 6) — this rule overrides all others
 - CONDENSE verbose command output → extract only key facts
-- Within the token budget below, favor completeness over brevity: when in doubt
-  about whether a detail matters, keep it rather than cut it
-
-FORMAT — an <analysis> block, then a numbered narrative in past tense, then the
-Next Step line. Target ≤800 tokens for the narrative + Next Step (the
-<analysis> block is scratch work and is not counted against this budget).
-  1. <what was done and what was learned>
-  2. ...
-Next Step: <verbatim quote of the current instruction/expected outcome>
+- When in doubt about whether a detail matters, keep it rather than cut it
 
 Do NOT output JSON — plain text only.
 

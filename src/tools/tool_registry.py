@@ -22,6 +22,7 @@ from .web_search_tool import WebSearchTool
 from .email_tool import EmailTool
 from .teams_tool import TeamsTool
 from .ask_human_tool import AskHumanTool
+from .notify_user_tool import NotifyUserTool
 from .wait_interval_tool import WaitIntervalTool
 from .skill_tool import ReadSkillTool
 from .spawn_agent_tool import SpawnAgentTool
@@ -100,6 +101,10 @@ class ToolRegistry:
     TEAMS = "teams"
     ASK_HUMAN = "ask_human"
     WAIT_INTERVAL = "wait_interval"
+    # Fire-and-forget agent→user message. Distinct from ASK_HUMAN, which
+    # BLOCKS awaiting a typed reply: "stop clicking that button" must not
+    # stall the work it is trying to protect.
+    NOTIFY_USER = "notify_user"
     READ_SKILL = "read_skill"
     SPAWN_AGENT = "spawn_agent"
     FAN_OUT_AGENTS = "fan_out_agents"
@@ -721,6 +726,38 @@ EXAMPLES
                             "terminates the background task."
                         )
                     },
+                    "success_pattern": {
+                        "type": "string",
+                        "description": (
+                            "Regex that MUST appear in stdout/stderr for this call to "
+                            "count as successful. Set it whenever the command's exit code "
+                            "is not the thing you actually care about — which is almost "
+                            "always true when you run a script you just wrote. "
+                            "exit_code only tells you the interpreter ran; it says nothing "
+                            "about whether your script achieved its goal, and a script that "
+                            "prints 'CLICKED' unconditionally after a DOM call will report "
+                            "exit_code=0 while nothing happened. Declaring the oracle here "
+                            "makes the TOOL decide instead of you: if the pattern does not "
+                            "match, the call comes back success=false. "
+                            "Example: running a UI-automation script that must reach a "
+                            "dialog → success_pattern=\"DIALOG_OPEN\"; a flash script → "
+                            "success_pattern=\"Status: SUCCESS\"."
+                        )
+                    },
+                    "failure_pattern": {
+                        "type": "string",
+                        "description": (
+                            "Regex that, if it appears in stdout/stderr, marks this call as "
+                            "failed even when the exit code is 0. Checked BEFORE "
+                            "success_pattern. Use it for the specific bad outcome you are "
+                            "trying to avoid, e.g. failure_pattern=\"NOT_FOUND|NO_DIALOG\" "
+                            "or \"Switch failed from all connections\". "
+                            "Independent of the automatic scan: the tool already surfaces "
+                            "obvious self-reported failures in `reported_failures` for every "
+                            "call, but that is advisory only — a pattern you declare here is "
+                            "authoritative and flips success."
+                        )
+                    },
                     "concurrent_safe": {
                         "type": "boolean",
                         "description": (
@@ -1126,57 +1163,12 @@ pooling behavior, and shell-compatibility notes."""
             on_demand=True,
         )
 
-        # Register REMOTE_HANDQ tool — delegate tasks to a remote Linux HandQ
-        # agent over SSH. Windows-only: the Windows GUI delegates complex work
-        # to Linux agents; Linux HandQ doesn't delegate to itself.
-        if _IS_WINDOWS:
-            from .remote_handq_tool import RemoteHandQTool
-            _remote_handq_usage_guide = """\
-WHEN TO USE
-  - The remote task requires REASONING or PLANNING — not just a known command.
-  - You cannot write out the full solution as a bash script in advance.
-  - Complex multi-step work: "analyze this code", "fix all test failures",
-    "investigate and resolve the build error".
-  - Fire-and-forget: submit a goal and check back later.
-
-WHEN NOT TO USE (use ssh tool instead)
-  - You know the exact command(s) to run → ssh exec / run_script.
-  - Single command, file copy, known script → ssh tool.
-  - Real-time interactive session → session tool.
-  - Never combine ["ssh", "remote_handq"] in one step.
-
-KEY DISTINCTION: ssh vs remote_handq
-  - ssh tool:        YOU drive the remote work step by step (intelligence here)
-  - remote_handq:    REMOTE AGENT drives autonomously (intelligence there)
-  - Rule of thumb:   "Can I write the bash commands?" → ssh.
-                     "I need an agent to figure it out?" → remote_handq.
-
-PREREQUISITES
-  Remote Linux host must have HandQ installed by the user: copy the built dist
-  package (handq_linux.dist/ + handq_config.yaml) and run handq_setup.sh to
-  install the `handq_linux` command, or drop a source checkout (handq_linux.py
-  next to src/) in ~/handq/. No service/systemd needed. submit_goal auto-wakes
-  the resident daemon (handq_linux --_daemon) if it is not already running, but
-  cannot deploy the files.
-
-ACTIONS: submit_goal | get_status | get_result | send_message | new_session |
-  interrupt | exit_handq
-
-Read the 'remote-handq-workflow' skill for the recommended submit/poll/fetch
-sequence and how to handle pending confirmations."""
-            cls._tools[cls.REMOTE_HANDQ] = ToolMetadata(
-                name=cls.REMOTE_HANDQ,
-                description=(
-                    "Delegate a task to a remote Linux HandQ agent over SSH. "
-                    "Manages the full lifecycle: submit goal, monitor progress, "
-                    "collect result. The remote agent plans and executes independently. "
-                    "SECURITY: credentials read from local file only."
-                ),
-                usage_guide=_remote_handq_usage_guide,
-                parameter_schema=RemoteHandQTool().parameter_schema,
-                tool_class=RemoteHandQTool,
-                on_demand=True,
-            )
+        # ─── REMOTE_HANDQ tool — DISABLED (v6 Connect redesign, 2026-08-08) ────
+        # This tool has been superseded by the Connect panel's direct control
+        # channel. The agent no longer drives remote machines through this SSH-
+        # polling tool; all remote session management is done by the human
+        # operator through the Connect panel UI. The file (remote_handq_tool.py)
+        # is kept for its install/deploy helpers which the Connect module reuses.
 
         # Register LIVE_SHELL tool family — interactive subprocess sessions
         # (adb shell, Python REPL, telnet, etc.). Windows-only: the
@@ -1638,7 +1630,7 @@ EXAMPLES
                 DesktopFindElementTool, DesktopFindAndClickTool,
                 DesktopClickAtTool, DesktopTypeTextTool, DesktopDragTool,
                 DesktopScrollTool, DesktopHotkeyTool, DesktopKeyPressTool,
-                DesktopRunUiaTool,
+                DesktopRunUiaTool, DesktopFillFileDialogTool,
             )
             _desktop_props = DesktopTool.parameter_schema.get("properties", {})
             # Safety facts a caller of these specific actions needs even
@@ -1668,7 +1660,7 @@ EXAMPLES
                     "Capture the active window or full screen as PNG. Reserve "
                     "for cases where you need actual pixels — snapshot covers "
                     "'what's on screen' faster.",
-                    [], ["region", "monitor", "hwnd", "with_ocr", "path"]),
+                    [], ["region", "monitor", "hwnd", "with_ocr", "save_path"]),
                 ("desktop_find_element", DesktopFindElementTool,
                     "Locate a UI element by text or visual descriptor via OCR. "
                     "Slower than snapshot (~2.8 s) — try snapshot first.",
@@ -1715,6 +1707,18 @@ EXAMPLES
                     "UIA pattern (confirmed via desktop_snapshot) and you need "
                     "a SPECIFIC one, not click_at's automatic fallthrough.",
                     ["pattern"], ["x", "y", "text"]),
+                ("desktop_fill_file_dialog", DesktopFillFileDialogTool,
+                    "Detect and drive a NATIVE Windows file-open/save dialog "
+                    "(the #32770 window a BROWSE / Open / Save button opens in "
+                    "Electron apps like xPCAT / QPM). This is the ONLY way to "
+                    "reach that dialog: it is NOT in the Chromium DOM, so CDP "
+                    "file-chooser interception never fires for it and clicking "
+                    "the DOM button over CDP just leaves an invisible dialog "
+                    "open. Call with NO path to detect whether a dialog is open "
+                    "(the perception CDP cannot give you); call WITH path to "
+                    "type the full file path and confirm. Works without a "
+                    "foreground window and without a screenshot.",
+                    [], ["path", "submit", "dialog_hwnd"]),
             ):
                 _register_atomic(
                     _name, tool_class=_cls, description=_desc,
@@ -1726,7 +1730,7 @@ EXAMPLES
                             "desktop_click_at", "desktop_type_text",
                             "desktop_find_and_click", "desktop_hotkey",
                             "desktop_key_press", "desktop_drag", "desktop_scroll",
-                            "desktop_run_uia",
+                            "desktop_run_uia", "desktop_fill_file_dialog",
                         ) else ""
                     ),
                 )
@@ -1879,22 +1883,33 @@ fallback routes, and the id-discovery-before-send pattern.""",
                 on_demand=True,
             )
 
-        # Register ASK_HUMAN tool. Windows-only — relies on the GUI bridge to
-        # render the modal and capture the reply. Linux/CLI runtimes use the
-        # IM's stderr+stdin fallback, but the official surface is the Electron
-        # UI. on_demand=True so it only enters the LLM tool list once the
-        # agent claims it. Toggleable via the tool_ask_human interaction switch.
-        if _IS_WINDOWS:
-            cls._tools[cls.ASK_HUMAN] = ToolMetadata(
-                name=cls.ASK_HUMAN,
-                description=(
-                    "Ask the user a single clarifying question via a modal "
-                    "dialog and return their text reply. Use ONLY when the "
-                    "task literally cannot proceed without information you "
-                    "cannot derive from context — see usage_guide for the "
-                    "restraint contract."
-                ),
-                usage_guide="""\
+        # Register ASK_HUMAN tool. Cross-platform and always available
+        # (on_demand=False, like read/write/todo_write) — NOT claim-gated,
+        # because the agent should never have to think about claiming it
+        # before it can ask a clarifying question.
+        #
+        # Registered on Linux too (previously Windows-only) because a Linux
+        # daemon session driven remotely by a real human on the Windows
+        # Electron app (Connect-panel remote control, src/remote_control/)
+        # needs it: Linux itself has no GUI, but the connected Windows
+        # controller does, and NetworkUIDelegate.request_user_form already
+        # round-trips the question to the controller's local UI with no
+        # extra wiring. The Linux daemon's OWN local file-IPC session never
+        # wires a UI delegate capable of answering request_user_form —
+        # InteractionManager._await_delegate already degrades that case to
+        # the {} default with no error, so no extra code is needed for it.
+        cls._tools[cls.ASK_HUMAN] = ToolMetadata(
+            name=cls.ASK_HUMAN,
+            description=(
+                "Ask the user a question via a modal dialog — a single "
+                "markdown question, optionally with structured fields "
+                "(text/textarea/radio/checkbox) for multiple distinct "
+                "sub-questions in one call — and return their reply. "
+                "Use ONLY when the task literally cannot proceed without "
+                "information you cannot derive from context — see "
+                "usage_guide for the restraint contract."
+            ),
+            usage_guide="""\
 RESTRAINT CONTRACT (read before EVERY call)
 
 WHEN TO USE
@@ -1909,6 +1924,11 @@ WHEN TO USE
         is not in any artifact you can read.
       • A destructive operation needs a final go-ahead and there is no
         captured prior consent in this session.
+      • You found a SPECIFIC point where continuing to execute literally
+        diverges from what the user actually wants, AND the mistake is
+        expensive to discover later — it would only surface after a
+        long-running step finishes, or after other work is already built
+        on top of it.
 
 WHEN NOT TO USE
   - To CONFIRM a choice the user already made — they made it; honour it.
@@ -1920,31 +1940,56 @@ WHEN NOT TO USE
   - To re-ask after the user dismissed the dialog — they declined; pick
     a default and continue.
 
-PHRASING RULES
-  - Pass exactly the literal sentence the user will read.
-  - One short sentence. Answerable in one short sentence.
-  - No "I need to ask…", no chain-of-thought, no options list, no
-    multi-part questions.
-  - Never include speculation, justification, or your reasoning — they
-    interrupt the user too.
+PHRASING
+  - 'question' is markdown (headings, lists, bold, code all render) and is
+    the shared framing/context — no "I need to ask:", no chain-of-thought.
+  - If you have MULTIPLE distinct questions, don't cram them into
+    'question' as prose the user has to parse and answer in one line.
+    Use 'fields' instead: one entry per question, each rendered as its own
+    labeled control. The user answers each one directly; you get back a
+    {field_id: value} object instead of having to parse free text.
+  - Only fall back to a single plain question (omit 'fields' entirely)
+    when there really is exactly one thing to ask and a free-text answer
+    is the natural shape for it.
+  - When the space of valid answers is enumerable, offer it as
+    radio/checkbox with concrete named options rather than an open
+    text box — a user who can't articulate what they want can still
+    recognize the right answer when it's put in front of them as a choice.
+
+FIELDS
+  - Each field: {id, label, type: 'text'|'textarea'|'radio'|'checkbox',
+    options (required for radio/checkbox), placeholder (optional)}.
+    'text'/'textarea' are free text; 'radio' picks exactly one option;
+    'checkbox' returns an array of the selected option strings.
+  - Never include speculation, justification, or your own reasoning in
+    any question or label — it interrupts the user too.
 
 OUTPUT
-  On success: ToolResult.output = the user's text reply (string).
+  On success: ToolResult.output is the user's answer — a plain string when
+  you asked a single question with no 'fields', or a {field_id: value}
+  object when you passed 'fields'.
   On user dismiss / empty reply: ToolResult.success=False with an error
   asking you to proceed with a default. DO NOT loop or re-ask.
 
 EXAMPLES
-  GOOD: {"question": "Which environment should I deploy to: staging or prod?"}
-  GOOD: {"question": "What's the team's distribution address for the report?"}
+  GOOD (single question):
+    {"question": "Which environment should I deploy to: staging or prod?"}
+  GOOD (several distinct questions, one call):
+    {"question": "I need a few details to finish the migration plan.",
+     "fields": [
+       {"id": "env", "label": "Target environment", "type": "radio",
+        "options": ["staging", "prod"]},
+       {"id": "window", "label": "Preferred maintenance window",
+        "type": "text", "placeholder": "e.g. Sat 02:00-04:00 UTC"}
+     ]}
   BAD:  {"question": "Should I name this file foo.py or bar.py?"}        ← decide yourself
-  BAD:  {"question": "I'm going to add error handling, OK?"}              ← do it
-  BAD:  {"question": "Let me know if you want me to continue."}           ← never
   BAD:  {"question": "The repo has X and Y. Should I use X or Y? Also,
-                       what colour should the header be?"}                ← multi-part""",
-                parameter_schema=AskHumanTool.parameter_schema,
-                tool_class=AskHumanTool,
-                on_demand=True,
-            )
+                       what colour should the header be? And should I
+                       deploy to staging or prod?"}                       ← use 'fields', not run-on prose""",
+            parameter_schema=AskHumanTool.parameter_schema,
+            tool_class=AskHumanTool,
+            on_demand=False,
+        )
 
         # Register WAIT_INTERVAL tool — cross-platform, always available.
         # Lightweight async sleep for monitoring loops. The agent uses this
@@ -1994,10 +2039,78 @@ Choosing the interval:
                             "Interruptible by user messages."
                         ),
                     },
+                    "user_message": {
+                        "type": "string",
+                        "description": (
+                            "REQUIRED whenever you are waiting on something the USER "
+                            "must do (press a button, replug a cable, stop doing "
+                            "something that is interfering). Delivered to them as a "
+                            "prominent bubble before the wait starts. "
+                            "Waiting silently for a human action they were never told "
+                            "about is an infinite loop with extra steps: the "
+                            "2026-08-03 run diagnosed that the user's own button "
+                            "presses were breaking the task, wrote the warning to a "
+                            "stdout nobody read, then called wait_interval(60) and "
+                            "waited for a change that could not come. "
+                            "Omit it for ordinary machine polling (download "
+                            "progress, build, install)."
+                        ),
+                    },
                 },
                 "required": [],
             },
             tool_class=WaitIntervalTool,
+        )
+
+        cls._tools[cls.NOTIFY_USER] = ToolMetadata(
+            name=cls.NOTIFY_USER,
+            description=(
+                "Send the user a prominent, one-way message right now, without "
+                "blocking or waiting for a reply. Your only way to reach them "
+                "mid-task."
+            ),
+            usage_guide="""\
+When to Use (all three are situations where staying silent loses the task):
+  1. The USER is doing something that is breaking your work. Say what to stop,
+     and for how long. They cannot see what you see.
+  2. An instruction they gave is wrong or impossible in this environment
+     (a control that does not exist, a value that is never auto-filled, a
+     GUI path this session physically cannot drive). Tell them, then take the
+     route that does work.
+  3. You need a physical action only a human can perform. Name the exact
+     action, then VERIFY the resulting world state yourself — a delivered
+     message is not a performed action.
+
+When NOT to Use:
+  - Progress narration. The activity trace already shows your tool calls.
+  - Anything you need an ANSWER to before continuing — that is a blocking
+     confirmation/question, not this.
+
+Delivery is one-way. success=true means the bubble was rendered, NOT that the
+user read it, agreed, or acted. Never mark a todo complete on the strength of
+having sent a message.""",
+            parameter_schema={
+                "type": "object",
+                "properties": {
+                    "message": {
+                        "type": "string",
+                        "description": (
+                            "What to tell the user, in their language. Be specific "
+                            "and actionable — name the exact button, file, or value."
+                        ),
+                    },
+                    "urgent": {
+                        "type": "boolean",
+                        "description": (
+                            "True adds a warning marker. Reserve for cases where "
+                            "the user acting within the next minute changes the "
+                            "outcome. Default: false."
+                        ),
+                    },
+                },
+                "required": ["message"],
+            },
+            tool_class=NotifyUserTool,
         )
 
         cls._tools[cls.SPAWN_AGENT] = ToolMetadata(
@@ -2146,8 +2259,15 @@ When NOT to Use:
 
 How:
   - Pass the FULL list each call; it replaces the stored list (edit by
-    re-emitting). Each item is {content, status} with status ∈
-    pending|in_progress|completed. Keep exactly ONE item in_progress at a time.
+    re-emitting). Each item is {content, status, verify, evidence} with
+    status ∈ pending|in_progress|completed. Keep exactly ONE item in_progress
+    at a time.
+  - `verify` = how you will KNOW the step worked, decided BEFORE you act.
+    `evidence` = what you actually observed. **An item cannot be flipped to
+    completed without `evidence` — the call is rejected.** That is deliberate:
+    "the tool returned success" and "my script printed CLICKED" are not
+    evidence that the goal was met, and a step closed on that basis is a step
+    you will have to redo.
   - This is YOUR plan, not a contract — revise it freely as you learn.""",
             parameter_schema={
                 "type": "object",
@@ -2156,7 +2276,8 @@ How:
                         "type": "array",
                         "description": (
                             "Your full plan, re-emitted each call. One item "
-                            "in_progress at a time; flip to completed as you finish."
+                            "in_progress at a time. Completing an item requires "
+                            "`evidence`."
                         ),
                         "items": {
                             "type": "object",
@@ -2166,6 +2287,27 @@ How:
                                     "type": "string",
                                     "enum": ["pending", "in_progress", "completed"],
                                     "description": "pending | in_progress | completed",
+                                },
+                                "verify": {
+                                    "type": "string",
+                                    "description": (
+                                        "The observable that will prove this step "
+                                        "worked, chosen before acting — e.g. "
+                                        "\"device list shows QDLoader 9008 with "
+                                        "Status: OK\", \"activity log contains "
+                                        "'Status: SUCCESS'\", \"re-reading the "
+                                        "field returns 1\"."
+                                    ),
+                                },
+                                "evidence": {
+                                    "type": "string",
+                                    "description": (
+                                        "REQUIRED to complete an item. The value "
+                                        "you actually observed, quoted. A tool "
+                                        "returning success, a command being sent, "
+                                        "or a success string your own script "
+                                        "printed do NOT count."
+                                    ),
                                 },
                             },
                             "required": ["content", "status"],
@@ -2239,19 +2381,28 @@ How:
         )
 
         # ── Agent-facing scheduling tools (Claude Code parity) ───────────────
-        # Cross-platform, on_demand: only enter the LLM tool schema once the
-        # agent claims them. The three cron tools wrap the process-global
-        # Scheduler (ctx.scheduler); schedule_wakeup is a session-scoped
-        # self-paced loop primitive that re-queues onto the current TaskChannel.
-        cls._tools[cls.SCHEDULE_CREATE] = ToolMetadata(
-            name=cls.SCHEDULE_CREATE,
-            description=(
-                "Schedule a prompt to fire automatically on a cadence (like a "
-                "cron job). Each fire runs in a fresh scheduled session. Use for "
-                "recurring or future one-shot tasks ('every morning summarise "
-                "PRs', 'in 2 hours check the build')."
-            ),
-            usage_guide="""\
+        # schedule_create/list/delete wrap the process-global Scheduler reached
+        # via ``ctx.scheduler``, which ONLY the Electron bridge installs
+        # (bridge_main wires stdio_bridge.scheduler; flow_controller reads it
+        # back). On Linux ``ctx.scheduler`` is always None, so those three can
+        # only ever return "scheduler unavailable" — advertising them in the
+        # claimable menu would break the menu's own promise that it never lists a
+        # tool the agent can't use. So they are Windows-only.
+        #
+        # schedule_wakeup is DIFFERENT and stays cross-platform: it is a
+        # session-scoped self-paced loop primitive that re-queues onto the
+        # current TaskChannel (ctx.schedule_wakeup), needs no Scheduler, and
+        # works identically on a Linux被控 session.
+        if _IS_WINDOWS:
+            cls._tools[cls.SCHEDULE_CREATE] = ToolMetadata(
+                name=cls.SCHEDULE_CREATE,
+                description=(
+                    "Schedule a prompt to fire automatically on a cadence (like a "
+                    "cron job). Each fire runs in a fresh scheduled session. Use for "
+                    "recurring or future one-shot tasks ('every morning summarise "
+                    "PRs', 'in 2 hours check the build')."
+                ),
+                usage_guide="""\
 When to Use:
   - The user wants something run repeatedly on a clock ("every weekday at 9am")
     or once at a future time ("remind me in 2 hours", "tomorrow morning run X").
@@ -2274,84 +2425,84 @@ Prompt phrasing:
 
 Not for live watching: this is polling on a clock. To react to a process/file
 changing in real time, stay in-session and use wait_interval loops instead.""",
-            parameter_schema={
-                "type": "object",
-                "properties": {
-                    "prompt": {
-                        "type": "string",
-                        "description": (
-                            "The prompt to fire on the cadence, phrased as an "
-                            "instruction to do NOW (no relative-time words)."
-                        ),
+                parameter_schema={
+                    "type": "object",
+                    "properties": {
+                        "prompt": {
+                            "type": "string",
+                            "description": (
+                                "The prompt to fire on the cadence, phrased as an "
+                                "instruction to do NOW (no relative-time words)."
+                            ),
+                        },
+                        "schedule": {
+                            "type": "string",
+                            "description": (
+                                "Cadence: friendly ('every 5 minutes', 'daily 09:00', "
+                                "'once in 10 minutes') or cron ('*/5 * * * *', "
+                                "'0 9 * * 1-5'). Omit to infer from the prompt."
+                            ),
+                        },
+                        "name": {
+                            "type": "string",
+                            "description": "Optional label shown in the UI.",
+                        },
+                        "durable": {
+                            "type": "boolean",
+                            "description": (
+                                "False (default)=session-only; True=persist across "
+                                "restarts. Only True when the user explicitly asks."
+                            ),
+                        },
                     },
-                    "schedule": {
-                        "type": "string",
-                        "description": (
-                            "Cadence: friendly ('every 5 minutes', 'daily 09:00', "
-                            "'once in 10 minutes') or cron ('*/5 * * * *', "
-                            "'0 9 * * 1-5'). Omit to infer from the prompt."
-                        ),
-                    },
-                    "name": {
-                        "type": "string",
-                        "description": "Optional label shown in the UI.",
-                    },
-                    "durable": {
-                        "type": "boolean",
-                        "description": (
-                            "False (default)=session-only; True=persist across "
-                            "restarts. Only True when the user explicitly asks."
-                        ),
-                    },
+                    "required": ["prompt"],
                 },
-                "required": ["prompt"],
-            },
-            tool_class=ScheduleCreateTool,
-            on_demand=True,
-        )
+                tool_class=ScheduleCreateTool,
+                on_demand=True,
+            )
 
-        cls._tools[cls.SCHEDULE_LIST] = ToolMetadata(
-            name=cls.SCHEDULE_LIST,
-            description=(
-                "List all scheduled tasks (both persistent and session-only), "
-                "with their id, cadence, enabled flag, and last run status."
-            ),
-            usage_guide="""\
+            cls._tools[cls.SCHEDULE_LIST] = ToolMetadata(
+                name=cls.SCHEDULE_LIST,
+                description=(
+                    "List all scheduled tasks (both persistent and session-only), "
+                    "with their id, cadence, enabled flag, and last run status."
+                ),
+                usage_guide="""\
 When to Use:
   - Before deleting a task (you need its id).
   - To answer "what do I have scheduled?" or confirm a task was created.
 
 Output: {count, tasks:[{id, name, schedule, enabled, durable, next_run_at,
 last_status, run_count}]}.""",
-            parameter_schema={"type": "object", "properties": {}, "required": []},
-            tool_class=ScheduleListTool,
-            on_demand=True,
-        )
+                parameter_schema={"type": "object", "properties": {}, "required": []},
+                tool_class=ScheduleListTool,
+                on_demand=True,
+            )
 
-        cls._tools[cls.SCHEDULE_DELETE] = ToolMetadata(
-            name=cls.SCHEDULE_DELETE,
-            description=(
-                "Delete a scheduled task by its id (get ids from schedule_list)."
-            ),
-            usage_guide="""\
+            cls._tools[cls.SCHEDULE_DELETE] = ToolMetadata(
+                name=cls.SCHEDULE_DELETE,
+                description=(
+                    "Delete a scheduled task by its id (get ids from schedule_list)."
+                ),
+                usage_guide="""\
 When to Use:
   - The user wants to cancel/remove a scheduled task.
 
 How:
   - Call schedule_list first to get the id, then schedule_delete(task_id=...).""",
-            parameter_schema={
-                "type": "object",
-                "properties": {
-                    "task_id": {
-                        "type": "string",
-                        "description": "Id of the task to delete (from schedule_list).",
+                parameter_schema={
+                    "type": "object",
+                    "properties": {
+                        "task_id": {
+                            "type": "string",
+                            "description": "Id of the task to delete (from schedule_list).",
+                        },
                     },
+                    "required": ["task_id"],
                 },
-                "required": ["task_id"],
-            },
-            tool_class=ScheduleDeleteTool,
-            on_demand=True,
-        )
+                tool_class=ScheduleDeleteTool,
+                on_demand=True,
+            )
 
         cls._tools[cls.SCHEDULE_WAKEUP] = ToolMetadata(
             name=cls.SCHEDULE_WAKEUP,
@@ -2430,7 +2581,7 @@ Ending the loop: simply DON'T call schedule_wakeup on a turn — the loop ends."
     # never here — keeping the per-turn prompt small.
     _MENU_FAMILY_ORDER: List[str] = [
         "browser_", "desktop_", "ssh", "live_shell_", "email", "teams",
-        "web_search", "ask_human", "remote_handq", "schedule_",
+        "web_search", "schedule_",
     ]
     _MENU_FAMILY_LABELS: Dict[str, str] = {
         "browser_":     "browser_*     Web pages + any CDP-debuggable app (Chromium DOM automation)",
@@ -2440,9 +2591,13 @@ Ending the loop: simply DON'T call schedule_wakeup on a turn — the loop ends."
         "email":        "email         Outlook mail (local MAPI)",
         "teams":        "teams         Microsoft Teams (Graph API)",
         "web_search":   "web_search    Internal enterprise search (Confluence, Jira, SharePoint, Orbit)",
-        "ask_human":    "ask_human     Ask the user ONE clarifying question (modal; use sparingly)",
-        "remote_handq": "remote_handq  Delegate a task to a remote Linux HandQ daemon",
-        "schedule_":    "schedule_*    Cron-style scheduling (schedule_create/list/delete) + schedule_wakeup (self-paced loop)",
+        "schedule_":    (
+            "schedule_*    Cron-style scheduling (schedule_create/list/delete) "
+            "+ schedule_wakeup (self-paced loop)"
+            if _IS_WINDOWS else
+            "schedule_wakeup  Self-paced loop: end this turn, resume this session "
+            "after a delay (no cron here)"
+        ),
     }
 
     # Reverse-push map: which BUNDLED ``*-workflow`` skill teaches each tool
@@ -2465,7 +2620,6 @@ Ending the loop: simply DON'T call schedule_wakeup on a turn — the loop ends."
         "email":        "email-workflow",
         "teams":        "teams-workflow",
         "web_search":   "web-search-workflow",
-        "remote_handq": "remote-handq-workflow",
     }
 
     @classmethod

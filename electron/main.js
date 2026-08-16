@@ -14,7 +14,7 @@
 
 'use strict';
 
-const { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, globalShortcut, Notification, dialog, shell, screen, desktopCapturer, clipboard } = require('electron');
+const { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, nativeTheme, globalShortcut, Notification, dialog, shell, screen, desktopCapturer, clipboard } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -189,13 +189,25 @@ function logLineDebug(component, msg, extra) {
 // Strip API_KEY (and the legacy api_key) out of any payload we log
 // (porting_design.md §(2.8) lets the renderer write the key directly into
 // YAML; we must not echo it to disk).
+//
+// The same applies to the remote-control bearer token and the
+// `handq://host:port/token` pairing string that embeds it: those flow through
+// the remote_pair / remote_probe / remote_control_status envelopes, which are
+// logged like any other. Anyone holding a machine's token can open agent
+// sessions on it, so it must never reach handq-main.log. `capability` is a
+// per-session authorization value with the same property.
+const REDACT_KEYS = new Set([
+    'API_KEY', 'api_key', 'api_key_env',
+    'token', 'pairing', 'capability', 'remote_control_token',
+]);
+
 function redactApiKey(payload) {
     if (!payload || typeof payload !== 'object') return payload;
     if (Array.isArray(payload)) return payload.map(redactApiKey);
     const out = {};
     for (const k of Object.keys(payload)) {
         const v = payload[k];
-        if (k === 'API_KEY' || k === 'api_key' || k === 'api_key_env') {
+        if (REDACT_KEYS.has(k)) {
             out[k] = (v === undefined || v === null || v === '') ? v : '<redacted>';
         } else if (v && typeof v === 'object') {
             out[k] = redactApiKey(v);
@@ -212,6 +224,23 @@ let mainWindow = null;
 let tray = null;
 let isQuitting = false;
 let pythonChild = null;
+
+// Content-protection (WDA_EXCLUDEFROMCAPTURE) state. Hoisted to module scope so
+// both the Ctrl+Shift+P manual toggle AND the renderer-driven glass-mode switch
+// (glass:setContentProtection IPC) share one source of truth. See the win32
+// block in createWindow() for the full rationale. win32-only in effect —
+// setContentProtection is a no-op elsewhere, but we still track the flag so the
+// two callers agree. Starts ON (needed by the WebGL glass boot; veil turns it
+// off once the renderer reports its mode).
+let contentProtected = true;
+
+// Apply the current contentProtected flag to the live window. Safe to call
+// before mainWindow exists (no-op) and wrapped since setContentProtection can
+// throw on unsupported platforms/builds.
+function applyContentProtection() {
+    if (!mainWindow) return;
+    try { mainWindow.setContentProtection(contentProtected); } catch (_) { /* ignore */ }
+}
 let _trayFlashTimer = null;
 let stdoutReader = null;
 let isShuttingDown = false;
@@ -270,8 +299,12 @@ function showTakeoverOverlay(sessionId) {
     takeoverOverlayController.show(sessionId);
 }
 
-function hideTakeoverOverlay() {
-    takeoverOverlayController.hide();
+function hideTakeoverOverlay(sessionId) {
+    // sessionId omitted (bridge exit / app quit) forces teardown regardless
+    // of which session is currently bound. sessionId present is checked
+    // against the controller's live binding — a stale/superseded session's
+    // `ended` must not tear down a newer session's still-active overlay.
+    takeoverOverlayController.hide(sessionId);
 }
 
 // --- global hotkey (toggle window visibility) --------------------------------
@@ -364,7 +397,7 @@ function notifyConfirmationNeeded(evt) {
         body  = String((evt && evt.prompt) || 'Enter a value to continue.');
     } else if (kind === 'ask_human') {
         title = '❓ HandQ — agent question';
-        body  = String((evt && evt.prompt) || 'The agent has a question for you.');
+        body  = String((evt && (evt.question || evt.prompt)) || 'The agent has a question for you.');
     } else if (kind === 'risk_confirmation') {
         // evt.title may be an override sent by the bridge for a specific
         // sub-flow (e.g. browser login). Fall back to the generic title
@@ -523,9 +556,30 @@ function spawnBridge() {
                             { err: err && err.message });
                 }
             } else if (evt.kind === 'desktop_takeover_ended') {
-                try { hideTakeoverOverlay(); }
+                try { hideTakeoverOverlay(evt.session_id); }
                 catch (err) {
                     logLine('OVERLAY', 'hideTakeoverOverlay threw',
+                            { err: err && err.message });
+                }
+            } else if (evt.kind === 'served_desktop_takeover_started') {
+                // A REMOTE operator's agent is driving this machine's desktop.
+                // Same overlay + same Ctrl+Shift+C revoke as a local takeover:
+                // the person sitting here must be able to see it and stop it.
+                // The id arrives as served_session_id, never session_id — the
+                // renderer mounts a tab for any unrecognised session_id, so a
+                // served rc- session must not travel under that key (see
+                // stdio_bridge._ServedDesktopNotifier). The overlay treats the
+                // id as opaque and stamps it onto the revoke envelope, which
+                // reaches the served session's real DesktopState.
+                try { showTakeoverOverlay(evt.served_session_id); }
+                catch (err) {
+                    logLine('OVERLAY', 'showTakeoverOverlay (served) threw',
+                            { err: err && err.message });
+                }
+            } else if (evt.kind === 'served_desktop_takeover_ended') {
+                try { hideTakeoverOverlay(evt.served_session_id); }
+                catch (err) {
+                    logLine('OVERLAY', 'hideTakeoverOverlay (served) threw',
                             { err: err && err.message });
                 }
             }
@@ -743,18 +797,26 @@ function seedUserConfigForVersion() {
         fs.mkdirSync(userCfgDir, { recursive: true });
 
         if (userCfgExists) {
-            const ts = new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 14);
-            const backup = `${userCfgPath}.prev-${previousVersion || 'unknown'}-${ts}`;
-            try {
-                fs.renameSync(userCfgPath, backup);
-            } catch (e) {
-                try {
-                    fs.copyFileSync(userCfgPath, backup);
-                    fs.unlinkSync(userCfgPath);
-                } catch (_) {}
-            }
-            logLine('MAIN', 'seedUserConfigForVersion: backed up old yaml',
-                    { backup, prevVersion: previousVersion });
+            // Upgrade, not first run — leave the file alone. Copying the shipped
+            // template over it is how 1.5.5→1.6.0 wiped llm.API_KEY out of the
+            // user's config: every value they own that the template ships blank
+            // was replaced by the blank.
+            //
+            // Migration belongs to bridge_main._merge_user_config_with_seed(),
+            // which walks _PRESERVE_PATHS (llm.API_KEY, session,
+            // interaction_switches, …), drops retired keys, writes atomically and
+            // keeps a .bak. A copy here didn't just duplicate that job, it
+            // DISARMED it: that merge only runs while the user yaml's `version:`
+            // is older than the shipped one, and a freshly-copied template
+            // already reports the shipped version.
+            //
+            // Only the stamp moves, so this branch is a no-op on the next boot.
+            fs.writeFileSync(stampPath, currentVersion, 'utf8');
+            logLine('MAIN',
+                    'seedUserConfigForVersion: upgrade — leaving the user yaml to the bridge merge',
+                    { userCfgPath, prevVersion: previousVersion,
+                      version: currentVersion });
+            return;
         }
 
         fs.copyFileSync(bundled, userCfgPath);
@@ -1081,6 +1143,40 @@ function createWindow() {
     // No native menu bar (Alt won't reveal it either).
     mainWindow.setMenuBarVisibility(false);
 
+    // Markdown-rendered chat links use target="_blank" (renderer.js
+    // renderMarkdownInline). Electron's default window-open behavior for
+    // that is a bare chromeless BrowserWindow with none of HandQ's custom
+    // titlebar/chrome — visually broken and confusing. Deny the in-app
+    // popup and hand http(s) off to the OS default browser instead.
+    mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+        if (/^https?:\/\//i.test(url)) {
+            shell.openExternal(url);
+        }
+        return { action: 'deny' };
+    });
+
+    // System-native Cut/Copy/Paste/Select All context menu — matches what
+    // VSCode/Slack/Discord do (a real OS-rendered menu, not an HTML
+    // popup), so right-click in the composer or any input feels native
+    // rather than a leftover browser affordance.
+    mainWindow.webContents.on('context-menu', (_event, params) => {
+        const { editFlags, isEditable, selectionText } = params;
+        const template = [];
+        if (isEditable) {
+            template.push(
+                { label: 'Cut', role: 'cut', enabled: editFlags.canCut },
+                { label: 'Copy', role: 'copy', enabled: editFlags.canCopy },
+                { label: 'Paste', role: 'paste', enabled: editFlags.canPaste },
+                { type: 'separator' },
+                { label: 'Select All', role: 'selectAll', enabled: editFlags.canSelectAll },
+            );
+        } else if (selectionText) {
+            template.push({ label: 'Copy', role: 'copy' });
+        }
+        if (template.length === 0) return;
+        Menu.buildFromTemplate(template).popup({ window: mainWindow });
+    });
+
     if (process.platform === 'win32') {
         // Content protection state — starts ON to keep the glass effect
         // working. When ON, SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)
@@ -1100,8 +1196,14 @@ function createWindow() {
         // internal capturePage() path fails (older Electron builds, some
         // driver issues) or when using external screen-recording tools.
         // State resets on app restart to ON.
-        let contentProtected = true;
-        try { mainWindow.setContentProtection(contentProtected); } catch (_) { /* ignore */ }
+        //
+        // NOTE: `contentProtected` is now module-level (see top of file) and is
+        // also driven by the renderer's glass-mode switch: veil mode needs no
+        // self-capture guard (it's a pure-CSS veil, not a desktopCapturer
+        // shader) so it releases protection, letting the window show up in
+        // ordinary OS screenshots; webgl mode re-asserts it. The manual toggle
+        // below and that IPC path share this one flag.
+        applyContentProtection();
 
         // Window-scoped key handlers — `before-input-event` fires only
         // when this window has focus, so shortcuts don't clash with the
@@ -1118,7 +1220,7 @@ function createWindow() {
                 // window while WDA is on. Logs each flip so it's easy
                 // to reason about whether glass is "safe" right now.
                 contentProtected = !contentProtected;
-                try { mainWindow.setContentProtection(contentProtected); } catch (_) {}
+                applyContentProtection();
                 logLine('MAIN', 'content-protection toggled', { on: contentProtected });
                 event.preventDefault();
                 return;
@@ -1187,6 +1289,13 @@ function createWindow() {
     mainWindow.on('focus', () => {
         try { mainWindow.flashFrame(false); } catch (_) { /* ignore */ }
         stopTrayFlash();
+        mainWindow.webContents.send('window:activeState', { active: true });
+    });
+    // Push focus/blur to the renderer so titlebar chrome can dim like a
+    // real OS window when it's not the active one — frameless windows get
+    // no native active/inactive chrome swap for free.
+    mainWindow.on('blur', () => {
+        mainWindow.webContents.send('window:activeState', { active: false });
     });
 
     // Push maximize/unmaximize state to the renderer so the custom titlebar
@@ -1651,13 +1760,19 @@ ipcMain.on('window:hide', () => {
 //
 // Semantics:
 //   * Delta-application: _autoResizeApply tracks the previously-applied
-//     "auto extras" (target width above baseline) and applies only the
-//     DIFFERENCE on each call. Panel opens → window grows by that
-//     panel's delta; panel closes → window shrinks by the same delta;
-//     manual user resizes in between ride on top and are preserved.
-//     Without this, the chat region would keep the widened space after
-//     a panel closed (flex:1 auto swallowing the freed pixels), which
-//     reads as "the window won't shrink back".
+//     "auto extras" (width above baseline, tracked separately per side)
+//     and applies only the DIFFERENCE on each call. Panel opens → window
+//     grows by that panel's delta; panel closes → window shrinks by the
+//     same delta; manual user resizes in between ride on top and are
+//     preserved. Without this, the chat region would keep the widened
+//     space after a panel closed (flex:1 auto swallowing the freed
+//     pixels), which reads as "the window won't shrink back".
+//   * Edge anchoring: each panel's delta is applied to the window edge
+//     that panel actually lives on — rail grows the left edge, sidebar
+//     grows the right edge. So a sidebar toggle never moves x, and the
+//     centre chat card (whose width is unchanged by that toggle) never
+//     translates across the screen. See _autoResizeApply for the full
+//     rationale and what the previous re-centring rule got wrong.
 //   * Never touches a manually-maximized window (the user picked that
 //     state on purpose; we won't fight them).
 //   * No more auto-maximize threshold. The Stage-Manager rail absorbs
@@ -1692,9 +1807,14 @@ function _computeDesiredSize(layout) {
     const sidebarOpen = !!(layout && layout.sidebarOpen);
     const sidebarWidth = Math.max(0, Number(layout && layout.sidebarWidth) || 0);
     const railOpen = !!(layout && layout.railOpen);
-    let w = AUTO_RESIZE_BASELINE.w;
-    let h = AUTO_RESIZE_BASELINE.h;
-    if (railOpen) w += AUTO_RESIZE_RAIL_DELTA;
+    // Extras are tracked PER SIDE, not as one lump width. The rail lives on
+    // the layout's left edge and the sidebar on its right, so _autoResizeApply
+    // can grow the matching window edge instead of re-centring — see the
+    // anchoring comment there for why re-centring was wrong.
+    let left = 0;
+    let right = 0;
+    const h = AUTO_RESIZE_BASELINE.h;
+    if (railOpen) left += AUTO_RESIZE_RAIL_DELTA;
     if (sidebarOpen) {
         // Sidebar extras = actual measured width + its 10px right margin
         // against the window edge. Renderer sends the actual width because
@@ -1703,38 +1823,53 @@ function _computeDesiredSize(layout) {
         // (very early boot / legacy payload) fall back to the fixed
         // AUTO_RESIZE_SIDEBAR_DELTA so old shapes still resize sanely
         // instead of getting a 10px near-zero window grow.
-        w += sidebarWidth > 0
+        right += sidebarWidth > 0
             ? Math.round(sidebarWidth + 10)
             : AUTO_RESIZE_SIDEBAR_DELTA;
     }
-    return { w: w, h: h };
+    return {
+        w: AUTO_RESIZE_BASELINE.w + left + right,
+        h: h,
+        left: left,
+        right: right,
+    };
 }
 
 // Delta-application state: how much this session has auto-grown the
-// window ABOVE the baseline (from panels opening). Each _autoResizeApply
-// call computes the newly-requested "extras" (target - baseline) and
-// applies the DIFFERENCE from what we grew by last time. Closing a panel
-// therefore SHRINKS the window by that panel's delta, while any manual
-// resize the user did in between rides on top and is preserved. Reset to
-// {0,0} at module load; the first call after launch computes its true
-// baseline delta from whatever panels the renderer reports as open.
-let _lastAutoExtras = { w: 0, h: 0 };
+// window ABOVE the baseline (from panels opening), tracked SEPARATELY for
+// the left edge (rail) and the right edge (sidebar). Each _autoResizeApply
+// call computes the newly-requested "extras" per side and applies the
+// DIFFERENCE from what we grew by last time. Closing a panel therefore
+// SHRINKS the window by that panel's delta on that panel's own side, while
+// any manual resize the user did in between rides on top and is preserved.
+// Reset to zeroes at module load; the first call after launch computes its
+// true baseline delta from whatever panels the renderer reports as open.
+let _lastAutoExtras = { left: 0, right: 0, h: 0 };
 
 function _autoResizeApply(target) {
     if (!mainWindow || mainWindow.isDestroyed()) return;
     if (mainWindow.isMaximized()) return;
     const cur = mainWindow.getBounds();
 
-    // Extras above the fixed baseline this call is asking for. Clamped
-    // to ≥0 defensively — every current caller emits target ≥ baseline,
-    // but a stray legacy payload with a below-baseline entry would
-    // otherwise underflow deltaW/deltaH into a spurious extra shrink.
-    const wantExtraW = Math.max(0, target.w - AUTO_RESIZE_BASELINE.w);
+    // Extras above the fixed baseline this call is asking for, per side.
+    // Clamped to ≥0 defensively — every current caller emits target ≥
+    // baseline, but a stray legacy payload with a below-baseline entry
+    // would otherwise underflow the deltas into a spurious extra shrink.
+    // Legacy numeric payloads (AUTO_RESIZE_TABLE) carry no side breakdown;
+    // attribute their whole width delta to the left edge, since the table's
+    // only non-baseline entry is the rail — which is a left-side panel.
+    const hasSides = Number.isFinite(target.left) && Number.isFinite(target.right);
+    const wantLeft = hasSides
+        ? Math.max(0, target.left)
+        : Math.max(0, target.w - AUTO_RESIZE_BASELINE.w);
+    const wantRight = hasSides ? Math.max(0, target.right) : 0;
     const wantExtraH = Math.max(0, target.h - AUTO_RESIZE_BASELINE.h);
-    const deltaW = wantExtraW - _lastAutoExtras.w;
+    const deltaLeft = wantLeft - _lastAutoExtras.left;
+    const deltaRight = wantRight - _lastAutoExtras.right;
     const deltaH = wantExtraH - _lastAutoExtras.h;
-    _lastAutoExtras = { w: wantExtraW, h: wantExtraH };
-    if (deltaW === 0 && deltaH === 0) return;
+    _lastAutoExtras = { left: wantLeft, right: wantRight, h: wantExtraH };
+    if (deltaLeft === 0 && deltaRight === 0 && deltaH === 0) return;
+    const deltaW = deltaLeft + deltaRight;
 
     const display = screen.getDisplayMatching(cur);
     const wa = display.workArea;
@@ -1746,14 +1881,32 @@ function _autoResizeApply(target) {
     const nextH = Math.max(AUTO_RESIZE_BASELINE.h, Math.min(wa.height, cur.height + deltaH));
     if (nextW === cur.width && nextH === cur.height) return;
 
-    // Keep the window's centre roughly in place — the visual continuity
-    // reads as "panel slid in from one side" rather than "whole window
-    // jumped". Same math for grow and shrink: half the delta goes to
-    // each side. Then clamp so we don't spill off the display.
-    const cx = cur.x + cur.width  / 2;
-    const cy = cur.y + cur.height / 2;
-    let nextX = Math.round(cx - nextW / 2);
-    let nextY = Math.round(cy - nextH / 2);
+    // Anchor each panel's growth to ITS OWN side. The rail is a left-edge
+    // panel and the sidebar a right-edge one, so a sidebar toggle moves the
+    // window's RIGHT edge only and leaves x alone — the content between the
+    // two panels never translates across the screen.
+    //
+    // This replaces a re-centring rule (nextX = centre - nextW/2) whose
+    // stated intent was visual continuity but which achieved the opposite:
+    // opening the sidebar grew the window by ~520px and therefore slid x
+    // ~260px LEFT, so the entire UI lurched sideways "to make room" before
+    // the panel appeared. Worse, the centre chat card — whose width a
+    // sidebar toggle does NOT change, since the window grows by exactly the
+    // sidebar's width — visibly drifted along with it, which read as the
+    // card janking for no reason.
+    //
+    // The work-area ceiling above can clamp nextW below what was asked for;
+    // scale the left share by the width actually applied so we never move x
+    // further than the window really grew. Mixed-sign deltas (rail closing
+    // while the sidebar opens) fall out of this correctly: each edge lands
+    // where its own panel's delta puts it.
+    const appliedW = nextW - cur.width;
+    const leftShare = deltaW === 0 ? 0 : Math.round(appliedW * (deltaLeft / deltaW));
+    let nextX = cur.x - leftShare;
+    // Nothing grows the window vertically today (_computeDesiredSize always
+    // returns the baseline height), so vertical stays centred — a symmetric
+    // split is the right default for a delta with no side attribution.
+    let nextY = Math.round(cur.y + cur.height / 2 - nextH / 2);
     nextX = Math.max(wa.x, Math.min(nextX, wa.x + wa.width  - nextW));
     nextY = Math.max(wa.y, Math.min(nextY, wa.y + wa.height - nextH));
     try {
@@ -1856,6 +2009,66 @@ ipcMain.handle('glass:getWindowBounds', () => {
     };
 });
 
+// Renderer-driven content protection. The glass layer (glass-effect.js) calls
+// this on every mode switch: webgl needs WDA on (its desktopCapturer shader
+// would otherwise sample its own output — recursive wash-out), veil is a
+// pure-CSS surface with no self-capture concern, so it releases protection and
+// the window becomes visible in ordinary OS screenshots/recordings. Shares the
+// module-level `contentProtected` flag with the Ctrl+Shift+P manual toggle —
+// whichever fires last wins, which is the intended behavior (an explicit manual
+// toggle after a mode switch, or vice-versa, both take effect). No-op off win32
+// where setContentProtection does nothing anyway.
+ipcMain.handle('glass:setContentProtection', (_event, on) => {
+    contentProtected = !!on;
+    applyContentProtection();
+    logLine('GLASS', 'content-protection set by renderer', { on: contentProtected });
+    return contentProtected;
+});
+
+// Live toggle for Win11's system-level frosted glass (acrylic). Session-
+// only — nothing persists, and the window is re-created with default
+// (transparent-only) BrowserWindow options on next launch. The team tried
+// shipping `backgroundMaterial: 'acrylic'` as a launch-time default and
+// reverted because some Win11 builds rendered it fully opaque; this
+// runtime toggle lets an operator A/B the effect on the current build
+// without committing the whole install to it.
+//
+// `mainWindow.setBackgroundMaterial` was added in Electron 24; we're on
+// 31. macOS silently ignores it (the equivalent knob is `vibrancy` at
+// window-creation time, which we already set to 'sidebar'). Linux has no
+// equivalent — the call is a no-op there.
+//
+// Values passed through unchanged: 'none' / 'auto' / 'mica' / 'acrylic'
+// / 'tabbed'. Unknown values raise a TypeError inside Electron, so we
+// whitelist here rather than letting a bad renderer input propagate.
+const BACKGROUND_MATERIALS = new Set(['none', 'auto', 'mica', 'acrylic', 'tabbed']);
+ipcMain.handle('window:setBackgroundMaterial', (_event, material) => {
+    if (!mainWindow || mainWindow.isDestroyed()) return false;
+    if (process.platform !== 'win32') return false;
+    if (!BACKGROUND_MATERIALS.has(material)) return false;
+    try {
+        mainWindow.setBackgroundMaterial(material);
+        // Windows tints acrylic (and mica) from the SYSTEM theme — dark
+        // mode gets a grey wash, light mode a near-white one. HandQ's own
+        // palette is already light-mode-authored (dark text on light
+        // surfaces), so a grey system tint mismatches everything above.
+        // Force this Electron window's themeSource to 'light' while a
+        // material is active, back to 'system' when it's turned off.
+        // themeSource is a per-window override; other Electron apps and
+        // native Windows chrome are untouched.
+        if (material === 'none') {
+            nativeTheme.themeSource = 'system';
+        } else {
+            nativeTheme.themeSource = 'light';
+        }
+        logLine('GLASS', 'window backgroundMaterial set', { material, themeSource: nativeTheme.themeSource });
+        return true;
+    } catch (err) {
+        logLine('GLASS', 'setBackgroundMaterial failed', { material, err: err && err.message });
+        return false;
+    }
+});
+
 // --- "Load history" file picker for the Templates panel -------------------
 // Default path: %USERPROFILE%\HandQ\History\ (Windows) or ~/HandQ/History
 // elsewhere — same root the bridge writes session History under, so the
@@ -1886,13 +2099,12 @@ ipcMain.handle('dialog:pickHistoryLog', async () => {
 
 ipcMain.handle('dialog:pickSkillFile', async () => {
     const owner = BrowserWindow.getFocusedWindow() || mainWindow || null;
+    // A skill is a folder (SKILL.md + scripts/ + reference/), so import picks
+    // the directory and Python mirrors the whole tree. Picking a loose
+    // SKILL.md would lose every sibling file.
     const result = await dialog.showOpenDialog(owner, {
-        title: 'Import SKILL.md',
-        properties: ['openFile'],
-        filters: [
-            { name: 'Skill files', extensions: ['md'] },
-            { name: 'All files',   extensions: ['*'] },
-        ],
+        title: 'Select skill folder to import',
+        properties: ['openDirectory'],
     });
     if (result.canceled || !result.filePaths || !result.filePaths.length) {
         return { canceled: true, path: null };

@@ -358,6 +358,18 @@ if (-not $ElectronOnly) {
         # fresh install.
         "--include-data-files=$REPO_ROOT\src\infrastructure\long_term_memory\scripts\uia_query.ps1=src\infrastructure\long_term_memory\scripts\uia_query.ps1",
 
+        # handq_setup.sh — the Linux per-host installer. Not run on Windows; it is
+        # PUSHED to a Linux target by remote_handq_tool._repair_host_setup, which
+        # re-runs it there to rewrite a stale per-host dispatcher conf (the one
+        # backing `handq` / `hi`). It must land next to the entry point because
+        # _local_setup_script() looks for it at ``_install_dir()/handq_setup.sh``.
+        #
+        # Without this, repair in a packaged build falls back to extracting the
+        # script from the newest tarball on update.linux_share_path — which works,
+        # but only for operators who have a share configured, and only ships
+        # whatever script version that package was built with.
+        "--include-data-files=$REPO_ROOT\handq_setup.sh=handq_setup.sh",
+
         # ── Size reduction: trim unused sub-packages of large deps ────────────
         # Rules here only if the module is a genuinely separate entry-point that
         # the SDK core never imports itself. Fine-grained resource-level exclusions
