@@ -313,11 +313,11 @@ class NetworkUIDelegate:
         """
         if not self._allow_secret_prompt:
             hint = (
-                "⚠ Remote HandQ is requesting a password (typically a first-time SSH login to a third machine)."
+                "⚠ Remote HandQ is requesting a password (typically a first-time SSH login to a third machine). "
                 "This channel does not have TLS enabled, so the password will NOT be sent over the network — it has been refused automatically.\n"
-                "Instead, write it directly into the keyring on the controlled machine (one-time, won't be asked again):"
-                "\n    python handq_keyring.py set handq-<hostname> <username>\n"
-                "Or set remote_control.allow_remote_secret_prompt: true in the controlled machine's handq_config.yaml to allow forwarding"
+                "Instead, establish key trust from the controlled machine (one-time, won't be asked again):"
+                "\n    ssh-copy-id <username>@<hostname>\n"
+                "Or set remote_control.allow_remote_secret_prompt: true in the controlled machine's handq_config.yaml to allow forwarding "
                 "(only enable this after explicitly accepting the cleartext risk).\n"
                 f"Original prompt: {prompt}"
             )

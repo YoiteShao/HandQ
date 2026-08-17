@@ -534,7 +534,8 @@ def _load_credentials(credentials_file: str) -> Dict[str, Any]:
             raise ValueError(
                 f"No password found in keyring for service='{keyring_service}' "
                 f"username='{username}'. "
-                f"Store it first with: python handq_keyring.py set {keyring_service} {username}"
+                f"Establish key trust instead, then retry: "
+                f"ssh-copy-id {username}@{creds['hostname']}"
             )
         creds = dict(creds)  # don't mutate the parsed dict
         creds["password"] = secret

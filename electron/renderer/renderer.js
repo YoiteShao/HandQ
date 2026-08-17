@@ -1410,6 +1410,13 @@
             }
         }
 
+        // Slide the titlebar window-control buttons right by the rail's
+        // settled width whenever it's open, so they sit over the chat
+        // card's corner instead of the app's — see .titlebar-controls in
+        // styles.css for the CSS transition that actually animates this.
+        document.documentElement.style.setProperty(
+            '--tb-controls-shift', railEmpty ? '0px' : RAIL_WIDTH_PX + 'px');
+
         // Minimize/maximize only make sense once >1 session exists at all
         // — the literal condition the user specified — independent of how
         // many of them currently happen to be in main vs rail.
@@ -3078,6 +3085,151 @@
         return s.confirmUI;
     }
 
+    // ── Top-layer secret prompt ─────────────────────────────────────────────
+    //
+    // secret_input gets its own dialog rather than the inline per-session
+    // confirmation card, because the inline card is not reachable in the two
+    // situations that actually raise a credential prompt:
+    //
+    //   1. The Connect panel (#overlay-connect) is a full-window .overlay at
+    //      z-index 100 with live pointer events, and it stays open for the whole
+    //      SSH bootstrap — nothing on the pairing path closes it. The inline card
+    //      is an ordinary flow child of the session card with no z-index of its
+    //      own (max 2 in that subtree), so a password prompt raised during
+    //      Connect-panel Linux pairing renders BEHIND the panel. Worse than
+    //      invisible: the card still calls focus(), so keystrokes would land in a
+    //      password field the user cannot see.
+    //   2. Only one session occupies the main stage; the others are rail
+    //      thumbnails at zoom 0.43 with pointer-events:none. A secret_input for a
+    //      railed session was unusable even with no panel open.
+    //
+    // Risk/tool confirmations deliberately stay inline — they carry tool
+    // parameters and a guidance textarea and belong beside the conversation that
+    // produced them. A credential prompt is modal and app-level.
+    //
+    // Everything below the presentation layer is reused as-is: the same
+    // secret_input envelope, the same sendConfirmationAnswer reply (so the
+    // masked durable record still lands in the chat), the same bridge-side
+    // future. No new IPC.
+    let secretDialogEl = null;
+    let secretPending = null;   // { sid, promptId } while a prompt is open
+
+    function _buildSecretDialog() {
+        if (secretDialogEl) return secretDialogEl;
+        const wrap = document.createElement('div');
+        wrap.className = 'overlay hidden';
+        wrap.id = 'overlay-secret-input';
+        // Above the Connect panel (100) and both remote-control dialogs
+        // (2000 pairing, 2100 confirm), so it is reachable from any of them.
+        wrap.style.zIndex = '2200';
+
+        const card = document.createElement('div');
+        card.className = 'overlay-card rc-dialog-card';
+        card.setAttribute('role', 'dialog');
+        card.setAttribute('aria-modal', 'true');
+
+        const title = document.createElement('div');
+        title.className = 'rc-dialog-title';
+        title.textContent = 'Input required';
+        card.appendChild(title);
+
+        // .rc-dialog-body already carries white-space: pre-line, which these
+        // prompts need — ssh_setup sends a two-line message.
+        const body = document.createElement('div');
+        body.className = 'rc-dialog-body';
+        card.appendChild(body);
+
+        const input = document.createElement('input');
+        input.type = 'password';
+        input.className = 'scc-secret';
+        input.autocomplete = 'off';
+        input.spellcheck = false;
+        card.appendChild(input);
+
+        const status = document.createElement('div');
+        status.className = 'rc-dialog-status';
+        card.appendChild(status);
+
+        const actions = document.createElement('div');
+        actions.className = 'scc-actions rc-dialog-actions';
+        const cancelBtn = document.createElement('button');
+        cancelBtn.type = 'button';
+        cancelBtn.textContent = 'Cancel';
+        const okBtn = document.createElement('button');
+        okBtn.type = 'button';
+        okBtn.className = 'primary';
+        okBtn.textContent = 'Submit';
+        actions.appendChild(cancelBtn);
+        actions.appendChild(okBtn);
+        card.appendChild(actions);
+
+        wrap.appendChild(card);
+        document.body.appendChild(wrap);
+
+        cancelBtn.addEventListener('click', () => _settleSecret(''));
+        okBtn.addEventListener('click', () => _settleSecret(input.value));
+        input.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') { e.preventDefault(); _settleSecret(input.value); }
+        });
+        // Backdrop and Escape cancel, matching the other dialogs in this app.
+        wrap.addEventListener('mousedown', (ev) => {
+            if (ev.target === wrap) _settleSecret('');
+        });
+        document.addEventListener('keydown', (e) => {
+            if (!secretDialogEl || wrap.classList.contains('hidden')) return;
+            if (e.key === 'Escape') { e.preventDefault(); _settleSecret(''); }
+        });
+
+        secretDialogEl = { wrap, title, body, input, status };
+        return secretDialogEl;
+    }
+
+    // Answer the open prompt, then clear the field so the secret does not sit in
+    // the DOM. An empty answer is a valid, meaningful reply — ssh_setup reads it
+    // as "no password provided" and aborts cleanly — so Cancel / Escape /
+    // backdrop all resolve the bridge-side future instead of abandoning it.
+    function _settleSecret(value) {
+        const dlg = secretDialogEl;
+        const pending = secretPending;
+        secretPending = null;
+        if (dlg) {
+            dlg.wrap.classList.add('hidden');
+            dlg.input.value = '';
+            dlg.status.textContent = '';
+        }
+        if (!pending) return;
+        sendConfirmationAnswer(pending.sid, String(value || ''));
+    }
+
+    function showSecretPrompt(evt) {
+        const sid = _resolveSid(evt);
+        const s = sessions.get(sid);
+        if (!s) {
+            window.__handqLog('ERROR', 'secret_input for unknown session',
+                { sid, id: evt && evt.id });
+            return;
+        }
+        const promptId = String(evt.id || '');
+        // A fresh prompt arriving while one is still open (ssh_setup retries up
+        // to 3 times) must not orphan the previous future — answer it empty,
+        // then re-target the dialog.
+        if (secretPending && secretPending.promptId &&
+            secretPending.promptId !== promptId) {
+            _settleSecret('');
+        }
+        const dlg = _buildSecretDialog();
+        dlg.body.textContent = String(evt.prompt || 'Enter value:');
+        dlg.input.value = '';
+        dlg.status.textContent = '';
+        dlg.wrap.classList.remove('hidden');
+        // sendConfirmationAnswer reads the prompt id and kind off the session and
+        // writes the masked durable record into that session's chat.
+        s.pendingConfirm = { id: promptId, kind: 'secret_input' };
+        secretPending = { sid, promptId };
+        if (sid !== activeSid) s.unread = true;
+        try { dlg.input.focus(); } catch (_) { /* ignore */ }
+    }
+
     function showConfirmationModal(evt) {
         const sid = _resolveSid(evt);
         const s = sessions.get(sid);
@@ -3092,6 +3244,11 @@
         ui.card.classList.remove('desktop-takeover');
 
         if (evt.kind === 'secret_input') {
+            // Not reached from the status dispatcher any more — secret_input is
+            // routed to showSecretPrompt()'s top-layer dialog. Kept as a working
+            // fallback so a direct caller degrades to the old inline card
+            // instead of falling through to the risk/tool branch below and
+            // rendering a password prompt as an Approve/Reject modal.
             ui.titleEl.textContent = 'Input required';
             ui.descEl.classList.remove('md-rendered');
             ui.descEl.textContent = String(evt.prompt || 'Enter value:');
@@ -3925,9 +4082,17 @@
             return;
         }
 
+        if (evt.kind === 'secret_input') {
+            // Top layer, not the inline card — see _buildSecretDialog() for why
+            // a credential prompt cannot live inside the session card.
+            try { showSecretPrompt(evt); }
+            catch (e) { window.__handqLog('ERROR', 'showSecretPrompt failed',
+                                           { error: String(e) }); }
+            return;
+        }
+
         if (evt.kind === 'risk_confirmation' ||
             evt.kind === 'tool_confirmation' ||
-            evt.kind === 'secret_input' ||
             evt.kind === 'ask_human') {
             // Show the confirmation modal and stop further dispatch — these
             // envelopes are not informational status updates.
@@ -5201,6 +5366,12 @@
         markRemoteSessionState,
         addGlobalSystemBubble,
         hasSession: (sid) => sessions.has(sid),
+        // Panel-initiated operations that may need to prompt the user (e.g. a
+        // first-time SSH password during Linux pairing) must stamp a session_id
+        // so the bridge can route the prompt somewhere. There is always a
+        // session to name: boot creates one and closeSession re-spawns when the
+        // last is closed.
+        currentSid,
     };
 })();
 

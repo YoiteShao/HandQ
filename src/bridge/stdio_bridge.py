@@ -34,6 +34,18 @@ logger = logging.getLogger("handq.bridge")
 _ui_logger = logging.getLogger("handq.bridge.ui")
 
 
+def _exc_text(exc: BaseException) -> str:
+    """Render *exc* for a user-visible message, never as the empty string.
+
+    Argument-less exceptions stringify to ``""`` — ``str(EOFError())`` is the
+    canonical case — which turns an ``f"...失败: {exc}"`` into a message with
+    nothing after the colon and leaves the user (and whoever reads the log)
+    with no idea what went wrong. Fall back to the class name, which at least
+    names the failure.
+    """
+    return str(exc) or exc.__class__.__name__
+
+
 def _truncate(s: Any, n: int = 200) -> str:
     """Stringify *s* and clip to *n* chars with an ellipsis suffix."""
     try:
@@ -79,11 +91,12 @@ def _redact_payload(obj: Any, n: int = 200) -> str:
 # Public symbols imported from the controller stack. FlowControllerV2
 # is built lazily on the first 'request' so config-only round-trips don't
 # need an API key. UserConfirmation is the value type returned by our async
-# _StdioUI confirmation handlers; the InteractionManager is imported for
-# typing only — the bridge never constructs one (FlowControllerV2 owns its
-# IM and exposes it as ``flow.interaction_manager``).
+# _StdioUI confirmation handlers. FlowControllerV2 normally owns the
+# InteractionManager and exposes it as ``flow.interaction_manager``, but the
+# bridge also constructs a bare one over a session's _StdioUI for operations
+# that need to prompt before any flow exists — see remote_pair_linux.
 from src.controller_v2.flow_controller import FlowControllerV2
-from src.controller_v2.interaction_manager import InteractionManager  # noqa: F401  (type only)
+from src.controller_v2.interaction_manager import InteractionManager
 from src.controller_v2.user_confirmation import UserConfirmation
 from src.infrastructure.anthropic_streaming_service import (  # noqa: F401
     AnthropicStreamingService,
@@ -2964,9 +2977,30 @@ class StdioBridge:
                 flow = self._flows.get(sid) if sid else None
                 if flow is not None:
                     im = getattr(flow, "interaction_manager", None)
+                if im is None and sid:
+                    # No flow for this sid. That is the COMMON case here, not an
+                    # edge one: _flows is only populated by _ensure_flow /
+                    # _ensure_any_flow off the `request` path, so a cold-boot tab
+                    # that has never sent a message has no entry — and pairing
+                    # from the Connect panel is exactly the "user hasn't typed
+                    # anything yet" scenario. Relying on the flow lookup alone is
+                    # what left interaction_manager=None and made a first-time
+                    # SSH password unaskable (the prompt then fell through to a
+                    # CLI getpass against the bridge's /dev/null stdin).
+                    #
+                    # The per-session _StdioUI is the whole of what a credential
+                    # prompt needs; building a real flow here would spin up a
+                    # session dir, engine log and LLM pool for a password box.
+                    im = InteractionManager(self._get_or_create_ui(sid))
+                elif im is None:
+                    logger.warning(
+                        "remote_pair_linux: no session_id supplied; a first-time "
+                        "SSH password cannot be prompted for and will fail with "
+                        "the no-interactive-terminal error",
+                    )
                 ssh_target = str(msg.get("ssh_target") or "")
                 self._emit_connect_log(
-                    "ssh", f"引导 Linux 目标: {ssh_target} …",
+                    "ssh", f"Prepare Linux target: {ssh_target} …",
                     "info", "client",
                 )
                 try:
@@ -2986,7 +3020,7 @@ class StdioBridge:
                     )
                 except Exception as exc:
                     self._emit_connect_log(
-                        "ssh", f"{ssh_target} 引导失败: {exc}",
+                        "ssh", f"{ssh_target} Fail: {_exc_text(exc)}",
                         "error", "client",
                     )
                     raise
@@ -2995,15 +3029,15 @@ class StdioBridge:
                 if pending:
                     self._emit_connect_log(
                         "upgrade",
-                        f"{target.name or target.host}: 已连接当前版本 "
-                        f"{pending.get('from') or '未知'}，新版本 "
-                        f"{pending.get('to') or '?'} 待安装（有会话在运行，"
-                        f"结束后可从面板升级）",
+                        f"{target.name or target.host}: Connected current version "
+                        f"{pending.get('from') or 'Unknown'}, new version "
+                        f"{pending.get('to') or '?'} to be installed(Session working,"
+                        f"Can update later）",
                         "warn", "client",
                     )
                 self._emit_connect_log(
                     "ssh",
-                    f"{ssh_target} 引导完成 (监听 {target.host}:{target.port})",
+                    f"{ssh_target} Prepare done (Listening {target.host}:{target.port})",
                     "info", "client",
                 )
                 self._get_connect_state().set_role("client")
@@ -3045,7 +3079,7 @@ class StdioBridge:
                 await hub.close_client(target_id)
                 self._emit_connect_log(
                     "disconnect",
-                    f"已断开与 {target_id} 的连接（远端会话保持运行）",
+                    f"Disconnected {target_id} connections(remote session still in working)",
                     "info", "client",
                 )
                 _reply({"ok": True, "targets": hub.list_targets()})
@@ -3096,7 +3130,7 @@ class StdioBridge:
                             "remote_control: remote_bind adopt failed for %s: %s",
                             sid, exc)
                         _reply({"ok": False,
-                                "error": f"无法恢复远端会话: {exc}"})
+                                "error": f"fail to restore remote session: {exc}"})
                         return
                 _reply({"ok": True, "session_id": sid})
                 return
@@ -3138,7 +3172,7 @@ class StdioBridge:
                 started = await self._start_remote_control_server()
                 if not started:
                     err = (self._remote_server_error
-                           or "无法开始监听（详见 handq-bridge.log）")
+                           or "fail to listen(refer handq-bridge.log)")
                     self._emit_connect_log("start", err, "error", "server")
                     _reply({"ok": False, "error": err})
                     return
@@ -3147,7 +3181,7 @@ class StdioBridge:
                 payload = self._remote_control_address_payload()
                 self._emit_connect_log(
                     "start",
-                    f"正在监听 {payload.get('endpoint') or ''}",
+                    f"Listening {payload.get('endpoint') or ''}",
                     "info", "server",
                 )
                 _reply({"ok": True, "serving": payload})
@@ -3166,7 +3200,7 @@ class StdioBridge:
                 cs = self._get_connect_state()
                 if cs.role == "server":
                     cs.set_role(None)
-                self._emit_connect_log("stop", "server 已停止", "info", "server")
+                self._emit_connect_log("stop", "server stopped", "info", "server")
                 _reply({"ok": True})
                 return
 
@@ -3181,7 +3215,7 @@ class StdioBridge:
                 self._broadcast_serve_state()
                 self._emit_connect_log(
                     "disconnect",
-                    f"已断开 client，销毁了 {destroyed} 个 session",
+                    f"Disconnected client, destory {destroyed} sessions",
                     "info", "server",
                 )
                 _reply({"ok": True, "destroyed": destroyed})
@@ -3201,7 +3235,7 @@ class StdioBridge:
                 self._broadcast_serve_state()
                 self._emit_connect_log(
                     "session",
-                    f"session {sid} {'已销毁' if ok else '关闭失败'}",
+                    f"session {sid} {'Destory' if ok else 'fail to close'}",
                     "info" if ok else "warn", "server",
                 )
                 _reply({"ok": ok})
@@ -3219,8 +3253,8 @@ class StdioBridge:
                 outcome = await hub.release_target(target_id)
                 self._emit_connect_log(
                     "release",
-                    f"已结束与 {target_id} 的服务关系"
-                    + ("（配对已移除）" if outcome.get("forgot") else "（配对保留）"),
+                    f"Finished {target_id} server "
+                    + ("(Remove pair)" if outcome.get("forgot") else "(Keep pair)"),
                     "info", "client",
                 )
                 if outcome.get("warning"):
@@ -3249,14 +3283,14 @@ class StdioBridge:
                     cs.set_role(None)
                 self._emit_connect_log(
                     "disconnect",
-                    "已退出 client 模式：所有连接已断开，远端会话保持运行",
+                    "Exited client mode：All connection dis, remote server continues",
                     "info", "client",
                 )
                 _reply({"ok": True, "targets": hub.list_targets()})
                 return
 
         except AddressError as exc:
-            _reply({"ok": False, "error": f"配对地址无法解析: {exc}"})
+            _reply({"ok": False, "error": f"fail to parse address: {exc}"})
             return
         except LinuxDaemonBusyError as exc:
             # Distinct kind, not just distinct text: this is the ONE failure
@@ -3271,7 +3305,7 @@ class StdioBridge:
             return
         except Exception as exc:
             logger.exception("remote_control: %s failed", msg_type)
-            _reply({"ok": False, "error": f"{msg_type} 失败: {exc}"})
+            _reply({"ok": False, "error": f"{msg_type} fail: {_exc_text(exc)}"})
             return
 
     # ------------------------------------------------------------------

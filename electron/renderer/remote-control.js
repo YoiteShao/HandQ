@@ -121,6 +121,19 @@
         return result || {};
     }
 
+    // The active chat tab's id, for panel-initiated operations that may need to
+    // prompt the user mid-flight. Only stamp this on requests that actually need
+    // a prompt route — a session_id also tells the bridge which session an
+    // operation belongs to, so stamping it blindly would misattribute work.
+    function activeSessionId() {
+        try {
+            if (window.HandQRenderer && window.HandQRenderer.currentSid) {
+                return window.HandQRenderer.currentSid() || '';
+            }
+        } catch (_) { /* ignore */ }
+        return '';
+    }
+
     // ── Generic prompt dialog ────────────────────────────────────────────────
 
     let dialogEl = null;
@@ -623,6 +636,10 @@
                 ssh_target: answer.pairing,
                 name: answer.name,
                 force: !!force,
+                // A host with no key trust and nothing in the keyring needs a
+                // password, and the bridge can only route that prompt if it
+                // knows which session to attach it to.
+                session_id: activeSessionId(),
             }, LINUX_PAIR_TIMEOUT_MS);
             targets = res.targets || targets;
             renderTargets();

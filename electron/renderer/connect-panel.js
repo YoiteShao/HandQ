@@ -105,6 +105,19 @@
         return result || {};
     }
 
+    // The active chat tab's id, for panel-initiated operations that may need to
+    // prompt the user mid-flight (e.g. a first-time SSH password). Only stamp it
+    // on requests that actually need a prompt route — a session_id also tells the
+    // bridge which session an operation belongs to.
+    function activeSessionId() {
+        try {
+            if (window.HandQRenderer && window.HandQRenderer.currentSid) {
+                return window.HandQRenderer.currentSid() || '';
+            }
+        } catch (_) { /* ignore */ }
+        return '';
+    }
+
     // ── Log rendering ───────────────────────────────────────────────────
 
     function appendLog(which, message) {
@@ -812,6 +825,9 @@
                 ssh_target: target.ssh_target || '',
                 name: target.name || '',
                 force: true,
+                // Re-running the bootstrap can re-hit SSH auth; stamp a session
+                // so a credential prompt has somewhere to surface.
+                session_id: activeSessionId(),
             });
             targets = res.targets || targets;
             appendLog('client', `${name} upgraded`);

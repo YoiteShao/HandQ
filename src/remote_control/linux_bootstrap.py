@@ -87,6 +87,16 @@ EXIT_POLL_TIMEOUT_SEC = 12.0
 MIN_VERSION_WITH_REMOTE_CONTROL = (1, 5, 5)
 
 
+def _exc_text(exc: BaseException) -> str:
+    """Render *exc* for an operator-facing message, never as the empty string.
+
+    Argument-less exceptions stringify to ``""`` (``str(EOFError())`` being the
+    case that actually bit us here), which turns ``f"...: {exc}"`` into a
+    message with nothing after the colon. Fall back to the class name.
+    """
+    return str(exc) or exc.__class__.__name__
+
+
 class LinuxBootstrapError(RuntimeError):
     """Raised with an operator-actionable message."""
 
@@ -160,7 +170,7 @@ async def resolve_linux_address(
             )
         except SSHSetupError as exc:
             raise LinuxBootstrapError(
-                f"Failed to establish SSH credentials to {ssh_target}: {exc}"
+                f"Failed to establish SSH credentials to {ssh_target}: {_exc_text(exc)}"
             ) from exc
 
     loop = asyncio.get_running_loop()
@@ -360,7 +370,7 @@ def _bootstrap_sync(credentials_file: str, *, install: bool,
         raise
     except Exception as exc:
         raise LinuxBootstrapError(
-            f"Failed to bootstrap HandQ via SSH on {creds.get('hostname', '?')}: {exc}"
+            f"Failed to bootstrap HandQ via SSH on {creds.get('hostname', '?')}: {_exc_text(exc)}"
         ) from exc
     finally:
         rht._pool_threadlocal.pool = None
@@ -581,7 +591,7 @@ async def sync_linux_llm_config(
             )
         except SSHSetupError as exc:
             raise LinuxBootstrapError(
-                f"Failed to establish SSH credentials to {ssh_target}: {exc}"
+                f"Failed to establish SSH credentials to {ssh_target}: {_exc_text(exc)}"
             ) from exc
 
     loop = asyncio.get_running_loop()

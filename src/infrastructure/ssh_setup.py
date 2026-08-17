@@ -70,6 +70,38 @@ def _safe_hostname(hostname: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_-]", "_", hostname)
 
 
+def _stdin_is_interactive() -> bool:
+    """Can we actually read a password from stdin?
+
+    ``sys.stdin.isatty()`` alone is NOT a usable answer under the Electron
+    bridge. ``bridge_main.py`` moves the real stdin to a private fd for the
+    JSON-IPC channel and points fd 0 at ``os.devnull``; on Windows ``NUL`` is a
+    *character device*, so ``isatty()`` returns **True** for it. The check then
+    passes, ``getpass`` reads from the null device, and CPython's
+    ``fallback_getpass`` raises a bare ``EOFError`` — an exception whose
+    ``str()`` is the empty string, which is how this surfaced originally: a
+    user-visible "failed: " with nothing after the colon.
+
+    ``HANDQ_BRIDGE_STDIN_FD`` (published by ``bridge_main.py`` when it performs
+    that redirection) is therefore the load-bearing signal here, not isatty.
+    """
+    if os.environ.get("HANDQ_BRIDGE_STDIN_FD"):
+        return False
+    stream = getattr(sys, "stdin", None)
+    if stream is None:
+        # pythonw, or spawned with no stdin handle at all. Reading `.isatty()`
+        # off None is the AttributeError this replaces.
+        return False
+    try:
+        if stream.closed:
+            return False
+        return bool(stream.isatty())
+    except Exception:
+        # A stdin substitute that doesn't implement isatty/closed is not
+        # something we should hand a password prompt to.
+        return False
+
+
 def _default_creds_path(hostname: str) -> str:
     return os.path.expanduser(f"~/.ssh/handq_{_safe_hostname(hostname)}.yaml")
 
@@ -518,20 +550,29 @@ class SSHSetupManager:
                     result = await result
                 return result
 
-        # CLI path: only when stdin is a real terminal — never block headless environments.
-        if not sys.stdin.isatty():
-            raise SSHSetupError(
-                f"SSH password required for {username}@{hostname} but no interactive "
-                f"terminal is available.\n"
-                f"Pre-store the password with:\n"
-                f"  python handq_keyring.py set handq-{_safe_hostname(hostname)} {username}"
-            )
+        # CLI path: only when stdin is a real terminal — never block headless
+        # environments. See _stdin_is_interactive() for why isatty() alone is
+        # not trustworthy here.
+        no_tty_msg = (
+            f"SSH password required for {username}@{hostname} but no interactive "
+            f"terminal is available.\n"
+            f"Establish key trust instead, then retry:\n"
+            f"  ssh-copy-id {username}@{hostname}"
+        )
+        if not _stdin_is_interactive():
+            raise SSHSetupError(no_tty_msg)
 
         def _getpass() -> str:
             print(prompt_msg)
             return getpass.getpass("  Password: ")
 
-        return await asyncio.get_event_loop().run_in_executor(None, _getpass)
+        try:
+            return await asyncio.get_event_loop().run_in_executor(None, _getpass)
+        except (EOFError, OSError, KeyboardInterrupt) as exc:
+            # Belt and braces behind _stdin_is_interactive(): if some future
+            # stdin arrangement fools the check again, the user still gets the
+            # actionable message rather than a bare EOFError whose str() is "".
+            raise SSHSetupError(no_tty_msg) from exc
 
 
 # ── Lazy credential setup (called directly by ssh_tool / remote_handq_tool) ──

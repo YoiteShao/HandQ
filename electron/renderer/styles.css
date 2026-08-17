@@ -1053,8 +1053,17 @@ body.glass-fallback .ss-files-list {
     /* macOS traffic-light corner. 12px inset from the window edge, 8px from
        the top so the group sits at the same vertical band as the centered
        title pill ([y=8, y=28] with the pill's 20px height). 4px gap gives
-       the three pucks breathing room without touching. */
-    left: 12px;
+       the three pucks breathing room without touching.
+       --tb-controls-shift is set by renderer.js's _updateLayout() to the
+       stage rail's width whenever it's open, sliding this group right so
+       it sits over the chat card's corner instead of the rail's, in the
+       same 200ms spring-soft the rail itself uses (styles.css's .stage-rail
+       rule) so the two moves read as one gesture. The buttons are
+       absolutely-positioned and outside .main's flex flow, so this
+       transition can't bulge/pinch the chat region the way an untamed
+       width transition would (see layout-drive.js's header comment) —
+       nothing here needs that mechanism's per-frame drive. */
+    left: calc(12px + var(--tb-controls-shift, 0px));
     top: 8px;
     display: flex;
     align-items: center;
@@ -1062,6 +1071,7 @@ body.glass-fallback .ss-files-list {
     padding: 0;
     -webkit-app-region: no-drag;
     app-region: no-drag;
+    transition: left 200ms var(--spring-soft, cubic-bezier(0.22, 1.2, 0.36, 1));
 }
 
 /* Window buttons — small circular pucks (20×20), one size down from the
@@ -3709,6 +3719,11 @@ body.card-width-instant .ss-files-list {
     width: 160px;
     display: flex;
     flex-direction: column;
+    /* Explicit, not just absent — the rail floats on the WebGL glass canvas
+       underneath (glass-effect.js) with no fill of its own. Declaring it
+       keeps that a stated invariant rather than an accident a future rule
+       could quietly override. */
+    background: transparent;
     /* overflow: clip (not hidden) + overflow-clip-margin: 12px so the
        Stage-Manager tilt's rightward fan and its box-shadow can paint a
        few px past the rail's 132px width without getting shaved. `clip`
@@ -3835,10 +3850,9 @@ body.card-width-instant .ss-files-list {
     /* Whole-thumb click target (switches to this session) with no button
        chrome inside it — same reasoning as .ss-resume-row above. */
     cursor: pointer;
-    border: 1px solid rgba(60, 80, 120, 0.14);
-    box-shadow: 0 2px 8px rgba(20, 20, 30, 0.08);
-    transition: box-shadow 200ms var(--ease-glass),
-                transform 220ms var(--spring, cubic-bezier(0.22, 1.2, 0.36, 1)),
+    /* No border, no shadow — the rail is meant to look fully see-through,
+       floating with zero "card" identity of its own. */
+    transition: transform 220ms var(--spring, cubic-bezier(0.22, 1.2, 0.36, 1)),
                 opacity 220ms var(--ease-glass);
     position: relative;
     -webkit-app-region: no-drag;
@@ -4018,11 +4032,26 @@ body.card-width-instant .ss-files-list {
     -webkit-backdrop-filter: none;
     transition: none;
     contain: none;
+    /* No card identity at all — the rail floats fully transparent (see
+       .stage-rail / .stage-rail-thumb), so the reparented card must not
+       carry the main-stage .session-card's own drop-shadow (--l2-shadow-*)
+       either. Without this override the thumb had no border of its own but
+       still painted its inherited shadow, reading as a faint edge. */
+    box-shadow: none;
+    /* Fill/border are 0-alpha by default (--l2-fill-a/b/c and
+       --l2-border-alpha), so today this is a no-op — but that "0 by
+       default" is a live, user-tunable value (Ctrl+Shift+G's Layer 2
+       panel), not a constant. Hardcoding transparent/none here, instead
+       of relying on the token defaults, keeps the rail's "zero card
+       chrome" promise true even if that panel is used to raise the main
+       stage's own fill/border. */
+    background: transparent;
+    border-color: transparent;
 }
 .stage-rail-thumb .session-card.active {
-    box-shadow:
-        0 0 0 2px rgba(184, 175, 196, 0.45),
-        0 6px 22px rgba(20, 20, 30, 0.12);
+    /* Active-thumb highlight was itself a box-shadow ring — also dropped,
+       for the same "zero card chrome" reason as the base override above. */
+    box-shadow: none;
 }
 
 /* Inline per-session confirmation card (UI3). */
