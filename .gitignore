@@ -3,5 +3,5 @@ __pycache__
 workspace
 docs
 *.zip
-Skill\device-ops
-Skill\web-search-workflow
+QualcommSkill
+.gitignore
