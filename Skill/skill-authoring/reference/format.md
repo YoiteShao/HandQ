@@ -242,7 +242,7 @@ flash-meta-build/
 ```markdown
 ---
 name: flash-meta-build
-description: "Flash a full meta build to an attached Qualcomm automotive device: EDL entry, Firehose load, then verification. Read before any flashing request — entering the wrong EDL mode wastes a full power cycle."
+description: "Flash a full meta build to an attached COMPANY automotive device: EDL entry, Firehose load, then verification. Read before any flashing request — entering the wrong EDL mode wastes a full power cycle."
 allowed-tools: [shell]
 ---
 # Flash a Meta Build

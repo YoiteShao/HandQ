@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Web search across Qualcomm internal sources via the authenticated browser.
+"""Web search across COMPANY internal sources via the authenticated browser.
 
 Auth model
 ----------
@@ -13,11 +13,11 @@ HandQ sessions in the persistent profile.
 
 Sources
 -------
-* ``confluence``  — Confluence Cloud (`qualcomm-confluence.atlassian.net`).
+* ``confluence``  — Confluence Cloud (`COMPANY-confluence.atlassian.net`).
                     REST + CQL.
-* ``jira``        — Jira Data Center (`jira-dc.qualcomm.com`).
+* ``jira``        — Jira Data Center (`jira-dc.COMPANY.com`).
                     REST + JQL.
-* ``sharepoint``  — SharePoint Online (`qualcomm.sharepoint.com`).
+* ``sharepoint``  — SharePoint Online (`COMPANY.sharepoint.com`).
                     Search REST (KQL) with ODATA flattening.
 * ``orbit``       — intranet portal. No JSON API — DOM-extract fallback;
                     the result selector lives in ``handq_config.yaml``
@@ -55,35 +55,35 @@ _HARD_MAX_LIMIT = 25
 _DEFAULT_SNIPPET_MAX_CHARS = 300
 _DEFAULT_ORBIT_TIMEOUT_MS = 30_000
 
-# ── qgenie-chat defaults (overridable via web_search.sources.qgenie.*) ───────
-# The qgenie source talks to the SSO-gated qgenie-chat web app — NOT the QGenie
+# ── YOUR-AI-ENDPOINT-chat defaults (overridable via web_search.sources.YOUR-AI-ENDPOINT.*) ───────
+# The YOUR-AI-ENDPOINT source talks to the SSO-gated YOUR-AI-ENDPOINT-chat web app — NOT the YOUR-AI-ENDPOINT
 # LLM API gateway SDK the rest of HandQ uses. Reverse-engineered + verified live
-# 2026-07-20 (see tmp/qgenie_chat_*.py). Unlike the other four sources it:
+# 2026-07-20 (see tmp/YOUR-AI-ENDPOINT_chat_*.py). Unlike the other four sources it:
 #   * authenticates with TWO tokens (Bearer access_token + x-copilot-token Azure
 #     JWT), NOT cookies — so the bare-httpx fast path does not apply; it runs
 #     in-page like orbit.
 #   * returns a SYNTHESISED answer (SSE stream), not a ranked hit list.
-_DEFAULT_QGENIE_BASE_URL = "https://qgenie-chat.qualcomm.com"
-_DEFAULT_QGENIE_CHAT_PAGE = "https://qgenie-chat.qualcomm.com/apps/chat"
-_DEFAULT_QGENIE_TOKEN_URL = "https://qgenie-chat.qualcomm.com/api/apigee/token"
-_DEFAULT_QGENIE_CHAT_URL = "https://apigw-op.qualcomm.com/qgeniechat/ui/v1/chat"
-_DEFAULT_QGENIE_MODEL = "anthropic::claude-4-6-sonnet"
+_DEFAULT_YOUR-AI-ENDPOINT_BASE_URL = "https://YOUR-AI-ENDPOINT-chat.COMPANY.com"
+_DEFAULT_YOUR-AI-ENDPOINT_CHAT_PAGE = "https://YOUR-AI-ENDPOINT-chat.COMPANY.com/apps/chat"
+_DEFAULT_YOUR-AI-ENDPOINT_TOKEN_URL = "https://YOUR-AI-ENDPOINT-chat.COMPANY.com/api/apigee/token"
+_DEFAULT_YOUR-AI-ENDPOINT_CHAT_URL = "https://apigw-op.COMPANY.com/YOUR-AI-ENDPOINTchat/ui/v1/chat"
+_DEFAULT_YOUR-AI-ENDPOINT_MODEL = "anthropic::claude-4-6-sonnet"
 # RAG + synthesis is slow — 30-60s+ is normal, so the default is generous.
-_DEFAULT_QGENIE_TIMEOUT_MS = 120_000
+_DEFAULT_YOUR-AI-ENDPOINT_TIMEOUT_MS = 120_000
 # access_token lives ~8h (expires_in≈28799); refresh a bit early to be safe.
-_QGENIE_TOKEN_SAFETY_MARGIN_S = 300.0
+_YOUR-AI-ENDPOINT_TOKEN_SAFETY_MARGIN_S = 300.0
 # Fixed headers the web app always sends on the /chat call (verified live).
-_QGENIE_FIXED_HEADERS = {
+_YOUR-AI-ENDPOINT_FIXED_HEADERS = {
     "x-qcom-tokentype": "Azure",
     "x-qcom-clienttype": "web app",
     "x-qcom-appname": "Aware",
-    "client-source": "QGenie::WebApp",
+    "client-source": "YOUR-AI-ENDPOINT::WebApp",
 }
 # Process-wide cache of the two tokens harvested passively from the app's own
 # /api/apigee/token traffic. Shared across calls so we skip the goto/reload
 # token dance while the access_token is still valid. Shape:
 #   {"access": str, "azure": str, "expires_at": float}
-_qgenie_token: Optional[Dict[str, Any]] = None
+_YOUR-AI-ENDPOINT_token: Optional[Dict[str, Any]] = None
 
 # Per-process cache for repeat (source, query, limit) lookups. Bounded LRU
 # with a 60s TTL — covers the common case where the agent re-runs the same
@@ -126,6 +126,7 @@ def _cache_put(key: _CacheKey, value: _CacheValue) -> None:
     _query_cache.move_to_end(key)
     while len(_query_cache) > _QUERY_CACHE_MAX:
         _query_cache.popitem(last=False)
+
 
 # Markers that indicate a body is actually an SSO login page rather than the
 # requested JSON. The list is intentionally conservative — only well-known
@@ -235,8 +236,8 @@ class _AuthRequired(RuntimeError):
 #
 # evaluate_fetch's page.goto(origin) round trip exists purely to hold
 # cookies for the fetch() that follows — the actual API call is a single
-# GET. Verified live 2026-07-17 against real jira-dc.qualcomm.com,
-# qualcomm-confluence.atlassian.net, and qualcomm.sharepoint.com: a bare
+# GET. Verified live 2026-07-17 against real jira-dc.COMPANY.com,
+# COMPANY-confluence.atlassian.net, and COMPANY.sharepoint.com: a bare
 # httpx GET carrying the live session's real cookies gets an identical 200
 # + real JSON body, cutting per-call latency from ~2-6s (evaluate_fetch,
 # dominated by the goto) down to ~0.5-0.9s for jira/confluence. sharepoint's
@@ -323,25 +324,25 @@ class WebSearchTool(BaseTool):
             },
             "source": {
                 "type": "string",
-                "enum": ["confluence", "jira", "sharepoint", "orbit", "qgenie"],
+                "enum": ["confluence", "jira", "sharepoint", "orbit", "YOUR-AI-ENDPOINT"],
                 "description": (
                     "Which source to query. Choose ONE per call; agent can "
                     "fan out by issuing parallel calls — jira/confluence/"
                     "sharepoint genuinely run concurrently (each independently "
                     "reads live cookies + fires its own request); orbit and "
-                    "qgenie serialise on the browser session lock (real page "
+                    "YOUR-AI-ENDPOINT serialise on the browser session lock (real page "
                     "navigation). Pick the most likely source "
                     "first; recommended order when you do not know which: "
                     "jira → sharepoint → orbit → confluence (confluence is "
                     "the flakiest under SSO and should be tried last). "
-                    "'qgenie' is DIFFERENT from the other four: it queries the "
-                    "qgenie-chat assistant, which returns ONE synthesised, "
+                    "'YOUR-AI-ENDPOINT' is DIFFERENT from the other four: it queries the "
+                    "YOUR-AI-ENDPOINT-chat assistant, which returns ONE synthesised, "
                     "cited answer (read hits[0].snippet — it is the full "
                     "answer, not a ranking snippet) rather than a list of "
-                    "documents to open. Use qgenie when you want a direct "
+                    "documents to open. Use YOUR-AI-ENDPOINT when you want a direct "
                     "answer synthesised from internal knowledge; use the other "
                     "sources when you want to find and open specific documents. "
-                    "qgenie ignores limit/offset (always one answer + optional "
+                    "YOUR-AI-ENDPOINT ignores limit/offset (always one answer + optional "
                     "source docs). "
                     "Sources can be individually disabled in "
                     "handq_config.yaml under web_search.sources.<name>.enabled."
@@ -446,7 +447,7 @@ class WebSearchTool(BaseTool):
             "jira":       self._search_jira,
             "sharepoint": self._search_sharepoint,
             "orbit":      self._search_orbit,
-            "qgenie":     self._search_qgenie,
+            "YOUR-AI-ENDPOINT":     self._search_YOUR-AI-ENDPOINT,
         }
         executor = executors.get(source)
         if executor is None:
@@ -455,11 +456,11 @@ class WebSearchTool(BaseTool):
         # Per-process cache lookup — skips the browser round-trip when the
         # same (source, query, limit, offset, cursor) was answered recently.
         # Orbit isn't cached because its DOM-extract may legitimately change;
-        # qgenie isn't cached because its answer is a fresh LLM synthesis
+        # YOUR-AI-ENDPOINT isn't cached because its answer is a fresh LLM synthesis
         # (non-deterministic) and each call also mints a server-side
         # conversation, so a cache hit would be misleading.
         cache_key: Optional[_CacheKey] = (
-            None if source in ("orbit", "qgenie")
+            None if source in ("orbit", "YOUR-AI-ENDPOINT")
             else (source, query, limit, offset, cursor or "")
         )
         if cache_key is not None:
@@ -507,11 +508,11 @@ class WebSearchTool(BaseTool):
         # per-source parsers can see full excerpts during normalisation.
         for i, h in enumerate(hits):
             h.title = _normalize_snippet(h.title)
-            # qgenie's first hit IS the synthesised answer (markdown body meant
+            # YOUR-AI-ENDPOINT's first hit IS the synthesised answer (markdown body meant
             # to be read in full), not a ranking snippet — skip normalisation
             # and truncation for it so newlines / markdown / long text survive.
-            # Any additional qgenie hits (source docs) are truncated normally.
-            if source == "qgenie" and i == 0:
+            # Any additional YOUR-AI-ENDPOINT hits (source docs) are truncated normally.
+            if source == "YOUR-AI-ENDPOINT" and i == 0:
                 continue
             if h.snippet:
                 h.snippet = _normalize_snippet(h.snippet)
@@ -555,7 +556,7 @@ class WebSearchTool(BaseTool):
         session's other fixes have been closing, not a pattern to repeat
         at the tool layer).
         """
-        base_url = (src_cfg.get("base_url") or "https://qualcomm-confluence.atlassian.net").rstrip("/")
+        base_url = (src_cfg.get("base_url") or "https://COMPANY-confluence.atlassian.net").rstrip("/")
         api_path = src_cfg.get("api_path") or "/wiki/rest/api/search"
         # CQL: free-text against all content. Caller can pass a full CQL
         # expression in `query` and it will be forwarded verbatim — Atlassian
@@ -646,7 +647,7 @@ class WebSearchTool(BaseTool):
         self, query: str, limit: int, offset: int, cursor: Optional[str],
         src_cfg: Dict[str, Any],
     ) -> Tuple[List[SearchHit], bool, Optional[str]]:
-        base_url = (src_cfg.get("base_url") or "https://jira-dc.qualcomm.com").rstrip("/")
+        base_url = (src_cfg.get("base_url") or "https://jira-dc.COMPANY.com").rstrip("/")
         api_path = src_cfg.get("api_path") or "/rest/api/2/search"
 
         # JQL: free-text against summary + description. Caller can pass a
@@ -681,7 +682,7 @@ class WebSearchTool(BaseTool):
             data = json.loads(body)
         except json.JSONDecodeError:
             raise RuntimeError(f"jira returned non-JSON ({len(body)} bytes): "
-                f"{(body[:200] or '<empty body>')!r}")
+                               f"{(body[:200] or '<empty body>')!r}")
 
         hits: List[SearchHit] = []
         for issue in (data.get("issues") or [])[:limit]:
@@ -725,7 +726,7 @@ class WebSearchTool(BaseTool):
         self, query: str, limit: int, offset: int, cursor: Optional[str],
         src_cfg: Dict[str, Any],
     ) -> Tuple[List[SearchHit], bool, Optional[str]]:
-        base_url = (src_cfg.get("base_url") or "https://qualcomm.sharepoint.com").rstrip("/")
+        base_url = (src_cfg.get("base_url") or "https://COMPANY.sharepoint.com").rstrip("/")
         api_path = src_cfg.get("api_path") or "/_api/search/query"
 
         # SharePoint SEARCH expects single-quoted querytext; selectproperties
@@ -763,7 +764,7 @@ class WebSearchTool(BaseTool):
             data = json.loads(body)
         except json.JSONDecodeError:
             raise RuntimeError(f"sharepoint returned non-JSON ({len(body)} bytes): "
-                f"{(body[:200] or '<empty body>')!r}")
+                               f"{(body[:200] or '<empty body>')!r}")
 
         relevant = ((data.get("PrimaryQueryResult") or {}).get("RelevantResults") or {})
         rows = (relevant.get("Table", {}) or {}).get("Rows") or []
@@ -917,15 +918,15 @@ class WebSearchTool(BaseTool):
         has_more = len(hits) >= limit
         return hits, has_more, None
 
-    async def _search_qgenie(
+    async def _search_YOUR-AI-ENDPOINT(
         self, query: str, limit: int, offset: int, cursor: Optional[str],
         src_cfg: Dict[str, Any],
     ) -> Tuple[List[SearchHit], bool, Optional[str]]:
-        """Ask the qgenie-chat assistant and return its synthesised answer.
+        """Ask the YOUR-AI-ENDPOINT-chat assistant and return its synthesised answer.
 
         Unlike the other four sources this does NOT return a ranked list — it
-        returns ONE hit whose ``snippet`` is qgenie's full answer, followed by
-        optional source-document hits (the RAG results qgenie cited). ``limit``
+        returns ONE hit whose ``snippet`` is YOUR-AI-ENDPOINT's full answer, followed by
+        optional source-document hits (the RAG results YOUR-AI-ENDPOINT cited). ``limit``
         / ``offset`` / ``cursor`` are ignored (there is only ever one answer).
 
         Auth is two tokens, NOT cookies (verified live 2026-07-20):
@@ -940,16 +941,16 @@ class WebSearchTool(BaseTool):
 
         Runs entirely under the browser session lock (like orbit): the token
         harvest needs a real page navigation, and the /chat SSE fetch runs
-        in-page so the qgenie-chat origin is the fetch origin (the API gateway's
+        in-page so the YOUR-AI-ENDPOINT-chat origin is the fetch origin (the API gateway's
         CORS only allows that origin).
         """
-        base_url = (src_cfg.get("base_url") or _DEFAULT_QGENIE_BASE_URL).rstrip("/")
-        chat_page = src_cfg.get("chat_page") or _DEFAULT_QGENIE_CHAT_PAGE
-        token_url = src_cfg.get("token_url") or _DEFAULT_QGENIE_TOKEN_URL
-        chat_url = src_cfg.get("chat_url") or _DEFAULT_QGENIE_CHAT_URL
-        model_name = src_cfg.get("model_name") or _DEFAULT_QGENIE_MODEL
-        internal_search = bool(src_cfg.get("internal_qualcomm_search", True))
-        timeout_ms = int(src_cfg.get("timeout_ms") or _DEFAULT_QGENIE_TIMEOUT_MS)
+        base_url = (src_cfg.get("base_url") or _DEFAULT_YOUR-AI-ENDPOINT_BASE_URL).rstrip("/")
+        chat_page = src_cfg.get("chat_page") or _DEFAULT_YOUR-AI-ENDPOINT_CHAT_PAGE
+        token_url = src_cfg.get("token_url") or _DEFAULT_YOUR-AI-ENDPOINT_TOKEN_URL
+        chat_url = src_cfg.get("chat_url") or _DEFAULT_YOUR-AI-ENDPOINT_CHAT_URL
+        model_name = src_cfg.get("model_name") or _DEFAULT_YOUR-AI-ENDPOINT_MODEL
+        internal_search = bool(src_cfg.get("internal_COMPANY_search", True))
+        timeout_ms = int(src_cfg.get("timeout_ms") or _DEFAULT_YOUR-AI-ENDPOINT_TIMEOUT_MS)
 
         async with self.holder.acquire() as session:
             tab_id = session.first_tab_id()
@@ -960,12 +961,12 @@ class WebSearchTool(BaseTool):
             else:
                 page = session.tabs[tab_id]
 
-            access, azure = await self._qgenie_ensure_tokens(
+            access, azure = await self._YOUR-AI-ENDPOINT_ensure_tokens(
                 page, chat_page=chat_page, token_url_marker="/api/apigee/token",
                 base_url=base_url,
             )
 
-            # Fire the chat request from inside the page (qgenie-chat origin) and
+            # Fire the chat request from inside the page (YOUR-AI-ENDPOINT-chat origin) and
             # stream the SSE body to completion. Returns {status, contentType,
             # raw, error?}.
             chat_js = r"""
@@ -981,7 +982,7 @@ class WebSearchTool(BaseTool):
                         agent_options: {
                             deep_research_options: {enabled: false, research_level: 'low'},
                             tool_options: {
-                                internal_qualcomm_search: {enabled: internalSearch},
+                                internal_COMPANY_search: {enabled: internalSearch},
                                 web_search_options: {enabled: false},
                                 python_sandbox: {enabled: false},
                                 image_generation: {enabled: false},
@@ -1025,31 +1026,31 @@ class WebSearchTool(BaseTool):
                     "query": query, "model": model_name, "url": chat_url,
                     "access": access, "azure": azure,
                     "internalSearch": internal_search,
-                    "fixedHeaders": dict(_QGENIE_FIXED_HEADERS),
+                    "fixedHeaders": dict(_YOUR-AI-ENDPOINT_FIXED_HEADERS),
                     "timeoutMs": timeout_ms,
                 })
             except Exception as exc:
-                raise RuntimeError(f"qgenie chat request failed: {exc}")
+                raise RuntimeError(f"YOUR-AI-ENDPOINT chat request failed: {exc}")
 
         status = int(chat.get("status") or 0)
         if chat.get("error"):
-            raise RuntimeError(f"qgenie chat transport error: {chat['error']}")
+            raise RuntimeError(f"YOUR-AI-ENDPOINT chat transport error: {chat['error']}")
         if status in (401, 403):
             # Token likely expired/revoked — drop the cache so the next call
             # re-harvests, and route through the standard login-recovery error.
-            global _qgenie_token
-            _qgenie_token = None
-            raise _AuthRequired("qgenie", base_url, status)
+            global _YOUR-AI-ENDPOINT_token
+            _YOUR-AI-ENDPOINT_token = None
+            raise _AuthRequired("YOUR-AI-ENDPOINT", base_url, status)
         if status >= 400 or status == 0:
             raise RuntimeError(
-                f"qgenie HTTP {status}: {(chat.get('errBody') or '')[:300]}"
+                f"YOUR-AI-ENDPOINT HTTP {status}: {(chat.get('errBody') or '')[:300]}"
             )
 
         raw = chat.get("raw") or ""
-        answer, conversation_id, source_docs = self._parse_qgenie_sse(raw)
+        answer, conversation_id, source_docs = self._parse_YOUR-AI-ENDPOINT_sse(raw)
         if not answer.strip():
             raise RuntimeError(
-                "qgenie returned no answer text (SSE had no 'final' tokens). "
+                "YOUR-AI-ENDPOINT returned no answer text (SSE had no 'final' tokens). "
                 f"Raw head: {raw[:200]!r}"
             )
 
@@ -1058,10 +1059,10 @@ class WebSearchTool(BaseTool):
             if conversation_id else chat_page
         )
         hits: List[SearchHit] = [SearchHit(
-            title=f"QGenie: {query[:60]}",
+            title=f"YOUR-AI-ENDPOINT: {query[:60]}",
             url=conv_url,
             snippet=answer,
-            source="qgenie",
+            source="YOUR-AI-ENDPOINT",
             last_modified=None,
         )]
         # Optional: cited source documents. Only include ones with a usable
@@ -1075,12 +1076,12 @@ class WebSearchTool(BaseTool):
                 title=d_title,
                 url=d_url,
                 snippet=_strip_html(doc.get("content") or ""),
-                source="qgenie",
+                source="YOUR-AI-ENDPOINT",
                 last_modified=None,
             ))
         return hits, False, None
 
-    async def _qgenie_ensure_tokens(
+    async def _YOUR-AI-ENDPOINT_ensure_tokens(
         self, page: Any, *, chat_page: str, token_url_marker: str, base_url: str,
     ) -> Tuple[str, str]:
         """Return a valid (access_token, azure_jwt) pair, harvesting them from
@@ -1089,9 +1090,9 @@ class WebSearchTool(BaseTool):
         Raises :class:`_AuthRequired` when the page redirects to SSO or the
         tokens never appear (so the agent runs the standard login recovery).
         """
-        global _qgenie_token
+        global _YOUR-AI-ENDPOINT_token
         now = time.time()
-        cached = _qgenie_token
+        cached = _YOUR-AI-ENDPOINT_token
         if cached and cached.get("access") and cached.get("azure") \
                 and cached.get("expires_at", 0) > now:
             return cached["access"], cached["azure"]
@@ -1123,7 +1124,7 @@ class WebSearchTool(BaseTool):
 
         import asyncio as _asyncio
         page.on("request", on_request)
-        response_handler = lambda r: _asyncio.create_task(on_response(r))
+        def response_handler(r): return _asyncio.create_task(on_response(r))
         page.on("response", response_handler)
         try:
             # Navigate to the chat page — the SPA auto-fires /api/apigee/token
@@ -1132,12 +1133,12 @@ class WebSearchTool(BaseTool):
             try:
                 await page.goto(chat_page, wait_until="domcontentloaded", timeout=60_000)
             except Exception as exc:
-                raise RuntimeError(f"qgenie navigate {chat_page} failed: {exc}")
+                raise RuntimeError(f"YOUR-AI-ENDPOINT navigate {chat_page} failed: {exc}")
 
             landed = (page.url or "").lower()
             for marker in _SSO_BODY_MARKERS:
                 if marker in landed:
-                    raise _AuthRequired("qgenie", base_url, 302)
+                    raise _AuthRequired("YOUR-AI-ENDPOINT", base_url, 302)
 
             for _ in range(20):  # ~10s
                 if captured["azure"] and captured["access"]:
@@ -1162,14 +1163,14 @@ class WebSearchTool(BaseTool):
 
         if not (captured["azure"] and captured["access"]):
             # Most likely not logged in (no token minted). Route to login recovery.
-            raise _AuthRequired("qgenie", base_url, 401)
+            raise _AuthRequired("YOUR-AI-ENDPOINT", base_url, 401)
 
         try:
             expires_in = float(captured["expires_in"] or 0)
         except (TypeError, ValueError):
             expires_in = 0.0
-        expires_at = now + max(0.0, expires_in - _QGENIE_TOKEN_SAFETY_MARGIN_S)
-        _qgenie_token = {
+        expires_at = now + max(0.0, expires_in - _YOUR-AI-ENDPOINT_TOKEN_SAFETY_MARGIN_S)
+        _YOUR-AI-ENDPOINT_token = {
             "access": captured["access"],
             "azure": captured["azure"],
             "expires_at": expires_at,
@@ -1177,8 +1178,8 @@ class WebSearchTool(BaseTool):
         return captured["access"], captured["azure"]
 
     @staticmethod
-    def _parse_qgenie_sse(raw: str) -> Tuple[str, Optional[str], List[Dict[str, Any]]]:
-        """Parse qgenie's SSE stream into (answer, conversation_id, source_docs).
+    def _parse_YOUR-AI-ENDPOINT_sse(raw: str) -> Tuple[str, Optional[str], List[Dict[str, Any]]]:
+        """Parse YOUR-AI-ENDPOINT's SSE stream into (answer, conversation_id, source_docs).
 
         Framing (verified live 2026-07-20): lines of ``data: {json}`` separated
         by blank lines, terminated by ``data: [Done]``. Events carry a

@@ -28,7 +28,7 @@ the cache landed — that was the "dead zone after a message" bug).
 
 Two retrieval legs, fused by RRF, exactly mirroring
 ``long_term_memory/recall.py``'s pattern but INTENTIONALLY not sharing its
-runtime: LTM's dense leg calls the remote QGenie gateway (cold-start
+runtime: LTM's dense leg calls the remote YOUR-AI-ENDPOINT gateway (cold-start
 7.8-70s), which is unusable on resume's real-time first-message path. Both
 legs here are fully local:
 
@@ -113,7 +113,7 @@ DENSE_COS_GATE: float = 0.68
 _BM25_PREFILTER_LIMIT: int = 50
 
 # bge-small-zh-v1.5: selected in §6.3.1 over 2 other local models + the web
-# QGenie embedder — best/tied-best hit rate, 90MB, 2ms/query, zero cold start.
+# YOUR-AI-ENDPOINT embedder — best/tied-best hit rate, 90MB, 2ms/query, zero cold start.
 EMBED_MODEL_NAME: str = "BAAI/bge-small-zh-v1.5"
 
 # Batch size for every ``model.embed(...)`` call below. MUST stay small.

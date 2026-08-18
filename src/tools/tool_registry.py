@@ -94,7 +94,7 @@ class ToolRegistry:
     GLOB = "glob"
     GREP = "grep"
     NOTEBOOK_EDIT = "notebook_edit"
-    SSH  = "ssh"
+    SSH = "ssh"
     REMOTE_HANDQ = "remote_handq"
     WEB_SEARCH = "web_search"
     EMAIL = "email"
@@ -1735,7 +1735,6 @@ EXAMPLES
                     ),
                 )
 
-
         # Register WEB_SEARCH tool. Windows-only — depends on browser_tool
         # whose Playwright session is Windows-tested. on_demand=True so it
         # only enters the LLM tool list once the agent claims it.
@@ -1743,7 +1742,7 @@ EXAMPLES
             cls._tools[cls.WEB_SEARCH] = ToolMetadata(
                 name=cls.WEB_SEARCH,
                 description=(
-                    "Search across Qualcomm internal sources "
+                    "Search across COMPANY internal sources "
                     "(Confluence Cloud, Jira DC, SharePoint Online, orbit) "
                     "via the authenticated browser session. Cookies + SSO "
                     "are reused from the persistent browser profile so the "
@@ -1751,8 +1750,8 @@ EXAMPLES
                     "cookie thereafter. Returns a list of normalised "
                     "(title, url, snippet, source, last_modified) hits — "
                     "use browser.navigate + extract to read full documents. "
-                    "A fifth source, 'qgenie', is DIFFERENT: it queries the "
-                    "qgenie-chat assistant and returns ONE synthesised, cited "
+                    "A fifth source, 'YOUR-AI-ENDPOINT', is DIFFERENT: it queries the "
+                    "YOUR-AI-ENDPOINT-chat assistant and returns ONE synthesised, cited "
                     "answer (hits[0].snippet is the full answer, read it "
                     "directly) rather than documents to open."
                 ),
@@ -1761,8 +1760,8 @@ WHEN TO USE
   - Step text says "search Confluence/Jira/SharePoint/orbit/intranet for X"
   - Step text says "find internal docs / wiki page / ticket about X"
   - Anything that looks like cross-source enterprise search
-  - Step text says "ask qgenie X" / "what does qgenie say about X" / you want a
-    synthesised answer from internal knowledge → source=qgenie
+  - Step text says "ask YOUR-AI-ENDPOINT X" / "what does YOUR-AI-ENDPOINT say about X" / you want a
+    synthesised answer from internal knowledge → source=YOUR-AI-ENDPOINT
 
 WHEN NOT TO USE
   Public web search (Google / DuckDuckGo)        → browser navigate + extract
@@ -1775,7 +1774,7 @@ confluence/jira/sharepoint/orbit return ranking hits, not full documents
 browser.navigate. Default limit 10, hard cap 25 (clamped from
 web_search.max_limit in handq_config.yaml).
 
-qgenie is the exception: it returns ONE hit whose snippet is qgenie's full,
+YOUR-AI-ENDPOINT is the exception: it returns ONE hit whose snippet is YOUR-AI-ENDPOINT's full,
 untruncated answer (optionally followed by the source docs it cited). It
 ignores limit/offset. Like orbit it needs a launched browser session
 (browser.launch_browser is idempotent — call it first if unsure).

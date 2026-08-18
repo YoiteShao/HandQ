@@ -2,7 +2,7 @@
 
 ## What is "Flash Meta"
 
-Write a Qualcomm meta build (a directory containing all sub-system images) to the device's storage (UFS / SPINOR). Equivalent to the full xPCAT GUI download flow, but executed entirely via command line.
+Write a COMPANY meta build (a directory containing all sub-system images) to the device's storage (UFS / SPINOR). Equivalent to the full xPCAT GUI download flow, but executed entirely via command line.
 
 ## Default Build Server
 
@@ -33,7 +33,7 @@ Notes:
 | Condition | How to verify |
 |-----------|---------------|
 | TAC board connected | `tac.py probe` shows ✓ |
-| Device USB data connected | Device Manager shows Qualcomm device |
+| Device USB data connected | Device Manager shows COMPANY device |
 | Meta path reachable | `dir \\server\share\META...` has content |
 | fh_loader + QSaharaServer in PATH | `where fh_loader.exe` returns a path |
 | fastboot + adb in PATH | `where fastboot` / `where adb` |

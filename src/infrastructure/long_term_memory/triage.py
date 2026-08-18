@@ -16,6 +16,7 @@ worker. The worker is a single asyncio.Task spawned inside
 ``LongTermMemory.init`` and cancelled on shutdown.
 """
 from __future__ import annotations
+import re as _re  # local import to keep top-of-file imports unchanged
 
 import asyncio
 import json
@@ -116,7 +117,6 @@ def _looks_structured(text: str) -> bool:
 # that the LLM kept proposing as memory. Matches: drive-letter
 # Windows paths, /Local/... POSIX-ish paths, and any backslash-heavy
 # fragment.
-import re as _re  # local import to keep top-of-file imports unchanged
 _PATH_FRAGMENT_RE = _re.compile(
     r"(?:[A-Za-z]:[\\/][\w./\\\-]+|/[Ll]ocal/[\w./\\\-]+|[\w\-]+[\\/][\w\-]+[\\/][\w\-]+)"
 )
@@ -578,7 +578,7 @@ class DreamWorker:
 
         # Cold-boot network-not-ready window. On a freshly-booted laptop
         # the corporate VPN / proxy / DNS commonly need 30-60s before
-        # qgenie-api.qualcomm.com becomes reachable. Without this delay
+        # YOUR-AI-ENDPOINT-api.COMPANY.com becomes reachable. Without this delay
         # the first warmup ran at boot+2s and ate the full embedder retry
         # budget (~3.5min of ConnectError) before the network came up.
         try:
@@ -1155,7 +1155,6 @@ class DreamWorker:
             title=title, description=description, content=content,
             allowed_tools=allowed_tools, reference_md=reference_md,
         )
-
 
     # ── Per-candidate ───────────────────────────────────────────────────────
 

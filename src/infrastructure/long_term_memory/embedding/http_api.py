@@ -1,7 +1,7 @@
-"""HTTP-API embedding provider — OpenAI-compatible /v1/embeddings via QGenie.
+"""HTTP-API embedding provider — OpenAI-compatible /v1/embeddings via YOUR-AI-ENDPOINT.
 
 Mirrors the pattern in :mod:`src.infrastructure.vision.llm`: an
-``AsyncOpenAI`` client pointed at the QGenie gateway, sharing
+``AsyncOpenAI`` client pointed at the YOUR-AI-ENDPOINT gateway, sharing
 ``llm.API_KEY`` and tolerating the internal CA via ``verify_ssl=False``.
 
 Failure policy:
@@ -104,7 +104,7 @@ class HttpApiEmbedder(EmbeddingProvider):
         """Single HTTP roundtrip — shared by embed / embed_query.
 
         Retry policy: 3 attempts with 2/4/8s exponential backoff. Without
-        this, a transient QGenie failure (cold-start past timeout, brief
+        this, a transient YOUR-AI-ENDPOINT failure (cold-start past timeout, brief
         gateway 5xx) caused the warmup callsite in DreamWorker to swallow
         the exception and never re-attempt — leaving the chunk permanently
         missing an embedding until backfill happened to retry. Backfill
@@ -177,7 +177,7 @@ class HttpApiEmbedder(EmbeddingProvider):
             self._http = httpx.AsyncClient(
                 verify=self._verify_ssl, timeout=self._timeout,
                 # trust_env=False: do NOT honour HTTP(S)_PROXY / system proxy
-                # env vars. The QGenie gateway is an INTERNAL address
+                # env vars. The YOUR-AI-ENDPOINT gateway is an INTERNAL address
                 # (10.x.x.x); routing embedding calls through a corporate
                 # proxy makes them fail (APIConnectionError / RemoteProtocol
                 # / ReadTimeout), which silently degraded LTM recall to

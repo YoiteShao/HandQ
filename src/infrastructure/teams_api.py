@@ -748,7 +748,7 @@ class TeamsClient:
             suggestions.append({
                 "confidence": s.get("confidence"),
                 "start":      (slot.get("start") or {}).get("dateTime") or "",
-                "end":        (slot.get("end")   or {}).get("dateTime") or "",
+                "end":        (slot.get("end") or {}).get("dateTime") or "",
                 "reason":     s.get("suggestionReason") or "",
             })
         return {"suggestions": suggestions, "count": len(suggestions)}
@@ -1021,7 +1021,7 @@ class TeamsChatClient:
         if self._http is not None:
             return self._http
         # verify=False mirrors the corporate-proxy fix already applied
-        # to the rest of teams_*; SSL inspection on Qualcomm's network.
+        # to the rest of teams_*; SSL inspection on COMPANY's network.
         self._http = httpx.AsyncClient(timeout=30.0, verify=False)
         return self._http
 

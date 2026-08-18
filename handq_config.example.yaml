@@ -151,15 +151,15 @@ web_search:
   sources:
     confluence:
       enabled: true
-      base_url: https://qualcomm-confluence.atlassian.net
+      base_url: https://COMPANY-confluence.atlassian.net
       api_path: /wiki/rest/api/search
     jira:
       enabled: true
-      base_url: https://jira-dc.qualcomm.com
+      base_url: https://jira-dc.COMPANY.com
       api_path: /jira/rest/api/2/search
     sharepoint:
       enabled: true
-      base_url: https://qualcomm.sharepoint.com
+      base_url: https://COMPANY.sharepoint.com
       api_path: /_api/search/query
     orbit:
       enabled: true
@@ -167,18 +167,18 @@ web_search:
       search_url_template: 'https://orbit/search?query={q}&pagesize=10'
       result_selector: 'a.request-link'
       timeout_ms: 30000   # page.goto deadline; the real intranet page can take >10s to load
-    qgenie:
-      # The qgenie-chat assistant (SSO web app) — returns ONE synthesised,
+    YOUR-AI-ENDPOINT:
+      # The YOUR-AI-ENDPOINT-chat assistant (SSO web app) — returns ONE synthesised,
       # cited answer, not a ranked hit list. Auth is two tokens (Bearer +
       # x-copilot-token), harvested passively from the app's own token traffic;
       # NOT cookies. Runs in-page (needs a launched browser session, like orbit).
       enabled: true
-      base_url: https://qgenie-chat.qualcomm.com
-      chat_page: https://qgenie-chat.qualcomm.com/apps/chat
-      token_url: https://qgenie-chat.qualcomm.com/api/apigee/token
-      chat_url: https://apigw-op.qualcomm.com/qgeniechat/ui/v1/chat
+      base_url: https://YOUR-AI-ENDPOINT-chat.COMPANY.com
+      chat_page: https://YOUR-AI-ENDPOINT-chat.COMPANY.com/apps/chat
+      token_url: https://YOUR-AI-ENDPOINT-chat.COMPANY.com/api/apigee/token
+      chat_url: https://apigw-op.COMPANY.com/YOUR-AI-ENDPOINTchat/ui/v1/chat
       model_name: anthropic::claude-4-6-sonnet
-      internal_qualcomm_search: true   # let qgenie RAG-search internal knowledge before answering
+      internal_COMPANY_search: true   # let YOUR-AI-ENDPOINT RAG-search internal knowledge before answering
       timeout_ms: 120000   # RAG + synthesis is slow — 30-60s+ is normal
 email:
   body_preview_chars: 500
@@ -193,9 +193,9 @@ personalization:
   excluded_apps: []
   git_hook_repos: []
 update:
-  share_path: '\\wine\APTAuto\ADAS\fengxuan\HandQ\Windows'
+  share_path:
   # Where built handq-linux-<version>.tar.gz packages are dropped (see
   # packaging/build_linux.sh). When set, remote_handq auto-deploys/upgrades
   # handq_linux on a remote host before delegating a goal to it. Blank
   # disables the feature — the remote must be pre-installed as before.
-  linux_share_path: '\\wine\APTAuto\ADAS\fengxuan\HandQ\Linux'
+  linux_share_path: 

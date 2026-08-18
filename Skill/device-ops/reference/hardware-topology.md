@@ -106,4 +106,4 @@ pip install pyserial
 python probe.py
 ```
 
-After this, all device-ops scripts will find their tools automatically (they search PATH + common Qualcomm install dirs).
+After this, all device-ops scripts will find their tools automatically (they search PATH + common COMPANY install dirs).

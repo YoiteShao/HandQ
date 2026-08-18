@@ -2,7 +2,7 @@
 
 File layout
 -----------
-  llm.py       multimodal LLM client (QGenie azure::gpt-5.4-mini)
+  llm.py       multimodal LLM client (YOUR-AI-ENDPOINT azure::gpt-5.4-mini)
   ocr.py       local OCR engines (RapidOCR / PP-OCR-v4 mobile)
   storage.py   tiered scratch storage (ephemeral / task / activity)
 

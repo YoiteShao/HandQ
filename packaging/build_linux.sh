@@ -167,9 +167,9 @@ INCLUDE_COMMON=(
     "--include-package=src"
     "--include-package=yaml"
     "--include-package=json_repair"
-    # QGenie SDK temporarily disabled — uncomment when re-enabling qgenie support
-    # "--include-module=qgenie_service"
-    # "--include-package=qgenie"
+    # YOUR-AI-ENDPOINT SDK temporarily disabled — uncomment when re-enabling YOUR-AI-ENDPOINT support
+    # "--include-module=YOUR-AI-ENDPOINT_service"
+    # "--include-package=YOUR-AI-ENDPOINT"
     # "--include-package=pydantic"
     "--include-package=anthropic"       # AnthropicStreamingService (src/infrastructure/)
     "--include-package=httpx"           # dep of anthropic SDK

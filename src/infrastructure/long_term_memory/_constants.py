@@ -16,7 +16,7 @@ Sections:
 - 4. Recall    (k values, min_score thresholds, RRF k, kind / tag names)
 - 5. PII       (always-on)
 - 6. LLM tier  (which role pool the dream worker uses)
-- 7. QGenie endpoint
+- 7. YOUR-AI-ENDPOINT endpoint
 - 8. Chunking
 - 9. Candidate-status reason strings
 """
@@ -40,9 +40,9 @@ EMBEDDING_PROVIDER: str = PROVIDER_ONNX_LOCAL
 # Model identifier sent in `embeddings.create(model=...)`. Only consumed by
 # the PROVIDER_HTTP_API branch of from_config() — PROVIDER_ONNX_LOCAL's
 # OnnxEmbedder hardcodes its own model/dims (see embedding/onnx_local.py).
-# Verified live against QGenie: `qgenie_embedd` resolves to
+# Verified live against YOUR-AI-ENDPOINT: `YOUR-AI-ENDPOINT_embedd` resolves to
 # ``Qwen/Qwen3-Embedding-0.6B`` and returns 1024-dim vectors.
-EMBEDDING_MODEL: str = "qgenie_embedd"
+EMBEDDING_MODEL: str = "YOUR-AI-ENDPOINT_embedd"
 
 # Output vector dimensions for PROVIDER_HTTP_API (Qwen3-Embedding-0.6B).
 # PROVIDER_ONNX_LOCAL's OnnxEmbedder reports its own dims (512); not read
@@ -105,9 +105,7 @@ class RecallTier(str, Enum):
     PRECISE = "precise"  # rerank=True, run concurrently off the INTENT critical path
 
 
-
 # ── 3. DreamWorker ──────────────────────────────────────────────────────────
-
 DREAM_INTERVAL_SECONDS: float = 60.0
 DREAM_BATCH_SIZE: int = 8
 DREAM_MAX_RETRY: int = 5
@@ -145,7 +143,7 @@ DREAM_INTERVAL_MAX_SEC: float = 3600.0
 #   - DREAM_BACKFILL_CYCLE   : on every subsequent cycle (steady-state trickle)
 #
 # CYCLE was 10 originally; raised to 50 after a real-world incident where
-# a multi-hour QGenie outage left ~30% of new chunks without embeddings,
+# a multi-hour YOUR-AI-ENDPOINT outage left ~30% of new chunks without embeddings,
 # and 10/cycle could not catch up before the worker backed off to long
 # idle intervals. 50 still fits in one /v1/embeddings batch round-trip.
 DREAM_BACKFILL_STARTUP: int = 50
@@ -335,7 +333,7 @@ DREAM_L3_WINDOW_SECONDS: int = 60 * 60 * 24 * 90        # 90 days
 # distribution, not the current local embedder's.
 DREAM_L2_CLUSTER_THRESHOLD: float = 0.55
 DREAM_L3_CLUSTER_THRESHOLD: float = 0.35    # patterns are already
-                                            # synthesised, looser still
+# synthesised, looser still
 
 # A cluster needs at least this many members for the LLM to even consider
 # extracting a pattern. Below that, "pattern" is just an artefact.
@@ -473,13 +471,13 @@ PII_ENABLED: bool = True
 # from those two YAML lists by their respective callers.
 
 
-# ── 7. QGenie endpoint ──────────────────────────────────────────────────────
+# ── 7. YOUR-AI-ENDPOINT endpoint ──────────────────────────────────────────────────────
 
-QGENIE_BASE_URL: str = "https://qgenie-api.qualcomm.com/v1"
-QGENIE_VERIFY_SSL: bool = False
+YOUR-AI-ENDPOINT_BASE_URL: str = "https://YOUR-AI-ENDPOINT-api.COMPANY.com/v1"
+YOUR-AI-ENDPOINT_VERIFY_SSL: bool = False
 
 # Per-request timeout for embedding calls. Live-tested: cold-start
-# qgenie_embedd takes 30–45s for the first request; bumping to 90 covers
+# YOUR-AI-ENDPOINT_embedd takes 30–45s for the first request; bumping to 90 covers
 # that and any 1-second jitter without making real failures hang too long.
 EMBEDDING_TIMEOUT_SECONDS: float = 90.0
 

@@ -117,7 +117,6 @@ else:
 # longer wires one; the IM arrives via tool construction.
 
 
-
 # Maximum characters returned by ``extract`` — mirrors read_tool's 100KB
 # cap so the LLM context budget stays predictable.
 _EXTRACT_MAX_CHARS = 100_000
@@ -758,7 +757,7 @@ async def evaluate_fetch(
     # Previously we reused session.first_tab_id() and goto(target_origin),
     # which silently hijacked whatever page the agent had been working on
     # (e.g. weather.com.cn) and pointed it at our target origin
-    # (qualcomm.sharepoint.com). web_search_tool's planned per-source-tab
+    # (COMPANY.sharepoint.com). web_search_tool's planned per-source-tab
     # refactor lives here.
     page = await session.context.new_page()
     try:
@@ -870,7 +869,7 @@ def _json_safe(value: Any) -> Any:
 # attaching there is a genuine privacy-sensitive action that needs an
 # explicit opt-in. But the same gate also fires when the CDP target is an
 # Electron app the AGENT ITSELF just launched with --remote-debugging-port
-# (e.g. a Qualcomm flashing tool, QPM3) purely to get deterministic DOM
+# (e.g. a COMPANY flashing tool, QPM3) purely to get deterministic DOM
 # access instead of screenshot/OCR guessing — there is no user-privacy risk
 # there, since the desktop takeover approval already covers "agent may drive
 # this app's UI". Confirmed live 2026-07-26 (xPCAT flash-meta incident): the
@@ -1507,7 +1506,7 @@ class BrowserTool(BaseTool):
                     "(SameSite=Strict / Lax). Set false to fire from "
                     "whatever tab is in front; only useful when the API "
                     "exposes CORS for cross-origin reads, which is rare "
-                    "on internal Qualcomm endpoints."
+                    "on internal COMPANY endpoints."
                 ),
             },
         },
@@ -3157,7 +3156,7 @@ class BrowserTool(BaseTool):
     #
     # Asks a vision LLM about the visible page. Routes through
     # ``infrastructure.vision`` (the ``client.py`` submodule) which talks
-    # to the QGenie gateway
+    # to the YOUR-AI-ENDPOINT gateway
     # (azure::gpt-5.4-mini); endpoint / api_key / model live in
     # ``handq_config.yaml`` under the ``vision:`` section.
     #
@@ -4148,18 +4147,21 @@ class _BrowserAtomic(BrowserTool):
 
 class BrowserLaunchTool(_BrowserAtomic):
     _action = "launch_browser"
+
     def __init__(self, ctx=None) -> None:
         super().__init__(ctx=ctx, name="browser_launch")
 
 
 class BrowserAttachTool(_BrowserAtomic):
     _action = "attach_browser"
+
     def __init__(self, ctx=None) -> None:
         super().__init__(ctx=ctx, name="browser_attach")
 
 
 class BrowserNewTabTool(_BrowserAtomic):
     _action = "new_tab"
+
     def __init__(self, ctx=None) -> None:
         super().__init__(ctx=ctx, name="browser_new_tab")
 
@@ -4167,12 +4169,14 @@ class BrowserNewTabTool(_BrowserAtomic):
 class BrowserListTabsTool(_BrowserAtomic):
     _action = "list_tabs"
     is_read_only = True
+
     def __init__(self, ctx=None) -> None:
         super().__init__(ctx=ctx, name="browser_list_tabs")
 
 
 class BrowserNavigateTool(_BrowserAtomic):
     _action = "navigate"
+
     def __init__(self, ctx=None) -> None:
         super().__init__(ctx=ctx, name="browser_navigate")
 
@@ -4180,6 +4184,7 @@ class BrowserNavigateTool(_BrowserAtomic):
 class BrowserExtractTool(_BrowserAtomic):
     _action = "extract"
     is_read_only = True
+
     def __init__(self, ctx=None) -> None:
         super().__init__(ctx=ctx, name="browser_extract")
 
@@ -4187,18 +4192,21 @@ class BrowserExtractTool(_BrowserAtomic):
 class BrowserSnapshotTool(_BrowserAtomic):
     _action = "snapshot"
     is_read_only = True
+
     def __init__(self, ctx=None) -> None:
         super().__init__(ctx=ctx, name="browser_snapshot")
 
 
 class BrowserClickTool(_BrowserAtomic):
     _action = "click"
+
     def __init__(self, ctx=None) -> None:
         super().__init__(ctx=ctx, name="browser_click")
 
 
 class BrowserTypeTool(_BrowserAtomic):
     _action = "type"
+
     def __init__(self, ctx=None) -> None:
         super().__init__(ctx=ctx, name="browser_type")
 
@@ -4206,6 +4214,7 @@ class BrowserTypeTool(_BrowserAtomic):
 class BrowserWaitForTool(_BrowserAtomic):
     _action = "wait_for"
     is_read_only = True  # observation-only
+
     def __init__(self, ctx=None) -> None:
         super().__init__(ctx=ctx, name="browser_wait_for")
 
@@ -4213,6 +4222,7 @@ class BrowserWaitForTool(_BrowserAtomic):
 class BrowserScreenshotTool(_BrowserAtomic):
     _action = "screenshot"
     is_read_only = True
+
     def __init__(self, ctx=None) -> None:
         super().__init__(ctx=ctx, name="browser_screenshot")
 
@@ -4220,6 +4230,7 @@ class BrowserScreenshotTool(_BrowserAtomic):
 class BrowserVisionQueryTool(_BrowserAtomic):
     _action = "vision_query"
     is_read_only = True
+
     def __init__(self, ctx=None) -> None:
         super().__init__(ctx=ctx, name="browser_vision_query")
 
@@ -4227,6 +4238,7 @@ class BrowserVisionQueryTool(_BrowserAtomic):
 class BrowserVideoContextTool(_BrowserAtomic):
     _action = "video_context"
     is_read_only = True
+
     def __init__(self, ctx=None) -> None:
         super().__init__(ctx=ctx, name="browser_video_context")
 
@@ -4234,23 +4246,27 @@ class BrowserVideoContextTool(_BrowserAtomic):
 class BrowserFetchJsonTool(_BrowserAtomic):
     _action = "fetch_json"
     is_read_only = True  # network-only read
+
     def __init__(self, ctx=None) -> None:
         super().__init__(ctx=ctx, name="browser_fetch_json")
 
 
 class BrowserRequestUserLoginTool(_BrowserAtomic):
     _action = "request_user_login"
+
     def __init__(self, ctx=None) -> None:
         super().__init__(ctx=ctx, name="browser_request_user_login")
 
 
 class BrowserEvaluateTool(_BrowserAtomic):
     _action = "evaluate"
+
     def __init__(self, ctx=None) -> None:
         super().__init__(ctx=ctx, name="browser_evaluate")
 
 
 class BrowserCloseTabTool(_BrowserAtomic):
     _action = "close_tab"
+
     def __init__(self, ctx=None) -> None:
         super().__init__(ctx=ctx, name="browser_close_tab")

@@ -276,7 +276,7 @@ class LLMService(ABC):
         reasoning_effort:
             ``"low"`` | ``"medium"`` | ``"high"``.  Legacy knob — maps to
             Anthropic's ``thinking.budget_tokens`` (fixed token counts).
-            Not deprecated on the QGenie/Bedrock gateway HandQ ships against:
+            Not deprecated on the YOUR-AI-ENDPOINT/Bedrock gateway HandQ ships against:
             verified 2026-07-17 that ``budget_tokens=4096`` returns 200 and
             activates extended thinking on Opus 4.7/4.8 and Sonnet 5. Note
             this contradicts the native Anthropic API, where Opus 4.7+ and
@@ -301,7 +301,7 @@ class LLMService(ABC):
             ``anthropic_streaming_service._resolve_effort``).
 
             Call-site convention in ``controller_v2`` (verified live
-            against the QGenie/Bedrock gateway 2026-07-16 — see the
+            against the YOUR-AI-ENDPOINT/Bedrock gateway 2026-07-16 — see the
             per-model acceptance notes in
             ``anthropic_streaming_service._MODEL_EFFORT_VALUES``):
 
@@ -348,7 +348,6 @@ class LLMService(ABC):
     # Concrete helpers – backend-agnostic, available to all adapters
     # ------------------------------------------------------------------
 
-
     def mark_exhausted(self, retry_after_secs: float = 0.0) -> None:
         """Flag this service as rate-limited out for (at least) *retry_after_secs*.
 
@@ -384,8 +383,8 @@ class LLMService(ABC):
         """Return ``True`` if *error* indicates the prompt exceeded the model's context limit.
 
         Covers error messages from:
-          - QGenie / generic: "prompt is too long", "limit exceeded"
-          - QGenie/Bedrock gateway: ValidationException "Input is too long for
+          - YOUR-AI-ENDPOINT / generic: "prompt is too long", "limit exceeded"
+          - YOUR-AI-ENDPOINT/Bedrock gateway: ValidationException "Input is too long for
             requested model." — note the wording is *Input*, not *prompt*. Until
             this literal was added, detection of the gateway's own phrasing
             relied entirely on the ``"400" and "too long"`` fallback below,
@@ -547,4 +546,3 @@ class LLMService(ABC):
             "remote end closed connection",
         )
         return any(s in error_str for s in network_strs)
-

@@ -77,7 +77,7 @@ flash_meta.py --meta <build_id_or_path>
 
 **Cannot do**:
 - Flash a single partition (full meta only; use raw fastboot for partials)
-- Handle non-Qualcomm platforms
+- Handle non-COMPANY platforms
 - Auto-download meta builds (path must pre-exist)
 - Execute remotely (must run on the PC where TAC board is attached)
 - Correctly guess parameters for a chip not in the built-in defaults table (falls back to requiring explicit flags)

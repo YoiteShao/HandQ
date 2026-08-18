@@ -26,7 +26,7 @@ as the primary local engine.  ``find_element`` walks:
   4. on hit: return bbox center, source='ocr', elapsed ~2.8 s
   5. on miss: optionally fall back to LLM vision (vision_client.query
      with a JSON output_schema), source='vision', elapsed ~4 s
-     (anthropic::claude-4-5-haiku via the QGenie gateway)
+     (anthropic::claude-4-5-haiku via the YOUR-AI-ENDPOINT gateway)
 
   NB: a UIA `snapshot` is ~170 ms — ~16x cheaper than the OCR pass here.
   Prefer snapshot to name a control, then click it directly; reserve
@@ -288,7 +288,6 @@ def _snapshot_sig(state: Dict[str, Any]) -> Tuple[int, str, int]:
     )
 
 
-
 def _desktop_store():
     """Lazy ScreenshotStore for the desktop tool. Roots at
     ``%USERPROFILE%\\HandQ\\desktop_shots\\`` per ARCHITECTURE.md §1.6.
@@ -357,7 +356,7 @@ async def flush_desktop_store() -> Dict[str, int]:
 # full IPC contract.
 
 _takeover_active: bool = False
-_task_approved: bool = False# Once the user revokes (Ctrl+Shift+C), we set this for the rest of the
+_task_approved: bool = False  # Once the user revokes (Ctrl+Shift+C), we set this for the rest of the
 # task so the YAML ``tool_desktop.auto_approve=true`` policy stops
 # silently re-approving. The runtime gate then forces a real confirmation
 # every desktop ToolCall until ``reset_takeover_state`` clears the flag
@@ -862,6 +861,7 @@ class DesktopState:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
+
         def _load() -> None:
             try:
                 from ..infrastructure.vision import get_local_ocr
@@ -1451,9 +1451,9 @@ def _capture_state_after(state_before: Dict[str, Any]) -> Dict[str, Any]:
     new_windows already convey "what's new on screen".
     """
     info = _foreground_window_info()
-    fg_hwnd  = int(info.get("hwnd", 0) or 0)
+    fg_hwnd = int(info.get("hwnd", 0) or 0)
     fg_title = info.get("title", "") or ""
-    fg_pid   = int(info.get("pid", 0) or 0)
+    fg_pid = int(info.get("pid", 0) or 0)
 
     foreground_changed = (
         fg_hwnd != state_before.get("foreground_hwnd", 0)
@@ -1749,7 +1749,6 @@ def _failsafe_error_text(
         "it, and avoid disabling the failsafe check as a workaround — it "
         "is the only way a human can abort a runaway automation."
     )
-
 
 
 # One-line hint appended to a click result when NOTHING changed. This is the
@@ -2519,6 +2518,7 @@ def _format_snapshot_summary(
     for e in elements:
         by_role.setdefault(e.get("role") or "Other", []).append(e)
     # Plural pluralisation: append S unless role already ends in S.
+
     def _heading(role: str, count: int) -> str:
         upper = role.upper()
         plural = upper if upper.endswith("S") else upper + "S"
@@ -3509,7 +3509,8 @@ class DesktopTool(BaseTool):
             return self._error(params, start, guard)
 
         try:
-            x = int(kwargs["x"]); y = int(kwargs["y"])
+            x = int(kwargs["x"])
+            y = int(kwargs["y"])
         except (KeyError, TypeError, ValueError):
             return self._error(params, start, "hover_at requires integer 'x' and 'y'.")
         try:
@@ -3976,7 +3977,8 @@ class DesktopTool(BaseTool):
             return self._error(params, start, guard)
 
         try:
-            x = int(kwargs["x"]); y = int(kwargs["y"])
+            x = int(kwargs["x"])
+            y = int(kwargs["y"])
         except (KeyError, TypeError, ValueError):
             return self._error(params, start, "click_at requires integer 'x' and 'y'.")
         button = (kwargs.get("button") or "left").lower()
@@ -4170,8 +4172,10 @@ class DesktopTool(BaseTool):
             return self._error(params, start, guard)
 
         try:
-            fx = int(kwargs["from_x"]); fy = int(kwargs["from_y"])
-            tx = int(kwargs["to_x"]);   ty = int(kwargs["to_y"])
+            fx = int(kwargs["from_x"])
+            fy = int(kwargs["from_y"])
+            tx = int(kwargs["to_x"])
+            ty = int(kwargs["to_y"])
         except (KeyError, TypeError, ValueError):
             return self._error(
                 params, start,
@@ -4231,7 +4235,9 @@ class DesktopTool(BaseTool):
             return self._error(params, start, guard)
 
         try:
-            x = int(kwargs["x"]); y = int(kwargs["y"]); dy = int(kwargs["dy"])
+            x = int(kwargs["x"])
+            y = int(kwargs["y"])
+            dy = int(kwargs["dy"])
         except (KeyError, TypeError, ValueError):
             return self._error(
                 params, start,
@@ -4419,7 +4425,8 @@ class DesktopTool(BaseTool):
             out_extra: Dict[str, Any] = {"text_chars": len(str(text))}
         else:
             try:
-                x = int(kwargs["x"]); y = int(kwargs["y"])
+                x = int(kwargs["x"])
+                y = int(kwargs["y"])
             except (KeyError, TypeError, ValueError):
                 return self._error(
                     params, start,
@@ -4495,6 +4502,7 @@ class DesktopTool(BaseTool):
                 )
                 for d in dlgs:
                     ref = [False]
+
                     def _cb(h, _lp, _ref=ref):
                         try:
                             cls = ctypes.create_unicode_buffer(96)
@@ -4814,6 +4822,7 @@ class _DesktopAtomic(DesktopTool):
 class DesktopScreenshotTool(_DesktopAtomic):
     _action = "screenshot"
     is_read_only = True
+
     def __init__(self, ctx=None) -> None:
         super().__init__(ctx=ctx, name="desktop_screenshot")
 
@@ -4821,6 +4830,7 @@ class DesktopScreenshotTool(_DesktopAtomic):
 class DesktopListWindowsTool(_DesktopAtomic):
     _action = "list_windows"
     is_read_only = True
+
     def __init__(self, ctx=None) -> None:
         super().__init__(ctx=ctx, name="desktop_list_windows")
 
@@ -4828,6 +4838,7 @@ class DesktopListWindowsTool(_DesktopAtomic):
 class DesktopSnapshotTool(_DesktopAtomic):
     _action = "snapshot"
     is_read_only = True
+
     def __init__(self, ctx=None) -> None:
         super().__init__(ctx=ctx, name="desktop_snapshot")
 
@@ -4835,6 +4846,7 @@ class DesktopSnapshotTool(_DesktopAtomic):
 class DesktopHoverAtTool(_DesktopAtomic):
     _action = "hover_at"
     is_read_only = True  # move + read tooltip
+
     def __init__(self, ctx=None) -> None:
         super().__init__(ctx=ctx, name="desktop_hover_at")
 
@@ -4842,59 +4854,69 @@ class DesktopHoverAtTool(_DesktopAtomic):
 class DesktopFindElementTool(_DesktopAtomic):
     _action = "find_element"
     is_read_only = True
+
     def __init__(self, ctx=None) -> None:
         super().__init__(ctx=ctx, name="desktop_find_element")
 
 
 class DesktopFindAndClickTool(_DesktopAtomic):
     _action = "find_and_click"
+
     def __init__(self, ctx=None) -> None:
         super().__init__(ctx=ctx, name="desktop_find_and_click")
 
 
 class DesktopClickAtTool(_DesktopAtomic):
     _action = "click_at"
+
     def __init__(self, ctx=None) -> None:
         super().__init__(ctx=ctx, name="desktop_click_at")
 
 
 class DesktopTypeTextTool(_DesktopAtomic):
     _action = "type_text"
+
     def __init__(self, ctx=None) -> None:
         super().__init__(ctx=ctx, name="desktop_type_text")
 
 
 class DesktopDragTool(_DesktopAtomic):
     _action = "drag"
+
     def __init__(self, ctx=None) -> None:
         super().__init__(ctx=ctx, name="desktop_drag")
 
 
 class DesktopScrollTool(_DesktopAtomic):
     _action = "scroll"
+
     def __init__(self, ctx=None) -> None:
         super().__init__(ctx=ctx, name="desktop_scroll")
 
 
 class DesktopHotkeyTool(_DesktopAtomic):
     _action = "hotkey"
+
     def __init__(self, ctx=None) -> None:
         super().__init__(ctx=ctx, name="desktop_hotkey")
 
 
 class DesktopKeyPressTool(_DesktopAtomic):
     _action = "key_press"
+
     def __init__(self, ctx=None) -> None:
         super().__init__(ctx=ctx, name="desktop_key_press")
 
 
 class DesktopRunUiaTool(_DesktopAtomic):
     _action = "run_uia"
+
     def __init__(self, ctx=None) -> None:
         super().__init__(ctx=ctx, name="desktop_run_uia")
 
 
 class DesktopFillFileDialogTool(_DesktopAtomic):
     _action = "fill_file_dialog"
+
     def __init__(self, ctx=None) -> None:
         super().__init__(ctx=ctx, name="desktop_fill_file_dialog")

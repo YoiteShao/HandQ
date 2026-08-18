@@ -1,6 +1,6 @@
 ---
 name: device-ops
-description: Qualcomm automotive device operations — TAC serial control (power/EDL/fastboot), full meta build flashing (Firehose/Sahara), device info/log/dump collection. Pure scripts, no GUI automation. Read this before operating any connected Qualcomm automotive device.
+description: COMPANY automotive device operations — TAC serial control (power/EDL/fastboot), full meta build flashing (Firehose/Sahara), device info/log/dump collection. Pure scripts, no GUI automation. Read this before operating any connected COMPANY automotive device.
 enabled: true
 standing: false
 origin: bundled
@@ -8,7 +8,7 @@ allowed-tools: [shell]
 ---
 # Device Operations
 
-Qualcomm automotive platform device control and firmware operations via TAC serial boards and USB data channel. Zero dependency on Axiom, xPCAT, or any GUI — pure Python scripts using pyserial, subprocess calls to fh_loader/QSaharaServer/fastboot/adb.
+COMPANY automotive platform device control and firmware operations via TAC serial boards and USB data channel. Zero dependency on Axiom, xPCAT, or any GUI — pure Python scripts using pyserial, subprocess calls to fh_loader/QSaharaServer/fastboot/adb.
 
 ## Available Scripts
 
@@ -34,7 +34,7 @@ Run `${SKILL_DIR}/scripts/probe.py` to verify all prerequisites in one shot.
 ## Cannot Do
 
 - Operate a device without a TAC board (cannot control power/mode without hardware fixture)
-- Flash non-Qualcomm platforms
+- Flash non-COMPANY platforms
 - Download/fetch meta builds (path must already exist)
 - Push execution to remote machines (scripts run locally where TAC board is attached)
 - JTAG-level debug or trace capture

@@ -119,6 +119,7 @@ class FlashDomain:
     provision: bool    # 是否做 provisioning
     erase_luns: bool   # 是否全盘 LUN 擦除
 
+
 @dataclass
 class Config:
     # ---- 来自 CLI ----
@@ -313,9 +314,9 @@ def run(cmd: List[str], cfg: Config, capture=True, timeout=None,
 
 # 常见 QC 工具安装目录 (Windows)
 _QC_DIRS_WIN = [
-    r"C:\Program Files (x86)\Qualcomm\QFIL",
-    r"C:\Program Files (x86)\Qualcomm\QPST\bin",
-    r"C:\Qualcomm\QFIL",
+    r"C:\Program Files (x86)\COMPANY\QFIL",
+    r"C:\Program Files (x86)\COMPANY\QPST\bin",
+    r"C:\COMPANY\QFIL",
 ]
 
 

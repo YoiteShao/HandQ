@@ -4,17 +4,17 @@
 # Production runtime path: Electron app -> bridge_main.py (stdio bridge) ->
 # src/.
 
-# ── Custom index (Qualcomm internal) ─────────────────────────────────────────
-# Uncomment the two lines below when re-enabling qgenie-sdk.
-# --extra-index-url https://devpi.qualcomm.com/qcom/dev/+simple
-# --trusted-host devpi.qualcomm.com
+# ── Custom index (COMPANY internal) ─────────────────────────────────────────
+# Uncomment the two lines below when re-enabling YOUR-AI-ENDPOINT-sdk.
+# --extra-index-url https://devpi.COMPANY.com/qcom/dev/+simple
+# --trusted-host devpi.COMPANY.com
 
 # ── LLM clients ───────────────────────────────────────────────────────────────
 
-# QGenie SDK (Qualcomm internal). Currently disabled — qgenie_service.py is the
-# only importer and nothing else imports qgenie_service. Uncomment together
+# YOUR-AI-ENDPOINT SDK (COMPANY internal). Currently disabled — YOUR-AI-ENDPOINT_service.py is the
+# only importer and nothing else imports YOUR-AI-ENDPOINT_service. Uncomment together
 # with the index lines above to re-enable.
-# qgenie-sdk
+# YOUR-AI-ENDPOINT-sdk
 
 # Anthropic Claude API client (src/infrastructure/anthropic_streaming_service.py)
 anthropic>=0.40.0
@@ -23,7 +23,7 @@ anthropic>=0.40.0
 # infrastructure/vision/llm.py; also a transitive dep of anthropic / openai.
 httpx>=0.23.0
 
-# OpenAI-compatible client used by VisionClient against the QGenie gateway
+# OpenAI-compatible client used by VisionClient against the YOUR-AI-ENDPOINT gateway
 # (azure::gpt-5.4-mini). Endpoint and key live in handq_config.yaml under the
 # `vision:` section. Drives browser.vision_query and desktop find_element's
 # vision fallback.

@@ -19,7 +19,7 @@ section::
         engine: rapidocr
         lang: ch
 
-The endpoint is hardcoded to the QGenie gateway; the API key is shared
+The endpoint is hardcoded to the YOUR-AI-ENDPOINT gateway; the API key is shared
 with ``llm.API_KEY``.
 
 The client is a process-wide singleton fetched via
@@ -28,11 +28,12 @@ The client is a process-wide singleton fetched via
 closes both.  Modeled after :func:`browser_tool.flush_browser_pool`
 so the bridge / flow controller has one consistent shutdown idiom.
 
-Why ``verify_ssl=False`` by default: the QGenie gateway uses an internal
-Qualcomm CA that is not in the public truststore.  This mirrors the
+Why ``verify_ssl=False`` by default: the YOUR-AI-ENDPOINT gateway uses an internal
+COMPANY CA that is not in the public truststore.  This mirrors the
 already-shipped pattern in ``scripts/vision_bench/test_vision_gpt.py``.
 """
 from __future__ import annotations
+import threading as _threading  # local import keeps top of file clean
 
 import asyncio
 import base64
@@ -88,7 +89,7 @@ class VisionResult:
 
 
 class VisionClient:
-    """Single-shot multimodal client for the QGenie OpenAI-compatible gateway.
+    """Single-shot multimodal client for the YOUR-AI-ENDPOINT OpenAI-compatible gateway.
 
     Not thread-safe by itself — the underlying ``AsyncOpenAI`` is built
     on httpx and is safe across awaits, but the singleton state (set by
@@ -130,7 +131,7 @@ class VisionClient:
     def _ensure_client(self) -> None:
         if self._client is not None:
             return
-        # verify=False routes around the QGenie self-signed cert chain;
+        # verify=False routes around the YOUR-AI-ENDPOINT self-signed cert chain;
         # see test_vision_gpt.py for the same pattern.
         self._http = httpx.AsyncClient(verify=self.verify_ssl, timeout=self.timeout)
         self._client = AsyncOpenAI(
@@ -302,9 +303,7 @@ class VisionClient:
         self._client = None
 
 
-
 # ── Process-wide singleton ───────────────────────────────────────────────────
-
 _client: Optional[VisionClient] = None
 # Defensive build lock. ``get_vision_client`` is currently fully synchronous
 # — the ``if _client is not None: return`` check, the config reads, and the
@@ -316,11 +315,10 @@ _client: Optional[VisionClient] = None
 # being called from multiple threads via ``loop.run_in_executor`` before any
 # build had completed. Threading lock, not asyncio.Lock, because the
 # function signature is sync and we don't want every caller to ``await``.
-import threading as _threading  # local import keeps top of file clean
 _BUILD_LOCK = _threading.Lock()
 
 
-_VISION_ENDPOINT = "https://qgenie-api.qualcomm.com/v1"
+_VISION_ENDPOINT = "https://YOUR-AI-ENDPOINT-api.COMPANY.com/v1"
 
 
 def get_vision_client(config_manager: Any) -> VisionClient:

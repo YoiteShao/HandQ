@@ -58,7 +58,7 @@ AMBIENT_PROCESSES = frozenset({
 
 # user@host pattern in window title. Anchored on @ to avoid matching
 # email addresses inside arbitrary text. Hostnames may contain dashes
-# (e.g. longjian6-gv) and dots (e.g. apt-lv-sh186.qualcomm.com).
+# (e.g. longjian6-gv) and dots (e.g. apt-lv-sh186.COMPANY.com).
 _USER_AT_HOST_RE = re.compile(
     r"\b([a-z_][\w-]*)@([a-z0-9][a-z0-9.\-]+)",
     re.IGNORECASE,

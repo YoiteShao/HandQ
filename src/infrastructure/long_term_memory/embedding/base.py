@@ -88,11 +88,11 @@ def from_config(config: dict) -> EmbeddingProvider:
             return _FTSOnlyProvider()
         try:
             return HttpApiEmbedder(
-                endpoint=C.QGENIE_BASE_URL,
+                endpoint=C.YOUR-AI-ENDPOINT_BASE_URL,
                 api_key=api_key,
                 model=C.EMBEDDING_MODEL,
                 dims=C.EMBEDDING_DIMS,
-                verify_ssl=C.QGENIE_VERIFY_SSL,
+                verify_ssl=C.YOUR-AI-ENDPOINT_VERIFY_SSL,
                 timeout=C.EMBEDDING_TIMEOUT_SECONDS,
             )
         except Exception:

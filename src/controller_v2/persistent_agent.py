@@ -365,7 +365,6 @@ class PersistentAgent:
         self._total_items_succeeded = 0
         self._total_items_failed = 0
 
-
         # Skills / tools injection tracking
         self._loaded_tools: Set[str] = set()
         # Tools the agent has explicitly released for visibility purposes.
@@ -1284,7 +1283,7 @@ class PersistentAgent:
             messages=messages, tools=self._api_tools, json_mode=False,
             effort="xhigh",
             # Pair effort with an explicit thinking budget: without this, the
-            # QGenie/Bedrock gateway silently suppresses thinking_delta events
+            # YOUR-AI-ENDPOINT/Bedrock gateway silently suppresses thinking_delta events
             # in streaming mode (verified 2026-07-16 — same request returns a
             # thinking block non-streaming but 0 thinking_deltas via
             # chat_stream). Effect: agent loop cannot see its own reasoning
@@ -1572,9 +1571,11 @@ class PersistentAgent:
             try:
                 result = await task
             except asyncio.CancelledError:
-                result = ToolResult(success=False, output=None, error="Tool execution was cancelled", tool_name=tc.tool_name, tool_parameters=tc.parameters)
+                result = ToolResult(success=False, output=None, error="Tool execution was cancelled",
+                                    tool_name=tc.tool_name, tool_parameters=tc.parameters)
             except Exception as exc:
-                result = ToolResult(success=False, output=None, error=f"Tool execution error: {exc}", tool_name=tc.tool_name, tool_parameters=tc.parameters)
+                result = ToolResult(success=False, output=None,
+                                    error=f"Tool execution error: {exc}", tool_name=tc.tool_name, tool_parameters=tc.parameters)
             tool_results.append(result)
 
         # Drain claim_tool/release_tool intent recorded by the real

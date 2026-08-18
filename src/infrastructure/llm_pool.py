@@ -73,7 +73,7 @@ class NetworkUnavailableError(Exception):
 #
 # Probe target = (host, port) parsed from services[0]._base_url.  All
 # services in a single call list typically share the same host (e.g. one
-# QGenie gateway proxying many models), so we just probe whichever target
+# YOUR-AI-ENDPOINT gateway proxying many models), so we just probe whichever target
 # the first service exposes.
 
 _PROBE_TIMEOUT: float = 1.0      # per-attempt TCP connect timeout

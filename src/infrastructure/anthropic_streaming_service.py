@@ -35,7 +35,7 @@ Usage
 
     svc = AnthropicStreamingService(
         api_key="...",
-        base_url="https://qgenie-api.qualcomm.com/",
+        base_url="https://YOUR-AI-ENDPOINT-api.COMPANY.com/",
         model="anthropic::claude-4-5-haiku",
     )
 
@@ -220,7 +220,7 @@ _DEFAULT_THINKING_BUDGET_TOKENS = 4096
 
 # Rate-limit detail extraction.
 #
-# The QGenie/Bedrock gateway does NOT send an HTTP ``Retry-After`` header on a
+# The YOUR-AI-ENDPOINT/Bedrock gateway does NOT send an HTTP ``Retry-After`` header on a
 # 429. It puts the wait inside the JSON body, as a STRING WITH A UNIT SUFFIX:
 #
 #   {'error': {'code': 'RATE_LIMIT_EXCEEDED',
@@ -277,7 +277,7 @@ def _parse_rate_limit_details(error: Exception) -> tuple[float, str]:
     except (TypeError, ValueError, AttributeError):
         pass
 
-    # (2) Structured body — what the QGenie gateway actually sends.
+    # (2) Structured body — what the YOUR-AI-ENDPOINT gateway actually sends.
     secs = 0.0
     limit_type = ""
     try:
@@ -449,9 +449,9 @@ class AnthropicStreamingService(LLMService):
     Parameters
     ----------
     api_key:
-        Anthropic / QGenie API key.
+        Anthropic / YOUR-AI-ENDPOINT API key.
     base_url:
-        Optional custom base URL (e.g. ``"https://qgenie-api.qualcomm.com/"``).
+        Optional custom base URL (e.g. ``"https://YOUR-AI-ENDPOINT-api.COMPANY.com/"``).
     model:
         Default model identifier (e.g. ``"anthropic::claude-4-5-haiku"``).
     max_tokens:
@@ -471,7 +471,7 @@ class AnthropicStreamingService(LLMService):
     def __init__(
         self,
         api_key: str,
-        base_url: Optional[str] = "https://qgenie-api.qualcomm.com/",
+        base_url: Optional[str] = "https://YOUR-AI-ENDPOINT-api.COMPANY.com/",
         model: str = "anthropic::claude-4-5-haiku",
         max_tokens: int = _DEFAULT_MAX_OUTPUT_TOKENS,
         temperature: float = 0.7,
@@ -626,7 +626,7 @@ class AnthropicStreamingService(LLMService):
                 # message_delta carries the real input+output token counts for
                 # streaming AND the cache_creation / cache_read fields. The
                 # message_start branch below is a fallback only; on Anthropic
-                # (and the QGenie gateway) cache tokens land here.
+                # (and the YOUR-AI-ENDPOINT gateway) cache tokens land here.
                 # ``delta.stop_reason`` also arrives here — critical for
                 # detecting truncated (max_tokens) completions downstream.
                 delta_obj = getattr(event, "delta", None)
