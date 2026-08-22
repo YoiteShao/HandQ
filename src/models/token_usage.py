@@ -28,6 +28,7 @@ for backward-compatible JSON output.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Dict, List
 
 
 @dataclass
@@ -93,3 +94,21 @@ class TokenUsage:
             cache_creation_tokens=getattr(result, "cache_creation_input_tokens", 0) or 0,
             cache_read_tokens=getattr(result, "cache_read_input_tokens", 0) or 0,
         )
+
+
+def flatten_model_stats(stats: Dict[str, TokenUsage]) -> List[dict]:
+    """``{model_name: TokenUsage}`` -> a JSON-safe list, heaviest model first.
+
+    The single place that turns non-serialisable ``TokenUsage`` dataclasses
+    into plain dicts, so every UI delegate (local ``_StdioUI`` and remote
+    ``NetworkUIDelegate`` alike) receives identical, wire-safe data rather
+    than each doing its own ad-hoc flattening.
+    """
+    if not isinstance(stats, dict):
+        return []
+    return [
+        {"model": name, **usage.to_dict()}
+        for name, usage in sorted(
+            stats.items(), key=lambda kv: kv[1].total_tokens, reverse=True,
+        )
+    ]

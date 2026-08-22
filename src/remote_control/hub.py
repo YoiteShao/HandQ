@@ -506,6 +506,15 @@ class RemoteControlHub:
             results.extend(pushed)
         return results
 
+    async def list_skills_on(self, target_id: str) -> List[Dict[str, Any]]:
+        """What skills ``target_id`` already has — bundled and
+        user/uploaded alike. Lets ``RemoteControlError`` propagate: this is
+        only reachable from an already-open picker for a connected target,
+        and the renderer treats it as best-effort (see ``connect-panel.js``).
+        """
+        client = await self.ensure_client(target_id)
+        return await client.list_remote_skills()
+
     async def _maybe_sync_linux_config(
         self, target_id: str, address: "ControlAddress"
     ) -> "ControlAddress":

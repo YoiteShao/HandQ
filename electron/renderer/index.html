@@ -1115,25 +1115,30 @@
     <!-- fully overwriting the same-named folder over there.           -->
     <!-- ============================================================ -->
     <div class="overlay hidden" id="overlay-skill-upload" aria-hidden="true">
-        <div class="overlay-card settings-card skills-card" role="dialog" aria-modal="true">
+        <div class="overlay-card settings-card skills-card skill-upload-card" role="dialog" aria-modal="true">
             <header class="overlay-header">
                 <h2>Upload Skill</h2>
                 <button type="button" class="overlay-close" id="skill-upload-close"
                         aria-label="Close">×</button>
             </header>
-            <p class="connect-note" id="skill-upload-target"></p>
-            <p class="connect-note">
-                Each selected skill's folder on the target machine is fully
-                overwritten to match your copy — files over there that aren't
-                in your copy are deleted.
-            </p>
+            <p class="skill-upload-note" id="skill-upload-target"></p>
             <div class="settings-toast hidden" id="skill-upload-toast" role="status"></div>
-            <div class="skills-body">
-                <div class="skills-list-header">
-                    <button type="button" id="skill-upload-refresh-btn">Refresh</button>
-                    <span class="admin-count" id="skill-upload-count"></span>
+            <div class="skills-body skill-upload-columns">
+                <div class="skill-upload-col">
+                    <div class="skills-list-header">
+                        <span>Your skills</span>
+                        <button type="button" id="skill-upload-refresh-btn">Refresh</button>
+                        <span class="admin-count" id="skill-upload-count"></span>
+                    </div>
+                    <div class="skills-grid skill-upload-grid" id="skill-upload-grid"></div>
                 </div>
-                <div class="skills-grid" id="skill-upload-grid"></div>
+                <div class="skill-upload-col">
+                    <div class="skills-list-header">
+                        <span>Already on target</span>
+                        <span class="admin-count" id="skill-upload-remote-count"></span>
+                    </div>
+                    <div class="skills-grid skill-upload-grid" id="skill-upload-remote-grid"></div>
+                </div>
             </div>
             <div class="settings-actions">
                 <button type="button" id="skill-upload-cancel">Cancel</button>

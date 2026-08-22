@@ -836,6 +836,9 @@ class RemoteControlServer:
             # the read loop, which still has to answer heartbeats.
             self._spawn(self._skill_push(conn, frame), f"rc-skill-push-{conn.peer}")
             return
+        if kind == protocol.SKILL_LIST:
+            self._spawn(self._skill_list(conn), f"rc-skill-list-{conn.peer}")
+            return
         if kind == protocol.CONFIRM_RESPONSE:
             self._confirm_response(conn, frame)
             return
@@ -1084,6 +1087,38 @@ class RemoteControlServer:
                 if isinstance(s, dict)
             ]
         conn.enqueue(protocol.make_skill_push_result(results))
+
+    async def _skill_list(self, conn: _Conn) -> None:
+        """Answer "what skills do you have" straight off ``SkillRegistry``,
+        with no ``SessionHost`` involvement — unlike ``create_flow``/
+        ``handle_rpc``, listing skills has nothing platform-specific about it:
+        the registry's root is resolved purely from the local install, the
+        same on the Windows bridge and the Linux daemon. Connection-scoped
+        like ``SKILL_PUSH``, so no capability check.
+        """
+        try:
+            from ..infrastructure.skills import SkillRegistry
+
+            def _reload_and_list():
+                registry = SkillRegistry.get()
+                registry.reload()
+                return registry.list_all(include_bundled=True)
+
+            entries = await asyncio.to_thread(_reload_and_list)
+            skills = [
+                {
+                    "name": e.get("name"),
+                    "description": e.get("description"),
+                    "origin": e.get("origin"),
+                    "enabled": e.get("enabled"),
+                    "mtime": e.get("mtime"),
+                }
+                for e in entries
+            ]
+        except Exception:
+            logger.exception("remote_control: skill list failed")
+            skills = []
+        conn.enqueue(protocol.make_skill_list_result(skills))
 
     def _confirm_response(self, conn: _Conn, frame: Dict[str, Any]) -> None:
         session = self._owned(conn, frame)

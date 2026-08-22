@@ -1220,7 +1220,7 @@ class ShellTool(BaseTool):
                     # branch waits forever (the non-interrupt branch already has
                     # wait_for). Kill the process tree and report a timeout.
                     if communicate_task not in done:
-                        await _kill_process_tree_graceful(process)
+                        await _kill_process_tree_graceful(process, wait=False)
                         return ToolResult(
                             success=False,
                             output={
@@ -1249,7 +1249,7 @@ class ShellTool(BaseTool):
                             timeout=effective_timeout if effective_timeout > 0 else None,
                         )
                     except asyncio.TimeoutError:
-                        await _kill_process_tree_graceful(process)
+                        await _kill_process_tree_graceful(process, wait=False)
                         return ToolResult(
                             success=False,
                             output={
@@ -1401,7 +1401,7 @@ class ShellTool(BaseTool):
                 )
 
             except asyncio.TimeoutError:
-                await _kill_process_tree(process)
+                await _kill_process_tree(process, wait=False)
                 return ToolResult(
                     success=False,
                     output={'stdout': '', 'stderr': 'command timed out', 'exit_code': -1, 'truncated': False},
@@ -1424,10 +1424,44 @@ class ShellTool(BaseTool):
 
 # ── Process termination utilities ─────────────────────────────────────────────
 
-async def _kill_process_tree_graceful(process: asyncio.subprocess.Process) -> None:
-    """SIGTERM → wait 5s → SIGKILL escalation. Windows: immediate force-kill."""
+# Fire-and-forget _wait_after_kill() tasks (see _schedule_wait_after_kill).
+# Tracked so they aren't garbage-collected mid-flight — asyncio surfaces that
+# as a spurious "Task was destroyed but it is pending" warning.
+_background_kill_waits: set = set()
+
+
+def _schedule_wait_after_kill(process: asyncio.subprocess.Process) -> None:
+    """Fire-and-forget the bounded post-kill observation (_wait_after_kill)
+    instead of blocking the caller on it.
+
+    The kill signal is already sent by the time this runs (see the callers
+    below) — this only decouples OBSERVING whether the process actually
+    exited from the caller's return path. None of ShellTool's
+    timeout ToolResults depend on that observation's outcome, yet every
+    foreground command that timed out on a wedged UNC/SMB path (see
+    _wait_after_kill's docstring) used to pay its full timeout PLUS up to
+    another _KILL_WAIT_TIMEOUT_SECONDS before the agent even saw the
+    timeout result — confirmed live 2026-08-20: "did not exit within 10s
+    of being killed" warnings landing within milliseconds of the
+    "Command execution timeout" result for the same call.
+    """
+    task = asyncio.create_task(_wait_after_kill(process))
+    _background_kill_waits.add(task)
+    task.add_done_callback(_background_kill_waits.discard)
+
+
+async def _kill_process_tree_graceful(
+    process: asyncio.subprocess.Process, *, wait: bool = True,
+) -> None:
+    """SIGTERM → wait 5s → SIGKILL escalation. Windows: immediate force-kill.
+
+    ``wait=False`` (used by ShellTool's own timeout paths, which already
+    know what ToolResult they're returning) schedules the post-kill
+    observation in the background instead of blocking on it — see
+    _schedule_wait_after_kill.
+    """
     if _IS_WINDOWS:
-        await _kill_process_tree(process)
+        await _kill_process_tree(process, wait=wait)
         return
 
     _killpg = getattr(os, "killpg", None)
@@ -1457,11 +1491,19 @@ async def _kill_process_tree_graceful(process: asyncio.subprocess.Process) -> No
     except Exception:
         pass
 
-    await _wait_after_kill(process)
+    if wait:
+        await _wait_after_kill(process)
+    else:
+        _schedule_wait_after_kill(process)
 
 
-async def _kill_process_tree(process: asyncio.subprocess.Process) -> None:
-    """Force-terminate process and all children. Cross-platform."""
+async def _kill_process_tree(
+    process: asyncio.subprocess.Process, *, wait: bool = True,
+) -> None:
+    """Force-terminate process and all children. Cross-platform.
+
+    ``wait=False`` — see _kill_process_tree_graceful's docstring.
+    """
     if _IS_WINDOWS:
         try:
             os.system(f"taskkill /F /T /PID {process.pid} >nul 2>&1")
@@ -1487,7 +1529,10 @@ async def _kill_process_tree(process: asyncio.subprocess.Process) -> None:
             except Exception:
                 pass
 
-    await _wait_after_kill(process)
+    if wait:
+        await _wait_after_kill(process)
+    else:
+        _schedule_wait_after_kill(process)
 
 
 async def _wait_after_kill(process: asyncio.subprocess.Process) -> None:

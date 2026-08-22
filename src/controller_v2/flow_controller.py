@@ -180,6 +180,7 @@ class FlowControllerV2:
             scheduler=self._resolve_scheduler(),
             _task_channel=self._task_channel,
         )
+        self._ctx.on_model_stats_changed = self._forward_model_stats_to_ui
 
         self._orchestrator = Orchestrator(
             llm_services=self._llm_services,
@@ -190,6 +191,7 @@ class FlowControllerV2:
             on_state_changed=self._forward_state_to_ui,
             on_recall_started=self._forward_recall_started_to_ui,
             on_task_complete=self._on_task_complete_cleanup,
+            on_task_completed_notify=self._forward_task_completed_to_ui,
             on_intent_classified=self._on_intent_classified,
             session_dir=self.storage_directory,
             session_ctx=self._ctx,
@@ -600,6 +602,17 @@ class FlowControllerV2:
             except Exception:
                 pass
 
+    def _forward_task_completed_to_ui(self, summary: str) -> None:
+        """Forward a real task-completion (not just a chat reply) to the UI
+        so it can raise a system notification / taskbar flash. Fired from
+        ``Orchestrator._emit_completion_reply`` — never for ordinary chat
+        turns, which only go through ``_forward_reply_to_ui``."""
+        if self.interaction_manager:
+            try:
+                self.interaction_manager.notify_task_completed(summary)
+            except Exception:
+                pass
+
     async def _on_task_complete_cleanup(self) -> None:
         """Close on-demand tool resources at the task-complete boundary.
 
@@ -636,6 +649,16 @@ class FlowControllerV2:
         if self.interaction_manager:
             try:
                 self.interaction_manager.notify_task_plan_changed(items)
+            except Exception:
+                pass
+
+    def _forward_model_stats_to_ui(self, stats: Dict[str, Any]) -> None:
+        """Forward a per-model token tally (from ``ctx.record_model_usage``)
+        to the UI stats panel. ``stats`` is ``{model_name: TokenUsage}``.
+        Fire-and-forget."""
+        if self.interaction_manager:
+            try:
+                self.interaction_manager.notify_model_stats_changed(stats)
             except Exception:
                 pass
 

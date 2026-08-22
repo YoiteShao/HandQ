@@ -35,11 +35,12 @@ import asyncio
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import TYPE_CHECKING, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, Optional, Tuple
 
 if TYPE_CHECKING:
     from ..infrastructure.config_manager import ConfigManager
     from ..infrastructure.execution_recorder import ExecutionRecorder
+    from ..models.token_usage import TokenUsage
     from ..tools.browser_tool import BrowserSessionHolder
     from ..tools.desktop_tool import DesktopState
     from ..tools.file_state import FileState
@@ -102,6 +103,37 @@ class SessionContext:
 
     # ── Execution recorder (per-session, owned by ctx) ───────────────────
     execution_recorder: Optional["ExecutionRecorder"] = None
+
+    # ── Per-model token tally (session-scoped, UI stats panel) ──────────
+    # Keyed by ``LLMService.model``. Accumulates across every LLM call this
+    # session makes through the main think loop / compaction / coordinator
+    # calls — fallback hops included, since callers pass whichever service
+    # actually produced the result (not services[0]). Never reset per task
+    # item, mirroring the existing task-plan/agent-todo panels which are
+    # also session-scoped. ``on_model_stats_changed`` is wired by
+    # FlowControllerV2.start() to forward snapshots to the UI.
+    model_token_stats: Dict[str, "TokenUsage"] = field(default_factory=dict, repr=False)
+    on_model_stats_changed: Optional[Callable[[Dict[str, "TokenUsage"]], None]] = field(
+        default=None, repr=False,
+    )
+
+    def record_model_usage(self, model: str, usage: "TokenUsage") -> None:
+        """Accumulate *usage* under *model* and notify the UI hook.
+
+        Called by PersistentAgent/Orchestrator after every LLM call that
+        actually produced a result, with the model that served it (not
+        necessarily the chain's first choice — fallback hops are recorded
+        under whichever model served THAT particular call).
+        """
+        if not model:
+            return
+        cur = self.model_token_stats.get(model)
+        self.model_token_stats[model] = usage if cur is None else cur + usage
+        if self.on_model_stats_changed is not None:
+            try:
+                self.on_model_stats_changed(self.model_token_stats)
+            except Exception:
+                pass
 
     # ── File checkpoints for undo + change auditing (RewindStore) ─────────
     # Per-session before/after file snapshots keyed by item_id. write/edit

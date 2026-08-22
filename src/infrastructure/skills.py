@@ -179,6 +179,9 @@ class SkillEntry:
                    the knowledge reappears exactly when it's relevant, however
                    deep into the task that is. Empty for skills with no
                    process-specific behavior to pin.
+      mtime:       ``SKILL.md``'s filesystem modification time (epoch
+                   seconds), used only for panel display ("uploaded on ...");
+                   not part of the skill's semantics.
     """
 
     name: str
@@ -191,6 +194,7 @@ class SkillEntry:
     origin: str = SKILL_ORIGIN_USER
     allowed_tools: List[str] = field(default_factory=list)
     process_hints: Dict[str, str] = field(default_factory=dict)
+    mtime: float = 0.0
 
 
 class SkillRegistry:
@@ -447,15 +451,20 @@ class SkillRegistry:
     # verbatim. Name mutations are constrained to _NAME_PATTERN, so a crafted
     # name can never escape the Skill root.
 
-    def list_all(self) -> List[Dict[str, object]]:
+    def list_all(self, *, include_bundled: bool = False) -> List[Dict[str, object]]:
         """Full inventory for the panel — enabled AND disabled skills.
 
-        Excludes ``origin: bundled`` entries: product-shipped skills are not
-        part of the user's own inventory, so they never appear in the panel
-        and can't be discovered there to enable/disable/edit/delete. The
-        Agent-facing side (render_menu_block / render_standing_block) is a
-        SEPARATE code path and still surfaces bundled skills normally — this
-        method only gates what the human-facing panel can see.
+        Excludes ``origin: bundled`` entries by default: product-shipped
+        skills are not part of the user's own inventory, so they never
+        appear in the panel and can't be discovered there to
+        enable/disable/edit/delete. The Agent-facing side
+        (render_menu_block / render_standing_block) is a SEPARATE code path
+        and still surfaces bundled skills normally — this method only gates
+        what the human-facing panel can see.
+
+        ``include_bundled=True`` lifts that gate — used by the remote-control
+        skill-list query, whose whole point is showing what a target already
+        has, built-ins included.
         """
         return [
             {
@@ -469,9 +478,10 @@ class SkillRegistry:
                 "body": e.body.strip(),
                 "source_path": e.source_path,
                 "problems": list(e.problems),
+                "mtime": e.mtime,
             }
             for e in sorted(self._entries.values(), key=lambda x: x.name)
-            if e.origin != SKILL_ORIGIN_BUNDLED
+            if include_bundled or e.origin != SKILL_ORIGIN_BUNDLED
         ]
 
     def get_any(self, name: str) -> Optional[SkillEntry]:
@@ -1287,6 +1297,7 @@ def _load_skill_file(skill_md: Path, *, dir_name: str) -> Optional[SkillEntry]:
         origin=origin,
         allowed_tools=allowed_tools,
         process_hints=process_hints,
+        mtime=skill_md.stat().st_mtime,
     )
     return entry
 

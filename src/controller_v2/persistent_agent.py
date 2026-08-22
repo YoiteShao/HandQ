@@ -167,6 +167,13 @@ class PersistentAgent:
         self._skip_next_compaction: bool = False
         self._ptl_backoffs: int = 0
 
+        # Model that actually served the most recent LLM call, set by
+        # `_on_service_selected` (the `on_service_selected` callback passed to
+        # call_with_fallback*). Captures the real fallback-chain winner —
+        # not necessarily services[0] — so per-model token accounting
+        # (SessionContext.record_model_usage) attributes usage correctly.
+        self._last_serving_model: Optional[str] = None
+
         # Token-based compaction trigger (CC parity). `_last_input_tokens` is
         # the most recent REAL token count from the API response's `usage`
         # (input_tokens + cache_read); updated every turn by _log_context_pressure.
@@ -513,6 +520,53 @@ class PersistentAgent:
                 component="PersistentAgent",
             )
 
+    def _salvage_findings_from_turns(self, limit: int = 5) -> List[str]:
+        """Extract short, human-readable lines from the current item's most
+        recent successful tool observations.
+
+        Called at every abnormal `_item_loop` exit (interrupt, LLM error,
+        iteration cap, ...) right before building the returned `TaskResult` —
+        `self._turns` already holds every `ConversationTurn` appended this
+        item via `_think_streaming`, so a tool result that landed the instant
+        before the exit fired is sitting right here instead of being silently
+        dropped. Confirmed live (2026-08-20): `fan_out_agents` returned a
+        fully correct answer at the same log timestamp an interrupt killed the
+        item; the old bare `issues=[...]` TaskResult carried none of it
+        forward, so the next item redid the whole computation via SSH.
+
+        Only looks at the last `limit` turns — at any non-completion exit
+        point those are still this item's own unsummarized turns (an item
+        boundary compacts/folds a PRIOR item's turns before this one starts,
+        see `_compact_item_boundary`), so a small limit never reaches into
+        another item's history. Returns `[]` when nothing succeeded yet.
+        """
+        _MAX_LINE_CHARS = 300
+        _MAX_LINES = 10
+
+        def _fmt(tool_name: str, text: Any) -> str:
+            text = str(text).strip()
+            if len(text) > _MAX_LINE_CHARS:
+                text = text[:_MAX_LINE_CHARS] + "...[truncated]"
+            return f"{tool_name}: {text}" if text else tool_name
+
+        lines: List[str] = []
+        for turn in self._turns[-limit:]:
+            for obs in turn.observations:
+                if not obs.success:
+                    continue
+                out = obs.output
+                if isinstance(out, dict) and isinstance(out.get("summary"), str) and out["summary"].strip():
+                    # spawn_agent shape: {"summary": "...", "iterations": N}
+                    lines.append(_fmt(obs.tool_name, out["summary"]))
+                elif isinstance(out, dict) and isinstance(out.get("results"), list):
+                    # fan_out_agents shape: {"results": [{"prompt":..., "summary":...}, ...]}
+                    for sub in out["results"]:
+                        if isinstance(sub, dict) and isinstance(sub.get("summary"), str) and sub["summary"].strip():
+                            lines.append(_fmt(obs.tool_name, sub["summary"]))
+                elif out is not None:
+                    lines.append(_fmt(obs.tool_name, out))
+        return lines[-_MAX_LINES:]
+
     # ── Per-item execution ───────────────────────────────────────────────────
 
     async def _execute_item(self, item: TaskSpec) -> None:
@@ -671,10 +725,13 @@ class PersistentAgent:
                 issue_msg = INTERRUPTED_BY_COORDINATOR
                 if interrupt_reason:
                     issue_msg = f"{INTERRUPTED_BY_COORDINATOR}: {interrupt_reason}"
+                _salvaged = self._salvage_findings_from_turns()
                 return TaskResult(
                     item_id=item.item_id,
                     success=False,
                     issues=[issue_msg],
+                    verification=_salvaged,
+                    key_findings=_salvaged,
                     artifacts=list(_produced_paths),
                     iterations=iteration,
                     token_usage=_token_usage,
@@ -731,10 +788,13 @@ class PersistentAgent:
                     issue_msg = INTERRUPTED_BY_COORDINATOR
                     if interrupt_reason:
                         issue_msg = f"{INTERRUPTED_BY_COORDINATOR}: {interrupt_reason}"
+                    _salvaged = self._salvage_findings_from_turns()
                     return TaskResult(
                         item_id=item.item_id,
                         success=False,
                         issues=[issue_msg],
+                        verification=_salvaged,
+                        key_findings=_salvaged,
                         iterations=iteration,
                         token_usage=_token_usage,
                     )
@@ -828,10 +888,13 @@ class PersistentAgent:
                         f"[{iteration}] LLM API error: {raw_error[:200]}",
                         component="PersistentAgent",
                     )
+                    _salvaged = self._salvage_findings_from_turns()
                     return TaskResult(
                         item_id=item.item_id,
                         success=False,
                         issues=[f"LLM API error: {raw_error[:300]}"],
+                        verification=_salvaged,
+                        key_findings=_salvaged,
                         iterations=iteration,
                         token_usage=_token_usage,
                     )
@@ -841,10 +904,13 @@ class PersistentAgent:
                     component="PersistentAgent",
                 )
                 err_text = turn_result.error or ""
+                _salvaged = self._salvage_findings_from_turns()
                 return TaskResult(
                     item_id=item.item_id,
                     success=False,
                     issues=[f"Error: {err_text[:300]}"],
+                    verification=_salvaged,
+                    key_findings=_salvaged,
                     plan_feedback=turn_result.plan_feedback or "",
                     iterations=iteration,
                     token_usage=_token_usage,
@@ -866,6 +932,7 @@ class PersistentAgent:
                         f"the retry loop.",
                         component="PersistentAgent",
                     )
+                    _salvaged = self._salvage_findings_from_turns()
                     return TaskResult(
                         item_id=item.item_id,
                         success=False,
@@ -876,6 +943,8 @@ class PersistentAgent:
                             "usually means the item had no actionable world-work "
                             "(e.g. a bare stop/cancel directive)."
                         ],
+                        verification=_salvaged,
+                        key_findings=_salvaged,
                         final_answer=(turn_result.final_answer or turn_result.reasoning or "").strip(),
                         iterations=iteration,
                         token_usage=_token_usage,
@@ -887,10 +956,13 @@ class PersistentAgent:
                         f"[{iteration}] Stream error masked as completion: {error_summary}",
                         component="PersistentAgent",
                     )
+                    _salvaged = self._salvage_findings_from_turns()
                     return TaskResult(
                         item_id=item.item_id,
                         success=False,
                         issues=[f"Stream error: {error_summary[:300]}"],
+                        verification=_salvaged,
+                        key_findings=_salvaged,
                         iterations=iteration,
                         token_usage=_token_usage,
                     )
@@ -1163,10 +1235,13 @@ class PersistentAgent:
             # ── 7. USER_NEW_INSTRUCTION propagation ──────────────────────────
             for tr in tool_results:
                 if tr.error == "USER_NEW_INSTRUCTION":
+                    _salvaged = self._salvage_findings_from_turns()
                     return TaskResult(
                         item_id=item.item_id,
                         success=False,
                         issues=["User new instruction"],
+                        verification=_salvaged,
+                        key_findings=_salvaged,
                         iterations=iteration,
                         token_usage=_token_usage,
                     )
@@ -1250,10 +1325,13 @@ class PersistentAgent:
             f"Success rate: {advisor_summary['success_rate']:.1%}",
             component="PersistentAgent",
         )
+        _salvaged = self._salvage_findings_from_turns()
         return TaskResult(
             item_id=item.item_id,
             success=False,
             issues=[f"Reached per-item iteration cap ({self._max_item_iterations})"],
+            verification=_salvaged,
+            key_findings=_salvaged,
             iterations=iteration,
             token_usage=_token_usage,
         )
@@ -1320,7 +1398,7 @@ class PersistentAgent:
                     f"[{self.current_iteration}][ThinkStream] fallback to service {service_offset + idx}: {e}",
                     component="PersistentAgent",
                 ),
-                on_service_selected=self._update_obs_budget_for_service,
+                on_service_selected=self._on_service_selected,
                 on_network_event=self._on_network_event,
             )
 
@@ -1374,6 +1452,7 @@ class PersistentAgent:
                         stream_tool_calls.append(tc)
                         api_tool_calls_for_msg.append({
                             "id": event.call_id,
+                            "type": "function",
                             "function": {"name": event.tool_name, "arguments": json.dumps(event.args)},
                         })
 
@@ -1402,6 +1481,14 @@ class PersistentAgent:
                         reasoning = llm_result.content or ""
                         _thinking_blocks = llm_result.thinking_blocks or []
                         self._log_context_pressure(llm_result)
+                        if self._ctx is not None:
+                            try:
+                                self._ctx.record_model_usage(
+                                    self._last_serving_model or self._services[service_offset].model,
+                                    TokenUsage.from_llm_result(llm_result),
+                                )
+                            except Exception:
+                                pass
 
                         if stream_tool_calls:
                             _asst_msg = {
@@ -2768,6 +2855,16 @@ class PersistentAgent:
             )
             self._obs_budget_chars = new_budget
 
+    def _on_service_selected(self, service: LLMService) -> None:
+        """Callback: fires once an LLM call actually produces a result.
+
+        Combines the existing obs-budget shrink with recording which model
+        served this call, so per-model token accounting (below) attributes
+        usage to the real fallback-chain winner rather than services[0].
+        """
+        self._update_obs_budget_for_service(service)
+        self._last_serving_model = service.model
+
     def _on_network_event(self, state: str, attempt: int, sleep_secs: int) -> None:
         """UI hook for network-aware fallback wrappers."""
         try:
@@ -3054,7 +3151,16 @@ class PersistentAgent:
             result = await call_with_fallback(
                 self._services,
                 dict(messages=[{"role": "user", "content": summary_prompt}], json_mode=False),
+                on_service_selected=self._on_service_selected,
             )
+            if self._ctx is not None:
+                try:
+                    self._ctx.record_model_usage(
+                        self._last_serving_model or self._services[0].model,
+                        TokenUsage.from_llm_result(result),
+                    )
+                except Exception:
+                    pass
             if result.content and result.content.strip():
                 return self._strip_analysis_scratch(result.content.strip()), True
         except Exception as e:

@@ -865,9 +865,13 @@
     // excludes bundled ones — same rule the admin Skills panel relies on) so
     // one or more can be picked and pushed to a connected server. Each
     // picked skill's folder over there is fully overwritten to match the
-    // local copy; skills not picked are left untouched.
+    // local copy; skills not picked are left untouched. Also queries the
+    // target's own inventory (remote_list_skills — bundled + previously
+    // uploaded) so the "Already on target" section and the overwrite/shadow
+    // badges below reflect what's actually there before the push happens.
     let skillUploadTarget = null;
     let skillUploadSkills = [];
+    let skillUploadRemoteSkills = [];
     const skillUploadSelected = new Set();
 
     function showSkillUploadToast(msg, kind) {
@@ -888,7 +892,8 @@
         dom.skillUploadOverlay.setAttribute('aria-hidden', 'false');
         const name = target.name || target.host || target.target_id;
         if (dom.skillUploadTargetLabel) {
-            dom.skillUploadTargetLabel.textContent = `Uploading to: ${name}`;
+            dom.skillUploadTargetLabel.textContent =
+                `Uploading to: ${name} — overwrites its skill folder; files not in your copy are deleted.`;
         }
         await refreshSkillUploadGrid();
     }
@@ -904,9 +909,85 @@
         try {
             const res = await call('skill_list', {});
             skillUploadSkills = res.skills || [];
-            renderSkillUploadGrid();
         } catch (err) {
             showSkillUploadToast(`Failed to load skills: ${err.message || err}`, 'error');
+            return;
+        }
+        // Best-effort: an older peer or a link mid-reconnect simply means no
+        // "already there" annotations, not a reason to block the picker.
+        try {
+            const remoteRes = await call('remote_list_skills', {
+                target_id: skillUploadTarget.target_id,
+            });
+            skillUploadRemoteSkills = remoteRes.skills || [];
+        } catch (err) {
+            skillUploadRemoteSkills = [];
+            appendLog('client', `Could not read target's skill inventory: ${err.message || err}`);
+        }
+        renderSkillUploadRemoteGrid();
+        renderSkillUploadGrid();
+    }
+
+    function fmtSkillDate(epochSec) {
+        if (!epochSec) return '';
+        const d = new Date(epochSec * 1000);
+        const p = (n) => String(n).padStart(2, '0');
+        return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+    }
+
+    function renderSkillUploadRemoteGrid() {
+        if (!dom.skillUploadRemoteGrid) return;
+        dom.skillUploadRemoteGrid.innerHTML = '';
+        // Built-ins ship identically on every machine already — showing them
+        // here just adds noise to "what did I actually put there". They stay
+        // in skillUploadRemoteSkills itself (unfiltered) so the "will shadow
+        // built-in" badge below still works.
+        const visible = skillUploadRemoteSkills.filter((s) => s.origin !== 'bundled');
+        if (dom.skillUploadRemoteCount) {
+            dom.skillUploadRemoteCount.textContent = visible.length
+                ? `${visible.length} on target`
+                : '';
+        }
+        if (!visible.length) {
+            const empty = document.createElement('div');
+            empty.className = 'muted skills-empty';
+            empty.textContent = skillUploadRemoteSkills.length
+                ? '(only built-in skills on target)'
+                : '(none found — target may be offline or running an older build)';
+            dom.skillUploadRemoteGrid.appendChild(empty);
+            return;
+        }
+        for (const s of visible) {
+            const card = document.createElement('div');
+            card.className = 'skill-card';
+
+            const head = document.createElement('div');
+            head.className = 'skill-card-head';
+            const name = document.createElement('span');
+            name.className = 'skill-card-name';
+            name.textContent = s.name;
+            head.appendChild(name);
+            if (!s.enabled) {
+                const disabledBadge = document.createElement('span');
+                disabledBadge.className = 'skill-card-badge builtin';
+                disabledBadge.textContent = 'disabled';
+                head.appendChild(disabledBadge);
+            }
+            card.appendChild(head);
+
+            const desc = document.createElement('div');
+            desc.className = 'skill-card-desc';
+            desc.textContent = s.description || '(no description)';
+            card.appendChild(desc);
+
+            if (s.mtime) {
+                const mtime = document.createElement('div');
+                mtime.className = 'skill-upload-mtime';
+                mtime.textContent = fmtSkillDate(s.mtime);
+                card.appendChild(mtime);
+            }
+
+            dom.skillUploadRemoteGrid.appendChild(card);
         }
     }
 
@@ -947,12 +1028,38 @@
             cbLabel.appendChild(cb);
             cbLabel.appendChild(name);
             head.appendChild(cbLabel);
+
+            const existing = skillUploadRemoteSkills.find((r) => r.name === s.name);
+            if (existing) {
+                const badge = document.createElement('span');
+                badge.className = 'skill-card-badge builtin';
+                badge.textContent = existing.origin === 'bundled'
+                    ? 'will shadow built-in' : 'will overwrite';
+                head.appendChild(badge);
+            }
             card.appendChild(head);
 
             const desc = document.createElement('div');
             desc.className = 'skill-card-desc';
             desc.textContent = s.description || '(no description)';
             card.appendChild(desc);
+
+            if (s.mtime) {
+                const mtime = document.createElement('div');
+                mtime.className = 'skill-upload-mtime';
+                mtime.textContent = fmtSkillDate(s.mtime);
+                card.appendChild(mtime);
+            }
+
+            // Card-style pick: clicking anywhere on the card toggles the
+            // checkbox, not just the checkbox+name label. Clicks that land
+            // inside the label are skipped — the native label-for-input
+            // behavior already toggled it, so forwarding again would just
+            // flip it straight back.
+            card.addEventListener('click', (ev) => {
+                if (ev.target.closest('.skill-upload-pick')) return;
+                cb.click();
+            });
 
             dom.skillUploadGrid.appendChild(card);
         }
@@ -1309,6 +1416,8 @@
         dom.skillUploadToast = document.getElementById('skill-upload-toast');
         dom.skillUploadGrid = document.getElementById('skill-upload-grid');
         dom.skillUploadCount = document.getElementById('skill-upload-count');
+        dom.skillUploadRemoteGrid = document.getElementById('skill-upload-remote-grid');
+        dom.skillUploadRemoteCount = document.getElementById('skill-upload-remote-count');
 
         // Wire buttons.
         dom.closeBtn.addEventListener('click', close);

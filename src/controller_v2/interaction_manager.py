@@ -83,6 +83,9 @@ class UIDelegate(Protocol):
     def stream_coordinator_reply_chunk(self, text: str) -> None: ...
     def seal_coordinator_reply(self) -> None: ...
 
+    # ── Task completion ─────────────────────────────────────────────────────
+    def show_task_completed(self, summary: str) -> None: ...
+
 
 # ── InteractionManager ───────────────────────────────────────────────────────
 
@@ -178,6 +181,14 @@ class InteractionManager:
         the activity strip; the next state / decision / tool event supersedes
         it. Fire-and-forget — no-op when the delegate doesn't expose it."""
         self._ui_call("show_recall_started")
+
+    def notify_task_completed(self, summary: str) -> None:
+        """A task actually finished (Orchestrator._emit_completion_reply),
+        as opposed to the coordinator merely replying in chat. Distinct from
+        the reply-streaming methods above so a host UI can react ONLY to
+        real completions — e.g. raising a system notification / flashing the
+        taskbar when the window isn't focused. Fire-and-forget."""
+        self._ui_call("show_task_completed", str(summary or ""))
 
     def notify_decision_made(
         self, iteration: int, reasoning: str, token_count: int = 0
@@ -283,6 +294,18 @@ class InteractionManager:
         task plan). Fire-and-forget; delegates opt in by exposing a same-named
         method, so tests with no delegate silently drop it."""
         self._ui_call("notify_agent_todo_changed", todos if isinstance(todos, list) else [])
+
+    def notify_model_stats_changed(self, stats: Dict[str, Any]) -> None:
+        """Live per-model token tally for the current session, for the UI
+        stats panel. ``stats`` is ``{model_name: TokenUsage}``, accumulated
+        by ``SessionContext.record_model_usage`` across every LLM call this
+        session makes (fallback hops included). Flattened to a JSON-safe
+        list here (single choke point for both local and remote-driven
+        delegates) since ``TokenUsage`` dataclasses cannot cross the wire
+        as-is. Fire-and-forget; delegates opt in by exposing a same-named
+        method, so tests with no delegate silently drop it."""
+        from ..models.token_usage import flatten_model_stats
+        self._ui_call("notify_model_stats_changed", flatten_model_stats(stats))
 
     # ── Async confirmation / input flows ──────────────────────────────────
 

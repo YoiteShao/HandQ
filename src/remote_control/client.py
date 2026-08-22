@@ -109,6 +109,7 @@ class RemoteControlClient:
         self._open_waiters: List["asyncio.Future[Dict[str, Any]]"] = []
         self._list_waiters: List["asyncio.Future[Dict[str, Any]]"] = []
         self._push_waiters: List["asyncio.Future[Dict[str, Any]]"] = []
+        self._skill_list_waiters: List["asyncio.Future[Dict[str, Any]]"] = []
         #: session_id → futures awaiting that session's ``session_closed``. A
         #: destruction the operator asked for is only reported as done once the
         #: controlled side says so; see :meth:`close_remote_session`.
@@ -371,6 +372,32 @@ class RemoteControlClient:
             ) from None
         results = frame.get("results")
         return results if isinstance(results, list) else []
+
+    async def list_remote_skills(
+        self, *, timeout: float = 8.0
+    ) -> List[Dict[str, Any]]:
+        """Ask what skills the server already has — bundled and
+        user/uploaded alike. Connection-scoped like ``push_skills``, and the
+        same "old server never replies" failure mode: a timeout, not an
+        error, is how an unsupporting peer shows up.
+        """
+        jc = self._require_connection()
+        loop = asyncio.get_running_loop()
+        waiter: "asyncio.Future[Dict[str, Any]]" = loop.create_future()
+        self._skill_list_waiters.append(waiter)
+        await jc.send(protocol.make_skill_list())
+        try:
+            frame = await asyncio.wait_for(waiter, timeout=timeout)
+        except asyncio.TimeoutError:
+            if waiter in self._skill_list_waiters:
+                self._skill_list_waiters.remove(waiter)
+            raise RemoteControlError(
+                f"Remote did not return the skill list within {timeout:.0f} seconds"
+                " — it may be running an older HandQ build that doesn't support"
+                " skill listing yet"
+            ) from None
+        skills = frame.get("skills")
+        return skills if isinstance(skills, list) else []
 
     def since_seq_for(self, session_id: str) -> int:
         tracked = self._sessions.get(session_id)
@@ -647,7 +674,8 @@ class RemoteControlClient:
         # set_exception rather than cancel: the awaiting caller is not itself
         # being cancelled, and surfacing CancelledError to it would read as
         # "the user aborted this" all the way up the stack.
-        for waiters in (self._list_waiters, self._open_waiters, self._push_waiters):
+        for waiters in (self._list_waiters, self._open_waiters, self._push_waiters,
+                        self._skill_list_waiters):
             for waiter in list(waiters):
                 waiters.remove(waiter)
                 if not waiter.done():
@@ -766,6 +794,15 @@ class RemoteControlClient:
                     waiter.set_result(frame)
                     return
             logger.warning("remote_control: skill_push_result with nobody waiting")
+            return
+
+        if kind == protocol.SKILL_LIST_RESULT:
+            for waiter in list(self._skill_list_waiters):
+                if not waiter.done():
+                    self._skill_list_waiters.remove(waiter)
+                    waiter.set_result(frame)
+                    return
+            logger.warning("remote_control: skill_list_result with nobody waiting")
             return
 
         if kind == protocol.ERROR:

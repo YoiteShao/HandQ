@@ -621,28 +621,34 @@ async function initGlass() {
     // back to light, and vice versa at 0.42.
     const LUMA_TO_LIGHT = 0.58;
     const LUMA_TO_DARK = 0.42;
-    let _lumaRafId = 0;
     let _isDarkDesktop = false;
+    // Synchronous, NOT deferred through requestAnimationFrame. An earlier
+    // version gated this behind a "one in flight" rAF debounce, but the only
+    // reset point for that guard was inside the queued rAF callback itself —
+    // and Chromium suspends a window's rAF queue while it's occluded (fully
+    // covered by another window; this app isn't always-on-top). If a rAF got
+    // queued right as occlusion started, it never fired, the guard never
+    // reset, and every later call silently no-opped — freezing the label
+    // text color at whatever it was until something else (a resize) forced
+    // a repaint and woke the stalled rAF pump. This function is already
+    // called at most once per DESKTOP_REFRESH_MS tick, so the debounce was
+    // never load-bearing; running it inline removes the failure mode.
     function _publishDesktopLuma(sample) {
-        if (_lumaRafId) return;
-        _lumaRafId = requestAnimationFrame(() => {
-            _lumaRafId = 0;
-            let sum = 0;
-            const n = sample.length / 4;
-            for (let i = 0; i < sample.length; i += 4) {
-                // Rec. 601 luma. Matches the shader's own `dot(color,
-                // vec3(0.299,0.587,0.114))` (see fragment shader above) so
-                // the CSS-side threshold and the shader's internal luma
-                // concept agree on what "bright" means.
-                sum += 0.299 * sample[i] + 0.587 * sample[i + 1] + 0.114 * sample[i + 2];
-            }
-            const luma = (sum / n) / 255;
-            const nextDark = _isDarkDesktop ? (luma < LUMA_TO_LIGHT) : (luma <= LUMA_TO_DARK);
-            if (nextDark !== _isDarkDesktop) {
-                _isDarkDesktop = nextDark;
-                document.documentElement.classList.toggle('desktop-is-dark', _isDarkDesktop);
-            }
-        });
+        let sum = 0;
+        const n = sample.length / 4;
+        for (let i = 0; i < sample.length; i += 4) {
+            // Rec. 601 luma. Matches the shader's own `dot(color,
+            // vec3(0.299,0.587,0.114))` (see fragment shader above) so
+            // the CSS-side threshold and the shader's internal luma
+            // concept agree on what "bright" means.
+            sum += 0.299 * sample[i] + 0.587 * sample[i + 1] + 0.114 * sample[i + 2];
+        }
+        const luma = (sum / n) / 255;
+        const nextDark = _isDarkDesktop ? (luma < LUMA_TO_LIGHT) : (luma <= LUMA_TO_DARK);
+        if (nextDark !== _isDarkDesktop) {
+            _isDarkDesktop = nextDark;
+            document.documentElement.classList.toggle('desktop-is-dark', _isDarkDesktop);
+        }
     }
     function _desktopChanged() {
         try {

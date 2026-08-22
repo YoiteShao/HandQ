@@ -5,3 +5,6 @@ docs
 *.zip
 QualcommSkill
 .gitignore
+node_modules
+tests_v3
+*.txt

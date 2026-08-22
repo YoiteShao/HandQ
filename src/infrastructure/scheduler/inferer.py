@@ -134,9 +134,7 @@ def _build_llm_services(config: dict) -> List[Any]:
     """
     try:
         from src.infrastructure.role_resolver import resolve_models_and_helper
-        from src.infrastructure.anthropic_streaming_service import (
-            AnthropicStreamingService,
-        )
+        from src.infrastructure.llm_service_factory import create_llm_service
     except Exception:
         _logger.exception("failed to import LLM stack for schedule inference")
         return []
@@ -157,7 +155,7 @@ def _build_llm_services(config: dict) -> List[Any]:
     services: List[Any] = []
     for m in models:
         try:
-            services.append(AnthropicStreamingService(
+            services.append(create_llm_service(
                 api_key=api_key,
                 model=m,
                 max_tokens=_INFERENCE_MAX_TOKENS,

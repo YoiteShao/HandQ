@@ -858,9 +858,7 @@ async def _resolve_retriage_helpers(cfg: dict) -> List:
     """
     try:
         from src.infrastructure.role_resolver import resolve_models_and_helper
-        from src.infrastructure.anthropic_streaming_service import (
-            AnthropicStreamingService,
-        )
+        from src.infrastructure.llm_service_factory import create_llm_service
     except Exception:
         _logger.exception("retriage: failed to import LLM stack")
         return []
@@ -876,5 +874,5 @@ async def _resolve_retriage_helpers(cfg: dict) -> List:
         )
         return []
     return [
-        AnthropicStreamingService(model=m, api_key=api_key) for m in main_models
+        create_llm_service(model=m, api_key=api_key) for m in main_models
     ]

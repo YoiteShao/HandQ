@@ -432,6 +432,43 @@ function notifyConfirmationNeeded(evt) {
     startTrayFlash();
 }
 
+// Show a system toast + flash the taskbar when a task actually finishes
+// (bridge emits {type:"status", kind:"task_completed", summary}) and the
+// window is not in focus. Distinct from notifyConfirmationNeeded: this fires
+// once per real completion, not per confirmation request. Removed by
+// accident in the 1.3.0 controller v1->v2 migration (main.js dropped the
+// whole function while nothing else in that diff replaced its trigger) —
+// re-added so "task finished while the window is hidden/minimized" is
+// visible again.
+function notifyTaskCompleted(evt) {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    const windowNeedsAttention =
+        !mainWindow.isVisible() ||
+        mainWindow.isMinimized() ||
+        !mainWindow.isFocused();
+    if (!windowNeedsAttention) return;
+
+    const summary = String((evt && evt.summary) || '');
+    const title = 'HandQ — 任务完成';
+    let body = summary || '任务已完成。';
+    if (body.length > 120) body = body.slice(0, 117) + '…';
+
+    if (Notification.isSupported()) {
+        const note = new Notification({ title, body, silent: false });
+        note.on('click', () => {
+            if (!mainWindow || mainWindow.isDestroyed()) return;
+            if (mainWindow.isMinimized()) mainWindow.restore();
+            mainWindow.show();
+            mainWindow.focus();
+        });
+        note.show();
+        logLine('NOTIFY', 'task_completed toast shown');
+    }
+
+    try { mainWindow.flashFrame(true); } catch (_) { /* ignore */ }
+    startTrayFlash();
+}
+
 function writeToBridge(obj) {
     if (!pythonChild || !pythonChild.stdin || pythonChild.stdin.destroyed) {
         logLine('IPC-OUT', 'bridge stdin unavailable',
@@ -596,6 +633,15 @@ function spawnBridge() {
             try { notifyConfirmationNeeded(evt); }
             catch (err) {
                 logLine('NOTIFY', 'notifyConfirmationNeeded threw',
+                        { err: err && err.message });
+            }
+        }
+        // Notify the user when a task actually completes (not just a chat
+        // reply) and the window is not in focus.
+        if (evtType === 'status' && evt && evt.kind === 'task_completed') {
+            try { notifyTaskCompleted(evt); }
+            catch (err) {
+                logLine('NOTIFY', 'notifyTaskCompleted threw',
                         { err: err && err.message });
             }
         }

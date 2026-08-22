@@ -104,8 +104,10 @@ from src.infrastructure.anthropic_streaming_service import (  # noqa: F401
     StreamToolCallEvent,
     StreamDoneEvent,
 )
+from src.infrastructure.openai_streaming_service import OpenAIStreamingService
 from src.infrastructure.config_manager import ConfigManager
 from src.infrastructure.llm_service import LLMService
+from src.infrastructure.llm_service_factory import create_llm_service
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +134,21 @@ class _SessionLLMService(LLMService):
     @property
     def _base_url(self) -> str:  # type: ignore[override]
         return getattr(self._shared, "_base_url", "")
+
+    def mark_exhausted(self, retry_after_secs: float = 0.0) -> None:  # type: ignore[override]
+        # Delegate to the shared service — exhaustion (rate limit / monthly
+        # cost cap) is a property of the underlying provider+key, not of any
+        # one session's wrapper. The 429 is observed inside
+        # self._shared.chat_stream()'s own retry loop, which calls
+        # self._shared.mark_exhausted(...) directly — never this wrapper's.
+        # Without this override, llm_pool._try_all_services checks THIS
+        # object's is_exhausted() (always False) and keeps re-issuing real
+        # network requests to a service already known dead for the rest of
+        # the account's billing window, once per session, forever.
+        self._shared.mark_exhausted(retry_after_secs)
+
+    def is_exhausted(self) -> bool:  # type: ignore[override]
+        return self._shared.is_exhausted()
 
     async def chat_stream(  # type: ignore[override]
         self,
@@ -161,6 +178,15 @@ class _SessionLLMService(LLMService):
 
 
 DEFAULT_CONFIG_PATH = "./handq_config.yaml"
+
+def _llm_service_for_model(api_key: str, model: str, *, max_retries: int = 10) -> LLMService:
+    """Create the concrete LLM service for *model* based on its provider prefix.
+
+    Thin wrapper around :func:`create_llm_service` — kept as a named entry
+    point since callers throughout this module already reference it.
+    """
+    return create_llm_service(api_key=api_key, model=model, max_retries=max_retries)
+
 
 
 # ---------------------------------------------------------------------------
@@ -594,6 +620,16 @@ class _StdioUI:
         _emit({"type": "status", "kind": "recall_started"},
               session_id=self._session_id)
 
+    def show_task_completed(self, summary: str) -> None:
+        """A real task-completion (Orchestrator._emit_completion_reply), not
+        just a chat reply. Renderer maps ``kind=task_completed`` to a system
+        notification / taskbar flash when the window isn't focused — see
+        electron/main.js's notifyTaskCompleted.
+        """
+        _emit({"type": "status", "kind": "task_completed",
+               "summary": str(summary or "")},
+              session_id=self._session_id)
+
     def notify_decision_made(
         self, iteration: int, reasoning: str, token_count: int = 0,
     ) -> None:
@@ -689,6 +725,18 @@ class _StdioUI:
                          len(todos) if isinstance(todos, list) else 0)
         _emit({"type": "status", "kind": "agent_todo",
                "todos": todos if isinstance(todos, list) else []},
+              session_id=self._session_id)
+
+    def notify_model_stats_changed(self, models: Any = None) -> None:
+        """Live per-model token tally → renderer ``kind=model_stats`` panel.
+        ``models`` arrives already flattened by
+        ``InteractionManager.notify_model_stats_changed``
+        (``interaction_manager.py``'s ``flatten_model_stats``) into a list
+        sorted by total_tokens descending (heaviest model first). An empty
+        list tells the renderer to drop the panel."""
+        models = models if isinstance(models, list) else []
+        _ui_logger.debug("notify_model_stats_changed: %d model(s)", len(models))
+        _emit({"type": "status", "kind": "model_stats", "models": models},
               session_id=self._session_id)
 
     def notify_file_touch(
@@ -2268,6 +2316,7 @@ class StdioBridge:
             "remote_connect",
             "remote_disconnect",
             "remote_push_skills",
+            "remote_list_skills",
             "remote_bind",
             "remote_close_session",
             "remote_pair_linux",
@@ -2573,17 +2622,13 @@ class StdioBridge:
             models = ["anthropic::claude-4-5-haiku"]
 
         self._shared_services = [
-            AnthropicStreamingService(
-                api_key=api_key, model=m, max_retries=10,
-            )
+            _llm_service_for_model(api_key=api_key, model=m, max_retries=10)
             for m in models
         ]
 
         _helper_model_names = _helper_models or models
         self._shared_helper_services = [
-            AnthropicStreamingService(
-                api_key=api_key, model=m, max_retries=10,
-            )
+            _llm_service_for_model(api_key=api_key, model=m, max_retries=10)
             for m in _helper_model_names
         ]
 
@@ -3091,6 +3136,13 @@ class StdioBridge:
                 names = [str(n) for n in (msg.get("names") or []) if str(n)]
                 results = await hub.push_skills_to(target_id, names)
                 _reply({"ok": True, "results": results})
+                return
+
+            if msg_type == "remote_list_skills":
+                hub = self._get_remote_hub()
+                target_id = str(msg.get("target_id") or "")
+                skills = await hub.list_skills_on(target_id)
+                _reply({"ok": True, "skills": skills})
                 return
 
             if msg_type == "remote_bind":

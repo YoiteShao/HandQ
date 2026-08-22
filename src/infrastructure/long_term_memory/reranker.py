@@ -261,9 +261,7 @@ def _build_llm_services_for_rerank(config: dict) -> List:
     """
     try:
         from src.infrastructure.role_resolver import resolve_models_and_helper
-        from src.infrastructure.anthropic_streaming_service import (
-            AnthropicStreamingService,
-        )
+        from src.infrastructure.llm_service_factory import create_llm_service
     except Exception:
         _logger.exception("failed to import LLM stack for rerank")
         return []
@@ -275,4 +273,4 @@ def _build_llm_services_for_rerank(config: dict) -> List:
 
     main_models, helper_models = resolve_models_and_helper(llm_cfg)
     models = helper_models or main_models
-    return [AnthropicStreamingService(model=m, api_key=api_key) for m in models]
+    return [create_llm_service(model=m, api_key=api_key) for m in models]

@@ -3,7 +3,7 @@
 Installed on a remote session's ``InteractionManager`` in place of the local
 ``_StdioUI``. Two responsibilities:
 
-**Fire-and-forget events fan out.** Each of the 17 non-blocking delegate methods
+**Fire-and-forget events fan out.** Each of the non-blocking delegate methods
 is recorded in the session's :class:`~src.remote_control.event_log.EventLog`
 (giving it a ``seq``) and pushed to the attached controller. Optionally it also
 goes to a *local* delegate — on a Windows controlled machine that is the machine's own
@@ -113,6 +113,9 @@ class NetworkUIDelegate:
     def show_recall_started(self) -> None:
         self._forward("show_recall_started")
 
+    def show_task_completed(self, summary: str) -> None:
+        self._forward("show_task_completed", str(summary))
+
     def notify_decision_made(
         self, iteration: int, reasoning: str, token_count: int = 0
     ) -> None:
@@ -145,6 +148,9 @@ class NetworkUIDelegate:
 
     def notify_agent_todo_changed(self, todos: Any = None) -> None:
         self._forward("notify_agent_todo_changed", todos if isinstance(todos, list) else [])
+
+    def notify_model_stats_changed(self, models: Any = None) -> None:
+        self._forward("notify_model_stats_changed", models if isinstance(models, list) else [])
 
     def notify_file_touch(
         self,

@@ -1902,9 +1902,7 @@ class DreamWorker:
         try:
             from src.infrastructure.role_resolver import resolve_models_and_helper
             from src.infrastructure.llm_pool import make_from_data_services
-            from src.infrastructure.anthropic_streaming_service import (
-                AnthropicStreamingService,
-            )
+            from src.infrastructure.llm_service_factory import create_llm_service
             from src.infrastructure.llm_service import LLMService
         except Exception:
             _logger.exception("dream worker: failed to import LLM stack")
@@ -1929,7 +1927,7 @@ class DreamWorker:
                 "triage: helper_models empty; deriving from main pool",
             )
             services: List[LLMService] = [
-                AnthropicStreamingService(model=m, api_key=api_key)
+                create_llm_service(model=m, api_key=api_key)
                 for m in main_models
             ]
             self._helper_services = (
@@ -1946,7 +1944,7 @@ class DreamWorker:
             return
 
         self._helper_services = [
-            AnthropicStreamingService(model=m, api_key=api_key)
+            create_llm_service(model=m, api_key=api_key)
             for m in models
         ]
         if self._helper_services:

@@ -97,6 +97,7 @@ from __future__ import annotations
 
 import argparse
 import contextvars
+import fcntl
 import getpass
 import json
 import os
@@ -850,6 +851,10 @@ class _LinuxDaemon:
         await self._flow.start()
         self._bind_mirror()
 
+        # Safe to write via a fresh open (Path.write_text) even though
+        # _run_daemon holds a separate locked fd on this same path: flock is
+        # scoped to the open file description, not the path, so this
+        # write+close cannot release that lock.
         PID_FILE.write_text(str(os.getpid()), encoding="utf-8")
         self._mirror.set_task_status("")
         await self._start_remote_control(cm)
@@ -1317,23 +1322,42 @@ def _archive(path: Path) -> None:
 def _llm_credential_problem(config_path: Optional[str]) -> str:
     """Return "" if this machine can authenticate to the LLM, else why it cannot.
 
-    A blank ``llm.API_KEY`` is *survivable* on a Windows controller: with an empty
-    key the Anthropic SDK falls back to ``ANTHROPIC_API_KEY`` /
-    ``ANTHROPIC_AUTH_TOKEN`` from the environment, so that machine keeps working
-    and nothing there complains. A daemon has no such environment, so the same
-    blank surfaces as ``TypeError: Could not resolve authentication method`` on the
-    first LLM call of every session — and that is precisely how a blank got here
-    once already: an upgrade wiped the controller's key and its next deploy copied
-    the blank over a key that had been working.
+    A blank ``llm.API_KEY`` is *survivable* on a Windows controller ONLY for
+    Anthropic models: with an empty key the Anthropic SDK falls back to
+    ``ANTHROPIC_API_KEY`` / ``ANTHROPIC_AUTH_TOKEN`` from the environment, so
+    that machine keeps working and nothing there complains. A daemon has no
+    such environment, so the same blank surfaces as ``TypeError: Could not
+    resolve authentication method`` on the first LLM call of every session —
+    and that is precisely how a blank got here once already: an upgrade
+    wiped the controller's key and its next deploy copied the blank over a
+    key that had been working. ``OpenAIStreamingService`` (Azure/OpenAI-
+    compatible models) has no such fallback at all — it always sends
+    ``Authorization: Bearer {api_key}`` verbatim — so a blank key there is
+    never survivable, env vars or not.
 
     Checked up front so the failure is one readable line in daemon.log and one
     immediate message in the operator's tab, rather than a stall.
     """
     from src.infrastructure.config_manager import ConfigManager
+    from src.infrastructure.role_resolver import resolve_models_and_helper
 
     llm_cfg = ConfigManager(config_path).get_section("llm") or {}
     if str(llm_cfg.get("API_KEY") or "").strip():
         return ""
+
+    models, helper_models = resolve_models_and_helper(llm_cfg)
+    all_models = list(models) + list(helper_models)
+    if not all_models:
+        all_models = ["anthropic::claude-4-5-haiku"]
+    non_anthropic = [m for m in all_models if not m.lower().startswith("anthropic::")]
+
+    if non_anthropic:
+        return (
+            f"llm.API_KEY 为空（{config_path or 'handq_config.yaml'}），且以下非 Anthropic "
+            f"模型没有环境变量兜底，每一次 LLM 调用都会失败：{', '.join(sorted(set(non_anthropic)))}。"
+            "请在这台机器的 handq_config.yaml 里填入 llm.API_KEY（控制端每次连接时也会自动同步这一段）。"
+        )
+
     for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
         if os.environ.get(name, "").strip():
             return ""
@@ -1348,15 +1372,17 @@ def _llm_credential_problem(config_path: Optional[str]) -> str:
 def _build_llm_services(config_path: Optional[str]) -> Tuple[List[Any], List[Any]]:
     """Build (consolidated, helper) LLM service pools from config.
 
-    Mirrors stdio_bridge's construction: one AnthropicStreamingService per
-    model in priority order (the fallback chain), plus a distinct helper pool
-    (llm.helper_models, falling back to the main models). The helper pool is
-    threaded through to FlowControllerV2/Orchestrator for constructor
-    compatibility but currently has no live consumer on this (LTM-less) Linux
-    path — kept for pool-lifecycle symmetry with stdio_bridge's shutdown.
+    Mirrors stdio_bridge's construction: one concrete LLMService per model
+    in priority order (the fallback chain), routed to the right adapter class
+    by ``create_llm_service`` (Anthropic vs. Azure/OpenAI-compatible), plus a
+    distinct helper pool (llm.helper_models, falling back to the main
+    models). The helper pool is threaded through to FlowControllerV2/
+    Orchestrator for constructor compatibility but currently has no live
+    consumer on this (LTM-less) Linux path — kept for pool-lifecycle symmetry
+    with stdio_bridge's shutdown.
     """
-    from src.infrastructure.anthropic_streaming_service import AnthropicStreamingService
     from src.infrastructure.config_manager import ConfigManager
+    from src.infrastructure.llm_service_factory import create_llm_service
     from src.infrastructure.role_resolver import resolve_models_and_helper
 
     cm = ConfigManager(config_path)
@@ -1368,18 +1394,77 @@ def _build_llm_services(config_path: Optional[str]) -> Tuple[List[Any], List[Any
         models = ["anthropic::claude-4-5-haiku"]
 
     consolidated = [
-        AnthropicStreamingService(api_key=api_key, model=m, max_retries=10)
+        create_llm_service(api_key=api_key, model=m, max_retries=10)
         for m in models
     ]
     helper = [
-        AnthropicStreamingService(api_key=api_key, model=m, max_retries=10)
+        create_llm_service(api_key=api_key, model=m, max_retries=10)
         for m in (helper_models or models)
     ]
     return consolidated, helper
 
 
+def _acquire_singleton_lock() -> Optional[int]:
+    """Exclusive, non-blocking ``flock`` on ``PID_FILE`` — at most one daemon
+    process may hold it at a time.
+
+    Guards a race ``PID_FILE``'s *content* alone cannot: two near-simultaneous
+    spawns (e.g. two independent Windows controllers auto-pairing the same
+    host within the same window) can both observe "no live pid" via
+    ``_daemon_alive()`` before either has written its own pid, and both
+    proceed to bind a port and write ``state.json`` — leaving two live
+    daemons with only the last writer's pid recorded, so ``handq.pid`` /
+    ``cmd_exit`` / the upgrade-bounce logic can only ever see and kill one of
+    them; the other survives indefinitely as an orphan nothing is aware of.
+    ``flock`` closes that gap because the *acquire* itself is atomic at the
+    kernel level: of several processes racing to lock the same file, exactly
+    one succeeds.
+
+    Opened via ``os.open`` with no ``O_TRUNC`` — a plain ``open(path, "w")``
+    would truncate the file the instant it's opened, before we know whether
+    we win the lock, which would wipe the pid the CURRENT winner already
+    wrote. The lock is only ever used for mutual exclusion; ``PID_FILE``'s
+    content is written separately, later, only by whichever process actually
+    wins (see ``_LinuxDaemon.start``'s ``PID_FILE.write_text`` call).
+
+    The kernel releases the lock automatically when the holding process
+    exits or is killed (even ``SIGKILL``), so there is no stale-lock case to
+    clean up.
+
+    Returns the held fd on success (the CALLER must keep it open for the
+    daemon's entire lifetime — closing it releases the lock), or ``None`` if
+    another process already holds it.
+    """
+    HANDQ_ROOT.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(PID_FILE), os.O_CREAT | os.O_RDWR, 0o644)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        return None
+    return fd
+
+
 def _run_daemon(config_path: Optional[str]) -> int:
     import asyncio
+
+    lock_fd = _acquire_singleton_lock()
+    if lock_fd is None:
+        # Lost the startup race to another daemon process (see
+        # _acquire_singleton_lock). Exit quietly rather than proceeding to
+        # bind a port / write state.json on top of the daemon that already
+        # won — PID_FILE and state.json already reflect (or will shortly
+        # reflect) that winner, not this process.
+        try:
+            HANDQ_ROOT.mkdir(parents=True, exist_ok=True)
+            with open(DAEMON_LOG, "a", encoding="utf-8") as f:
+                f.write(
+                    f"[handq_linux] pid={os.getpid()}: another daemon process "
+                    f"already holds the lock on {PID_FILE}; exiting without starting\n"
+                )
+        except Exception:
+            pass
+        return 0
 
     daemon = _LinuxDaemon(config_path)
 
@@ -1400,6 +1485,8 @@ def _run_daemon(config_path: Optional[str]) -> int:
         except Exception:
             pass
         return 1
+    finally:
+        os.close(lock_fd)
     return 0
 
 

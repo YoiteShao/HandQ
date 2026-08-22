@@ -38,6 +38,7 @@ logger = logging.getLogger("handq.remote_control.bridge")
 _SNAPSHOT_REPLAY = (
     ("task_plan", "notify_task_plan_changed"),
     ("agent_todos", "notify_agent_todo_changed"),
+    ("model_stats", "notify_model_stats_changed"),
 )
 
 
@@ -65,6 +66,15 @@ class _RemoteDesktopState:
     def revoke_takeover(self) -> bool:
         self._on_revoke()
         return True
+
+    def _release_global_takeover_if_owned(self) -> None:
+        """No-op: a remote session never holds this machine's global desktop
+        lock (the被控 machine owns that state). Exists only so
+        ``stdio_bridge._force_release_session_locks`` — called unconditionally
+        from teardown paths that don't all know whether ``_flows[sid]`` is a
+        local flow or a remote bridge — can call it without an AttributeError.
+        """
+        return None
 
 
 class _NullConfigManager:

@@ -51,6 +51,7 @@ DEFAULT_CAPACITY = 50_000
 _SNAPSHOT_METHODS = {
     "notify_task_plan_changed": "task_plan",
     "notify_agent_todo_changed": "agent_todos",
+    "notify_model_stats_changed": "model_stats",
 }
 
 _CHUNK_METHOD = "stream_coordinator_reply_chunk"
@@ -173,6 +174,7 @@ class EventLog:
             return {
                 "task_plan": list(self._snapshot.get("task_plan") or []),
                 "agent_todos": list(self._snapshot.get("agent_todos") or []),
+                "model_stats": list(self._snapshot.get("model_stats") or []),
                 "desktop_takeover": self._desktop_takeover,
             }
 

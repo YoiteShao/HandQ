@@ -152,6 +152,14 @@ SESSIONS_LIST = "sessions_list"            # s→c {sessions[]}
 SKILL_PUSH = "skill_push"                  # c→s {skills: [{name, files: [{path, content_b64}]}]}
 SKILL_PUSH_RESULT = "skill_push_result"    # s→c {results: [{name, ok, error}]}
 
+# Skill inventory query. Connection-scoped like SKILL_PUSH — asks the server
+# what it already has (bundled + previously-uploaded), so the upload picker
+# can show existing skills before overwriting one. Same additive-degrade
+# reasoning as LIST_SESSIONS: an old server ignores the unknown frame and the
+# new client's call just times out.
+SKILL_LIST = "skill_list"                  # c→s {}
+SKILL_LIST_RESULT = "skill_list_result"    # s→c {skills: [{name, description, origin, enabled, mtime}]}
+
 # Connection lifecycle
 #
 # RELEASE_SERVER is what makes "the operator clicked Disconnect" different from
@@ -330,6 +338,20 @@ def make_skill_push_result(results: List[Dict[str, Any]]) -> Dict[str, Any]:
     bad name (invalid characters, disk error) must not roll back the sibling
     skills in the same push."""
     return {"t": SKILL_PUSH_RESULT, "results": results}
+
+
+def make_skill_list() -> Dict[str, Any]:
+    """Controller → server: "what skills do you already have?" Deliberately
+    unparameterised, same as ``make_list_sessions`` — the answer is the whole
+    inventory, not a per-name probe."""
+    return {"t": SKILL_LIST}
+
+
+def make_skill_list_result(skills: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Server → controller: every skill this server has, bundled and
+    user/uploaded alike, as ``{name, description, origin, enabled, mtime}``
+    dicts."""
+    return {"t": SKILL_LIST_RESULT, "skills": skills}
 
 
 def make_session_superseded(session_id: str, generation: int) -> Dict[str, Any]:

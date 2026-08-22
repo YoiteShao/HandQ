@@ -1134,7 +1134,9 @@ Agent 每 turn:
 
 Electron renderer.js:
   window.handq.onTaskPlan(data) → renderTaskPlan(data)
-  → DOM: .task-plan-panel > .task-plan-items > .task-plan-item.tp-done / .tp-running / ...
+  → SessionSidebar.setTaskPlan(sid, items)（session-sidebar.js）
+
+session-sidebar.js 的 Plan bar 以 agent_todo（agent 主动调用 todo_write 写入，细粒度、可选）为主要展示；task_plan 队列本身粒度是"整条用户指令"，不够细，从不整份渲染——只在当前没有 agent_todo 时，退化显示 task_plan 里状态为 running 的那一条 instruction 作为单行提示（DOM: `.task-plan-panel.task-plan-fallback > .task-plan-item.tp-running`）。
 ```
 
 Skill 面板走独立的 `skill_list`/`skill_set_enabled`/`skill_set_standing`/`skill_create`/`skill_update`/`skill_delete`/`skill_import` IPC 消息(`stdio_bridge.py` → `SkillRegistry`)。`skill_list` 返回的清单已经过滤掉 `origin: bundled` 的条目(见 2.7),前端 `admin-panel.js` 直接渲染返回的数组,不做任何额外的 origin 过滤或硬编码假设。

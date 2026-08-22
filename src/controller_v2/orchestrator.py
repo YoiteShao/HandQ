@@ -48,6 +48,7 @@ from ..infrastructure.anthropic_streaming_service import (
 from ..infrastructure.logger import get_logger
 from ..infrastructure.long_term_memory._constants import RecallTier
 from ..infrastructure.utils import try_parse_json
+from ..models.token_usage import TokenUsage
 from .mention_preprocessing import preprocess_mentions
 from .session_context import GoalState
 from .task_channel import (
@@ -149,6 +150,7 @@ class Orchestrator:
         on_state_changed: Optional[Callable[[str], Any]] = None,
         on_recall_started: Optional[Callable[[], Any]] = None,
         on_task_complete: Optional[Callable[[], Awaitable[None]]] = None,
+        on_task_completed_notify: Optional[Callable[[str], Any]] = None,
         on_intent_classified: Optional[Callable[[str], Any]] = None,
         session_dir: Optional[str] = None,
         session_ctx: Optional["SessionContext"] = None,
@@ -158,6 +160,11 @@ class Orchestrator:
         self._services: List[LLMService] = list(llm_services)
         self._task_channel = task_channel
         self.logger = get_logger()
+        # Model that actually served the most recent LLM call, set by
+        # `_on_service_selected`. Captures the real fallback-chain winner —
+        # not necessarily services[0] — so per-model token accounting
+        # (SessionContext.record_model_usage) attributes usage correctly.
+        self._last_serving_model: Optional[str] = None
         self._on_reply_to_user = on_reply_to_user
         self._on_response_chunk = on_response_chunk
         self._on_response_done = on_response_done
@@ -175,6 +182,13 @@ class Orchestrator:
         # close so Chromium doesn't linger between tasks in the same session.
         # Optional; ``None`` = no cleanup callback.
         self._on_task_complete = on_task_complete
+        # Fires with the completion reply's plain-text summary at the exact
+        # moment a task actually finishes (_emit_completion_reply) — distinct
+        # from on_reply_to_user, which also carries ordinary chat replies and
+        # gives the UI no way to tell "task done" apart from "coordinator
+        # chatted back". Lets the host surface a system notification /
+        # taskbar flash only for real completions. Optional; best-effort.
+        self._on_task_completed_notify = on_task_completed_notify
         # Fires once per on_user_message call, right after this turn's FINAL
         # intent lane is settled (chat/queue/interrupt — after the
         # commitment-leak guard has had its say, never the raw pre-guard LLM
@@ -268,7 +282,19 @@ class Orchestrator:
                 f"[Orchestrator] on_user_message error: {e} — fallback",
                 component="Orchestrator",
             )
-            fallback = f"⚠ Failed to process that message: {type(e).__name__}: {e}"
+            # All configured LLM services are session-exhausted (see
+            # llm_pool._try_all_services / _SessionLLMService.is_exhausted) —
+            # most commonly an account-wide monthly cost cap. Name it plainly
+            # instead of dumping the raw exception string, since that
+            # RuntimeError text is an internal implementation detail, not
+            # something a user can act on.
+            if isinstance(e, RuntimeError) and "session-exhausted" in str(e):
+                fallback = (
+                    "⚠ 所有已配置的模型当前都被限流或额度已耗尽，本次消息无法处理。"
+                    "请到设置中更换模型，或稍后重试。"
+                )
+            else:
+                fallback = f"⚠ Failed to process that message: {type(e).__name__}: {e}"
             self.conversation_history.append({"role": "assistant", "content": fallback})
             if self._on_reply_to_user:
                 self._on_reply_to_user(fallback)
@@ -420,9 +446,13 @@ class Orchestrator:
             elif parsed:
                 # Parsed fine, response_to_user just wasn't populated — show
                 # what the model DID return rather than a generic sentence.
+                # Plain str(v) (not !r/repr) so a value containing a real
+                # newline renders as one in the chat bubble instead of the
+                # literal two-character sequence \n that repr() would emit.
+                fields = ", ".join(f"{k}: {v}" for k, v in parsed.items())
                 final_reply = (
                     f"⚠ LLM response was missing 'response_to_user' — "
-                    f"parsed fields: {parsed!r}"
+                    f"parsed fields: {fields}"
                 )
             else:
                 # Total failure: `_last_llm_error` carries the real cause
@@ -541,6 +571,11 @@ class Orchestrator:
                     component="Orchestrator",
                 )
 
+    def _on_service_selected(self, service: LLMService) -> None:
+        """Callback: records which service actually served the most recent
+        LLM call, for per-model token accounting."""
+        self._last_serving_model = service.model
+
     async def _call_and_parse_streaming(
         self,
         messages: List[Dict[str, str]],
@@ -571,6 +606,7 @@ class Orchestrator:
         # actually fails; a clean run must not leak a stale message from a
         # previous turn.
         self._last_llm_error = None
+        llm_result: Optional[LLMChatResult] = None
 
         try:
             async for event in call_with_fallback_stream(
@@ -580,6 +616,7 @@ class Orchestrator:
                     f"Orchestrator {log_context} stream fallback to index {idx}: {e}",
                     component="Orchestrator",
                 ),
+                on_service_selected=self._on_service_selected,
                 wait_on_network_down=True,
             ):
                 if isinstance(event, StreamTextDeltaEvent):
@@ -597,7 +634,17 @@ class Orchestrator:
                                     pass
 
                 elif isinstance(event, StreamDoneEvent):
+                    llm_result = event.result
                     break
+
+            if self._session_ctx is not None and llm_result is not None:
+                try:
+                    self._session_ctx.record_model_usage(
+                        self._last_serving_model or self._services[0].model,
+                        TokenUsage.from_llm_result(llm_result),
+                    )
+                except Exception:
+                    pass
 
             full_text = "".join(accumulated)
             # Record whether we actually streamed the reply: drives the INTENT
@@ -612,11 +659,13 @@ class Orchestrator:
             # JSON). A silent None here propagates to `or {}` at the call site.
             # Capture the actual offending text before retrying, so a total
             # failure can show the user what the model really said instead of
-            # a generic placeholder.
+            # a generic placeholder. Plain str (not !r/repr) — repr would
+            # render any real newline in the model's prose as the literal
+            # two-character sequence \n in the chat bubble.
             snippet = full_text.strip()
             self._last_llm_error = (
                 f"model returned non-JSON output ({len(snippet)} chars): "
-                f"{snippet[:300]!r}"
+                f"{snippet[:300]}"
             ) if snippet else "model returned an empty response"
             self.logger.warning(
                 f"Orchestrator {log_context} stream produced non-JSON "
@@ -660,8 +709,17 @@ class Orchestrator:
                 f"Orchestrator {log_context} fallback to index {idx}: {e}",
                 component="Orchestrator",
             ),
+            on_service_selected=self._on_service_selected,
             wait_on_network_down=True,
         ))
+        if self._session_ctx is not None:
+            try:
+                self._session_ctx.record_model_usage(
+                    self._last_serving_model or self._services[0].model,
+                    TokenUsage.from_llm_result(raw),
+                )
+            except Exception:
+                pass
         parsed = try_parse_json(raw.content or "")
         return parsed if isinstance(parsed, dict) else None
 
@@ -1361,6 +1419,11 @@ class Orchestrator:
         if self._on_reply_to_user:
             try:
                 self._on_reply_to_user(full)
+            except Exception:
+                pass
+        if self._on_task_completed_notify:
+            try:
+                self._on_task_completed_notify(full)
             except Exception:
                 pass
 

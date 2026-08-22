@@ -9,6 +9,10 @@ llm:
   # tabs below.  One entry per model; order determines fallback priority
   # within each role's checked subset.
   available_models:
+  - azure::gpt-5.6-luna
+  - azure::gpt-5.6-terra
+  - azure::gpt-5.6-sol
+  - azure::gpt-5.5
   - anthropic::claude-5-opus
   - anthropic::claude-5-sonnet
   - anthropic::claude-4-8-opus
@@ -193,9 +197,9 @@ personalization:
   excluded_apps: []
   git_hook_repos: []
 update:
-  share_path:
+  share_path: '\\wine\APTAuto\ADAS\fengxuan\HandQ\Windows'
   # Where built handq-linux-<version>.tar.gz packages are dropped (see
   # packaging/build_linux.sh). When set, remote_handq auto-deploys/upgrades
   # handq_linux on a remote host before delegating a goal to it. Blank
   # disables the feature — the remote must be pre-installed as before.
-  linux_share_path: 
+  linux_share_path: '\\wine\APTAuto\ADAS\fengxuan\HandQ\Linux'

@@ -603,6 +603,7 @@ html.desktop-is-dark {
 .tool-card::before,
 .task-plan-panel::before,
 .agent-todo-panel::before,
+.model-stats-panel::before,
 .floating-composer::before,
 .mention-dropdown::before {
     content: '';
@@ -872,6 +873,7 @@ html, body {
 body.glass-fallback .session-card,
 body.glass-fallback .task-plan-panel,
 body.glass-fallback .agent-todo-panel,
+body.glass-fallback .model-stats-panel,
 body.glass-fallback .ss-section {
     background: rgba(255, 255, 255, var(--fallback-card-alpha, 0.60));
 }
@@ -898,13 +900,13 @@ body.glass-fallback .ss-section {
    body.glass-fallback, so webgl mode keeps its load-bearing plates untouched.
    (Layer-2 only; the panel shells and card fills are handled above.) */
 body.glass-fallback .session-card-head,
-body.glass-fallback .task-plan-header,
 body.glass-fallback .agent-todo-header,
+body.glass-fallback .model-stats-header,
 body.glass-fallback .ss-section-head,
 body.glass-fallback .ss-header .ss-title,
 body.glass-fallback .ss-header .ss-name,
-body.glass-fallback .task-plan-items,
 body.glass-fallback .agent-todo-items,
+body.glass-fallback .model-stats-items,
 body.glass-fallback .ss-activity-list,
 body.glass-fallback .ss-files-list {
     background: transparent;
@@ -3077,14 +3079,19 @@ code {
 .admin-entry-actions button:hover { background: rgba(255, 255, 255, 0.78); }
 .admin-entry-actions button:active { transform: translateY(1px); }
 
-/* ── Task-plan / agent-todo item rows (session-sidebar.js's plan bar) ──── */
-/* Panel/header chrome (.task-plan-panel, .agent-todo-panel, etc.) lives in
-   the "Session sidebar" section below alongside the rest of the right-hand
+/* ── Task-plan fallback / agent-todo item rows (session-sidebar.js's plan
+   bar) ──────────────────────────────────────────────────────────────── */
+/* Panel chrome (.task-plan-panel, .agent-todo-panel, etc.) lives in the
+   "Session sidebar" section below alongside the rest of the right-hand
    detail panel's styling — only the per-row item styling lives here, since
    it's shared visual vocabulary (glyph + status color) independent of
-   which panel it's rendered inside. */
-.task-plan-header,
-.agent-todo-header {
+   which panel it's rendered inside.
+   .task-plan-header/.task-plan-items have no rule here: the task_plan
+   fallback is a single unlabeled running-item row with no header or list
+   wrapper (see _renderPlanBar's else-branch) — only .agent-todo-header/
+   .agent-todo-items are ever built. */
+.agent-todo-header,
+.model-stats-header {
     display: inline-block;
     font-size: var(--fs-body);
     line-height: var(--lh-body);
@@ -3097,7 +3104,6 @@ code {
        backing shape. */
     color: var(--label);
 }
-.task-plan-items,
 .agent-todo-items {
     display: flex;
     flex-direction: column;
@@ -3123,21 +3129,11 @@ code {
 .task-plan-item .tp-text,
 .agent-todo-item .at-text { word-break: break-word; }
 
-.task-plan-item.tp-done .tp-glyph     { color: #2e8b57; }
-.task-plan-item.tp-done .tp-text      { color: var(--label-secondary); text-decoration: line-through; }
+/* Only .tp-running is ever rendered (the fallback shows the single
+   currently-running task_plan item); the other status colors that used to
+   back a full done/failed/pending/skipped list were removed with it. */
 .task-plan-item.tp-running .tp-glyph  { color: rgba(184, 175, 196, 0.95); }
 .task-plan-item.tp-running            { font-weight: var(--fw-semibold); }
-.task-plan-item.tp-failed .tp-glyph   { color: #c0392b; }
-.task-plan-item.tp-interrupted .tp-glyph { color: #d08a1e; }
-.task-plan-item.tp-skipped .tp-glyph  { color: var(--label-secondary); opacity: 0.7; }
-.task-plan-item.tp-skipped .tp-text   {
-    color: var(--label-secondary);
-    text-decoration: line-through;
-    text-decoration-style: dashed;
-    opacity: 0.85;
-}
-.task-plan-item.tp-pending .tp-glyph,
-.task-plan-item.tp-pending .tp-text   { color: var(--label-secondary); }
 
 .agent-todo-item.at-completed .at-glyph { color: #2e8b57; }
 .agent-todo-item.at-completed .at-text  { color: var(--label-secondary); text-decoration: line-through; }
@@ -3145,6 +3141,34 @@ code {
 .agent-todo-item.at-in_progress          { font-weight: var(--fw-semibold); }
 .agent-todo-item.at-pending .at-glyph,
 .agent-todo-item.at-pending .at-text     { color: var(--label-secondary); }
+
+/* Model/token stats rows — plain "name : tokens" pairs, no status glyph
+   (a model's tally has no lifecycle state to color). */
+.model-stats-items {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin-top: 8px;
+}
+.model-stats-item {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 8px;
+    font-size: var(--fs-callout);
+    line-height: 1.45;
+    color: var(--label);
+}
+.model-stats-item .ms-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.model-stats-item .ms-tokens {
+    flex: 0 0 auto;
+    font-family: var(--mono);
+    color: var(--label-secondary);
+}
 
 .admin-stats-output {
     font-family: var(--mono);
@@ -3374,6 +3398,7 @@ body.card-width-instant .session-card {
    is settled. */
 body.card-width-instant .task-plan-panel,
 body.card-width-instant .agent-todo-panel,
+body.card-width-instant .model-stats-panel,
 body.card-width-instant .ss-section {
     backdrop-filter: none !important;
     -webkit-backdrop-filter: none !important;
@@ -3387,13 +3412,13 @@ body.card-width-instant .ss-section {
    (--l2-plate / -strong), which over the near-opaque fill above is more than
    enough contrast on its own. What's lost for the ~370ms window is the
    brightness() boost, not the plate itself. */
-body.card-width-instant .task-plan-header,
 body.card-width-instant .agent-todo-header,
+body.card-width-instant .model-stats-header,
 body.card-width-instant .ss-section-head,
 body.card-width-instant .ss-header .ss-name,
 body.card-width-instant .ss-header .ss-title,
-body.card-width-instant .task-plan-items,
 body.card-width-instant .agent-todo-items,
+body.card-width-instant .model-stats-items,
 body.card-width-instant .ss-activity-list,
 body.card-width-instant .ss-files-list {
     backdrop-filter: none !important;
@@ -4475,6 +4500,11 @@ button.danger:hover:not(:disabled) {
     background: rgba(230, 160, 40, 0.16);
     border-color: rgba(230, 160, 40, 0.46);
 }
+.skill-card-badge.builtin {
+    color: var(--fg-mute);
+    background: rgba(120, 120, 130, 0.14);
+    border-color: rgba(120, 120, 130, 0.40);
+}
 .skill-card-head {
     display: flex;
     align-items: center;
@@ -4495,6 +4525,88 @@ button.danger:hover:not(:disabled) {
     flex: none;
     accent-color: var(--tint);
     margin: 0;
+}
+
+/* Upload-Skill picker — wider card + left/right split (local skills to
+   pick from vs. target's existing skills), scoped so the main Skills
+   overlay's card/grid/desc defaults are untouched. */
+.skill-upload-card { width: min(900px, 94vw); }
+
+/* .skills-body normally IS the scroll container (single list, stacked).
+   Here it just hosts the two-column grid, whose own children (the
+   .skill-upload-grid panes below) do the scrolling instead — leaving
+   overflow-y: auto here would let this outer element claim the scrollbar
+   for whichever column is momentarily taller, instead of each column
+   getting its own. */
+.skill-upload-columns.skills-body { overflow: hidden; }
+
+.skill-upload-note {
+    margin: 0;
+    padding: 6px var(--space-3) 2px;
+    font-size: var(--fs-footnote);
+    line-height: var(--lh-footnote);
+    color: var(--fg-mute);
+    opacity: 0.85;
+    text-align: left;
+}
+
+.skill-upload-columns {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    grid-template-rows: minmax(0, 1fr);
+    flex: 1 1 auto;     /* fill .skills-body's bounded height instead of
+                           sizing to content — without this, the row grows
+                           with its tallest column and neither column ever
+                           hits its own overflow, so .skills-body's outer
+                           scrollbar ends up doing the (single, shared) job */
+    min-height: 0;
+    overflow: hidden;
+    gap: 20px;
+}
+.skill-upload-col {
+    min-width: 0;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    overflow: hidden;   /* clip at the column; only its .skill-upload-grid
+                           child scrolls (kept below its own header) */
+    border: 1px solid var(--hairline-soft);
+    border-radius: 12px;
+    padding: 10px;
+    background: rgba(0, 0, 0, 0.012);
+}
+
+.skill-upload-grid {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;      /* independent scrollbar per column — the header
+                               above stays put since it's a sibling, not a
+                               child, of this scrolling element */
+    align-content: start;
+    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+}
+.skill-upload-grid .skill-card {
+    cursor: pointer;
+}
+.skill-upload-grid .skill-card-desc {
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+}
+.skill-upload-mtime {
+    font-size: var(--fs-footnote);
+    line-height: var(--lh-footnote);
+    color: var(--fg-mute);
+    opacity: 0.75;
+}
+
+/* Bottom action row sits outside .skills-body (so it stays put while the
+   columns scroll) but that means it inherits no padding from a parent —
+   give it the same side/bottom gutter as the columns above it. */
+#overlay-skill-upload .settings-actions {
+    padding: 10px 22px 20px;
 }
 .skill-card-name {
     font-family: var(--mono);
@@ -4958,22 +5070,23 @@ body.ss-driving-active .ss-reopen {
     container-type: size;
 }
 
-/* Plan bar (top) — full task-plan queue, always fully expanded. Same
+/* Plan bar (top) — agent_todo when present, else a single task_plan
+   fallback row (see session-sidebar.js's _renderPlanBar). Same
    session-card-style translucent radial-gradient card look as the rest of
    the detail panel (see .ss-section below) rather than a flat hairline
    divider, so the whole right-hand panel reads as one visual family with
    the tiled session cards on the main stage.
    Content-sized (flex:0 0 auto, no fixed height) with a max-height CAP —
-   NOT the earlier fixed 15cqh slot. The fixed slot was wrong: when the
-   plan is short (e.g. one "Plan · 1/1 done" line) the slot still reserved
-   15% of the panel, leaving a big dead gap between the short plan card and
-   Activity below. Content-sizing means the bar is exactly as tall as its
-   card and no taller, so there's no gap; the max-height cap (30cqh) is
-   what prevents the OTHER failure mode — a very long completed-item list
-   growing tall enough to squeeze Activity — by making the plan list scroll
-   inside its own capped box past that point instead of pushing Activity
-   down. .ss-body below is flex:1 1 auto, so whatever height the plan bar
-   doesn't use flows to Activity/Files rather than becoming dead space. */
+   NOT a fixed slot. A fixed slot is wrong: when the bar holds only the
+   one-line fallback, a fixed slot still reserves the same share of the
+   panel, leaving a dead gap between the short bar and Activity below.
+   Content-sizing means the bar is exactly as tall as its content and no
+   taller; the max-height cap (30cqh) is what prevents the OTHER failure
+   mode — a long agent_todo checklist growing tall enough to squeeze
+   Activity — by making it scroll inside its own capped box past that
+   point instead of pushing Activity down. .ss-body below is flex:1 1
+   auto, so whatever height the plan bar doesn't use flows to
+   Activity/Files rather than becoming dead space. */
 /* ── Resume candidates section (top of sidebar when idle) ───────────── */
 .ss-resume-section {
     flex: 0 0 auto;
@@ -5111,7 +5224,8 @@ body.ss-driving-active .ss-reopen {
     app-region: no-drag;
 }
 .task-plan-panel,
-.agent-todo-panel {
+.agent-todo-panel,
+.model-stats-panel {
     position: relative;
     border: 1px solid rgba(255, 255, 255, var(--l2-border-alpha));
     border-radius: 14px;

@@ -1,8 +1,14 @@
 /**
  * session-sidebar.js — right-hand session detail panel (Stage-Manager
  * redesign). Stacked top to bottom inside one frosted panel:
- *   1. Plan bar     — collapsed summary of the coordinator's task-plan
- *      queue (+ the agent's own current sub-step, when present).
+ *   1. Plan bar     — agent_todo is the primary signal (fine-grained,
+ *      per-turn, written by the agent's own todo_write tool). It is
+ *      OPTIONAL — the agent may finish a whole task without ever writing
+ *      one — so when it's absent this bar falls back to a single line
+ *      showing whichever task_plan item is currently "running" (the
+ *      coordinator's coarse, whole-instruction-grained queue). The full
+ *      task_plan queue is never listed wholesale; it's too coarse to read
+ *      as real progress.
  *   2. Activity feed — flat chronological log of decisions/tool calls/
  *      results for the focused session (formerly rendered inline between
  *      chat bubbles; moved here so the chat pane stays pure conversation).
@@ -114,6 +120,7 @@
   //   itemFirstSeen: Map<itemId, ts>,   // for item-block sort
   //   taskItems: Array<{id, instruction, status}>,
   //   agentTodoItems: Array<{content, status}>,
+  //   modelStats: Array<{model, total_tokens, input_tokens, output_tokens, cache_read_tokens}>,
   //   activityItems: Array<{label, content, time, iter, tool, pending, resultContent}>,
   //   lastEvent: null | {path, touch, tool, itemId},
   //   selectedPath: string | null,
@@ -182,6 +189,7 @@
       taskItems: [],
       itemStatus: new Map(),
       agentTodoItems: [],
+      modelStats: [],
       activityItems: [],
       lastEvent: null,
       selectedPath: null,
@@ -292,6 +300,18 @@
         content: (t && t.content) || '',
         status: (t && t.status) || 'pending',
       })) : [];
+      if (sid === activeSid) _renderPlanBar();
+    },
+    setModelStats: function (sid, models) {
+      if (!sid || !Array.isArray(models)) return;
+      const s = _ensureState(sid);
+      s.modelStats = models.map(m => ({
+        model: (m && m.model) || '',
+        total_tokens: (m && m.total_tokens) || 0,
+        input_tokens: (m && m.input_tokens) || 0,
+        output_tokens: (m && m.output_tokens) || 0,
+        cache_read_tokens: (m && m.cache_read_tokens) || 0,
+      }));
       if (sid === activeSid) _renderPlanBar();
     },
     ingestFileTouch: function (sid, evt) {
@@ -1231,26 +1251,30 @@
     dom.name.textContent = s ? (s.name || activeSid.slice(0, 8)) : '';
   }
 
+  // Used by showResumeCandidates (line ~587) for completed/interrupted, and
+  // by the task_plan fallback below for running. Other statuses (pending,
+  // failed, skipped) are no longer rendered anywhere but stay defined so
+  // status strings from the wire always resolve to a glyph.
   const PLAN_GLYPH = {
     done: '✓', running: '▶', pending: '○', failed: '✗', interrupted: '⊗', skipped: '⊘',
   };
   const TODO_GLYPH = { completed: '✓', in_progress: '▶', pending: '☐' };
 
-  // Full task-plan queue + (if present) the agent's own current sub-step.
-  // Always fully expanded — no collapse/toggle — so the plan is readable
-  // at a glance without an extra click.
-  // Order: Agent todo (top) → Plan (below). Agent todo reflects the
-  // currently-executing sub-agent's live checklist, which changes turn by
-  // turn and is what the user watches; Plan is the slower-moving parent
-  // queue and belongs below as reference context.
+  // Agent todo (fine-grained, optional) is the primary progress signal.
+  // When the agent hasn't written one for the current turn, fall back to
+  // a single line naming whichever task_plan item is "running" — the
+  // coordinator's queue is whole-instruction-grained and was never meant
+  // to be read as a step-by-step plan, so it's never rendered as a full
+  // list, only as this one-line "what's it doing right now" fallback.
   function _renderPlanBar() {
     if (!dom.planBar) return;
     const s = activeSid ? bySid.get(activeSid) : null;
     dom.planBar.innerHTML = '';
-    if (!s || (s.taskItems.length === 0 && s.agentTodoItems.length === 0)) return;
+    if (!s || (s.taskItems.length === 0 && s.agentTodoItems.length === 0 && s.modelStats.length === 0)) return;
 
-    // Agent todo panel (rendered FIRST so it sits above Plan).
     if (s.agentTodoItems.length > 0) {
+      // Todo present — this is the whole progress story; task_plan adds
+      // nothing a fine-grained checklist doesn't already say better.
       const todoPanel = document.createElement('div');
       todoPanel.className = 'agent-todo-panel';
       const todoDone = s.agentTodoItems.filter(t => t.status === 'completed').length;
@@ -1271,37 +1295,53 @@
       }
       todoPanel.appendChild(todoList);
       dom.planBar.appendChild(todoPanel);
+    } else {
+      const running = s.taskItems.find(it => it.status === 'running');
+      if (running) {
+        const panel = document.createElement('div');
+        panel.className = 'task-plan-panel task-plan-fallback';
+        panel.innerHTML =
+          '<div class="task-plan-item tp-running">' +
+          '<span class="tp-glyph">' + PLAN_GLYPH.running + '</span>' +
+          '<span class="tp-text">' + _esc(running.instruction) + '</span>' +
+          '</div>';
+        dom.planBar.appendChild(panel);
+      }
     }
 
-    // Plan panel (rendered SECOND so it sits below Agent todo).
-    if (s.taskItems.length > 0) {
-      const items = s.taskItems;
-      const doneCount = items.filter(it => it.status === 'done').length;
-      const failedCount = items.filter(it => it.status === 'failed').length;
-
+    // Model/token stats panel (rendered below Plan/Todo).
+    if (s.modelStats.length > 0) {
+      const totalTok = s.modelStats.reduce((sum, m) => sum + m.total_tokens, 0);
       const panel = document.createElement('div');
-      panel.className = 'task-plan-panel';
+      panel.className = 'model-stats-panel';
 
       const header = document.createElement('div');
-      header.className = 'task-plan-header';
-      let summary = 'Plan · ' + doneCount + '/' + items.length + ' done';
-      if (failedCount) summary += ' · ' + failedCount + ' failed';
-      header.innerHTML = '<span class="tp-summary">' + _esc(summary) + '</span>';
+      header.className = 'model-stats-header';
+      header.innerHTML = '<span class="ms-summary">Models · ' + _fmtTok(totalTok) + ' tokens</span>';
       panel.appendChild(header);
 
       const list = document.createElement('div');
-      list.className = 'task-plan-items';
-      for (const it of items) {
+      list.className = 'model-stats-items';
+      for (const m of s.modelStats) {
         const row = document.createElement('div');
-        row.className = 'task-plan-item tp-' + it.status;
+        row.className = 'model-stats-item';
+        row.title = 'in: ' + m.input_tokens + ' · out: ' + m.output_tokens + ' · cache_read: ' + m.cache_read_tokens;
         row.innerHTML =
-          '<span class="tp-glyph">' + (PLAN_GLYPH[it.status] || '·') + '</span>' +
-          '<span class="tp-text">' + _esc(it.instruction) + '</span>';
+          '<span class="ms-name">' + _esc(m.model) + '</span>' +
+          '<span class="ms-tokens">' + _fmtTok(m.total_tokens) + '</span>';
         list.appendChild(row);
       }
       panel.appendChild(list);
       dom.planBar.appendChild(panel);
     }
+  }
+
+  // Compact token-count formatter for the model-stats panel (e.g. 12400 -> "12.4k").
+  function _fmtTok(n) {
+    n = n || 0;
+    if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+    if (n >= 1e3) return (n / 1e3).toFixed(1) + 'k';
+    return String(n);
   }
 
   const ACTIVITY_TRUNC = 2000;

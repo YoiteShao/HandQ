@@ -4220,6 +4220,15 @@
             for (const sid of sessions.keys()) _forceFinalizePendingActivity(sid);
         } else if (evt.kind === 'reply') {
             addAssistantTextBubble(evt.text || '');
+        } else if (evt.kind === 'task_completed') {
+            // Fired ALONGSIDE 'reply' (same text) purely so main.js can raise
+            // a system notification for a real completion — see
+            // Orchestrator._emit_completion_reply's on_task_completed_notify.
+            // The chat bubble itself already came from 'reply' above; this
+            // only adds the activity-feed marker, so it must not re-render
+            // the text as a second bubble.
+            pushActivity('🏁', 'Task completed',
+                          String(evt.summary || '').slice(0, 80));
         } else if (evt.kind === 'user_message_echo') {
             // Replay of the operator's OWN past message (see
             // stdio_bridge.py's _StdioUI.show_user_message_echo) — the local
@@ -4300,6 +4309,13 @@
                 window.SessionSidebar.setAgentTodo(
                     _resolveSid(evt),
                     Array.isArray(evt.todos) ? evt.todos : [],
+                );
+            }
+        } else if (evt.kind === 'model_stats') {
+            if (window.SessionSidebar) {
+                window.SessionSidebar.setModelStats(
+                    _resolveSid(evt),
+                    Array.isArray(evt.models) ? evt.models : [],
                 );
             }
         } else if (evt.kind === 'llm_server_error') {
@@ -4385,14 +4401,6 @@
         // Any final response means the bridge is alive and serving — fade
         // the boot overlay if it's still up.
         if (!bootHidden) hideBootOverlay();
-
-        if (evt.result && evt.result.config && evt.result.config_path !== undefined) {
-            window.__handqLog('INFO', 'config_get final received',
-                { path: evt.result.config_path });
-            applyConfigToForm(evt.result.config);
-            settingsStatus.textContent = 'loaded';
-            return;
-        }
 
         // file_undo response — {ok, mode, item_id, restored:[{path,was_absent}],
         // conflicts:[{path,conflict,detail}]}. Dispatch to the sidebar so it
@@ -4940,7 +4948,20 @@
         });
     });
 
-    function renderModelCheckboxes() {
+    // DIAGNOSTIC (2026-08-20): tracking a reported "Agent tab checkbox
+    // won't check, Helper tab works fine" bug that isn't currently
+    // reproducible. Every rebuild wipes and recreates the <input> nodes via
+    // innerHTML — if that happens between a click's mousedown and its click
+    // (e.g. triggered by the async getConfig() response landing while the
+    // Agent tab, the default-visible one, is showing), the click can land on
+    // a node that's already been torn out. These logs exist to catch that
+    // race the next time it happens; remove once root-caused or once this
+    // theory is ruled out.
+    function renderModelCheckboxes(source) {
+        window.__handqLog('INFO', 'renderModelCheckboxes rebuild', {
+            source: source || 'unknown',
+            activeTab: document.querySelector('.model-tab.active')?.dataset.tab,
+        });
         const pool = textToModels(cfgLlmAvailableModels.value);
         for (const [container, group] of [
             [cfgLlmAgentChecks, 'agent'],
@@ -4972,7 +4993,31 @@
             }
         }
     }
-    cfgLlmAvailableModels.addEventListener('input', renderModelCheckboxes);
+    cfgLlmAvailableModels.addEventListener('input', () => renderModelCheckboxes('textarea-input'));
+
+    // DIAGNOSTIC (2026-08-20): raw pointer/click trace on the two checkbox
+    // lists — see the rebuild race theory above. Capture phase so we see the
+    // event even if something upstream stops propagation. Logs the event
+    // target's connectedness: a click landing on a detached (already
+    // rebuilt-away) node is the smoking gun for the race.
+    for (const [container, label] of [
+        [cfgLlmAgentChecks, 'agent'],
+        [cfgLlmHelperChecks, 'helper'],
+    ]) {
+        for (const evtName of ['mousedown', 'click']) {
+            container.addEventListener(evtName, (ev) => {
+                const t = ev.target;
+                window.__handqLog('INFO', 'model-checks ' + evtName, {
+                    list: label,
+                    tag: t && t.tagName,
+                    type: t && t.type,
+                    value: t && t.value,
+                    isConnected: t && t.isConnected,
+                    checkedAfter: t && t.checked,
+                });
+            }, true);
+        }
+    }
 
     function showToast(message, kind) {
         settingsToast.textContent = message;
@@ -4998,7 +5043,7 @@
 
         const resolved = resolveModelsAndHelper(llm);
         cfgLlmAvailableModels.value = modelsToText(resolved.pool);
-        renderModelCheckboxes();
+        renderModelCheckboxes('applyConfigToForm');
         for (const m of resolved.agent) {
             const cb = cfgLlmAgentChecks.querySelector(`input[value="${CSS.escape(m)}"]`);
             if (cb) cb.checked = true;

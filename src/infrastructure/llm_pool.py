@@ -38,9 +38,11 @@ that want to short-circuit before even trying the LLM.
 Public API
 ----------
 ``call_with_fallback(services, chat_kwargs, on_fallback=None, *,
-                     wait_on_network_down=True, on_network_event=None)``
+                     on_service_selected=None, wait_on_network_down=True,
+                     on_network_event=None)``
 ``call_with_fallback_stream(services, chat_kwargs, on_fallback=None, *,
-                            wait_on_network_down=True, on_network_event=None)``
+                            on_service_selected=None, wait_on_network_down=True,
+                            on_network_event=None)``
 ``is_network_down() -> bool``
 ``NetworkUnavailableError``
 ``make_from_data_services(all_services)``
@@ -350,6 +352,7 @@ async def _try_all_services(
     services: List[LLMService],
     chat_kwargs: dict,
     on_fallback: Optional[Callable[[int, Exception], None]],
+    on_service_selected: Optional[Callable[["LLMService"], None]] = None,
 ) -> LLMChatResult:
     """One pass through every service.  Returns the first success;
     raises the last error on full exhaustion; fast-fails on 4xx.
@@ -374,6 +377,11 @@ async def _try_all_services(
                     result = event.result
             if result is None:
                 raise RuntimeError("chat_stream ended without a StreamDoneEvent")
+            if on_service_selected is not None:
+                try:
+                    on_service_selected(service)
+                except Exception:
+                    pass
             return result
         except Exception as exc:
             last_exc = exc
@@ -414,6 +422,7 @@ async def call_with_fallback(
     chat_kwargs: dict,
     on_fallback: Optional[Callable[[int, Exception], None]] = None,
     *,
+    on_service_selected: Optional[Callable[["LLMService"], None]] = None,
     wait_on_network_down: bool = True,
     on_network_event: Optional[Callable[[str, int, int], None]] = None,
 ) -> LLMChatResult:
@@ -426,6 +435,12 @@ async def call_with_fallback(
         chat_kwargs:     Forwarded verbatim to ``service.chat_stream``.
         on_fallback:     ``(next_index, error) -> None`` callback fired
                          before each within-pass fallback step.
+        on_service_selected: called with the service instance once a
+                         result is actually produced. Mirrors
+                         :func:`call_with_fallback_stream`'s callback of the
+                         same name — lets callers learn which service in
+                         the fallback chain actually served this call
+                         (e.g. for per-model token accounting).
         wait_on_network_down: When True (default), the wrapper sleeps
                          with exponential backoff until the LLM host
                          comes back, then retries from ``services[0]``.
@@ -445,7 +460,7 @@ async def call_with_fallback(
     """
     while True:
         try:
-            return await _try_all_services(services, chat_kwargs, on_fallback)
+            return await _try_all_services(services, chat_kwargs, on_fallback, on_service_selected)
         except Exception as exc:
             await _handle_network_failure(
                 services, exc,

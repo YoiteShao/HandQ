@@ -14,17 +14,21 @@ corruption) structurally impossible — the digest files are the only
 source of truth.
 
 The bridge calls ``build()`` twice: once at boot purely to warm the
-embedding model + fill the embedding cache (~5-7s cold — jieba dict load +
-onnx model load + first-time embed of every existing digest), and again
-right before EVERY resume search (see
+embedding model + fill the caches (~5-7s cold — jieba dict load + onnx
+model load + first-time read/parse/embed of every existing digest), and
+again right before EVERY resume search (see
 ``stdio_bridge._search_resume_candidates``) so a session destroyed
 earlier in the same bridge process is visible to resume without a
-restart. A pre-warmed rebuild is cheap because embeddings are CACHED per
-corpus (see ``_embed_cache`` / ``_build_indices_sync``): a rebuild only
-re-embeds NEW/changed digests, so the per-search cost is disk-scan +
-FTS5 insert + query embed (~100ms at ~80 sessions), not a full
-re-embed of the whole corpus (~4.8s at 83, measured 2026-08-01 before
-the cache landed — that was the "dead zone after a message" bug).
+restart. A pre-warmed rebuild is cheap because BOTH the disk-scan and the
+embedding are cached (see ``_digest_cache`` / ``_embed_cache``): a rebuild
+only re-reads/re-parses/re-embeds NEW/changed digests — everything else is
+one ``stat()`` per unchanged session dir — so the per-search cost is a
+cheap scan + FTS5 insert + query embed (a few ms per session, not the
+disk-read/JSON-parse cost), not a full re-scan of the whole corpus.
+Confirmed live 2026-08-20: before the digest cache, a cold-OS-file-cache
+rebuild took up to 28.6s at ~900 sessions (the ``digest.json`` re-read was
+the dominant cost, not the embedding) — that was the "first message of a
+new session feels frozen" bug.
 
 Two retrieval legs, fused by RRF, exactly mirroring
 ``long_term_memory/recall.py``'s pattern but INTENTIONALLY not sharing its
@@ -305,6 +309,17 @@ class ResumeIndex:
         # by design: distinct corpora ≈ session count (small); each entry is
         # ~512 floats (~2KB), so even hundreds of sessions is a few MB.
         self._embed_cache: Dict[str, List[float]] = {}
+        # session_dir -> (digest.json mtime_ns, parsed SessionDigest). The
+        # embed cache above only saves the (already cheap) re-embed step —
+        # the disk-scan itself was still a full read+JSON-parse of every
+        # digest.json on EVERY build() call (900+ files measured live),
+        # which is the actual dominant cost (18-28s cold-cache vs. <1s warm,
+        # confirmed against real boot logs 2026-08-20). Keyed on mtime_ns
+        # (not "already in cache") because a LIVE session's digest is
+        # rewritten repeatedly at every item boundary while status="crashed"
+        # (FlowControllerV2._on_item_done_checkpoint) — presence alone would
+        # wrongly freeze that session's card at its first-ever checkpoint.
+        self._digest_cache: Dict[Path, Tuple[int, SessionDigest]] = {}
 
     @property
     def size(self) -> int:
@@ -317,21 +332,57 @@ class ResumeIndex:
         digest.json files and rebuild the index from scratch.
 
         Safe to call repeatedly (e.g. periodic refresh) — each call fully
-        replaces the prior entries/vectors/connection.
+        replaces the prior entries/vectors/connection. Both the scan and the
+        FTS/embed rebuild run under ``self._lock`` via ``asyncio.to_thread``
+        so this never blocks the bridge's event loop, and so two overlapping
+        build() calls (from two sessions' messages) never race on
+        ``self._digest_cache``.
         """
         root = history_root or _session_history_root()
-        entries: List[Tuple[Path, SessionDigest]] = []
-        if root.exists():
-            for d in sorted(root.iterdir()):
-                if not d.is_dir():
-                    continue
-                digest = SessionDigest.load(d)
-                if digest is not None:
-                    entries.append((d, digest))
-
         async with self._lock:
-            self._entries = entries
+            self._entries = await asyncio.to_thread(self._scan_entries_sync, root)
             await asyncio.to_thread(self._build_indices_sync)
+
+    def _scan_entries_sync(self, root: Path) -> List[Tuple[Path, SessionDigest]]:
+        """Blocking half of build(): directory scan + digest load.
+
+        Reuses ``self._digest_cache`` keyed on the digest.json's mtime_ns —
+        a cache hit is one ``stat()`` call, a miss is the full read+parse
+        that ``SessionDigest.load`` does. Must only be called while
+        ``self._lock`` is held (see build()).
+        """
+        entries: List[Tuple[Path, SessionDigest]] = []
+        if not root.exists():
+            self._digest_cache.clear()
+            return entries
+
+        seen: set = set()
+        for d in sorted(root.iterdir()):
+            if not d.is_dir():
+                continue
+            target = d / SessionDigest.DIGEST_FILENAME
+            try:
+                mtime_ns = target.stat().st_mtime_ns
+            except OSError:
+                continue
+            seen.add(d)
+            cached = self._digest_cache.get(d)
+            if cached is not None and cached[0] == mtime_ns:
+                entries.append((d, cached[1]))
+                continue
+            digest = SessionDigest.load(d)
+            if digest is not None:
+                self._digest_cache[d] = (mtime_ns, digest)
+                entries.append((d, digest))
+            else:
+                self._digest_cache.pop(d, None)
+
+        # Drop cache entries for session dirs that no longer exist/qualify —
+        # unbounded growth otherwise across a long-running bridge process
+        # as old History/ dirs get cleaned up externally.
+        for stale in set(self._digest_cache) - seen:
+            del self._digest_cache[stale]
+        return entries
 
     def _build_indices_sync(self) -> None:
         """Blocking half of build(): FTS5 insert + batch dense embed.
